@@ -4,6 +4,7 @@
 //! No walker, path resolver, source capture or metadata cache lives here.
 use std::{ffi::c_char, path::Path, sync::OnceLock};
 use fcb_app::host::HostResponse;
+use fcb_app::host::catalog_session::CatalogDiscoveryPolicy;
 use super::{cstr, reply, string_out};
 use super::catalog_sessions::{AccessError, CatalogSessions, Command};
 
@@ -28,6 +29,24 @@ pub unsafe extern "C" fn fcb_catalog_open(handle: u64, root: *const c_char) -> *
     reply(|| answer(handle, |catalogs| {
         let root = unsafe { cstr(root) }.ok_or(AccessError::InvalidArgument)?;
         catalogs.open(handle, Path::new(root), || false)
+    }))
+}
+/// Explicit discovery policy: 0 honors repository rules; 1 includes ignored
+/// and generated regular files without reading rule configuration. Invalid
+/// values are refused before dereferencing root or consuming an empty handle.
+/// # Safety
+/// For a valid policy, root obeys the same contract as fcb_catalog_open.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_catalog_open_with_policy(handle: u64, root: *const c_char,
+    discovery_policy: u64) -> *mut c_char {
+    reply(|| answer(handle, |catalogs| {
+        let policy = match discovery_policy {
+            0 => CatalogDiscoveryPolicy::RepositoryRules,
+            1 => CatalogDiscoveryPolicy::IncludeExcluded,
+            _ => return Err(AccessError::InvalidArgument),
+        };
+        let root = unsafe { cstr(root) }.ok_or(AccessError::InvalidArgument)?;
+        catalogs.open_with_policy(handle, Path::new(root), policy, || false)
     }))
 }
 #[unsafe(no_mangle)]

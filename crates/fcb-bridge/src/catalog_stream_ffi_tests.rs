@@ -161,3 +161,116 @@ fn catalog_stream_c_signatures_match_public_header() {
         assert_eq!(header.matches(&symbol).count(), 1, "{symbol}");
     }
 }
+
+#[test]
+fn catalog_stream_policy_searches_excluded_sources_with_exact_witnesses_and_unchanged_hit_limits() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    // Keep the socket fixture short enough for macOS's sockaddr_un path.
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let root = std::env::temp_dir().join(format!("fcbps-{}-{stamp}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join(".gitignore"), b"ignored.rs\n").unwrap();
+    fs::write(root.join("visible.rs"), b"needle ordinary").unwrap();
+    fs::write(root.join("ignored.rs"), b"needle ignored").unwrap();
+    fs::create_dir(root.join("target")).unwrap();
+    let generated: Vec<u8> = "\u{feff}needle generated".encode_utf16().flat_map(u16::to_be_bytes).collect();
+    fs::write(root.join("target/generated.rs"), generated).unwrap();
+    fs::create_dir(root.join(".fcb-cache")).unwrap();
+    fs::write(root.join(".fcb-cache/private.rs"), b"needle owned artifact").unwrap();
+    std::os::unix::fs::symlink(root.join("ignored.rs"), root.join("alias.rs")).unwrap();
+    let _socket = std::os::unix::net::UnixListener::bind(root.join("s")).unwrap();
+    let croot = CString::new(root.to_str().unwrap()).unwrap();
+    let ordinary = fcb_catalog_stream_create(); assert_ne!(ordinary, 0);
+    assert!(open(ordinary, &croot, b"needle", 0, 1).contains("\"discovery_policy\":\"repository-rules-v1\""));
+    let default_report = drain(ordinary);
+    assert_eq!(number(&default_report, "matches_seen"), 1, "{default_report}");
+    assert_eq!(fcb_catalog_stream_close(ordinary), 1);
+
+    let extensions = CString::new("rs").unwrap();
+    for limit in [1, 32] {
+        let handle = fcb_catalog_stream_create(); assert_ne!(handle, 0);
+        let initial = take(unsafe { fcb_catalog_stream_open_with_policy(handle, croot.as_ptr(), 11,
+            b"needle".as_ptr(), 6, 0, 1, 1, 0, extensions.as_ptr(), std::ptr::null(),
+            0, std::ptr::null(), limit, 1024, 1024, 1) });
+        assert!(initial.contains("\"status\":\"ok\""), "{initial}");
+        assert!(initial.contains("\"discovery_policy\":\"all-regular-files/no-rule-files-v1\""));
+        assert!(initial.contains("\"rule_files_enabled\":false,\"rule_policy\":null"));
+        assert_eq!(number(&initial, "payload_bytes_read"), 0);
+        let report = drain(handle);
+        assert!(report.contains("\"search_complete\":true"), "{report}");
+        assert_eq!(number(&report, "matches_seen"), 3);
+        assert_eq!(number(&report, "retained_hits"), limit.min(3));
+        assert_eq!(number(&report, "max_matches"), limit);
+        assert_eq!(number(&report, "symlinks_not_followed"), 1);
+        assert_eq!(number(&report, "special_objects"), 1);
+        if limit == 1 {
+            assert!(report.contains("\"truncated\":true"));
+            assert_eq!(fcb_catalog_stream_close(handle), 1);
+            continue;
+        }
+        assert!(report.contains("\"hex\":\"7461726765742f67656e6572617465642e7273\""));
+        assert!(report.contains("\"encoding\":\"utf16be\""));
+        let ignored = report.split("\"index\":\"").skip(1).find_map(|row| {
+            row.contains("\"hex\":\"69676e6f7265642e7273\"")
+                .then(|| row.split('"').next().unwrap().parse::<u64>().unwrap())
+        }).unwrap();
+        let revision = number(&report, "revision");
+        fs::write(root.join("ignored.rs"), b"changed after the search").unwrap();
+        let pointer = fcb_catalog_stream_hit(handle, 11, revision, ignored);
+        assert_eq!(fcb_catalog_stream_close(handle), 1);
+        let witness = take(pointer);
+        assert!(witness.contains("\"original_hex\":\"6e6565646c65\""), "{witness}");
+        assert!(witness.contains("\"additional_source_bytes_read\":\"0\""));
+    }
+}
+
+#[test]
+fn catalog_stream_policy_rejects_unknown_values_before_pointers_and_ignores_malformed_configuration() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let root = root();
+    fs::write(root.join(".gitignore"), [0xff]).unwrap();
+    fs::write(root.join("kept.rs"), b"needle").unwrap();
+    let croot = CString::new(root.to_str().unwrap()).unwrap();
+    let ordinary = fcb_catalog_stream_create(); assert_ne!(ordinary, 0);
+    let initial = open(ordinary, &croot, b"needle", 0, 1);
+    assert!(initial.contains("RULE_INVALID_ENCODING"), "{initial}");
+    let report = drain(ordinary);
+    assert!(report.contains("\"search_complete\":false"));
+    assert_eq!(number(&report, "matches_seen"), 0);
+    assert_eq!(fcb_catalog_stream_close(ordinary), 1);
+
+    let handle = fcb_catalog_stream_create(); assert_ne!(handle, 0);
+    let dangling = std::ptr::NonNull::<u8>::dangling().as_ptr();
+    for policy in [2, u64::MAX] {
+        let error = take(unsafe { fcb_catalog_stream_open_with_policy(handle, dangling.cast(), 11,
+            dangling, 1, 0, 1, 1, 0, dangling.cast(), dangling.cast(), 0, dangling.cast(),
+            32, 1024, 1024, policy) });
+        assert!(error.len() < 4096);
+        assert!(error.contains("CATALOG_STREAM_HANDLE_INVALID_ARGUMENT"), "{error}");
+        assert!(take(fcb_catalog_stream_info(handle)).contains("CATALOG_STREAM_HANDLE_NOT_OPEN"));
+    }
+    // The broader discovery scope cannot relax the pre-pointer scalar bounds.
+    for (length, limit, bytes) in [(1025, 32, 1024), (1, 257, 1024), (1, 32, 0)] {
+        let error = take(unsafe { fcb_catalog_stream_open_with_policy(handle, dangling.cast(), 11,
+            dangling, length, 0, 1, 1, 0, dangling.cast(), dangling.cast(), 0, dangling.cast(),
+            limit, bytes, 1024, 1) });
+        assert!(error.contains("CATALOG_STREAM_HANDLE_INVALID_ARGUMENT"), "{error}");
+    }
+    let extensions = CString::new("rs").unwrap();
+    let initial = take(unsafe { fcb_catalog_stream_open_with_policy(handle, croot.as_ptr(), 11,
+        b"needle".as_ptr(), 6, 0, 1, 1, 0, extensions.as_ptr(), std::ptr::null(),
+        0, std::ptr::null(), 32, 1024, 1024, 1) });
+    assert!(initial.contains("\"status\":\"ok\""), "{initial}");
+    assert!(initial.contains("\"rule_files_enabled\":false,\"rule_policy\":null"));
+    assert!(!initial.contains("configuration_bytes_read"));
+    let report = drain(handle);
+    assert!(report.contains("\"search_complete\":true"), "{report}");
+    assert_eq!(number(&report, "matches_seen"), 1);
+    assert_eq!(number(&report, "payload_bytes_read"), 6);
+    assert_eq!(fcb_catalog_stream_close(handle), 1);
+
+    let _: unsafe extern "C" fn(u64, *const c_char, u64, *const u8, u64, u64, u64,
+        u64, u64, *const c_char, *const c_char, u64, *const c_char, u64, u64, u64,
+        u64) -> *mut c_char = fcb_catalog_stream_open_with_policy;
+    assert_eq!(include_str!("../include/fcb_catalog_stream.h").matches("fcb_catalog_stream_open_with_policy(").count(), 1);
+}

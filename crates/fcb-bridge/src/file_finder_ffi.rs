@@ -5,6 +5,7 @@
 use std::{ffi::c_char, path::Path, sync::OnceLock};
 use fcb::search::{PathCase, PathMatchMode};
 use fcb_app::host::{HostResponse, file_finder_session::{FileFinderOptions, MAX_FILE_FINDER_QUERY_BYTES}};
+use fcb_app::host::catalog_session::CatalogDiscoveryPolicy;
 use super::{cstr, reply, string_out};
 use super::file_finder_sessions::{AccessError, Command, FileFinderSessions};
 
@@ -30,7 +31,24 @@ pub extern "C" fn fcb_file_finder_create() -> u64 {
 pub unsafe extern "C" fn fcb_file_finder_open(handle: u64, root: *const c_char,
     generation: u64, query: *const u8, query_bytes: u64, mode: u32, match_case: u8,
     max_results: u64) -> *mut c_char {
+    unsafe { fcb_file_finder_open_with_policy(handle, root, generation, query, query_bytes,
+        mode, match_case, max_results, 0) }
+}
+/// The query owns its discovery policy: 0 repository rules, 1 all regular files
+/// without ignore configuration reads. Existing handles cannot change policy.
+/// # Safety
+/// For a valid discovery_policy, inputs obey fcb_file_finder_open's contract.
+/// Invalid policy values are refused before dereferencing any foreign pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_file_finder_open_with_policy(handle: u64, root: *const c_char,
+    generation: u64, query: *const u8, query_bytes: u64, mode: u32, match_case: u8,
+    max_results: u64, discovery_policy: u64) -> *mut c_char {
     reply(|| answer(handle, |finders| {
+        let policy = match discovery_policy {
+            0 => CatalogDiscoveryPolicy::RepositoryRules,
+            1 => CatalogDiscoveryPolicy::IncludeExcluded,
+            _ => return Err(AccessError::InvalidArgument),
+        };
         let length = number(query_bytes)?;
         if query.is_null() || length == 0 || length > MAX_FILE_FINDER_QUERY_BYTES {
             return Err(AccessError::InvalidArgument);
@@ -46,7 +64,10 @@ pub unsafe extern "C" fn fcb_file_finder_open(handle: u64, root: *const c_char,
         let root = unsafe { cstr(root) }.ok_or(AccessError::InvalidArgument)?;
         let needle = unsafe { std::slice::from_raw_parts(query, length) };
         let options = FileFinderOptions { max_results: number(max_results)?, case, mode };
-        finders.open(handle, Path::new(root), generation, needle, options, || false)
+        match policy {
+            CatalogDiscoveryPolicy::RepositoryRules => finders.open(handle, Path::new(root), generation, needle, options, || false),
+            CatalogDiscoveryPolicy::IncludeExcluded => finders.open_with_policy(handle, Path::new(root), generation, needle, options, policy, || false),
+        }
     }))
 }
 /// Return current retained results and coverage without walking another batch.

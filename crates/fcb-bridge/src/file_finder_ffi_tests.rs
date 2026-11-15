@@ -126,3 +126,119 @@ fn file_finder_c_signatures_match_public_header() {
         assert_eq!(header.matches(&symbol).count(), 1, "{symbol}");
     }
 }
+
+fn policy_finder_drain(handle: u64) -> String {
+    let mut report = take(fcb_file_finder_info(handle));
+    for _ in 0..64 {
+        assert!(report.contains("\"status\":\"ok\""), "{report}");
+        if report.contains("\"more\":false") { return report; }
+        let revision = number(&report, "revision");
+        report = take(fcb_file_finder_advance(handle, 11, revision, 16));
+        assert_eq!(take(fcb_file_finder_advance(handle, 11, revision, 16)), report);
+    }
+    panic!("small policy fixture did not finish within its discovery bound");
+}
+
+#[test]
+fn file_finder_policy_opt_in_discovers_and_captures_generated_source_without_broadening_default_queries() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let root = root();
+    fs::write(root.join(".gitignore"), b"ignored.rs\n").unwrap();
+    fs::write(root.join("visible.rs"), b"ordinary source").unwrap();
+    fs::write(root.join("ignored.rs"), b"ignored source").unwrap();
+    fs::create_dir(root.join("target")).unwrap();
+    fs::write(root.join("target/generated.rs"), b"generated source").unwrap();
+    fs::create_dir(root.join(".fcb-cache")).unwrap();
+    fs::write(root.join(".fcb-cache/private.rs"), b"owned artifact").unwrap();
+    std::os::unix::fs::symlink(root.join("ignored.rs"), root.join("alias.rs")).unwrap();
+    let croot = CString::new(root.to_str().unwrap()).unwrap();
+    let ordinary = fcb_file_finder_create(); assert_ne!(ordinary, 0);
+    let initial = take(unsafe { fcb_file_finder_open(ordinary, croot.as_ptr(), 11,
+        b".rs".as_ptr(), 3, 2, 1, 32) });
+    assert!(initial.contains("\"policy\":\"repository-rules-v1\""));
+    let default_report = policy_finder_drain(ordinary);
+    assert_eq!(number(&default_report, "matches_seen"), 1, "{default_report}");
+
+    let handle = fcb_file_finder_create(); assert_ne!(handle, 0); assert_ne!(handle, ordinary);
+    let initial = take(unsafe { fcb_file_finder_open_with_policy(handle, croot.as_ptr(), 11,
+        b".rs".as_ptr(), 3, 2, 1, 32, 1) });
+    assert!(initial.contains("\"status\":\"ok\""), "{initial}");
+    assert!(initial.contains("\"policy\":\"all-regular-files/no-rule-files-v1\""));
+    let report = policy_finder_drain(handle);
+    assert!(report.contains("\"search_complete\":true"), "{report}");
+    assert!(report.contains("\"rule_files_enabled\":false,\"rule_policy\":null"));
+    assert_eq!(number(&report, "matches_seen"), 3);
+    assert_eq!(number(&report, "retained_hits"), 3);
+    assert_eq!(number(&report, "symlinks_not_followed"), 1);
+    assert_eq!(number(&report, "discovery_source_bytes_read"), 0);
+    let revision = number(&report, "revision");
+    let file = report.split("\"file_id\":\"").skip(1).find_map(|row| {
+        row.contains("\"hex\":\"7461726765742f67656e6572617465642e7273\"")
+            .then(|| row.split('"').next().unwrap().parse::<u64>().unwrap())
+    }).unwrap();
+    let reader = fcb_reader_create(); assert_ne!(reader, 0);
+    let limited = take(fcb_file_finder_open_reader(handle, reader, 11, revision, file, 4));
+    assert!(limited.contains("\"status\":\"error\""), "{limited}");
+    let receipt = take(fcb_file_finder_open_reader(handle, reader, 11, revision, file, 1024));
+    assert!(receipt.contains("\"status\":\"ok\""), "{receipt}");
+    fs::write(root.join("target/generated.rs"), b"changed after capture").unwrap();
+    assert_eq!(fcb_file_finder_close(handle), 1);
+    assert!(take(fcb_reader_copy_range(reader, 0, 9)).contains("\"original_hex\":\"67656e657261746564\""));
+    assert_eq!(fcb_reader_close(reader), 1);
+    let still_default = take(fcb_file_finder_info(ordinary));
+    assert!(still_default.contains("\"policy\":\"repository-rules-v1\""));
+    assert_eq!(number(&still_default, "matches_seen"), 1);
+    assert_eq!(fcb_file_finder_close(ordinary), 1);
+}
+
+#[test]
+fn file_finder_policy_rejects_unknown_values_before_pointers_and_keeps_limits_without_rule_reads() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let root = root();
+    fs::write(root.join(".gitignore"), [0xff]).unwrap();
+    fs::write(root.join("kept-one.rs"), b"first source").unwrap();
+    fs::write(root.join("kept-two.rs"), b"second source").unwrap();
+    let croot = CString::new(root.to_str().unwrap()).unwrap();
+    let ordinary = fcb_file_finder_create(); assert_ne!(ordinary, 0);
+    let initial = take(unsafe { fcb_file_finder_open(ordinary, croot.as_ptr(), 11,
+        b"kept".as_ptr(), 4, 1, 1, 32) });
+    assert!(initial.contains("RULE_INVALID_ENCODING"), "{initial}");
+    let report = policy_finder_drain(ordinary);
+    assert!(report.contains("\"search_complete\":false"));
+    assert_eq!(number(&report, "matches_seen"), 0);
+    assert_eq!(fcb_file_finder_close(ordinary), 1);
+
+    let handle = fcb_file_finder_create(); assert_ne!(handle, 0);
+    let dangling = std::ptr::NonNull::<u8>::dangling().as_ptr();
+    for policy in [2, u64::MAX] {
+        let error = take(unsafe { fcb_file_finder_open_with_policy(handle, dangling.cast(), 11,
+            dangling, 1, 0, 1, 32, policy) });
+        assert!(error.len() < 4096);
+        assert!(error.contains("FILE_FINDER_HANDLE_INVALID_ARGUMENT"), "{error}");
+        assert!(take(fcb_file_finder_info(handle)).contains("FILE_FINDER_HANDLE_NOT_OPEN"));
+    }
+    for (length, mode) in [(257, 0), (1, 3)] {
+        let error = take(unsafe { fcb_file_finder_open_with_policy(handle, dangling.cast(), 11,
+            dangling, length, mode, 1, 32, 1) });
+        assert!(error.contains("FILE_FINDER_HANDLE_INVALID_ARGUMENT"), "{error}");
+    }
+    let initial = take(unsafe { fcb_file_finder_open_with_policy(handle, croot.as_ptr(), 11,
+        b"kept".as_ptr(), 4, 1, 1, 1, 1) });
+    assert!(initial.contains("\"status\":\"ok\""), "{initial}");
+    assert!(initial.contains("\"rule_files_enabled\":false,\"rule_policy\":null"));
+    assert!(!initial.contains("configuration_bytes_read"));
+    let report = policy_finder_drain(handle);
+    assert!(report.contains("\"search_complete\":true"), "{report}");
+    assert!(report.contains("\"truncated\":true"));
+    assert_eq!(number(&report, "matches_seen"), 2);
+    assert_eq!(number(&report, "retained_hits"), 1);
+    assert_eq!(number(&report, "max_results"), 1);
+    assert!(take(unsafe { fcb_file_finder_open_with_policy(handle, croot.as_ptr(), 11,
+        b"kept".as_ptr(), 4, 1, 1, 32, 0) }).contains("FILE_FINDER_HANDLE_ALREADY_OPEN"));
+    assert!(take(fcb_file_finder_info(handle)).contains("\"policy\":\"all-regular-files/no-rule-files-v1\""));
+    assert_eq!(fcb_file_finder_close(handle), 1);
+
+    let _: unsafe extern "C" fn(u64, *const c_char, u64, *const u8, u64, u32, u8,
+        u64, u64) -> *mut c_char = fcb_file_finder_open_with_policy;
+    assert_eq!(include_str!("../include/fcb_file_finder.h").matches("fcb_file_finder_open_with_policy(").count(), 1);
+}

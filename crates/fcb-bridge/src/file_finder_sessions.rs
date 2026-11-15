@@ -8,6 +8,7 @@ use std::{mem::size_of, path::Path, sync::{Arc, Mutex, MutexGuard, TryLockError,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}};
 use fcb_app::host::{HostResponse, file_finder_session::{FileFinderOptions,
     FileFinderSession, FileFinderSessionError}};
+use fcb_app::host::catalog_session::CatalogDiscoveryPolicy;
 use fcb_core::{ArenaOwnerId, ByteLength, FileId, ResourceAllocationId, ResourceBudget, ResourceLease};
 use super::reader_sessions::{self, ReaderSessions};
 
@@ -114,7 +115,13 @@ impl FileFinderSessions {
         cells.iter().flatten().find(|cell| cell.id == handle).cloned().ok_or(AccessError::Unknown)
     }
     pub(super) fn open(&self, handle: u64, root: &Path, generation: u64, needle: &[u8],
-        options: FileFinderOptions, mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
+        options: FileFinderOptions, canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
+        self.open_with_policy(handle, root, generation, needle, options,
+            CatalogDiscoveryPolicy::RepositoryRules, canceled)
+    }
+    pub(super) fn open_with_policy(&self, handle: u64, root: &Path, generation: u64, needle: &[u8],
+        options: FileFinderOptions, policy: CatalogDiscoveryPolicy,
+        mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
         let cell = self.get(handle)?;
         let epoch = cell.epoch.load(Ordering::Acquire);
         let mut state = lock(&cell.state)?;
@@ -123,7 +130,7 @@ impl FileFinderSessions {
         let mut stop = || cell.validate(epoch).is_err() || canceled();
         let result = (|| {
             let owner = ArenaOwnerId::new(handle).map_err(|_| AccessError::InvalidArgument)?;
-            let candidate = FileFinderSession::open(owner, root, generation, needle, options, &mut stop)?;
+            let candidate = FileFinderSession::open_with_policy(owner, root, generation, needle, options, policy, &mut stop)?;
             // Retain the admitted query BEFORE fallible response encoding or
             // late cancellation. Info recovers the initial accepted state.
             *state = Some(candidate);

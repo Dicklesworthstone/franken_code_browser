@@ -7,7 +7,7 @@
 use std::{mem::size_of, path::Path, sync::{Arc, Mutex, MutexGuard, TryLockError,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}};
 use fcb_app::host::{HostResponse, catalog_session::{CatalogContentSearchError,
-    CatalogContentSearchOptions, CatalogContentSearchSession}};
+    CatalogContentSearchOptions, CatalogContentSearchSession, CatalogDiscoveryPolicy}};
 use fcb_app::host::atlas_search::AtlasSearchError;
 use fcb_core::{ArenaOwnerId, ByteLength, ResourceAllocationId, ResourceBudget, ResourceLease};
 use super::reader_sessions;
@@ -121,7 +121,14 @@ impl CatalogStreamSessions {
         cells.iter().flatten().find(|cell| cell.id == handle).cloned().ok_or(AccessError::Unknown)
     }
     pub(super) fn open(&self, handle: u64, root: &Path, generation: u64, query: &str,
-        options: CatalogContentSearchOptions, mut canceled: impl FnMut() -> bool)
+        options: CatalogContentSearchOptions, canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, AccessError> {
+        self.open_with_policy(handle, root, generation, query, options,
+            CatalogDiscoveryPolicy::RepositoryRules, canceled)
+    }
+    pub(super) fn open_with_policy(&self, handle: u64, root: &Path, generation: u64, query: &str,
+        options: CatalogContentSearchOptions, policy: CatalogDiscoveryPolicy,
+        mut canceled: impl FnMut() -> bool)
         -> Result<HostResponse, AccessError> {
         let cell = self.get(handle)?;
         let epoch = cell.epoch.load(Ordering::Acquire);
@@ -131,7 +138,7 @@ impl CatalogStreamSessions {
         let mut stop = || cell.validate(epoch).is_err() || canceled();
         let result = (|| {
             let owner = ArenaOwnerId::new(handle).map_err(|_| AccessError::InvalidArgument)?;
-            let candidate = CatalogContentSearchSession::open(owner, root, generation, query, options, &mut stop)?;
+            let candidate = CatalogContentSearchSession::open_with_policy(owner, root, generation, query, options, policy, &mut stop)?;
             // Installation precedes fallible reply delivery. The metadata batch
             // and immutable query stay recoverable through info after a lost reply.
             *state = Some(candidate);

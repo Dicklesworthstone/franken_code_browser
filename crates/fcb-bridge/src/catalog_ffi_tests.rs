@@ -165,3 +165,116 @@ fn c_verified_links_bind_an_independent_reader_to_current_source_and_keep_old_by
     assert_eq!(fcb_reader_close(empty), 1); assert_eq!(fcb_reader_close(target), 1);
     assert_eq!(fcb_reader_close(origin), 1);
 }
+
+fn policy_number(text: &str, key: &str) -> u64 {
+    text.split_once(&format!("\"{key}\":\"")).unwrap().1.split('"').next().unwrap().parse().unwrap()
+}
+
+fn policy_catalog_pages(handle: u64, mut page: String) -> Vec<String> {
+    let mut pages = Vec::new();
+    for _ in 0..64 {
+        assert!(page.contains("\"status\":\"ok\""), "{page}");
+        assert!(policy_number(&page, "retained_pages") <= 4);
+        assert!(policy_number(&page, "retained_files") <= 1024);
+        let more = page.contains("\"more\":true");
+        let after = policy_number(&page, "latest_page");
+        pages.push(page);
+        if !more { return pages; }
+        page = take(fcb_catalog_advance(handle, after));
+        // Replaying an accepted predecessor must not consume another page.
+        assert_eq!(take(fcb_catalog_advance(handle, after)), page);
+    }
+    panic!("small policy fixture did not finish within its discovery bound");
+}
+
+#[test]
+fn catalog_policy_opt_in_opens_ignored_and_generated_files_but_keeps_source_boundaries() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let outside = root();
+    fs::write(outside.join("escape.rs"), b"outside root").unwrap();
+    // Keep the socket fixture short enough for macOS's sockaddr_un path.
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let root = std::env::temp_dir().join(format!("fcbpc-{}-{stamp}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join(".gitignore"), b"ignored.rs\n").unwrap();
+    fs::write(root.join("visible.rs"), b"ordinary source").unwrap();
+    fs::write(root.join("ignored.rs"), b"retained ignored source").unwrap();
+    fs::create_dir(root.join("target")).unwrap();
+    fs::write(root.join("target/generated.rs"), b"generated source").unwrap();
+    fs::create_dir(root.join(".fcb-cache")).unwrap();
+    fs::write(root.join(".fcb-cache/private.rs"), b"owned artifact").unwrap();
+    fs::write(root.join(".fcb.db"), b"owned database").unwrap();
+    std::os::unix::fs::symlink(outside.join("escape.rs"), root.join("escape.rs")).unwrap();
+    let _socket = std::os::unix::net::UnixListener::bind(root.join("s")).unwrap();
+    let croot = CString::new(root.to_str().unwrap()).unwrap();
+    let ignored_hex = "\"hex\":\"69676e6f7265642e7273\"";
+    let generated_hex = "\"hex\":\"7461726765742f67656e6572617465642e7273\"";
+
+    let ordinary = fcb_catalog_create(); assert_ne!(ordinary, 0);
+    let pages = policy_catalog_pages(ordinary, take(unsafe { fcb_catalog_open(ordinary, croot.as_ptr()) }));
+    assert!(pages.iter().all(|page| page.contains("\"policy\":\"repository-rules-v1\"")));
+    assert!(pages.iter().all(|page| !page.contains(ignored_hex) && !page.contains(generated_hex)));
+    assert_eq!(policy_number(pages.last().unwrap(), "catalogued_files"), 2);
+
+    let handle = fcb_catalog_create(); assert_ne!(handle, 0); assert_ne!(handle, ordinary);
+    let pages = policy_catalog_pages(handle, take(unsafe { fcb_catalog_open_with_policy(handle, croot.as_ptr(), 1) }));
+    assert!(pages.iter().all(|page| page.contains("\"policy\":\"all-regular-files/no-rule-files-v1\"")));
+    assert!(pages.iter().all(|page| page.contains("\"rule_files_enabled\":false,\"rule_policy\":null")));
+    assert!(pages.iter().any(|page| page.contains(generated_hex)));
+    let complete = pages.last().unwrap();
+    assert!(complete.contains("\"discovery_complete\":true"), "{complete}");
+    assert_eq!(policy_number(complete, "catalogued_files"), 4);
+    assert_eq!(policy_number(complete, "symlinks_not_followed"), 1);
+    assert_eq!(policy_number(complete, "special_objects"), 1);
+    assert_eq!(policy_number(complete, "discovery_source_bytes_read"), 0);
+    assert!(complete.contains("\"page_entries\":\"256\""));
+    let page = pages.iter().find(|page| page.contains(ignored_hex)).unwrap();
+    let file = page.split("\"file_id\":\"").skip(1).find_map(|row| {
+        row.contains(ignored_hex).then(|| row.split('"').next().unwrap().parse::<u64>().unwrap())
+    }).unwrap();
+    let reader = fcb_reader_create(); assert_ne!(reader, 0);
+    let capture = take(fcb_catalog_open_reader(handle, reader, policy_number(page, "page_id"), file, 1024));
+    assert!(capture.contains("\"status\":\"ok\""), "{capture}");
+    fs::write(root.join("ignored.rs"), b"changed after capture").unwrap();
+    assert_eq!(fcb_catalog_close(handle), 1);
+    assert!(take(fcb_reader_copy_range(reader, 0, 8)).contains("\"original_hex\":\"72657461696e6564\""));
+    assert_eq!(fcb_reader_close(reader), 1);
+    // The opt-in never widens the still-open default catalog's authority.
+    assert!(take(fcb_catalog_info(ordinary)).contains("\"policy\":\"repository-rules-v1\""));
+    assert_eq!(fcb_catalog_close(ordinary), 1);
+}
+
+#[test]
+fn catalog_policy_bypasses_malformed_ignore_configuration_and_rejects_unknown_policy_before_pointers() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let root = root();
+    fs::write(root.join(".gitignore"), [0xff]).unwrap();
+    fs::write(root.join("kept.rs"), b"retained source").unwrap();
+    let croot = CString::new(root.to_str().unwrap()).unwrap();
+    let ordinary = fcb_catalog_create(); assert_ne!(ordinary, 0);
+    let failed_rules = take(unsafe { fcb_catalog_open(ordinary, croot.as_ptr()) });
+    assert!(failed_rules.contains("RULE_INVALID_ENCODING"), "{failed_rules}");
+    assert!(failed_rules.contains("\"discovery_complete\":false"));
+    assert_eq!(fcb_catalog_close(ordinary), 1);
+
+    let handle = fcb_catalog_create(); assert_ne!(handle, 0);
+    let dangling = std::ptr::NonNull::<c_char>::dangling().as_ptr();
+    for policy in [2, u64::MAX] {
+        let error = take(unsafe { fcb_catalog_open_with_policy(handle, dangling, policy) });
+        assert!(error.len() < 4096);
+        assert!(error.contains("CATALOG_HANDLE_INVALID_ARGUMENT"), "{error}");
+        assert!(take(fcb_catalog_info(handle)).contains("CATALOG_HANDLE_NOT_OPEN"));
+    }
+    let pages = policy_catalog_pages(handle, take(unsafe { fcb_catalog_open_with_policy(handle, croot.as_ptr(), 1) }));
+    let complete = pages.last().unwrap();
+    assert!(complete.contains("\"discovery_complete\":true"), "{complete}");
+    assert!(complete.contains("\"rule_files_enabled\":false,\"rule_policy\":null"));
+    assert!(!complete.contains("configuration_bytes_read"));
+    assert_eq!(policy_number(complete, "catalogued_files"), 2);
+    assert!(take(unsafe { fcb_catalog_open_with_policy(handle, croot.as_ptr(), 0) }).contains("CATALOG_HANDLE_ALREADY_OPEN"));
+    assert!(take(fcb_catalog_info(handle)).contains("\"policy\":\"all-regular-files/no-rule-files-v1\""));
+    assert_eq!(fcb_catalog_close(handle), 1);
+
+    let _: unsafe extern "C" fn(u64, *const c_char, u64) -> *mut c_char = fcb_catalog_open_with_policy;
+    assert_eq!(include_str!("../include/fcb_project_catalog.h").matches("fcb_catalog_open_with_policy(").count(), 1);
+}

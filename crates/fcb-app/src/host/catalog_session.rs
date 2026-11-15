@@ -25,8 +25,9 @@ pub(crate) use content_search::cli::CatalogSearchProgress;
 use std::{collections::VecDeque, fs, mem::size_of, path::Path};
 use fcb::{ArenaOwnerId, ByteLength, FileId};
 use fcb::search::{ResourceAllocationId, ResourceBudget, RootId};
-use fcb::source::{CancelFlag, DirectoryId, NormalizedPath, RawPath, RootGrant, SourceError};
+use fcb::source::{CancelFlag, DirectoryId, NormalizedPath, RawPath, RootGrant, SourceError, SymlinkPolicy};
 use fcb::source::discovery::{BoundedDiscovery, DiscoveryAggregate, DiscoveryKind, DiscoveryLimits};
+use fcb::source::ignore::IgnoreMatcher;
 use fcb::source::ignore::repository::{RepositoryRules, RuleError, RuleLimits, RULE_POLICY_NAME};
 use fcb_core::ResourceLease;
 use crate::{AppError, EXIT_OK, EXIT_PARTIAL, MANAGED_BYTES, input, workspace};
@@ -50,6 +51,26 @@ const WALK_DEPTH: u32 = 32;
 // separately reserved; opening a reader uses its existing independent budget.
 const STATE_BYTES: u64 = 64 * 1024 * 1024;
 const FIRST_WINDOW_BYTES: usize = 16 * 1024;
+
+/// An explicit, immutable discovery scope. Including excluded files bypasses
+/// repository and product ignore rules, not root authority, special-object
+/// refusal, or the walker's independent own-artifact exclusions and limits.
+/// A policy change needs a new session; old page/file IDs keep their old scope.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CatalogDiscoveryPolicy {
+    #[default]
+    RepositoryRules,
+    IncludeExcluded,
+}
+impl CatalogDiscoveryPolicy {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::RepositoryRules => RULE_POLICY_NAME,
+            Self::IncludeExcluded => "all-regular-files/no-rule-files-v1",
+        }
+    }
+    pub const fn reads_rule_files(self) -> bool { matches!(self, Self::RepositoryRules) }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CatalogSessionError {
@@ -103,6 +124,7 @@ struct CatalogPage { id: u64, files: Vec<CatalogFile>, path_bytes: usize }
 
 pub struct CatalogSession {
     grant: RootGrant,
+    discovery_policy: CatalogDiscoveryPolicy,
     // Bounded exact spelling admitted at open, before canonicalization. It is
     // a label alias only; all later acquisition uses the canonical grant.
     requested_root: RawPath,
@@ -129,7 +151,16 @@ impl CatalogSession {
     /// opening authorizes bounded configuration reads, never source capture.
     /// A page containing only directories/exclusions can have no file rows and
     /// still have more=true. That is progress, never proof of an empty project.
-    pub fn open(owner: ArenaOwnerId, root: &Path, mut canceled: impl FnMut() -> bool)
+    pub fn open(owner: ArenaOwnerId, root: &Path, canceled: impl FnMut() -> bool)
+        -> Result<Self, CatalogSessionError> {
+        Self::open_with_policy(owner, root, CatalogDiscoveryPolicy::RepositoryRules, canceled)
+    }
+
+    /// Open with an explicitly selected discovery policy. IncludeExcluded
+    /// performs metadata-only discovery: even malformed or unreadable ignore
+    /// files do not become hidden configuration reads or block that scope.
+    pub fn open_with_policy(owner: ArenaOwnerId, root: &Path, policy: CatalogDiscoveryPolicy,
+        mut canceled: impl FnMut() -> bool)
         -> Result<Self, CatalogSessionError> {
         check(&mut canceled)?;
         if root.as_os_str().is_empty() || root.as_os_str().len() > 16_384 {
@@ -150,12 +181,16 @@ impl CatalogSession {
         let grant = RootGrant::new(RootId::new(owner, 1).map_err(|_| CatalogSessionError::IdentityExhausted)?, RawPath::from_path(&root));
         let limits = DiscoveryLimits::new(1, WALK_DEPTH, MAX_CATALOG_PATH_BYTES as u32,
             MAX_CATALOG_PAGE_ENTRIES as u32, 64 * 1024, WALK_QUEUE)?;
-        let discovery = BoundedDiscovery::open_rule_aware(grant.clone(), limits,
-            RuleLimits::default(), &budget, allocation(2)?)?;
+        let discovery = match policy {
+            CatalogDiscoveryPolicy::RepositoryRules => BoundedDiscovery::open_rule_aware(
+                grant.clone(), limits, RuleLimits::default(), &budget, allocation(2)?)?,
+            CatalogDiscoveryPolicy::IncludeExcluded => BoundedDiscovery::open_metadata_only(
+                grant.clone(), SymlinkPolicy::DisallowAll, limits, IgnoreMatcher::include_all())?,
+        };
         let mut pages = VecDeque::new();
         pages.try_reserve_exact(MAX_CATALOG_RETAINED_PAGES).map_err(|_| AppError::Admission)?;
         if pages.capacity() > MAX_CATALOG_RETAINED_PAGES { return Err(AppError::Admission.into()); }
-        let mut session = Self { grant, requested_root, root_identity, discovery: Some(discovery), repository_rules: None,
+        let mut session = Self { grant, discovery_policy: policy, requested_root, root_identity, discovery: Some(discovery), repository_rules: None,
             aggregate: DiscoveryAggregate::default(),
             pages, latest_page: 0, catalogued_files: 0, next_link_file: FIRST_CATALOG_LINK_FILE_ID, complete: false, paused: false,
             reader_receipts: document_links::CatalogReaderReceipts::default(), next_allocation: 3, budget, _lease: lease };
@@ -167,6 +202,12 @@ impl CatalogSession {
 
     pub fn owner(&self) -> ArenaOwnerId { self.grant.owner() }
     pub fn grant(&self) -> &RootGrant { &self.grant }
+    pub const fn discovery_policy(&self) -> CatalogDiscoveryPolicy { self.discovery_policy }
+
+    fn rule_policy_complete(&self) -> bool {
+        !self.discovery_policy.reads_rule_files()
+            || self.rule_policy().is_some_and(|rules| rules.stats().is_complete())
+    }
 
     fn rule_policy(&self) -> Option<&RepositoryRules> {
         self.repository_rules.as_ref().or_else(|| self.discovery.as_ref().and_then(BoundedDiscovery::repository_rules))
@@ -177,7 +218,8 @@ impl CatalogSession {
     fn encode_rule_policy(&self, out: &mut Output) -> Result<(), OutputError> {
         // Eight worst-case diagnostic paths fit alongside a full catalog page
         // in the existing response envelope. The omitted count remains exact.
-        workspace::rule_output::policy_fields(out, true, self.rule_policy(), self.complete, 8)
+        workspace::rule_output::policy_fields(out, self.discovery_policy.reads_rule_files(),
+            self.rule_policy(), self.complete, 8)
     }
 
     /// Root identity is pinned across a long-lived iterator. This detects an
@@ -358,7 +400,7 @@ impl CatalogSession {
         let a = self.aggregate;
         self.complete = !more && walker_complete && a.unavailable == 0 && a.cycles == 0
             && a.depth_limited == 0 && a.path_limited == 0 && a.queue_refused == 0
-            && self.rule_policy().is_some_and(|rules| rules.stats().is_complete());
+            && self.rule_policy_complete();
         if !more { self.retire_discovery(); }
         self.paused = false;
         if self.pages.len() == MAX_CATALOG_RETAINED_PAGES { self.pages.pop_front(); }
@@ -374,7 +416,7 @@ impl CatalogSession {
         out.quoted(command)?;
         out.literal(",\"owner\":")?; out.integer(self.owner().get())?;
         out.literal(",\"identity_scope\":\"retained-session\",\"ordering\":\"provisional-discovery-order\",\"policy\":")?;
-        out.quoted(RULE_POLICY_NAME)?;
+        out.quoted(self.discovery_policy.name())?;
         self.encode_rule_policy(&mut out)?;
         out.literal(",\"native_presented\":false,\"discovery_source_bytes_read\":\"0\",\"discovery_source_read_calls\":\"0\",\"state\":")?;
         out.quoted(if self.complete { "complete" } else if self.discovery.is_none() { "partial" }

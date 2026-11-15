@@ -44,6 +44,16 @@ uint64_t fcb_catalog_create(void);
  * Returns page 1 and current info fields, possibly empty with more=true.
  */
 char *fcb_catalog_open(uint64_t handle, const char *root);
+/* Explicit policy, fixed for the session: 0 is the legacy repository-rules-v1
+ * scope; 1 is all-regular-files/no-rule-files-v1 and includes ignored/generated
+ * files without reading .gitignore/.fcbignore as configuration. Root grants,
+ * symlink/special-object refusal, independent own-artifact exclusions and all
+ * work/retention limits still apply. Any other value refuses before reading
+ * root. A different policy requires a new handle. Every reply identifies the
+ * admitted policy; policy 1 reports rule_files_enabled=false/rule_policy=null.
+ */
+char *fcb_catalog_open_with_policy(uint64_t handle, const char *root,
+    uint64_t discovery_policy);
 char *fcb_catalog_info(uint64_t handle);
 
 /* Page IDs begin at 1; old pages can be replayed while retained. Metadata-only.

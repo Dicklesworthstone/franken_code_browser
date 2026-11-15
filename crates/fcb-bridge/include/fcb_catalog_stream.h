@@ -51,6 +51,22 @@ char *fcb_catalog_stream_open(uint64_t handle, const char *root, uint64_t genera
     uint64_t count_all, uint64_t start_after, const char *extensions, const char *filenames,
     uint64_t path_kind, const char *path, uint64_t max_matches, uint64_t max_scan_bytes,
     uint64_t max_read_calls);
+/* Additive explicit discovery scope. Policy 0 is repository-rules-v1 (also the
+ * unchanged legacy open behavior); 1 includes ignored/generated regular files
+ * and reports all-regular-files/no-rule-files-v1, with rule_files_enabled=false
+ * and rule_policy=null. No ignore configuration is read in policy 1; an ignore
+ * file selected as source is still subject to ordinary source I/O accounting.
+ * Root grants, own-artifact exclusions, symlink/special-file refusal, all query
+ * predicates and work/retention bounds remain effective. Policy is immutable
+ * through progress, row paging and witness replay. Invalid policy values
+ * refuse before dereferencing any foreign input or opening the handle.
+ */
+char *fcb_catalog_stream_open_with_policy(uint64_t handle, const char *root,
+    uint64_t generation, const uint8_t *query, uint64_t query_bytes, uint64_t mode,
+    uint64_t case_sensitive, uint64_t count_all, uint64_t start_after,
+    const char *extensions, const char *filenames, uint64_t path_kind,
+    const char *path, uint64_t max_matches, uint64_t max_scan_bytes,
+    uint64_t max_read_calls, uint64_t discovery_policy);
 
 /* Info, page and hit do not advance discovery or reopen source. Page/hit require
  * the current query generation and revision. Pages contain at most 32 rows.

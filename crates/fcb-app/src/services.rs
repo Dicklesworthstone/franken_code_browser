@@ -81,15 +81,17 @@ rows; omitted rows still exit 3 even when the admitted scan/count is complete.\n
 Whole-file mode starts at byte zero, requires named files, and does not accept\n\
 window offsets, stdin, path queries or indexed-capture byte-limit switches.\n\n\
 Progressive whole-project content search without a frozen catalog:\n\
-  fcb search ROOT --workspace --whole-file --progressive --respect-ignores\n\
+  fcb search ROOT --workspace --whole-file --progressive\n\
+      (--respect-ignores | --include-excluded)\n\
       --text TEXT [--ignore-case] [--count-all] [--json | --stream]\n\
   --identifier NAME and --query EXPRESSION also use this shared native service.\n\
 Discovery and reading interleave; total file/path counts have no catalog quota.\n\
 Four 256-entry catalog pages are retained, independent of files visited. Paths,\n\
 depth, pending directories, rule evaluation and source I/O remain bounded;\n\
 reported omissions make coverage partial. Order is provisional discovery order.\n\
---respect-ignores is required. Explicit --max-files, --include-excluded,\n\
---raw-hex, --encoding and capture/window controls are rejected in this mode.\n\
+Choose exactly one discovery policy: --respect-ignores reads bounded repository\n\
+rules; --include-excluded searches ignored/generated files without rule reads.\n\
+Explicit --max-files, --raw-hex, --encoding and capture/window controls are rejected.\n\
 Encoding is automatic UTF-8/UTF-16. Query limit: 1024 bytes; --limit: 1..256;\n\
 --max-scan-bytes: 1..4294967296 (default 256 MiB); read calls: 1048576.\n\
 --skip-matches and --count-all retain exact witnesses independently of counts.\n\
@@ -147,7 +149,7 @@ pub(crate) fn capabilities(args: &Arguments, out: &mut Output) -> Result<u8, App
         ("native-gui", "unavailable", "AppKit/Metal composition is not implemented in this binary."),
         ("native-app-launch", launch_state, "Binary-only handoff to a compatible installed app; no installation probe or in-process renderer. Native readiness is not established."),
         ("workspace-cli-search", file_state, "Explicit discovery, native paths, indexed captures or whole-file streaming; --respect-ignores separately admits bounded repository rules."),
-        ("progressive-workspace-content-search", file_state, "Explicit --progressive --respect-ignores interleaves bounded discovery and whole-file search without an aggregate catalog cap; separate JSON/NDJSON schemas and truthful omissions."),
+        ("progressive-workspace-content-search", file_state, "Explicit --progressive with --respect-ignores or --include-excluded interleaves bounded discovery and whole-file search without an aggregate catalog cap; separate JSON/NDJSON schemas and truthful omissions."),
         ("persistent-cli-index", "unavailable", "No store is opened or implicitly created."),
         ("markdown-preview", "unavailable", "No integrated upstream document renderer in this lane."),
         ("regex-search", "unavailable", "No qualified regex engine selected."),

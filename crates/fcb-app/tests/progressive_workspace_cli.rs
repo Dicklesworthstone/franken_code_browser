@@ -27,15 +27,22 @@ impl Tree {
 struct NoStdin;
 impl Read for NoStdin { fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("workspace search consumed stdin") } }
 fn arguments(root: &Path, flags: &[&str], output: Option<&str>) -> Vec<OsString> {
+    arguments_with_policy(root, flags, output, Some("--respect-ignores"))
+}
+fn arguments_with_policy(root: &Path, flags: &[&str], output: Option<&str>, policy: Option<&str>) -> Vec<OsString> {
     let mut args = vec!["search".into(), root.as_os_str().to_owned(), "--workspace".into(),
-        "--whole-file".into(), "--progressive".into(), "--respect-ignores".into()];
+        "--whole-file".into(), "--progressive".into()];
+    if let Some(policy) = policy { args.push(policy.into()); }
     args.extend(flags.iter().map(OsString::from));
     if let Some(output) = output { args.push(output.into()); }
     args
 }
 fn invoke(root: &Path, flags: &[&str]) -> (u8, Json) {
+    invoke_with_policy(root, flags, Some("--respect-ignores"))
+}
+fn invoke_with_policy(root: &Path, flags: &[&str], policy: Option<&str>) -> (u8, Json) {
     let (mut out, mut err) = (Vec::new(), Vec::new());
-    let code = run(&arguments(root, flags, Some("--json")), &mut NoStdin, &mut out, &mut err, || false);
+    let code = run(&arguments_with_policy(root, flags, Some("--json"), policy), &mut NoStdin, &mut out, &mut err, || false);
     assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
     let json = parse(&out).unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out)));
     assert_eq!(json.get("schema").text(), "fcb.progressive-search/1");
@@ -53,8 +60,11 @@ fn records(bytes: &[u8]) -> Vec<Json> {
     assert_eq!(rows.last().unwrap().get("type").text(), "terminal"); rows
 }
 fn stream(root: &Path, flags: &[&str]) -> (u8, Vec<Json>) {
+    stream_with_policy(root, flags, Some("--respect-ignores"))
+}
+fn stream_with_policy(root: &Path, flags: &[&str], policy: Option<&str>) -> (u8, Vec<Json>) {
     let (mut out, mut err) = (Vec::new(), Vec::new());
-    let code = run(&arguments(root, flags, Some("--stream")), &mut NoStdin, &mut out, &mut err, || false);
+    let code = run(&arguments_with_policy(root, flags, Some("--stream"), policy), &mut NoStdin, &mut out, &mut err, || false);
     assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err)); (code, records(&out))
 }
 fn bounds(hit: &Json) -> (u64, u64) {
@@ -180,6 +190,90 @@ fn expression_scope_ignores_and_incomplete_sources_never_create_false_negatives(
 }
 
 #[test]
+fn explicit_override_searches_ignored_and_generated_files_in_every_content_mode() {
+    let tree = Tree::new("include-excluded");
+    tree.file(".gitignore", b"ignored.rs\n");
+    tree.file("visible.rs", b"needle");
+    tree.file("ignored.rs", b"needle");
+    tree.file("target/generated.rs", b"needle");
+    tree.file(".fcb-cache/internal.rs", b"needle");
+    for flags in [vec!["--text", "needle", "--count-all"],
+        vec!["--identifier", "needle", "--count-all"], vec!["--query", "needle lang:rust"]] {
+        let (code, restricted) = invoke(&tree.0, &flags);
+        assert_eq!(code, EXIT_OK);
+        assert_eq!(restricted.get("discovery_policy").text(), "repository-rules-v1");
+        assert!(restricted.get("rule_files_enabled").flag());
+        assert_eq!(restricted.get("hits").array().len(), 1);
+        assert_eq!(restricted.get("hits").array()[0].get("path").get("display").text(), "visible.rs");
+
+        let (code, included) = invoke_with_policy(&tree.0, &flags, Some("--include-excluded"));
+        assert_eq!(code, EXIT_OK);
+        assert_eq!(included.get("discovery_policy").text(), "all-regular-files/no-rule-files-v1");
+        assert!(!included.get("rule_files_enabled").flag());
+        assert_eq!(included.get("rule_policy"), &Json::Null);
+        let hits = included.get("hits").array();
+        let mut paths: Vec<_> = hits.iter().map(|hit| hit.get("path").get("display").text()).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, ["ignored.rs", "target/generated.rs", "visible.rs"]);
+        assert!(hits.iter().all(|hit| bounds(hit) == (0, 6) && hit.get("original_hex").text() == "6e6565646c65"));
+        assert_eq!(included.get("summary").get("matches_seen").number(), 3);
+        assert!(included.get("summary").get("results_complete").flag());
+        assert!(included.get("summary").get("rule_policy_complete").flag());
+        // Internal product artifacts remain excluded independently of the override.
+        assert_eq!(included.get("discovery").get("excluded_entries").number(), 1);
+    }
+
+    for (policy, expected) in [("--respect-ignores", 1), ("--include-excluded", 3)] {
+        let (code, rows) = stream_with_policy(&tree.0, &["--text", "needle", "--count-all"], Some(policy));
+        assert_eq!(code, EXIT_OK);
+        let start = &rows[0];
+        assert_eq!(start.get("type").text(), "start");
+        assert_eq!(start.get("respect_ignores").flag(), policy == "--respect-ignores");
+        assert_eq!(start.get("include_excluded").flag(), policy == "--include-excluded");
+        for row in rows.iter().filter(|row| row.get("type").text() == "progress") {
+            assert_eq!(row.get("search").get("discovery_policy"), start.get("discovery_policy"));
+            assert_eq!(row.get("search").get("rule_files_enabled").flag(), policy == "--respect-ignores");
+        }
+        assert_eq!(rows.iter().filter(|row| row.get("type").text() == "match").count(), expected);
+        assert_eq!(rows.last().unwrap().get("matches_seen").number(), expected as u64);
+        assert!(rows.last().unwrap().get("results_complete").flag());
+    }
+}
+
+#[test]
+fn explicit_override_does_not_load_invalid_repository_rules() {
+    let tree = Tree::new("override-invalid-rules");
+    tree.file("bad/.gitignore", b"[unsupported");
+    tree.file("bad/hidden.rs", b"needle");
+    tree.file("safe.rs", b"other");
+    let flags = ["--query", "needle lang:rust"];
+    let (code, restricted) = invoke(&tree.0, &flags);
+    assert_eq!(code, EXIT_PARTIAL);
+    assert_eq!(restricted.get("summary").get("failed_rule_files").number(), 1);
+    assert!(restricted.get("hits").array().is_empty());
+
+    let (code, included) = invoke_with_policy(&tree.0, &flags, Some("--include-excluded"));
+    assert_eq!(code, EXIT_OK);
+    assert!(!included.get("rule_files_enabled").flag());
+    assert_eq!(included.get("rule_policy"), &Json::Null);
+    assert_eq!(included.get("hits").array().len(), 1);
+    assert_eq!(included.get("hits").array()[0].get("path").get("display").text(), "bad/hidden.rs");
+    // The language scope prevents the invalid configuration file from being
+    // read as source payload, either. Only the two Rust sources are read.
+    assert_eq!(included.get("summary").get("payload_bytes_read").number(), 11);
+    assert_eq!(included.get("summary").get("failed_rule_files").number(), 0);
+    assert_eq!(included.get("summary").get("unresolved_rule_paths").number(), 0);
+    assert!(included.get("summary").get("rule_policy_complete").flag());
+    assert!(included.get("summary").get("results_complete").flag());
+    let (code, rows) = stream_with_policy(&tree.0, &flags, Some("--include-excluded"));
+    assert_eq!(code, EXIT_OK);
+    let terminal = rows.last().unwrap();
+    assert_eq!(terminal.get("matches_seen").number(), 1);
+    assert_eq!(terminal.get("failed_rule_files").number(), 0);
+    assert!(terminal.get("rule_policy_complete").flag() && terminal.get("discovery_complete").flag());
+}
+
+#[test]
 fn traversal_omissions_and_result_windows_remain_explicit() {
     let deep = Tree::new("depth");
     let nested = std::iter::repeat_n("d", 35).collect::<Vec<_>>().join("/");
@@ -302,10 +396,29 @@ fn explicit_errors_and_human_output_use_the_new_route_without_source_side_effect
     let (code, rows) = stream(&missing, &["--raw-hex", "ff"]);
     assert_eq!(code, EXIT_ERROR); assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get("payload_bytes_read").number(), 0);
+    for (flags, policy, error) in [
+        (vec!["--text", "x"], None, "CLI_PROGRESSIVE_REQUIRES_DISCOVERY_POLICY"),
+        (vec!["--text", "x", "--include-excluded"], Some("--respect-ignores"), "CLI_INCOMPATIBLE_OPTIONS"),
+    ] {
+        let (code, result) = invoke_with_policy(&missing, &flags, policy);
+        assert_eq!(code, EXIT_ERROR);
+        assert_eq!(result.get("error").get("code").text(), error);
+        assert_eq!(result.get("summary").get("payload_bytes_read").number(), 0);
+        let (code, rows) = stream_with_policy(&missing, &flags, policy);
+        assert_eq!(code, EXIT_ERROR); assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("error").get("code").text(), error);
+        assert_eq!(rows[0].get("payload_bytes_read").number(), 0);
+    }
     tree.file("control\u{1b}.rs", b"needle");
     let (mut out, mut err) = (Vec::new(), Vec::new());
     assert_eq!(run(&arguments(&tree.0, &["--text", "needle"], None), &mut NoStdin, &mut out, &mut err, || false), EXIT_OK);
     assert!(err.is_empty() && !out.contains(&0x1b));
     let text = std::str::from_utf8(&out).unwrap();
     assert!(text.contains("bytes 0..6") && text.contains("1 files examined from 1 discovered files"));
+    assert!(text.contains("repository-rules-v1"));
+    out.clear();
+    assert_eq!(run(&arguments_with_policy(&tree.0, &["--text", "needle"], None, Some("--include-excluded")),
+        &mut NoStdin, &mut out, &mut err, || false), EXIT_OK);
+    assert!(err.is_empty() && !out.contains(&0x1b));
+    assert!(std::str::from_utf8(&out).unwrap().contains("all-regular-files/no-rule-files-v1"));
 }

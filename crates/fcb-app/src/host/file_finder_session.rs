@@ -22,7 +22,7 @@ use fcb::source::{NormalizedPath, RootGrant};
 use fcb_core::ResourceLease;
 use crate::{AppError, EXIT_OK, EXIT_PARTIAL};
 use crate::output::{Output, OutputError};
-use super::{CatalogSession, CatalogSessionError, MAX_CATALOG_PAGE_ENTRIES,
+use super::{CatalogDiscoveryPolicy, CatalogSession, CatalogSessionError, MAX_CATALOG_PAGE_ENTRIES,
     MAX_CATALOG_PAGE_PATH_BYTES, MAX_CATALOG_PATH_BYTES};
 use super::super::{HostResponse, reader::{ReaderSession, MAX_READER_SOURCE_BYTES}};
 
@@ -104,7 +104,16 @@ impl FileFinderSession {
     /// a candidate universe for refinements. Initial revision1 deliberately has
     /// an unprocessed first batch, so even a finished walk is not search-complete.
     pub fn open(owner: ArenaOwnerId, root: &Path, generation: u64, needle: &[u8],
-        options: FileFinderOptions, mut canceled: impl FnMut() -> bool)
+        options: FileFinderOptions, canceled: impl FnMut() -> bool)
+        -> Result<Self, FileFinderSessionError> {
+        Self::open_with_policy(owner, root, generation, needle, options,
+            CatalogDiscoveryPolicy::RepositoryRules, canceled)
+    }
+
+    /// Fix the discovery policy alongside the query. A broader scope requires
+    /// another independently owned session, never reuse of earlier top-k rows.
+    pub fn open_with_policy(owner: ArenaOwnerId, root: &Path, generation: u64, needle: &[u8],
+        options: FileFinderOptions, policy: CatalogDiscoveryPolicy, mut canceled: impl FnMut() -> bool)
         -> Result<Self, FileFinderSessionError> {
         if needle.is_empty() { return Err(PathSearchError::EmptyQuery.into()); }
         if needle.len() > MAX_FILE_FINDER_QUERY_BYTES { return Err(PathSearchError::QueryTooLong.into()); }
@@ -113,7 +122,7 @@ impl FileFinderSession {
         }
         let generation = QueryGeneration::new(owner, generation).map_err(|_| FileFinderSessionError::StaleQuery)?;
         check(&mut canceled)?;
-        let mut catalog = CatalogSession::open(owner, root, &mut canceled)?;
+        let mut catalog = CatalogSession::open_with_policy(owner, root, policy, &mut canceled)?;
         let allocation = catalog.next_id()?;
         let lease = catalog.budget.try_reserve_managed(owner, allocation,
             ByteLength::new(FINDER_STATE_BYTES + size_of::<Self>() as u64)).map_err(|_| AppError::Admission)?;
@@ -290,7 +299,7 @@ impl FileFinderSession {
         out.literal(",\"mode\":")?; out.quoted(match self.options.mode { PathMatchMode::Exact => "exact", PathMatchMode::Prefix => "prefix", PathMatchMode::Fuzzy => "fuzzy" })?;
         out.literal(",\"case\":")?; out.quoted(match self.options.case { PathCase::Sensitive => "sensitive", PathCase::UnicodeLowercase => "unicode-lowercase" })?;
         out.literal(",\"identity_scope\":\"retained-query-session\",\"ordering\":\"ranked-observed-paths\",\"policy\":")?;
-        out.quoted(super::RULE_POLICY_NAME)?;
+        out.quoted(self.catalog.discovery_policy().name())?;
         self.catalog.encode_rule_policy(&mut out)?;
         out.literal(",\"source_payload_read\":")?;
         out.boolean(command == "open-reader")?;

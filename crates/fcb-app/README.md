@@ -185,6 +185,8 @@ fcb search /path/to/repository --workspace --whole-file --progressive --respect-
   --query 'anchor required -forbidden path:src/ lang:rust' --stream
 fcb search /path/to/repository --workspace --whole-file --progressive --respect-ignores \
   --identifier cancel --skip-matches 256 --limit 100 --max-scan-bytes 4294967296
+fcb search /path/to/repository --workspace --whole-file --progressive --include-excluded \
+  --query 'generated_token path:target/ lang:rust' --stream
 ```
 
 This route uses the same progressive catalog service and continuous file matcher
@@ -195,9 +197,18 @@ reach files beyond both the frozen catalog's 65,536-file maximum and its path
 storage quota. Results follow observed discovery order; they are not a sorted
 or atomic workspace snapshot.
 
-The explicit `--respect-ignores` opt-in is required because this service reads
-bounded repository ignore rules. UTF-8 and BOM-marked UTF-16 text are detected
-automatically. Text and expressions support `--ignore-case`; identifiers retain
+Choose exactly one explicit discovery policy: **`--respect-ignores`** applies
+product exclusions and bounded repository ignore rules; **`--include-excluded`**
+searches normally ignored and generated files without loading repository rules
+as configuration. The override reports `all-regular-files/no-rule-files-v1`,
+`rule_files_enabled: false` and `rule_policy: null`. It still confines traversal
+to the selected root, skips symlinks and special objects, and excludes FCB's
+own cache, store, scratch and recovery artifacts. Omitting the policy returns
+`CLI_PROGRESSIVE_REQUIRES_DISCOVERY_POLICY`; combining both returns
+`CLI_INCOMPATIBLE_OPTIONS`, before discovery starts.
+
+UTF-8 and BOM-marked UTF-16 text are detected automatically. Text and expressions
+support `--ignore-case`; identifiers retain
 their exact whole-token policy. Expressions establish required/excluded
 predicates on each observed file before publishing primary matches. Counting
 continues for expressions, or for literal/identifier searches with `--count-all`,
@@ -212,7 +223,7 @@ pages, with 2,048-byte relative paths, depth 32 and a 4,096-entry pending
 frontier. These are residency and traversal bounds, not a total discovered-file
 ceiling. Omitted paths, refused frontier entries, rule diagnostics, unavailable
 sources and incomplete scans remain explicit coverage metadata. Raw-byte
-queries, explicit encodings, `--max-files`, `--include-excluded`, zero-row
+queries, explicit encodings, `--max-files`, zero-row
 requests and captured-window options are rejected for this mode.
 
 Ordinary output is human-readable; **`--json`** emits one bounded document with
@@ -470,7 +481,8 @@ project search and atlas membership. It loads nested `.gitignore` and
 source-payload counters do not hide those reads. JSON includes `rule_policy`
 limits, counters and diagnostics. Unsupported, unreadable or over-limit rules
 leave affected paths unknown and coverage partial, rather than guessing their
-membership. `--respect-ignores` and `--include-excluded` are mutually exclusive.
+membership. `--respect-ignores` and `--include-excluded` are mutually exclusive;
+progressive whole-file search requires one of them explicitly.
 `fcb snapshot save` accepts the same policy option and retains the rule evidence
 with the saved catalog. Without the option, these CLI routes retain their
 named policy that does not load repository rules as configuration.

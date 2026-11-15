@@ -23,7 +23,7 @@ use fcb::store::{Sha256, Sha256Digest};
 use fcb_core::ResourceLease;
 use crate::{AppError, input, workspace};
 use crate::output::OutputError;
-use super::{CatalogSession, CatalogSessionError};
+use super::{CatalogDiscoveryPolicy, CatalogSession, CatalogSessionError};
 use super::super::{HostResponse, atlas_search::{AtlasSearchError, AtlasSearchScope},
     atlas_stream_search::{AtlasStreamSearchOptions, MAX_ATLAS_STREAM_SEARCH_HITS,
         MAX_ATLAS_STREAM_SEARCH_NEEDLE_BYTES, MAX_ATLAS_STREAM_SEARCH_PAGE,
@@ -180,7 +180,18 @@ impl CatalogContentSearchSession {
     /// the query or requesting a later occurrence window creates a new session
     /// and live observation; independently enumerated walks are not snapshots.
     pub fn open(owner: ArenaOwnerId, root: &Path, generation: u64, query: &str,
-        mut options: CatalogContentSearchOptions, mut canceled: impl FnMut() -> bool)
+        options: CatalogContentSearchOptions, canceled: impl FnMut() -> bool)
+        -> Result<Self, CatalogContentSearchError> {
+        Self::open_with_policy(owner, root, generation, query, options,
+            CatalogDiscoveryPolicy::RepositoryRules, canceled)
+    }
+
+    /// An explicit override can search ignored/generated source with the same
+    /// streaming limits and exact witnesses. Policy is immutable for the query;
+    /// it does not read ignore configuration or expand native root authority.
+    pub fn open_with_policy(owner: ArenaOwnerId, root: &Path, generation: u64, query: &str,
+        mut options: CatalogContentSearchOptions, policy: CatalogDiscoveryPolicy,
+        mut canceled: impl FnMut() -> bool)
         -> Result<Self, CatalogContentSearchError> {
         let limits = options.limits;
         if query.is_empty() || query.len() > MAX_ATLAS_STREAM_SEARCH_NEEDLE_BYTES
@@ -193,7 +204,7 @@ impl CatalogContentSearchSession {
         }
         let generation = QueryGeneration::new(owner, generation).map_err(|_| CatalogContentSearchError::StaleQuery)?;
         check(&mut canceled)?;
-        let mut catalog = CatalogSession::open(owner, root, &mut canceled)?;
+        let mut catalog = CatalogSession::open_with_policy(owner, root, policy, &mut canceled)?;
         let id = catalog.next_id()?;
         let lease = catalog.budget.try_reserve_managed(owner, id,
             ByteLength::new(STATE_BYTES + size_of::<Self>() as u64)).map_err(|_| AppError::Admission)?;

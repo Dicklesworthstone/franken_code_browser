@@ -50,7 +50,7 @@ impl ArgumentError {
             Self::MultipleSources => "CLI_MULTIPLE_SOURCES", Self::InvalidNumber => "CLI_INVALID_NUMBER",
             Self::InvalidEncoding => "CLI_INVALID_ENCODING", Self::InvalidNeedle => "CLI_INVALID_NEEDLE",
             Self::IncompatibleOptions => "CLI_INCOMPATIBLE_OPTIONS", Self::Query(error) => error.code(),
-            Self::ProgressivePolicy => "CLI_PROGRESSIVE_REQUIRES_RESPECT_IGNORES",
+            Self::ProgressivePolicy => "CLI_PROGRESSIVE_REQUIRES_DISCOVERY_POLICY",
             Self::ProgressiveOptions => "CLI_PROGRESSIVE_UNSUPPORTED_OPTIONS",
             Self::ProgressiveLimits => "CLI_PROGRESSIVE_LIMITS",
         }
@@ -226,10 +226,10 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
     }
     if parsed.progressive {
         if parsed.command != Command::Search || !parsed.workspace || !parsed.whole_file
-            || seen & (32 | 512 | 1024 | 128) != 0 {
+            || seen & (32 | 1024 | 128) != 0 {
             return Err(ArgumentError::ProgressiveOptions);
         }
-        if !parsed.respect_ignores { return Err(ArgumentError::ProgressivePolicy); }
+        if !parsed.respect_ignores && !parsed.include_excluded { return Err(ArgumentError::ProgressivePolicy); }
         let query_bytes = match parsed.needle.as_ref() {
             Some(Needle::Text(text) | Needle::Identifier(text)) => text.len(),
             Some(Needle::Query(query)) => query.raw_query.len(),
@@ -356,18 +356,24 @@ mod tests {
 
     #[test]
     fn progressive_catalog_search_requires_its_explicit_scope_and_policy() {
-        let base = ["search", "root", "--workspace", "--whole-file", "--progressive", "--respect-ignores"];
-        for (mode, value) in [("--text", "needle"), ("--identifier", "needle"),
-            ("--query", "needle required -forbidden path:src lang:rust")] {
-            let mut input = args(&base); input.extend(args(&[mode, value, "--count-all", "--limit", "256",
-                "--skip-matches", "9007199254740993", "--max-scan-bytes", "4294967296", "--stream"]));
-            let parsed = parse(&input).unwrap();
-            assert!(parsed.progressive && parsed.respect_ignores && parsed.stream);
-            assert_eq!(parsed.skip_matches, 9_007_199_254_740_993);
-            assert_eq!(parsed.max_scan_bytes, 4u64 * 1024 * 1024 * 1024);
+        for policy in ["--respect-ignores", "--include-excluded"] {
+            let base = ["search", "root", "--workspace", "--whole-file", "--progressive", policy];
+            for (mode, value) in [("--text", "needle"), ("--identifier", "needle"),
+                ("--query", "needle required -forbidden path:src lang:rust")] {
+                let mut input = args(&base); input.extend(args(&[mode, value, "--count-all", "--limit", "256",
+                    "--skip-matches", "9007199254740993", "--max-scan-bytes", "4294967296", "--stream"]));
+                let parsed = parse(&input).unwrap();
+                assert!(parsed.progressive && parsed.stream);
+                assert_eq!(parsed.respect_ignores, policy == "--respect-ignores");
+                assert_eq!(parsed.include_excluded, policy == "--include-excluded");
+                assert_eq!(parsed.skip_matches, 9_007_199_254_740_993);
+                assert_eq!(parsed.max_scan_bytes, 4u64 * 1024 * 1024 * 1024);
+            }
         }
         assert_eq!(parse(&args(&["search", "root", "--workspace", "--whole-file", "--progressive", "--text", "x"])),
             Err(ArgumentError::ProgressivePolicy));
+        assert_eq!(parse(&args(&["search", "root", "--workspace", "--whole-file", "--progressive", "--text", "x",
+            "--respect-ignores", "--include-excluded"])), Err(ArgumentError::IncompatibleOptions));
         for input in [vec!["search", "root", "--whole-file", "--progressive", "--text", "x"],
             vec!["search", "root", "--workspace", "--progressive", "--text", "x"],
             vec!["inspect", "root", "--workspace", "--progressive"], vec!["--progressive", "root"]] {

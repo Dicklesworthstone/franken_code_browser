@@ -68,7 +68,7 @@ impl CatalogContentSearchSession {
             discovery_complete: self.catalog.complete, discovery_more: self.catalog.discovery.is_some(),
             catalogued_files: self.catalog.catalogued_files, discovery_pages: self.catalog.latest_page,
             discovery: self.catalog.aggregate,
-            rule_policy_complete: rules.is_some_and(|stats| stats.is_complete()),
+            rule_policy_complete: self.catalog.rule_policy_complete(),
             failed_rule_files: rules.map_or(0, |stats| stats.failed_files),
             unresolved_rule_paths: rules.map_or(0, |stats| stats.unresolved_paths),
             scope_files: self.search_files(),

@@ -6,7 +6,7 @@
 
 use std::{mem::size_of, path::Path, sync::{Arc, Mutex, MutexGuard, TryLockError,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}};
-use fcb_app::host::{HostResponse, catalog_session::{CatalogDocumentLinkSelection, CatalogSession, CatalogSessionError}};
+use fcb_app::host::{HostResponse, catalog_session::{CatalogDiscoveryPolicy, CatalogDocumentLinkSelection, CatalogSession, CatalogSessionError}};
 use fcb_core::{ArenaOwnerId, ByteLength, FileId, ResourceAllocationId, ResourceBudget, ResourceLease};
 use super::reader_sessions::{self, ReaderSessions};
 
@@ -105,7 +105,12 @@ impl CatalogSessions {
         let cells = lock(&self.cells)?;
         cells.iter().flatten().find(|cell| cell.id == handle).cloned().ok_or(AccessError::Unknown)
     }
-    pub(super) fn open(&self, handle: u64, root: &Path, mut canceled: impl FnMut() -> bool)
+    pub(super) fn open(&self, handle: u64, root: &Path, canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, AccessError> {
+        self.open_with_policy(handle, root, CatalogDiscoveryPolicy::RepositoryRules, canceled)
+    }
+    pub(super) fn open_with_policy(&self, handle: u64, root: &Path, policy: CatalogDiscoveryPolicy,
+        mut canceled: impl FnMut() -> bool)
         -> Result<HostResponse, AccessError> {
         let cell = self.get(handle)?;
         let epoch = cell.epoch.load(Ordering::Acquire);
@@ -115,7 +120,7 @@ impl CatalogSessions {
         let mut stop = || cell.validate(epoch).is_err() || canceled();
         let result = (|| {
             let owner = ArenaOwnerId::new(handle).map_err(|_| AccessError::InvalidArgument)?;
-            let mut candidate = CatalogSession::open(owner, root, &mut stop)?;
+            let mut candidate = CatalogSession::open_with_policy(owner, root, policy, &mut stop)?;
             let response = candidate.page(1, &mut stop)?;
             if stop() { return Err(AccessError::Canceled); }
             *state = Some(candidate);

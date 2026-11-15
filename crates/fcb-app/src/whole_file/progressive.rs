@@ -13,7 +13,7 @@ use crate::output::{Output, OutputError, MAX_RESPONSE_BYTES};
 use crate::host::atlas_search::AtlasSearchScope;
 use crate::host::atlas_stream_search::{AtlasStreamSearchOptions, MAX_ATLAS_STREAM_SEARCH_READ_CALLS};
 use crate::host::catalog_session::{CatalogContentSearchError, CatalogContentSearchMode,
-    CatalogContentSearchOptions, CatalogContentSearchSession, CatalogSearchProgress};
+    CatalogContentSearchOptions, CatalogContentSearchSession, CatalogDiscoveryPolicy, CatalogSearchProgress};
 use super::ndjson::{self, Sink};
 
 const SCHEMA: &str = "fcb.progressive-search/1";
@@ -48,6 +48,11 @@ pub(crate) fn run(parsed: Result<Arguments, ArgumentError>, json: bool, stream: 
     else { document_response(parsed, json, stdout, stderr, budget, canceled) }
 }
 
+fn discovery_policy(args: &Arguments) -> CatalogDiscoveryPolicy {
+    if args.include_excluded { CatalogDiscoveryPolicy::IncludeExcluded }
+    else { CatalogDiscoveryPolicy::RepositoryRules }
+}
+
 fn open(args: &Arguments, canceled: &mut impl FnMut() -> bool)
     -> Result<CatalogContentSearchSession, CatalogContentSearchError> {
     let (mode, query) = match args.needle.as_ref() {
@@ -56,11 +61,11 @@ fn open(args: &Arguments, canceled: &mut impl FnMut() -> bool)
         Some(Needle::Query(query)) => (CatalogContentSearchMode::Expression, query.raw_query.as_str()),
         _ => return Err(CatalogContentSearchError::InvalidLimits),
     };
-    CatalogContentSearchSession::open(owner(), args.file.as_deref().ok_or(AppError::InvalidRange)?, 1, query,
+    CatalogContentSearchSession::open_with_policy(owner(), args.file.as_deref().ok_or(AppError::InvalidRange)?, 1, query,
         CatalogContentSearchOptions { mode, count_all_matches: args.count_all, start_after: args.skip_matches,
             limits: AtlasStreamSearchOptions { max_matches: args.limit, max_scan_bytes: args.max_scan_bytes,
                 max_read_calls: MAX_ATLAS_STREAM_SEARCH_READ_CALLS },
-            scope: AtlasSearchScope::all().with_case_sensitive(!args.ignore_case) }, canceled)
+            scope: AtlasSearchScope::all().with_case_sensitive(!args.ignore_case) }, discovery_policy(args), canceled)
 }
 
 /// Poll cancellation before every bounded service step. An accepted file is
@@ -172,7 +177,11 @@ fn stream_response<C: FnMut() -> bool>(parsed: Result<Arguments, ArgumentError>,
         sink.emit("start", canceled, |out, _| {
             out.literal(",\"command\":\"search\",\"identity_scope\":\"invocation-local\",\"scope\":\"progressively-discovered-whole-files\",\"requested_path\":")?;
             out.path(args.file.as_deref().ok_or(AppError::InvalidRange)?)?;
-            out.literal(",\"membership\":\"progressive-observation\",\"ordering\":\"provisional-discovery-order\",\"respect_ignores\":true,\"terminal_required\":true,\"capture_limits_applied\":false,\"aggregate_file_limit\":null,\"aggregate_path_byte_limit\":null")?;
+            out.literal(",\"membership\":\"progressive-observation\",\"ordering\":\"provisional-discovery-order\",\"respect_ignores\":")?;
+            out.boolean(args.respect_ignores)?;
+            out.literal(",\"include_excluded\":")?; out.boolean(args.include_excluded)?;
+            out.literal(",\"discovery_policy\":")?; out.quoted(discovery_policy(&args).name())?;
+            out.literal(",\"terminal_required\":true,\"capture_limits_applied\":false,\"aggregate_file_limit\":null,\"aggregate_path_byte_limit\":null")?;
             integer(out, "max_record_bytes", MAX_RESPONSE_BYTES as u64)?;
             integer(out, "max_stream_output_bytes", ndjson::MAX_STREAM_OUTPUT_BYTES)?;
             integer(out, "max_write_calls_per_record", ndjson::MAX_WRITE_CALLS as u64)?;
@@ -256,6 +265,7 @@ fn document_response(parsed: Result<Arguments, ArgumentError>, json: bool, stdou
         Err(_) => { let _ = stderr.write(b"CLI_OUTPUT_ADMISSION\n"); return EXIT_ERROR; }
     };
     let mut session = None;
+    let policy = parsed.as_ref().ok().map(discovery_policy);
     let result = match parsed {
         Ok(args) => drive(&args, &mut session, canceled, |_, _, _| Ok(())),
         Err(error) => Err(Failure::Service(AppError::from(error).into())),
@@ -267,20 +277,20 @@ fn document_response(parsed: Result<Arguments, ArgumentError>, json: bool, stdou
     }
     let progress = session.as_ref().map_or_else(CatalogSearchProgress::default, CatalogContentSearchSession::cli_progress);
     let mut code = exit(progress, error);
-    let encoded = encode_document(&mut out, session.as_ref(), progress, json, code, error);
+    let encoded = encode_document(&mut out, session.as_ref(), policy, progress, json, code, error);
     if let Err(failure) = encoded {
         error = Some(failure); code = if failure.canceled() { EXIT_CANCELED } else { EXIT_ERROR };
         out.clear();
-        if encode_document(&mut out, None, progress, json, code, error).is_err() {
+        if encode_document(&mut out, None, policy, progress, json, code, error).is_err() {
             let _ = stderr.write(b"CLI_ERROR_ENCODING_FAILED\n"); return EXIT_ERROR;
         }
     }
     if code != EXIT_CANCELED && canceled() {
         code = EXIT_CANCELED; error = Some(AppError::Canceled.into());
         out.clear();
-        if encode_document(&mut out, session.as_ref(), progress, json, code, error).is_err() {
+        if encode_document(&mut out, session.as_ref(), policy, progress, json, code, error).is_err() {
             out.clear();
-            if encode_document(&mut out, None, progress, json, code, error).is_err() {
+            if encode_document(&mut out, None, policy, progress, json, code, error).is_err() {
                 let _ = stderr.write(b"CLI_ERROR_ENCODING_FAILED\n"); return EXIT_ERROR;
             }
         }
@@ -295,7 +305,7 @@ fn document_response(parsed: Result<Arguments, ArgumentError>, json: bool, stdou
     if delivered.is_err() { return interrupted(stderr, delivery_canceled); }
     code
 }
-fn encode_document(out: &mut Output, session: Option<&CatalogContentSearchSession>, p: CatalogSearchProgress,
+fn encode_document(out: &mut Output, session: Option<&CatalogContentSearchSession>, policy: Option<CatalogDiscoveryPolicy>, p: CatalogSearchProgress,
     json: bool, exit: u8, error: Option<Error>) -> Result<(), Error> {
     if json {
         out.literal("{\"schema\":")?; out.quoted(SCHEMA)?;
@@ -315,7 +325,9 @@ fn encode_document(out: &mut Output, session: Option<&CatalogContentSearchSessio
         summary(out, p, delivered, error.is_none() && p.complete)?;
         out.literal("}")?; error_field(out, error)?; out.literal("}\n")?;
     } else {
-        out.literal("Progressive workspace search; repository ignore policy; observed discovery order\n")?;
+        out.literal("Progressive workspace search; ")?;
+        out.literal(policy.map_or("discovery policy not admitted", CatalogDiscoveryPolicy::name))?;
+        out.literal("; observed discovery order\n")?;
         if let Some(search) = session { search.encode_cli_human_matches(out)?; }
         out.literal(status(exit))?; out.literal(": ")?; out.literal(&p.matches_seen.to_string())?;
         out.literal(" matches observed, ")?; out.literal(&p.retained_hits.to_string())?;

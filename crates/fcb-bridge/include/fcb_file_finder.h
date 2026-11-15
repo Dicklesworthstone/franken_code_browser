@@ -34,6 +34,16 @@ uint64_t fcb_file_finder_create(void);
 char *fcb_file_finder_open(uint64_t handle, const char *root, uint64_t generation,
     const uint8_t *query, uint64_t query_bytes, uint32_t mode, uint8_t match_case,
     uint64_t max_results);
+/* Additive explicit discovery policy: 0 preserves repository-rules-v1;
+ * 1 includes ignored/generated regular files without configuration reads and
+ * reports all-regular-files/no-rule-files-v1. Policy is immutable, including
+ * replay/recovery; changing it needs a new handle. Root authority, own-artifact
+ * exclusions, symlink/special-file refusal and all existing bounds still apply.
+ * Other policy values refuse before dereferencing any supplied pointer.
+ */
+char *fcb_file_finder_open_with_policy(uint64_t handle, const char *root,
+    uint64_t generation, const uint8_t *query, uint64_t query_bytes, uint32_t mode,
+    uint8_t match_case, uint64_t max_results, uint64_t discovery_policy);
 
 /* Info/page/stop include the complete retained top-K and coverage. Page accepts
  * only the current query/revision and never advances. Search completeness,

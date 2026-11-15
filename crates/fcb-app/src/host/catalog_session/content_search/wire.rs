@@ -6,7 +6,7 @@
 use super::*;
 use crate::{EXIT_OK, EXIT_PARTIAL};
 use crate::output::Output;
-use super::super::{MAX_CATALOG_RESPONSE_BYTES, RULE_POLICY_NAME};
+use super::super::MAX_CATALOG_RESPONSE_BYTES;
 
 impl CatalogContentSearchSession {
     pub(super) fn snapshot(&mut self, command: &str, start: usize, count: usize,
@@ -84,7 +84,7 @@ impl CatalogContentSearchSession {
         out.literal(",\"scope\":\"progressively-discovered-whole-files\",\"strategy\":\"streaming-whole-file\",
             \"capture_kind\":\"literal-witnesses-only\",\"source_observation\":\"per-file-streams-not-atomic-workspace\",
             \"ordering\":\"provisional-discovery-order\",\"membership\":\"progressive-observation\",\"discovery_policy\":")?;
-        out.quoted(RULE_POLICY_NAME)?;
+        out.quoted(self.catalog.discovery_policy().name())?;
         self.catalog.encode_rule_policy(out)?;
         self.options.scope.encode(out)?;
         out.literal(",\"mode\":")?;

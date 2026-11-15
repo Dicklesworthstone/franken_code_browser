@@ -5,7 +5,7 @@
 
 use std::{ffi::c_char, path::Path, sync::OnceLock};
 use fcb_app::host::{HostResponse, catalog_session::{CatalogContentSearchMode,
-    CatalogContentSearchOptions}};
+    CatalogContentSearchOptions, CatalogDiscoveryPolicy}};
 use fcb_app::host::atlas_stream_search::{AtlasStreamSearchOptions,
     MAX_ATLAS_STREAM_SEARCH_HITS, MAX_ATLAS_STREAM_SEARCH_NEEDLE_BYTES,
     MAX_ATLAS_STREAM_SEARCH_READ_CALLS, MAX_ATLAS_STREAM_SEARCH_SCAN_BYTES};
@@ -46,7 +46,28 @@ pub unsafe extern "C" fn fcb_catalog_stream_open(handle: u64, root: *const c_cha
     count_all: u64, start_after: u64, extensions: *const c_char, filenames: *const c_char,
     path_kind: u64, path: *const c_char, max_matches: u64, max_scan_bytes: u64,
     max_read_calls: u64) -> *mut c_char {
+    unsafe { fcb_catalog_stream_open_with_policy(handle, root, generation, query, query_bytes,
+        mode, case_sensitive, count_all, start_after, extensions, filenames, path_kind, path,
+        max_matches, max_scan_bytes, max_read_calls, 0) }
+}
+/// Fix an explicit discovery scope for the lifetime of this query. Policy 0
+/// honors repository rules; policy 1 includes ignored/generated regular files
+/// without rule-file reads. Both retain the same source and resource bounds.
+/// # Safety
+/// For a valid policy, inputs obey fcb_catalog_stream_open's pointer contract.
+/// Invalid policy values are rejected before reading any foreign input.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_catalog_stream_open_with_policy(handle: u64, root: *const c_char,
+    generation: u64, query: *const u8, query_bytes: u64, mode: u64, case_sensitive: u64,
+    count_all: u64, start_after: u64, extensions: *const c_char, filenames: *const c_char,
+    path_kind: u64, path: *const c_char, max_matches: u64, max_scan_bytes: u64,
+    max_read_calls: u64, discovery_policy: u64) -> *mut c_char {
     reply(|| answer(handle, |streams| {
+        let policy = match discovery_policy {
+            0 => CatalogDiscoveryPolicy::RepositoryRules,
+            1 => CatalogDiscoveryPolicy::IncludeExcluded,
+            _ => return Err(AccessError::InvalidArgument),
+        };
         let length = number(query_bytes)?;
         if generation == 0 || query.is_null() || length == 0
             || length > MAX_ATLAS_STREAM_SEARCH_NEEDLE_BYTES
@@ -74,7 +95,10 @@ pub unsafe extern "C" fn fcb_catalog_stream_open(handle: u64, root: *const c_cha
         let root = unsafe { cstr(root) }.ok_or(AccessError::InvalidArgument)?;
         let options = CatalogContentSearchOptions { mode, count_all_matches, start_after, scope,
             limits: AtlasStreamSearchOptions { max_matches: number(max_matches)?, max_scan_bytes, max_read_calls } };
-        streams.open(handle, Path::new(root), generation, query, options, || false)
+        match policy {
+            CatalogDiscoveryPolicy::RepositoryRules => streams.open(handle, Path::new(root), generation, query, options, || false),
+            CatalogDiscoveryPolicy::IncludeExcluded => streams.open_with_policy(handle, Path::new(root), generation, query, options, policy, || false),
+        }
     }))
 }
 
