@@ -154,6 +154,41 @@ fn structural_reader_cancellation_and_retirement_keep_source_ownership_separate(
 }
 
 #[test]
+fn saved_go_generic_symbols_open_exact_retained_names_after_archive_retirement() {
+    let source = b"package sample\n/*\nfunc Saved[T any](value T) T {}\n*/\nvar Template = `\nfunc Saved[T any](value T) T {}\n`\nfunc Saved[T any](value T) T { return value }\n";
+    let root = std::env::temp_dir().join(format!("fcb-saved-go-symbols-{}-{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    fs::create_dir(&root).unwrap();
+    let owner = ArenaOwnerId::new(8994).unwrap();
+    let budget = ResourceBudget::new(owner, ByteLength::new(64 * 1024 * 1024)).unwrap();
+    let entries = [SnapshotEntry { path: b"src/source.go", observed_bytes: source.len() as u64,
+        data: SnapshotData::Captured(source) }];
+    let encoded = SnapshotBytes::encode(owner, true, "go-symbol-test", &entries, Default::default(),
+        &budget, ResourceAllocationId::new(1).unwrap(), || false).unwrap();
+    let path = root.join("source.fcbs"); fs::write(&path, encoded.bytes()).unwrap(); drop(encoded);
+    let table = SavedSessions::new(); let readers = ReaderSessions::new();
+    let handle = table.create().unwrap(); table.open(handle, &path, Default::default(), || false).unwrap();
+    let results = search(&table, handle, 1, StructureMode::Symbols, SymbolNameMode::Exact, "Saved");
+    assert_eq!(number(&results, "retained_hits"), 1, "{results}");
+    assert!(results.contains("\"name\":\"Saved\""));
+    assert!(results.contains("\"semantic_complete\":false"));
+    let reader = readers.create().unwrap();
+    let receipt = table.open_reader(handle, &readers, reader, Selection::StructureHit { generation: 1, id: 1 }, || false).unwrap();
+    assert!(receipt.as_str().contains("\"selection_namespace\":\"saved-structure\""));
+    table.close(handle).unwrap(); fs::write(&path, b"archive replaced after source transfer").unwrap();
+    let outlined = readers.execute(reader, ReaderCommand::Outline { generation: 1, options: Default::default() }, || false).unwrap();
+    assert!(outlined.as_str().contains("\"language\":\"go\""));
+    assert!(outlined.as_str().contains("\"retained_symbols\":\"2\""), "{}", outlined.as_str());
+    assert!(outlined.as_str().contains("\"name\":\"Saved\""));
+    let copy = readers.execute(reader, ReaderCommand::CopySymbol { generation: 1, id: 2, whole_declaration: false }, || false).unwrap();
+    let declaration = readers.execute(reader, ReaderCommand::CopySymbol { generation: 1, id: 2, whole_declaration: true }, || false).unwrap();
+    readers.close(reader).unwrap();
+    assert!(copy.as_str().contains("\"original_hex\":\"5361766564\""));
+    let expected: String = b"func Saved[T any](value T) T { return value }".iter().map(|byte| format!("{byte:02x}")).collect();
+    assert!(declaration.as_str().contains(&format!("\"original_hex\":\"{expected}\"")));
+}
+
+#[test]
 fn structural_reader_admission_and_archive_corruption_never_replace_source() {
     let fixture = fixture(); let table = SavedSessions::new(); let readers = ReaderSessions::new();
     let handle = open(&table, &fixture);

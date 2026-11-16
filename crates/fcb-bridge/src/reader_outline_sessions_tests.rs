@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 use super::*;
 use crate::atlas_sessions::{AtlasSessions, Command as AtlasCommand};
-use fcb_app::host::atlas_search::AtlasSearchOptions;
+use fcb_app::host::atlas_search::{AtlasSearchOptions, AtlasSearchScope, AtlasStructureMode, AtlasStructureOptions};
 use std::fs;
 
 fn opened(readers: &ReaderSessions, source: &[u8]) -> u64 {
@@ -36,6 +36,49 @@ fn repository_search_reader_outline_and_symbol_remain_on_original_capture() {
     let copy = readers.execute(reader, Command::CopySymbol { generation: 1, id: 1, whole_declaration: false }, || false).unwrap();
     readers.close(reader).unwrap();
     assert!(copy.as_str().contains("\"original_hex\":\"6f726967696e616c\""));
+}
+
+#[test]
+fn go_live_symbols_ignore_literal_declarations_and_keep_exact_names_after_file_replacement() {
+    let source = b"package example\n/*\nfunc Read() {}\n*/\nvar Template = `\nfunc Read() {}\n`\ntype Box[T any] struct { Value T }\nfunc (b *Box[T]) Read() T { return b.Value }\n";
+    let root = std::env::temp_dir().join(format!("fcb-go-outline-journey-{}-{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    fs::create_dir(&root).unwrap(); fs::write(root.join("source.go"), source).unwrap();
+    let atlases = AtlasSessions::new(); let readers = ReaderSessions::new();
+    let atlas = atlases.create().unwrap(); atlases.open(atlas, &root, Default::default(), || false).unwrap();
+    let scope = AtlasSearchScope::default();
+    let options = AtlasStructureOptions { mode: AtlasStructureMode::Symbols,
+        name_mode: SymbolNameMode::Exact, limits: AtlasSearchOptions::default() };
+    atlases.execute(atlas, AtlasCommand::StructureBegin { generation: 1, needle: "Read", scope: &scope, options }, || false).unwrap();
+    let mut finished = false;
+    for _ in 0..100 {
+        let step = atlases.execute(atlas, AtlasCommand::SearchStep { generation: 1 }, || false).unwrap();
+        if step.as_str().contains("\"search_in_progress\":false") { finished = true; break; }
+    }
+    assert!(finished, "bounded Go structural search did not finish");
+    let page = atlases.execute(atlas, AtlasCommand::SearchPage { generation: 1, start: 0, limit: 10 }, || false).unwrap();
+    assert!(page.as_str().contains("\"retained_hits\":\"1\""), "{}", page.as_str());
+    assert!(page.as_str().contains("\"name\":\"Read\""));
+    assert!(page.as_str().contains("\"semantic_complete\":false"));
+    fs::write(root.join("source.go"), b"package replacement\nfunc Changed() {}\n").unwrap();
+    let reader = readers.create().unwrap();
+    let link = atlases.open_search_reader(atlas, &readers, reader, 1, 1, || false).unwrap();
+    assert!(link.as_str().contains("\"source_reopened\":false"));
+    atlases.close(atlas).unwrap();
+    let out = outline(&readers, reader, 1);
+    assert!(out.as_str().contains("\"language\":\"go\""));
+    assert!(out.as_str().contains("\"retained_symbols\":\"3\""), "{}", out.as_str());
+    assert!(out.as_str().contains("\"name\":\"Box\""));
+    assert!(names(&readers, reader, 1, "Read").as_str().contains("\"matched_symbols\":\"1\""));
+    assert!(names(&readers, reader, 1, "Changed").as_str().contains("\"matched_symbols\":\"0\""));
+    let window = readers.execute(reader, Command::Symbol { generation: 1, id: 3, context: 100 }, || false).unwrap();
+    assert!(window.as_str().contains("return b.Value"));
+    let copy = readers.execute(reader, Command::CopySymbol { generation: 1, id: 3, whole_declaration: false }, || false).unwrap();
+    let declaration = readers.execute(reader, Command::CopySymbol { generation: 1, id: 3, whole_declaration: true }, || false).unwrap();
+    readers.close(reader).unwrap();
+    assert!(copy.as_str().contains("\"original_hex\":\"52656164\""));
+    let expected: String = b"func (b *Box[T]) Read() T { return b.Value }".iter().map(|byte| format!("{byte:02x}")).collect();
+    assert!(declaration.as_str().contains(&format!("\"original_hex\":\"{expected}\"")));
 }
 
 #[test]

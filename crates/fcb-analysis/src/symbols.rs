@@ -11,7 +11,7 @@
 //! Worker work is bounded by 64 KiB original/decoded source and 4096 lines.
 //! Python also limits indentation to 128 bytes before invoking its recursive
 //! legacy extractor. Rejected files remain available to the ordinary reader.
-//! Rust, JavaScript/JSX, TypeScript/TSX, Swift, Java and C# use pinned upstream
+//! Rust, JavaScript/JSX, TypeScript/TSX, Go, Swift, Java and C# use pinned upstream
 //! lexers and bounded declaration
 //! recognizers; they do not introduce lexers or compiler-semantic claims.
 
@@ -25,6 +25,7 @@ mod swift;
 mod managed;
 mod rust;
 mod javascript;
+mod go;
 
 pub const MAX_SYMBOL_SOURCE_BYTES: usize = 64 * 1024;
 pub const MAX_SYMBOL_ITEMS: usize = 4096;
@@ -177,6 +178,8 @@ impl<'source> CapturedSymbols<'source> {
             swift::extract(&map, &line_starts, max_items, &mut canceled)?
         } else if matches!(language, SymbolLanguage::Java | SymbolLanguage::CSharp) {
             managed::extract(&map, language, &line_starts, max_items, &mut canceled)?
+        } else if language == SymbolLanguage::Go {
+            go::extract(&map, &line_starts, max_items, &mut canceled)?
         } else {
             // Do not pass the caller's display limit into extraction: nested items
             // outside earlier top-level results must not disappear during filtering.

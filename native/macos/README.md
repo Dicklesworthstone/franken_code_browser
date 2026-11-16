@@ -553,6 +553,34 @@ occurrences, large target ranges, partial coverage, independent generations,
 lost replies, cancellation and stale or forged activation receipts. Executable
 Rust/Swift verification and physical-Mac qualification remain pending.
 
+## Navigating Go declarations
+
+**Symbols** search and retained-reader **Outline** now use the shared
+FrankenMarkdown Go lexer to recognize declaration candidates. Comments, raw
+strings, interpreted strings and rune literals cannot create outline entries
+from declaration-looking text.
+
+The supported navigation subset includes package-level functions and methods,
+generic functions, individual and grouped type declarations, and grouped or
+individual `const`/`var` bindings. Generic parameters stay outside the selected
+name. Struct and interface declarations have distinct kinds; their fields and
+methods, function-local declarations and initializer bodies remain opaque.
+Receiver methods are listed as method candidates without claiming that a
+receiver has been resolved to a particular type.
+
+Selecting a result highlights its exact name in the same retained capture.
+Copying the declaration uses its captured source range, including a recognized
+function body. UTF-8 and BOM-marked UTF-16 preserve original-byte selection and
+copying even after the working-tree file changes. Live workspace search, saved
+repository search and retained outlines use the same adapter.
+
+These remain **heuristic outline candidates**, not compiler definitions or a
+complete package inventory. The existing 64 KiB source, 4,096 physical-line and
+bounded output limits still apply. Unsupported or malformed lexical context is
+reported explicitly, with the ordinary source reader still available. Focused
+unit and live/saved-to-retained-reader regressions are included; executable and
+physical-Mac qualification remain pending.
+
 ## Navigating Swift declarations
 
 Swift source now participates in **Symbols** searches in live projects and saved
