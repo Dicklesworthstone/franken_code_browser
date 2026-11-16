@@ -600,6 +600,37 @@ pending. The focused fixtures are in `swiftui/tests/test-desk-recovery-store.sh`
 and `swiftui/tests/test-reading-desk.sh`; the existing desk close, note and reader
 suites compile the same recovery-enabled model.
 
+## Navigating C and C++ declarations
+
+C and C++ **Symbols** search and retained-reader **Outline** use the pinned
+FrankenMarkdown C++ lexer. Comments, quoted literals and raw strings stay
+opaque. The shared recognizer follows namespace and type scopes to find
+ordinary function definitions and header prototypes, methods, constructors,
+destructors, named classes/structs/enums and supported type aliases. Function
+bodies and variable initializers cannot contribute declaration-looking decoys.
+
+Each candidate keeps a separate exact name range and declaration range in the
+retained capture. Selecting a method highlights its name; copying its
+declaration includes its recognized body. Both UTF-8 and BOM-marked UTF-16
+preserve original bytes. The same route serves live project search, saved
+repositories and retained readers, including captures whose live files have
+changed or whose original directory no longer exists.
+
+The language picker calls this **C / C++**. Case-insensitive `.c`, `.h`,
+`.cpp`, `.cc`, `.cxx` and `.hpp` filenames use the canonical `cpp` route.
+Candidates remain **heuristic outline candidates**: no preprocessor execution,
+macro expansion, compiler name binding or complete declaration inventory is
+claimed. Function pointer declarators, overloaded operators and advanced
+constraint syntax are outside the recognized subset. Conditional branches are
+not evaluated; a lexical declaration is not proof that a compiler enables it.
+
+The existing 64 KiB original/decoded-source, 4,096-line/item and bounded-scope
+limits apply. Unsupported lexical transformations and malformed delimiters fail
+explicitly while ordinary source reading remains available. Authored regressions
+cover comment/raw-string decoys, nested methods, header declarations, exact
+UTF-16 names, saved archives and opening a retained search result after a live
+edit. Independent executable and physical-Mac verification remain pending.
+
 ## Navigating Python declarations
 
 Python **Symbols** search and retained-reader **Outline** recognize `class`,

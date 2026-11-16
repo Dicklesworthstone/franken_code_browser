@@ -1062,6 +1062,45 @@ malformed text, UTF-16, lowercase expansion witnesses, later occurrence pages,
 stale/canceled requests and independent captured sources. Execution remains
 pending the repository's independent batch verification lane.
 
+## C and C++ declaration candidates
+
+File, workspace, saved-repository and retained-reader symbol navigation share
+the C/C++ recognizer. Case-insensitive `.c`, `.h`, `.cpp`, `.cc`, `.cxx`
+and `.hpp` suffixes select it. Explicit `--language c`, `h`, `cpp`, `cc`,
+`cxx` and `hpp` aliases all produce the canonical `cpp` language tag:
+
+```sh
+fcb symbols Widget.hpp --name open --json
+fcb symbols src --workspace --name open --json
+fcb symbols project.fcbs --snapshot --name open --json
+fcb symbols captured.txt --language cpp --name open --json
+```
+
+The pinned FrankenMarkdown C++ lexer supplies the tokens. The supported subset
+includes namespace/type hierarchy, named classes, structs and enums, ordinary
+function definitions and prototypes, methods, constructors, destructors and
+supported type aliases. Comments, strings, raw strings, function bodies and
+variable initializers remain opaque to declaration discovery. An exact
+`name_range` selects the identifier separately from the containing declaration;
+both ranges map back to the original captured bytes, including UTF-16LE/BE.
+Saved lookup uses captured members without reopening the original workspace.
+
+These are `heuristic-outline-candidate` results. Preprocessor directives are not
+expanded, conditional branches are not evaluated and names are not compiler
+resolved. Complex function pointer declarators, overloaded operators, advanced
+constraint forms and complete C/C++ inventories are not claimed. The existing
+64 KiB original/decoded-source, 4,096-line/item and bounded-nesting limits remain
+in force. Line splices, trigraph/digraph spellings, universal-character escapes
+outside literals and raw/directive forms the pinned lexer cannot safely delimit
+are refused. These cases and malformed delimiters return an explicit symbol
+error; workspace and archive coverage stays partial when a source cannot be
+analyzed.
+
+Production-path regressions cover file and explicit-language routes, live and
+offline workspace lookup, lexical decoys, nested scopes, exact UTF-16 selection,
+retained declaration copying and activation after a live file changes. These
+tests are authored; independent executable verification remains pending.
+
 ## Java and C# declaration candidates
 
 The shared symbol route accepts Java and C# for file, workspace, saved-repository

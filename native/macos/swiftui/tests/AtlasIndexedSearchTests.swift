@@ -155,7 +155,7 @@ import Dispatch
                 "Heading qualification failure preserves admitted work without claiming accepted extraction")
         }
         // Wire admission only; Rust public-route cases own declaration extraction.
-        for language in ["java", "csharp", "javascript", "typescript", "jsx", "tsx", "kotlin"] {
+        for language in ["java", "csharp", "javascript", "typescript", "jsx", "tsx", "cpp", "kotlin"] {
             let f = IndexedFixture()
             f.patch { phase, original in
                 var value = original

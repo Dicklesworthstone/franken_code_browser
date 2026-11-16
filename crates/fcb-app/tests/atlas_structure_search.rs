@@ -170,7 +170,7 @@ fn directory_and_type_scope_exclude_sources_before_file_and_match_quotas() {
 #[test]
 fn unsupported_invalid_encoding_and_oversized_sources_are_explicit_partial_coverage() {
     let oversized = vec![b'a'; 65_537];
-    let fixture = Fixture::new(&[("a.swift", b"func wanted() {}\n"), ("b.rs", &oversized),
+    let fixture = Fixture::new(&[("a.kt", b"fun wanted() {}\n"), ("b.rs", &oversized),
         ("c.rs", b"fn wanted() {}\xff"), ("d.rs", b"fn wanted() {}\n")]);
     let atlas = fixture.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
     search.begin_structure(&atlas, 1, "wanted", AtlasSearchScope::all(), options(AtlasStructureMode::Symbols), || false).unwrap();
@@ -306,4 +306,29 @@ fn live_java_and_csharp_symbol_search_opens_exact_retained_names_and_bodies() {
         let (reader, _) = search.open_reader(&atlas, ArenaOwnerId::new(31606).unwrap(), 1, 1, || false).unwrap();
         assert_eq!(reader.capture().bytes(), source);
     }
+}
+
+#[test]
+fn cpp_symbol_search_opens_the_original_capture_after_the_file_changes() {
+    let source = b"/*\nstruct open {};\n*/\nnamespace demo { struct Widget { int open(int n) const { return n; } }; }\n";
+    let fixture = Fixture::new(&[("src/Widget.hpp", source)]);
+    let atlas = fixture.open();
+    let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
+    let mut settings = options(AtlasStructureMode::Symbols);
+    settings.name_mode = SymbolNameMode::Exact;
+    search.begin_structure(&atlas, 1, "open", AtlasSearchScope::all(), settings, || false).unwrap();
+    let page = finish(&mut search, &atlas, 1);
+    count(&page, "retained_hits", 1);
+    count(&page, "matches_seen", 1);
+    count(&page, "unsupported_structure_files", 0);
+    assert!(page.contains("\"language\":\"cpp\""));
+    assert!(page.contains("\"semantic_complete\":false"));
+    let hit = search.hit(&atlas, 1, 1).unwrap();
+    let (start, end) = hit.original_range.as_usize_bounds().unwrap();
+    assert_eq!(&source[start..end], b"open");
+    assert!(start > source.windows(b"namespace".len()).position(|part| part == b"namespace").unwrap());
+    fs::write(fixture.0.join("src/Widget.hpp"), b"struct Replacement {};\n").unwrap();
+    let (reader, receipt) = search.open_reader(&atlas, ArenaOwnerId::new(31607).unwrap(), 1, 1, || false).unwrap();
+    assert_eq!(reader.capture().bytes(), source);
+    assert!(receipt.as_str().contains("\"source_reopened\":false"));
 }

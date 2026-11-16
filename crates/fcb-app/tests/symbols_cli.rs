@@ -393,3 +393,73 @@ fn javascript_family_live_and_offline_symbols_share_qualified_original_name_evid
     assert_eq!(&typed[range.get("start").number() as usize..range.get("end").number() as usize], expected);
     assert_eq!(output.get("stats").get("unsupported_language_files").number(), 0);
 }
+
+#[test]
+fn c_and_cpp_file_and_explicit_language_routes_return_exact_function_names() {
+    for (filename, alias, source, kind) in [
+        ("engine.c", "c", b"int open(int value) { return value; }\n".as_slice(), "function"),
+        ("engine.h", "h", b"int open(int value);\n".as_slice(), "function"),
+        ("Widget.cc", "cpp", b"namespace demo { struct Widget { int open(int n) const { return n; } }; }\n".as_slice(), "method"),
+        ("Widget.cxx", "cxx", b"class Widget { public: int open(int n) { return n; } };\n".as_slice(), "method"),
+    ] {
+        let fixture = Fixture::new();
+        fixture.file(filename, source);
+        fixture.file("capture.txt", source);
+        for (path, explicit) in [(filename, false), ("capture.txt", true)] {
+            let mut args = fixture.file_args(path);
+            values(&mut args, &["--name", "open"]);
+            if explicit { values(&mut args, &["--language", alias]); }
+            let (exit, output) = invoke(&args, || false);
+            assert_eq!(exit, EXIT_OK);
+            assert!(output.get("processing_complete").flag());
+            assert!(!output.get("compiler_resolved").flag());
+            assert!(!output.get("symbol_inventory_complete").flag());
+            let candidates = output.get("candidates").array();
+            assert_eq!(candidates.len(), 1);
+            let candidate = &candidates[0];
+            assert_eq!(candidate.get("language").text(), "cpp");
+            assert_eq!(candidate.get("kind").text(), kind);
+            let range = candidate.get("name_range");
+            assert_eq!(&source[range.get("start").number() as usize..range.get("end").number() as usize], b"open");
+        }
+    }
+}
+
+#[test]
+fn cpp_live_and_offline_lookup_keeps_utf16_evidence_and_excludes_lexical_decoys() {
+    let fixture = Fixture::new();
+    fixture.file("engine.c", b"int open(int n) { return n; }\n");
+    fixture.file("engine.h", b"int open(int n);\n");
+    let header = utf16("// 😀\r\nnamespace demo { struct Widget { int open(int n) const { return n; } }; }\r\n", false);
+    fixture.file("Widget.HPP", &header);
+    fixture.file("decoys.cpp", br#"/*
+struct open {};
+*/
+const char *text = R"tag(
+class open {};
+)tag";
+"#);
+    let mut live = fixture.workspace_args();
+    values(&mut live, &["--name", "open"]);
+    let (exit, output) = invoke(&live, || false);
+    assert_eq!(exit, EXIT_OK);
+    assert_eq!(output.get("candidates").array().len(), 3);
+    assert_eq!(output.get("stats").get("analyzed_files").number(), 4);
+    fixture.save();
+    fs::rename(fixture.root(), fixture.0.join("retired-cpp-root")).unwrap();
+    let mut saved = fixture.saved_args();
+    values(&mut saved, &["--name", "open"]);
+    let (exit, output) = invoke(&saved, || false);
+    assert_eq!(exit, EXIT_OK);
+    assert!(!output.get("live_roots_accessed").flag());
+    assert!(!output.get("compiler_resolved").flag());
+    assert!(!output.get("symbol_inventory_complete").flag());
+    let candidates = output.get("candidates").array();
+    assert_eq!(candidates.len(), 3);
+    assert!(candidates.iter().all(|candidate| candidate.get("language").text() == "cpp"));
+    let method = candidates.iter().find(|candidate| candidate.get("kind").text() == "method").unwrap();
+    let range = method.get("name_range");
+    let expected: Vec<_> = "open".encode_utf16().flat_map(u16::to_be_bytes).collect();
+    assert_eq!(&header[range.get("start").number() as usize..range.get("end").number() as usize], expected);
+    assert_eq!(output.get("stats").get("unsupported_language_files").number(), 0);
+}

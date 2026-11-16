@@ -1,16 +1,15 @@
 #![forbid(unsafe_code)]
 
-//! Navigation adapters over the existing outline extractor and shared lexers.
+//! Navigation adapters over shared upstream lexers.
 //!
-//! The legacy language routes recognize only a subset of declarations and some
-//! use line heuristics. Every non-fallback result here is therefore a CANDIDATE,
-//! never compiler resolution or an exhaustive definition inventory. Source and
-//! name ranges are validated against the decoded capture and mapped back to its
-//! original bytes. Markdown stays with its upstream document owner.
+//! Every result is a heuristic declaration candidate, never compiler resolution
+//! or an exhaustive definition inventory. Source and name ranges are validated
+//! against the decoded capture and mapped back to its original bytes. Markdown
+//! stays with its upstream document owner.
 //!
 //! Worker work is bounded by 64 KiB original/decoded source and 4096 lines.
 //! Rejected files remain available to the ordinary reader. Rust, Python,
-//! JavaScript/JSX, TypeScript/TSX, Go, Swift, Java and C# use pinned upstream
+//! JavaScript/JSX, TypeScript/TSX, Go, C/C++, Swift, Java and C# use pinned upstream
 //! lexers and bounded declaration recognizers; they do not introduce lexers or
 //! compiler-semantic claims. Python bounds declaration scopes and indentation
 //! iteratively without inspecting the contents of opaque multiline strings.
@@ -19,7 +18,7 @@ use std::mem::size_of;
 use fcb_core::{ByteLength, ByteRange, DecodedUtf8Offset, DecodedUtf8Range, FileId,
     QueryGeneration, ResourceAllocationId, ResourceBudget, ResourceLease, SourceRevision};
 use fcb_source::{CaptureEncodingMap, CaptureRequest, DetectedEncoding, SpanKind, detect_encoding};
-use crate::{ExtractorLimits, OutlineExtractor, OutlineItem, OutlineItemKind};
+use crate::OutlineItemKind;
 
 mod swift;
 mod managed;
@@ -27,6 +26,7 @@ mod rust;
 mod javascript;
 mod go;
 mod python;
+mod cpp;
 
 pub const MAX_SYMBOL_SOURCE_BYTES: usize = 64 * 1024;
 pub const MAX_SYMBOL_ITEMS: usize = 4096;
@@ -168,33 +168,16 @@ impl<'source> CapturedSymbols<'source> {
         line_starts.push(0);
         line_starts.extend(text.bytes().enumerate().filter_map(|(i, b)| (b == b'\n').then_some(i + 1)));
         if canceled() { return Err(SymbolError::Canceled); }
-        let (candidates, limited) = if language == SymbolLanguage::Rust {
-            rust::extract(&map, &line_starts, max_items, &mut canceled)?
-        } else if matches!(language, SymbolLanguage::JavaScript | SymbolLanguage::TypeScript | SymbolLanguage::Jsx | SymbolLanguage::Tsx) {
-            javascript::extract(&map, language, &line_starts, max_items, &mut canceled)?
-        } else if language == SymbolLanguage::Swift {
-            swift::extract(&map, &line_starts, max_items, &mut canceled)?
-        } else if matches!(language, SymbolLanguage::Java | SymbolLanguage::CSharp) {
-            managed::extract(&map, language, &line_starts, max_items, &mut canceled)?
-        } else if language == SymbolLanguage::Go {
-            go::extract(&map, &line_starts, max_items, &mut canceled)?
-        } else if language == SymbolLanguage::Python {
-            python::extract(&map, &line_starts, max_items, &mut canceled)?
-        } else {
-            // Do not pass the caller's display limit into extraction: nested items
-            // outside earlier top-level results must not disappear during filtering.
-            let extracted = OutlineExtractor::new(ExtractorLimits { max_items: MAX_SYMBOL_SOURCE_BYTES,
-                max_depth: MAX_RECURSIVE_SCOPES, work_budget_bytes: MAX_SYMBOL_SOURCE_BYTES, lines_per_block: 50 })
-                .extract(request.file(), request.revision(), language.name(), text.as_bytes());
-            if canceled() { return Err(SymbolError::Canceled); }
-            let mut candidates = Vec::new();
-            candidates.try_reserve_exact(max_items).map_err(|_| SymbolError::ResourceDenied)?;
-            if candidates.capacity() > max_items { return Err(SymbolError::ResourceDenied); }
-            let mut limited = false;
-            for item in &extracted.items {
-                append(item, None, 0, &map, &line_starts, &mut candidates, max_items, &mut limited, &mut canceled)?;
-            }
-            (candidates, limited)
+        let (candidates, limited) = match language {
+            SymbolLanguage::Rust => rust::extract(&map, &line_starts, max_items, &mut canceled)?,
+            SymbolLanguage::JavaScript | SymbolLanguage::TypeScript | SymbolLanguage::Jsx | SymbolLanguage::Tsx =>
+                javascript::extract(&map, language, &line_starts, max_items, &mut canceled)?,
+            SymbolLanguage::Swift => swift::extract(&map, &line_starts, max_items, &mut canceled)?,
+            SymbolLanguage::Java | SymbolLanguage::CSharp =>
+                managed::extract(&map, language, &line_starts, max_items, &mut canceled)?,
+            SymbolLanguage::Go => go::extract(&map, &line_starts, max_items, &mut canceled)?,
+            SymbolLanguage::Python => python::extract(&map, &line_starts, max_items, &mut canceled)?,
+            SymbolLanguage::Cpp => cpp::extract(&map, &line_starts, max_items, &mut canceled)?,
         };
         let fallback = candidates.is_empty() && !source.is_empty();
         if canceled() { return Err(SymbolError::Canceled); }
@@ -252,33 +235,6 @@ fn mapped(map: &CaptureEncodingMap, start: u64, end: u64) -> Result<ByteRange, S
         .map_err(|_| SymbolError::InvalidEvidence)?;
     map.decoded_utf8_range_to_byte_range(decoded).map_err(|_| SymbolError::InvalidEvidence)
 }
-#[allow(clippy::too_many_arguments)]
-fn append(item: &OutlineItem, parent: Option<u64>, depth: usize, map: &CaptureEncodingMap, line_starts: &[usize],
-    out: &mut Vec<SymbolCandidate>, limit: usize, limited: &mut bool, canceled: &mut impl FnMut() -> bool)
-    -> Result<(), SymbolError> {
-    if canceled() { return Err(SymbolError::Canceled); }
-    if depth > MAX_RECURSIVE_SCOPES { return Err(SymbolError::ComplexityLimit); }
-    if matches!(item.kind, OutlineItemKind::LineBlock { .. } | OutlineItemKind::Heading { .. }) { return Ok(()); }
-    if out.len() == limit { *limited = true; return Ok(()); }
-    let range = mapped(map, item.evidence.byte_start, item.evidence.byte_end)?;
-    let name_range = match item.evidence.name_range {
-        Some((start, end)) => {
-            if start < item.evidence.byte_start || end > item.evidence.byte_end { return Err(SymbolError::InvalidEvidence); }
-            let begin = usize::try_from(start).map_err(|_| SymbolError::InvalidEvidence)?;
-            let finish = usize::try_from(end).map_err(|_| SymbolError::InvalidEvidence)?;
-            if map.decoded_text().get(begin..finish) != Some(item.name.as_str()) { return Err(SymbolError::InvalidEvidence); }
-            Some(mapped(map, start, end)?)
-        }
-        None => None,
-    };
-    // LF-delimited logical position, never a visual column or byte-as-UTF16 index.
-    let line = line_starts.partition_point(|&start| start as u64 <= item.evidence.byte_start) as u64;
-    let id = out.len() as u64 + 1;
-    out.push(SymbolCandidate { id, parent, depth, name: item.name.clone(), kind: item.kind.clone(), range, name_range, line });
-    for child in &item.children { append(child, Some(id), depth + 1, map, line_starts, out, limit, limited, canceled)?; }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

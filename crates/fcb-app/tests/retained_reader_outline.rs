@@ -326,3 +326,46 @@ fn typescript_utf16_method_activation_copies_original_units_from_the_retained_ca
             .contains(&format!("\"original_hex\":\"{}\"", hex(&expected))));
     }
 }
+
+#[test]
+fn cpp_outline_ignores_comment_and_raw_string_decoys_and_copies_retained_methods() {
+    let source = br#"/*
+struct Ghost {};
+*/
+const char *text = R"tag(
+class Phantom {};
+)tag";
+namespace demo {
+struct Widget {
+    int open(int n) const { return n; }
+};
+}
+"#;
+    let mut reader = ReaderSession::from_bytes(ArenaOwnerId::new(9313).unwrap(),
+        Path::new("Widget.hpp"), source, || false).unwrap();
+    let address = reader.capture().bytes().as_ptr();
+    let response = reader.prepare_outline(1, Default::default(), || false).unwrap();
+    assert_eq!(response.exit_code(), EXIT_OK);
+    assert!(response.as_str().contains("\"language\":\"cpp\""));
+    assert!(response.as_str().contains("\"retained_symbols\":\"3\""));
+    assert!(response.as_str().contains("\"semantic_complete\":false"));
+    for absent in ["Ghost", "Phantom"] {
+        let page = reader.symbol_page(1, absent, SymbolNameMode::Exact, 0, 16, || false).unwrap();
+        assert!(page.as_str().contains("\"matched_symbols\":\"0\""));
+    }
+    let target = id(&mut reader, 1, "open");
+    let name = reader.symbol_range(1, target, false).unwrap();
+    assert_eq!(bytes(&reader, name), b"open");
+    let declaration = reader.symbol_range(1, target, true).unwrap();
+    assert_eq!(bytes(&reader, declaration), b"int open(int n) const { return n; }");
+    let window = reader.symbol_window(1, target, 128, || false).unwrap();
+    assert!(window.as_str().contains("\"declaration_line\":\"9\""));
+    assert!(window.as_str().contains("\"selection_namespace\":\"outline\""));
+    let copy = reader.copy_symbol(1, target, false, || false).unwrap();
+    assert!(copy.as_str().contains("\"original_hex\":\"6f70656e\""));
+    assert!(copy.as_str().contains("\"additional_source_bytes_read\":\"0\""));
+    assert_eq!(reader.capture().bytes().as_ptr(), address);
+    reader.prepare_outline(2, Default::default(), || false).unwrap();
+    assert_eq!(reader.symbol_range(1, target, false).err(),
+        Some(ReaderSessionError::Symbol(SymbolError::StaleQuery)));
+}

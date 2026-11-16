@@ -109,19 +109,25 @@ fn changed_bytes_under_a_reused_identity_and_foreign_queries_cannot_select_sourc
 }
 
 #[test]
-fn line_based_candidates_use_declaration_evidence_without_inventing_identifier_ranges() {
+fn python_method_navigation_selects_the_exact_identifier_within_its_declaration() {
     let session = BrowserSession::new(owner());
     let view = session.open_capture(source(1, b"class Thing:\n    def work(self):\n        return 1\n")).unwrap();
     let budget = budget();
     let symbols = view.symbols(SymbolOptions::new(generation(1), SymbolLanguage::Python), &budget, allocation(1), || false).unwrap();
     let method = symbols.candidates().iter().find(|item| item.name() == "work").unwrap();
-    assert_eq!(method.name_range(), None);
+    let name = method.name_range().expect("the Python recognizer retains exact name evidence");
+    assert_eq!(symbols.name_bytes(method.id()).unwrap(), Some(b"work".as_slice()));
+    assert!(method.original_range().start() <= name.start());
+    assert!(name.end() <= method.original_range().end());
     let reader = view.source_reader(ReaderLimits::default(), &budget, allocation(2)).unwrap();
     let mut seek = reader.seek_symbol(&symbols, method.id(), generation(1)).unwrap();
     let at = ready(&mut seek);
-    assert_eq!(at.selection(), Some(method.original_range()));
+    assert_eq!(at.line_number(), 2);
+    assert_eq!(at.selection(), Some(name));
     let window = reader.window(at, generation(1), ReadingWindowOptions::default(), &budget, allocation(3), || false).unwrap();
-    assert_eq!(window.line_text(0), Some("    def work(self):"));
+    let selected = window.text_selection(window.source_to_text(name).unwrap()).unwrap();
+    assert_eq!(selected.text, "work");
+    assert_eq!(selected.original_bytes, b"work");
 }
 
 #[cfg(feature = "snapshot")]
@@ -149,4 +155,44 @@ fn verified_snapshot_symbols_and_reader_survive_closing_the_archive() {
     assert_eq!(window.line_text(0), Some("saved() {}"));
     assert_eq!(window.frame_plan().source().get(), 4);
     assert_eq!(capture.bytes(), data);
+}
+
+#[test]
+fn cpp_nested_and_free_functions_open_exact_names_from_both_utf16_encodings() {
+    let text = "// 😀\r\nnamespace demo {\r\nstruct Widget {\r\n    int run(int n) const { return n; }\r\n};\r\nint run(int n) { return n + 1; }\r\n}\r\n";
+    for little in [false, true] {
+        let mut raw = if little { vec![0xff, 0xfe] } else { vec![0xfe, 0xff] };
+        for unit in text.encode_utf16() {
+            raw.extend_from_slice(&if little { unit.to_le_bytes() } else { unit.to_be_bytes() });
+        }
+        let session = BrowserSession::new(owner());
+        let view = session.open_capture(source(1, &raw)).unwrap();
+        let budget = budget();
+        let symbols = view.symbols(SymbolOptions::new(generation(1), SymbolLanguage::Cpp),
+            &budget, allocation(1), || false).unwrap();
+        let runs: Vec<_> = symbols.candidates().iter().filter(|item| item.name() == "run").collect();
+        assert_eq!(runs.len(), 2);
+        assert_ne!(runs[0].id(), runs[1].id());
+        assert_eq!(symbols.candidate(runs[0].parent_id().unwrap()).unwrap().name(), "Widget");
+        assert_eq!(symbols.candidate(runs[1].parent_id().unwrap()).unwrap().name(), "demo");
+        let reader = view.source_reader(ReaderLimits::default(), &budget, allocation(2)).unwrap();
+        for (candidate, line) in runs.into_iter().zip([4, 6]) {
+            let name = candidate.name_range().expect("C/C++ declaration names retain exact evidence");
+            let expected: Vec<_> = "run".encode_utf16().flat_map(|unit|
+                if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect();
+            assert_eq!(symbols.name_bytes(candidate.id()).unwrap().unwrap(), expected);
+            assert!(candidate.original_range().start() <= name.start());
+            assert!(name.end() <= candidate.original_range().end());
+            let mut seek = reader.seek_symbol(&symbols, candidate.id(), generation(1)).unwrap();
+            let at = ready(&mut seek);
+            assert_eq!(at.line_number(), line);
+            assert_eq!(at.selection(), Some(name));
+            let window = reader.window(at, generation(1), ReadingWindowOptions::default(),
+                &budget, allocation(3), || false).unwrap();
+            let selected = window.text_selection(window.source_to_text(name).unwrap()).unwrap();
+            assert_eq!(selected.text, "run");
+            assert_eq!(selected.original_bytes, expected);
+            assert_eq!(candidate.evidence_level(), "heuristic-outline-candidate");
+        }
+    }
 }
