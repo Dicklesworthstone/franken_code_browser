@@ -132,6 +132,15 @@ preserving the previous trail and all its visits. The CLI offers the same immuta
 workflow. This source implementation still requires
 independent native verification.
 
+**Reading Desk recovery preserves accepted work between sessions.** The native
+desk's **Recovery…** controls can enable local automatic checkpoints containing
+captured sources, bookmarks, reading locations and accepted notes. The bounded
+store keeps the two latest confirmed copies per desk and exposes interrupted
+copies for explicit recovery or deletion. Restoring never reopens saved source
+paths; unsubmitted note-editor drafts remain protected separately. See
+[local recovery](native/macos/README.md#recovering-reading-desk-work) for the
+opt-in, storage limits and pending native verification.
+
 **Project relationships keep your reading place.** Documentation links and
 backlinks open exact captured sources. Their Markdown preview can follow local
 links through the retained inventory, with Back/Forward across three retained

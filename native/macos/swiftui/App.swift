@@ -342,7 +342,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     @State private var observedReader: AtlasObservedReaderPresentation?
     @State private var workspaceStreamSearch: AtlasWorkspaceStreamPresentation?
     @State private var projectLinks: AtlasProjectLinksPresentation?
-    @State private var readingDesk = AtlasReadingDeskModel(transport: .native)
+    @State private var readingDesk = AtlasReadingDeskModel(transport: .native, recovery: .local)
     @State private var showsReadingDesk = false
     @State private var reviewDeskAfterSheetDismissal = false
     @State private var savedRepository = AtlasSavedRepositoryModel(transport: .native, trails: .native)

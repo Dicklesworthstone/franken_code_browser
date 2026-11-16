@@ -26,6 +26,29 @@ private struct AtlasDeskCheckpointRevision: Equatable, Sendable {
     init(_ state: AtlasDeskState) { owner = state.owner; revision = state.revision }
 }
 
+/// Optional host-owned persistence. Merely constructing a desk or this service
+/// does not inspect Application Support or create a recovery directory. Both
+/// operations run on the desk's existing serial worker, after a user action.
+struct AtlasDeskRecoveryService: Sendable {
+    typealias Writer = @Sendable (URL) throws -> AtlasDeskSaveReceipt
+    typealias Reader = @Sendable (URL) throws -> String?
+    let list: @Sendable () throws -> [AtlasDeskRecoveryEntry]
+    let save: @Sendable (UUID, AtlasDeskState, Writer) throws -> AtlasDeskRecoveryEntry
+    let read: @Sendable (AtlasDeskRecoveryEntry, Reader) throws -> String?
+    let remove: @Sendable (AtlasDeskRecoveryEntry) throws -> Void
+
+    static let local = Self(list: {
+        try AtlasDeskRecoveryStore.applicationSupport().list()
+    }, save: { session, state, write in
+        try AtlasDeskRecoveryStore.applicationSupport().save(session: session, owner: state.owner,
+            revision: state.revision, sourceBytes: state.retainedBytes, write: write)
+    }, read: { entry, read in
+        try AtlasDeskRecoveryStore.applicationSupport().withCheckpoint(entry, read: read)
+    }, remove: { entry in
+        try AtlasDeskRecoveryStore.applicationSupport().remove(entry)
+    })
+}
+
 /// Holds a native handle until its final worker operation drains. Closing is
 /// dispatched away from the interaction thread because retained sources can be
 /// released there. Immutable closures and the handle are safe to share.
@@ -93,7 +116,9 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
 @Observable @MainActor final class AtlasReadingDeskModel {
     private(set) var state: AtlasDeskState?
     private(set) var page: AtlasDeskPage?
-    private(set) var busy = false
+    private(set) var busy = false {
+        didSet { if !busy { scheduleRecoveryIfNeeded() } }
+    }
     private(set) var saving = false
     private(set) var exporting = false
     private(set) var closed = false
@@ -101,13 +126,26 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
     private(set) var lastSave: AtlasDeskSaveReceipt?
     private(set) var lastExport: AtlasDeskSourcePackReceipt?
     private(set) var hasUnverifiedChanges = false
+    private(set) var recoveryEnabled = false
+    private(set) var recoverySaving = false
+    private(set) var recoveryListing = false
+    private(set) var recoveryFailed = false
+    private(set) var recoveryEntries: [AtlasDeskRecoveryEntry] = []
+    private(set) var lastRecovery: AtlasDeskRecoveryEntry?
+    private(set) var recoveryNotice = "Automatic recovery is off. Enable it to keep local copies of this desk's captured sources and accepted notes."
     private var acceptedRevision: AtlasDeskCheckpointRevision?
     private var checkpointRevision: AtlasDeskCheckpointRevision?
+    private var recoveryRevision: AtlasDeskCheckpointRevision?
+    private var recoveryAttemptedRevision: AtlasDeskCheckpointRevision?
     private var acceptedContents = false
     var bookmarkLabel = ""
     var offsetInput = "0"
     var selectionEndInput = "0"
     @ObservationIgnored private let transport: AtlasReadingDeskTransport
+    @ObservationIgnored private let recovery: AtlasDeskRecoveryService?
+    @ObservationIgnored private let recoverySession = UUID()
+    @ObservationIgnored private var recoveryTask: Task<Void, Never>?
+    @ObservationIgnored private var recoveryDeferrals = 0
     @ObservationIgnored private let io = AtlasDeskIO()
     @ObservationIgnored private var session: AtlasDeskSessionLease?
     @ObservationIgnored private var task: Task<Void, Never>?
@@ -115,15 +153,19 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
     @ObservationIgnored private var lastIssuedAttempt: UInt64 = 0
     @ObservationIgnored private var noteDrafts: [UUID: @MainActor () -> UUID?] = [:]
 
-    init(transport: AtlasReadingDeskTransport) { self.transport = transport }
+    init(transport: AtlasReadingDeskTransport, recovery: AtlasDeskRecoveryService? = nil) {
+        self.transport = transport; self.recovery = recovery
+    }
     var canOperate: Bool { !busy && !closed }
     var readerDomain: UUID? { transport.readerDomain }
+    var supportsRecovery: Bool { recovery != nil }
     /// A failed attempt can advance lastAttempt without changing any personal
     /// work. Only the accepted model revision participates in dirty tracking.
     var hasUnsavedContents: Bool {
         guard !closed else { return false }
         if hasUnverifiedChanges { return true }
         guard let acceptedRevision else { return false }
+        if acceptedRevision == recoveryRevision { return false }
         if let checkpointRevision { return acceptedRevision != checkpointRevision }
         return acceptedContents
     }
@@ -131,6 +173,11 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
     /// even though that desk no longer needs a close warning.
     var hasCheckpointContents: Bool { state.map(Self.containsContents) ?? false }
     var canSaveCheckpoint: Bool { canOperate && state != nil && (hasCheckpointContents || hasUnsavedContents) }
+    private var needsRecoveryCopy: Bool {
+        state != nil && !hasUnverifiedChanges && acceptedRevision != recoveryRevision
+            && (hasCheckpointContents || hasUnsavedContents)
+    }
+    var canSaveRecovery: Bool { canOperate && recoveryEnabled && needsRecoveryCopy }
     var hasOpenNoteEditor: Bool { !noteDrafts.isEmpty }
     var closeSnapshot: AtlasDeskCloseSnapshot {
         guard !closed else { return .empty }
@@ -145,6 +192,186 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
     /// has passed close review; hiding the app does not dismiss the editor.
     func registerNoteDraft(_ id: UUID, revision: @escaping @MainActor () -> UUID?) { noteDrafts[id] = revision }
     func unregisterNoteDraft(_ id: UUID) { noteDrafts.removeValue(forKey: id) }
+
+    /// A native file panel runs a nested event loop. Do not let an automatic
+    /// save occupy the desk between the user's click and their chosen action.
+    func withAutomaticRecoveryDeferred<Value>(_ choose: () -> Value) -> Value {
+        recoveryDeferrals += 1; recoveryTask?.cancel(); recoveryTask = nil
+        defer { recoveryDeferrals -= 1; scheduleRecoveryIfNeeded() }
+        return choose()
+    }
+
+    /// The native view explains that these local copies contain unencrypted
+    /// source and accepted notes before calling this explicit opt-in action.
+    /// Consent belongs to this desk; another window does not inherit it.
+    func enableRecovery() {
+        guard supportsRecovery, canOperate else { return }
+        recoveryEnabled = true; recoveryAttemptedRevision = nil; recoveryFailed = false
+        recoveryNotice = "Automatic recovery is on for this desk. Unsubmitted note-editor drafts are not included."
+        if state == nil { start() }
+        else { saveRecoveryNow() }
+    }
+    func disableRecovery() {
+        guard !closed else { return }
+        recoveryEnabled = false; recoveryTask?.cancel(); recoveryTask = nil
+        // Revoke queued admission without canceling an entered native write.
+        if recoverySaving { operationCancellation?.cancel() }
+        recoveryNotice = recoverySaving
+            ? "Automatic recovery is paused. An already entered save may finish; existing copies are kept."
+            : "Automatic recovery is paused. Existing copies are kept; use Save new checkpoint for later changes."
+    }
+    func saveRecoveryNow() {
+        guard canSaveRecovery, let state else { return }
+        recoveryTask?.cancel(); recoveryTask = nil
+        beginRecoverySave(state)
+    }
+    func refreshRecoveryCopies() {
+        guard canOperate, let recovery else { return }
+        recoveryListing = true
+        recoveryNotice = "Looking for local reading desk recovery copies…"
+        perform { model, _, cancellation in
+            defer { model.recoveryListing = false }
+            do {
+                let entries = try await model.io.perform(keepingAlive: [], cancellation: cancellation) {
+                    try recovery.list()
+                }
+                try cancellation.check()
+                guard !model.closed else { return }
+                model.recoveryEntries = entries
+                if let previous = model.lastRecovery, !entries.contains(previous) {
+                    model.lastRecovery = nil; model.recoveryRevision = nil
+                    model.recoveryAttemptedRevision = model.acceptedRevision
+                    model.recoveryNotice = "This desk's saved recovery copy is no longer available. Save a new recovery copy or checkpoint before closing."
+                } else {
+                    model.recoveryNotice = entries.isEmpty
+                        ? "No local recovery copies were found."
+                        : "Choose a recovery copy to reopen its exact saved sources and notes after validation. No working-tree files will be opened."
+                }
+            } catch {
+                if !model.closed { model.recoveryNotice = Self.recoveryMessage(error) }
+            }
+        }
+    }
+    /// Selection and replacement review are tied to the exact desk/draft state
+    /// the user saw. A newer mutation cannot silently inherit that approval.
+    func restoreRecovery(_ entry: AtlasDeskRecoveryEntry, replacing reviewed: AtlasDeskCloseSnapshot) {
+        guard canOperate, supportsRecovery, recoveryEntries.contains(entry),
+              reviewed == closeSnapshot, !hasOpenNoteEditor else {
+            recoveryNotice = "The desk or its note editor changed. Review the current work before opening a recovery copy."
+            return
+        }
+        guard entry.url.isFileURL, Self.validPath(entry.url.path), entry.canRestore else {
+            recoveryNotice = "This recovery copy has no readable checkpoint payload within the size limit. You can delete it to free recovery space."
+            return
+        }
+        mutate(restoringCheckpoint: true, recoveryEntry: entry,
+            success: "Recovered the checkpoint's exact sources, notes and reading locations. Working-tree paths were not reopened.") {
+            state, attempt in .restore(revision: state.revision, attempt: attempt, path: entry.url.path)
+        }
+    }
+
+    /// Only the selected, revalidated immutable generation is removed. If it
+    /// was this desk's recovery baseline, the desk needs persistence again.
+    func removeRecovery(_ entry: AtlasDeskRecoveryEntry) {
+        guard canOperate, let recovery, recoveryEntries.contains(entry) else { return }
+        if lastRecovery?.id == entry.id {
+            // Deletion can take effect before an error is returned. A lost
+            // result must not leave close protection relying on this copy.
+            lastRecovery = nil; recoveryRevision = nil
+            recoveryAttemptedRevision = acceptedRevision
+        }
+        perform { model, _, cancellation in
+            do {
+                try await model.io.perform(keepingAlive: [], cancellation: cancellation) {
+                    try recovery.remove(entry)
+                }
+                model.recoveryEntries.removeAll { $0.id == entry.id }
+                model.recoveryNotice = "Deleted the selected recovery copy. Other copies are preserved."
+            } catch {
+                model.recoveryNotice = Self.recoveryMessage(error)
+                    + " Refresh the list before trying to remove this copy again."
+            }
+        }
+    }
+
+    private func scheduleRecoveryIfNeeded() {
+        guard !closed, recoveryEnabled, recoveryDeferrals == 0, !busy, needsRecoveryCopy,
+              let state, recoveryAttemptedRevision != AtlasDeskCheckpointRevision(state) else { return }
+        recoveryTask?.cancel()
+        // One replaceable timer coalesces nearby navigation changes. It owns no
+        // source snapshot and adds no queue backlog while a write is entered.
+        recoveryTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(nanoseconds: 350_000_000) }
+            catch { return }
+            guard let self, !Task.isCancelled else { return }
+            self.recoveryTask = nil
+            guard self.needsRecoveryCopy else { return }
+            self.saveRecoveryNow()
+        }
+    }
+
+    private func beginRecoverySave(_ savedState: AtlasDeskState) {
+        guard canOperate, recoveryEnabled, let recovery, let lease = session,
+              lease.handle == savedState.owner else { return }
+        let version = AtlasDeskCheckpointRevision(savedState)
+        guard version != recoveryRevision else { return }
+        recoveryAttemptedRevision = version
+        let cancellation = AtlasDeskCancellation(), transport = transport, sessionID = recoverySession
+        operationCancellation = cancellation; busy = true; recoverySaving = true; recoveryFailed = false
+        recoveryNotice = "Saving a local recovery copy… Keep this window open until the write finishes."
+        task = Task { [self] in
+            do {
+                let entry = try await io.perform(keepingAlive: [lease], cancellation: cancellation) {
+                    try recovery.save(sessionID, savedState) { destination in
+                        try cancellation.check()
+                        let json = transport.run(lease.handle, .save(revision: savedState.revision,
+                            path: destination.path, sourceBytes: savedState.retainedBytes))
+                        let receipt = try AtlasDeskSaveReceipt.decode(json, state: savedState)
+                        guard receipt.succeeded else { throw AtlasReadingDeskError.invalidResponse }
+                        return receipt
+                    }
+                }
+                guard entry.confirmed, entry.session == sessionID, entry.sourceBytes == savedState.retainedBytes else {
+                    throw AtlasReadingDeskError.invalidResponse
+                }
+                // Cancellation after a committed save cannot undo its effect.
+                // Its receipt is still never a baseline for a newer desk state.
+                lastRecovery = entry
+                if acceptedRevision == version, !hasUnverifiedChanges { recoveryRevision = version }
+                recoveryNotice = recoveryEnabled
+                    ? "A local recovery copy keeps this accepted desk's sources and notes. Unsubmitted editor drafts are not included."
+                    : "The entered recovery save completed. Automatic recovery is paused; existing copies are kept."
+            } catch {
+                if !recoveryEnabled, let canceled = error as? AtlasReadingDeskError, case .canceled = canceled {
+                    recoveryFailed = false
+                    recoveryNotice = "Automatic recovery was paused before the checkpoint write began. Existing copies are kept."
+                } else {
+                    recoveryFailed = true
+                    recoveryNotice = Self.recoveryMessage(error)
+                        + " Keep working here or save a new checkpoint. The last confirmed recovery copy is preserved."
+                }
+            }
+            recoverySaving = false; task = nil; operationCancellation = nil; busy = false
+            if closed { releaseSession() }
+        }
+    }
+    private static func recoveryMessage(_ error: Error) -> String {
+        if let error = error as? AtlasDeskRecoveryError { return error.message }
+        if let error = error as? AtlasReadingDeskError { return error.message }
+        return "The local recovery operation could not be confirmed."
+    }
+    private func acceptRecoveredCopy(_ entry: AtlasDeskRecoveryEntry, state: AtlasDeskState, storageVerified: Bool = true) {
+        let version = AtlasDeskCheckpointRevision(state)
+        let confirmed = entry.confirmed && storageVerified
+        lastRecovery = entry; recoveryFailed = !confirmed
+        recoveryRevision = confirmed ? version : nil
+        if !confirmed { recoveryAttemptedRevision = version }
+        recoveryNotice = confirmed
+            ? "Opened the selected recovery copy. Accepted sources and notes are retained; working-tree access has not been granted."
+            : storageVerified
+                ? "Opened and validated an interrupted recovery copy. Save a new recovery copy or checkpoint before closing; this interrupted save is not a confirmed persistence baseline."
+                : "The restored sources and notes were accepted, but the recovery file's location could not be revalidated. Save a new recovery copy or checkpoint before closing."
+    }
 
     func start() {
         guard state == nil, canOperate else { return }
@@ -246,7 +473,9 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
             let message: String
             switch target.outcome(in: accepted, attempt: attempt) {
             case .accepted:
-                message = "Reattached the saved note to the confirmed range after comparing its original bytes. Its label and text are preserved. Save a new checkpoint to retain this change."
+                message = model.recoveryEnabled
+                    ? "Reattached the saved note to the confirmed range after comparing its original bytes. Its label and text are preserved; automatic recovery will save this accepted change."
+                    : "Reattached the saved note to the confirmed range after comparing its original bytes. Its label and text are preserved. Save a new checkpoint to retain this change."
             case .notAccepted:
                 message = "Reattachment was not accepted. The saved note is unchanged; select a nonempty range with identical bytes and review the destination again."
             case .unconfirmed:
@@ -346,7 +575,9 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
         let message: String
         switch outcome {
         case .accepted:
-            message = "Saved the note on its exact captured source range. Save a new checkpoint to retain its text after closing the app."
+            message = recoveryEnabled
+                ? "Saved the note on its exact captured source range. Automatic recovery will save this accepted text; check its status before closing the app."
+                : "Saved the note on its exact captured source range. Save a new checkpoint to retain its text after closing the app."
         case .notAccepted:
             message = "The note change was not accepted. Your draft is preserved; review its label, text and original source range before saving again."
         case .unconfirmed:
@@ -449,7 +680,9 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
                 model.installState(accepted)
                 model.page = nil
                 try await model.loadPage(lease)
-                model.notice = "Kept the exact captured range in the reading desk. Add a bookmark or personal note, then save a checkpoint to preserve it."
+                model.notice = model.recoveryEnabled
+                    ? "Kept the exact captured range in the reading desk. Automatic recovery will save it; you can add bookmarks and personal notes."
+                    : "Kept the exact captured range in the reading desk. Add a bookmark or personal note, then save a checkpoint to preserve it."
             } catch {
                 try? await model.reconcile(lease)
                 throw error
@@ -519,6 +752,7 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
         guard busy else { return }
         operationCancellation?.cancel()
         if let session { _ = transport.cancel(session.handle) }
+        if recoverySaving { recoveryNotice = "Cancel requested. Waiting for the recovery copy's actual write outcome." }
         notice = exporting ? "Cancel requested. Waiting for the source pack’s actual write outcome."
             : saving ? "Cancel requested. Waiting for the checkpoint’s actual write outcome."
                 : "Cancel requested. Reconciling the desk’s accepted state."
@@ -528,27 +762,46 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
     func close() {
         guard !closed else { return }
         closed = true
+        recoveryTask?.cancel(); recoveryTask = nil
         if busy { cancel() }
         else { releaseSession() }
     }
 
-    private func mutate(accessLease: AnyObject? = nil, restoringCheckpoint: Bool = false, success: String? = nil,
+    private func mutate(accessLease: AnyObject? = nil, restoringCheckpoint: Bool = false,
+        recoveryEntry: AtlasDeskRecoveryEntry? = nil, success: String? = nil,
         _ request: @escaping @MainActor (AtlasDeskState, UInt64) -> AtlasDeskRequest) {
         perform(accessLease: accessLease) { model, access, cancellation in
             let lease = try await model.ensureStarted(cancellation)
             guard let state = model.state else { throw AtlasReadingDeskError.unavailable }
             let attempt = try model.nextAttempt()
-            let request = request(state, attempt), transport = model.transport
+            let request = request(state, attempt), transport = model.transport, recovery = model.recovery
+            var recoveryReadVerified = recoveryEntry == nil
             model.hasUnverifiedChanges = true
             do {
                 let json = try await model.io.perform(keepingAlive: [lease] + access, cancellation: cancellation) {
-                    transport.run(lease.handle, request)
+                    if let entry = recoveryEntry {
+                        guard let recovery, case .restore(let revision, let attempt, _) = request else {
+                            throw AtlasReadingDeskError.invalidInput
+                        }
+                        return try recovery.read(entry) { destination in
+                            try cancellation.check()
+                            return transport.run(lease.handle, .restore(revision: revision,
+                                attempt: attempt, path: destination.path))
+                        }
+                    }
+                    return transport.run(lease.handle, request)
                 }
+                recoveryReadVerified = true
                 let accepted = try AtlasDeskState.decode(json, handle: lease.handle, acceptedAttempt: attempt)
-                model.installState(accepted, fromCheckpoint: restoringCheckpoint)
+                model.installState(accepted, fromCheckpoint: restoringCheckpoint && recoveryEntry == nil)
+                if let recoveryEntry {
+                    model.acceptRecoveredCopy(recoveryEntry, state: accepted)
+                }
                 model.page = nil
                 try await model.loadPage(lease)
-                model.notice = success ?? "Reading desk updated. Save a new checkpoint to retain this state after closing the app."
+                model.notice = success ?? (model.recoveryEnabled
+                    ? "Reading desk updated. Automatic recovery will save this accepted state; its status appears below."
+                    : "Reading desk updated. Save a new checkpoint to retain this state after closing the app.")
             } catch {
                 // State may have committed before a delivery/encoding/cancel
                 // error. Never replay the operation to guess its outcome.
@@ -557,8 +810,16 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
                 // proves its outcome even when the initial reply was lost.
                 if restoringCheckpoint, let accepted = model.state,
                    accepted.revision == attempt, accepted.lastAttempt == attempt {
-                    model.checkpointRevision = AtlasDeskCheckpointRevision(accepted)
+                    if let recoveryEntry {
+                        model.acceptRecoveredCopy(recoveryEntry, state: accepted, storageVerified: recoveryReadVerified)
+                        model.notice = success ?? "Opened the selected recovery copy."
+                        if accepted.active != nil && model.page == nil {
+                            model.notice += " The source page is unavailable; reload state to retry reading it."
+                        }
+                        return
+                    } else { model.checkpointRevision = AtlasDeskCheckpointRevision(accepted) }
                 }
+                if recoveryEntry != nil { model.recoveryNotice = Self.recoveryMessage(error) }
                 throw error
             }
         }
@@ -640,6 +901,10 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
         let contents = Self.containsContents(accepted)
         if fromCheckpoint || (acceptedRevision == nil && !contents) { checkpointRevision = version }
         state = accepted; acceptedRevision = version; acceptedContents = contents; hasUnverifiedChanges = false
+        if recoveryEnabled, needsRecoveryCopy, recoveryAttemptedRevision != version {
+            recoveryNotice = "Accepted changes are waiting for local recovery. Keep this window open until their save is confirmed."
+        }
+        scheduleRecoveryIfNeeded()
     }
     private func invalidateState() {
         state = nil; page = nil; hasUnverifiedChanges = true

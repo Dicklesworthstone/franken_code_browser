@@ -553,6 +553,53 @@ occurrences, large target ranges, partial coverage, independent generations,
 lost replies, cancellation and stale or forged activation receipts. Executable
 Rust/Swift verification and physical-Mac qualification remain pending.
 
+## Recovering Reading Desk work
+
+Open **Reading Desk → Recovery… → Enable automatic recovery** to keep local
+copies of that desk's captured sources, bookmarks, reading locations and
+accepted notes. This is an explicit choice for each open desk. Constructing the
+model, opening a repository or merely listing recovery copies does not enable
+writes. Copies live in the app's private Application Support folder and are
+**unencrypted**. Text still in an open note editor is not included until its
+change has been accepted by the desk.
+
+Automatic saves coalesce nearby accepted changes and run on the existing desk
+I/O worker. A verified save protects only the exact revision it captured. A
+newer edit, an unverified mutation, or an unconfirmed write keeps the existing
+close/quit protection active. **Pause automatic recovery** preserves existing
+copies. **Save recovery copy now** and **Retry recovery save** let you request
+an immediate attempt; **Save new checkpoint…** remains available for an explicit
+destination outside the recovery store.
+
+The store keeps the two latest confirmed copies for each desk, with at most
+eight desk sessions and 256 MiB in total. Each checkpoint is limited to 64 MiB;
+admission reserves space for a new candidate before writing, including overlap
+with earlier copies. A successful replacement is published only after the
+checkpoint and its separate commit record have been synchronized. It never
+evicts another desk's notes to make space. Interrupted or unconfirmed generations
+remain visible for inspection and explicit deletion instead of silently consuming
+all available capacity. Their source-byte count is unknown until core validation.
+
+Use **Refresh copies**, select a copy and choose **Open copy…** to restore. A
+populated desk requires review before replacement, and an open note editor must
+be finished or dismissed first. The core validates saved bytes before adoption;
+source paths inside the checkpoint grant no working-tree access. Restoring an
+unconfirmed copy still requires a new confirmed save before the desk is treated
+as safely persisted. A missing or incomplete payload is delete-only. Deleting
+the current persistence copy, or an uncertain deletion outcome, restores the
+desk's unsaved-work protection when no other confirmed checkpoint covers it.
+
+Private file permissions, descriptor-relative no-follow operations and a
+cross-process lock protect store-owned I/O. The existing native bridge accepts
+paths and is bracketed by directory identity checks; this is not a confinement
+claim against a hostile process running as the same user. Filesystem and injected
+model regressions cover rotation, quotas, interrupted copies, accepted revisions,
+cancellation, lost replies and close protection. Their execution through the
+required verifier, app-bundle compilation and physical-Mac qualification remain
+pending. The focused fixtures are in `swiftui/tests/test-desk-recovery-store.sh`
+and `swiftui/tests/test-reading-desk.sh`; the existing desk close, note and reader
+suites compile the same recovery-enabled model.
+
 ## Navigating Python declarations
 
 Python **Symbols** search and retained-reader **Outline** recognize `class`,

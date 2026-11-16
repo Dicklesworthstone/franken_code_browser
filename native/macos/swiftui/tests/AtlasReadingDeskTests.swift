@@ -218,6 +218,80 @@ private final class Grant {
     deinit { flag.advance() }
 }
 
+/// This fake owns metadata only. Filesystem privacy, quota and publication are
+/// covered by AtlasDeskRecoveryTests; these checks exercise the real model's
+/// worker admission and interpretation of typed bridge save/restore receipts.
+private final class RecoveryFixture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var copies: [AtlasDeskRecoveryEntry] = []
+    private var listed = 0
+    private var attempted = 0
+    private var read = 0
+    private var removed = 0
+    private var failedRemovalAfterEffect = false
+    private var failedReadAfterEffect = false
+    private var acceptedRevisions: [UInt64] = []
+    var listCount: Int { locked { listed } }
+    var attemptCount: Int { locked { attempted } }
+    var readCount: Int { locked { read } }
+    var removeCount: Int { locked { removed } }
+    var revisions: [UInt64] { locked { acceptedRevisions } }
+    func failNextRemovalAfterEffect() { locked { failedRemovalAfterEffect = true } }
+    func failNextReadAfterEffect() { locked { failedReadAfterEffect = true } }
+    func removeExternally(_ entry: AtlasDeskRecoveryEntry) { locked { copies.removeAll { $0.id == entry.id } } }
+    func addInterruptedCopy(checkpointBytes: UInt64 = 256) -> AtlasDeskRecoveryEntry {
+        let entry = AtlasDeskRecoveryEntry(id: UUID(), session: UUID(),
+            url: URL(fileURLWithPath: "/private/reading-desk-recovery/\(UUID().uuidString).fcbdesk"),
+            savedAt: Date(), sourceBytes: 0, checkpointBytes: checkpointBytes, confirmed: false)
+        locked { copies.insert(entry, at: 0) }
+        return entry
+    }
+    private func locked<T>(_ body: () throws -> T) rethrows -> T {
+        lock.lock(); defer { lock.unlock() }; return try body()
+    }
+    var service: AtlasDeskRecoveryService {
+        AtlasDeskRecoveryService(list: { [self] in
+            precondition(!Thread.isMainThread)
+            return locked { listed += 1; return copies }
+        }, save: { [self] session, state, write in
+            precondition(!Thread.isMainThread)
+            locked { attempted += 1 }
+            let id = UUID(), url = URL(fileURLWithPath: "/private/reading-desk-recovery/\(UUID().uuidString).fcbdesk")
+            let receipt = try write(url)
+            precondition(receipt.succeeded)
+            let entry = AtlasDeskRecoveryEntry(id: id, session: session, url: url, savedAt: Date(),
+                sourceBytes: state.retainedBytes, checkpointBytes: receipt.checkpointBytes)
+            locked {
+                copies.insert(entry, at: 0); acceptedRevisions.append(state.revision)
+                copies = Array(copies.prefix(2))
+            }
+            return entry
+        }, read: { [self] entry, reader in
+            precondition(!Thread.isMainThread)
+            return try locked {
+                guard copies.contains(entry) else { throw AtlasDeskRecoveryError.changed }
+                read += 1
+                let result = try reader(entry.url)
+                if failedReadAfterEffect {
+                    failedReadAfterEffect = false
+                    throw AtlasDeskRecoveryError.unsafeLocation
+                }
+                return result
+            }
+        }, remove: { [self] entry in
+            precondition(!Thread.isMainThread)
+            try locked {
+                guard copies.contains(entry) else { throw AtlasDeskRecoveryError.changed }
+                copies.removeAll { $0.id == entry.id }; removed += 1
+                if failedRemovalAfterEffect {
+                    failedRemovalAfterEffect = false
+                    throw AtlasDeskRecoveryError.filesystem
+                }
+            }
+        })
+    }
+}
+
 @main struct AtlasReadingDeskTests {
     @MainActor static func entered(_ gate: DispatchSemaphore) async {
         for _ in 0..<1000 {
@@ -242,6 +316,10 @@ private final class Grant {
         await cancellationAdmission()
         await exportLifecycle()
         await checkpointTracking()
+        await recoveryLifecycle()
+        await recoveryCancellationAndClose()
+        await interruptedRecovery()
+        await restoredStorageRevalidation()
         let desk = AtlasReadingDeskModel(transport: fixture.transport)
         desk.capture(path: "/chosen/source.rs", accessLease: nil); await idle(desk)
         precondition(desk.state?.retainedSources == 1 && desk.page?.text == fixture.text)
@@ -301,7 +379,7 @@ private final class Grant {
         precondition(flag.value == 1 && gated.closeCount == 1)
 
         try wireNegativeControls()
-        print("Reading desk wire, exact-source model, lost replies, save/export receipts and grant drain tests passed")
+        print("Reading desk wire, exact-source model, recovery opt-in and receipts, lost replies, save/export receipts and grant drain tests passed")
     }
 
     @MainActor static func cancellationAdmission() async {
@@ -452,6 +530,209 @@ private final class Grant {
         desk.restore(path: "/chosen/complete.fcbdesk", accessLease: nil); await idle(desk)
         precondition(desk.state != nil && desk.page == nil && !desk.hasUnverifiedChanges && !desk.hasUnsavedContents,
             "a missing source page must not invalidate the verified checkpoint restore")
+        desk.close()
+    }
+
+    @MainActor static func waitForSaves(_ expected: Int, fixture: Fixture, desk: AtlasReadingDeskModel) async {
+        for _ in 0..<3000 {
+            if fixture.saveCount == expected && !desk.busy { return }
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        fatalError("automatic recovery did not finish the expected save")
+    }
+
+    @MainActor static func recoveryLifecycle() async {
+        let fixture = Fixture(), recovery = RecoveryFixture()
+        let desk = AtlasReadingDeskModel(transport: fixture.transport, recovery: recovery.service)
+        precondition(desk.supportsRecovery && !desk.recoveryEnabled && recovery.listCount == 0 && recovery.attemptCount == 0)
+        desk.capture(path: "/chosen/source.rs", accessLease: nil); await idle(desk)
+        try? await Task.sleep(nanoseconds: 450_000_000)
+        precondition(fixture.saveCount == 0 && recovery.listCount == 0 && desk.hasUnsavedContents,
+            "constructing and using a desk must not opt it into source-bearing local recovery")
+
+        desk.enableRecovery(); await idle(desk)
+        precondition(desk.recoveryEnabled && desk.lastRecovery != nil && !desk.recoveryFailed)
+        precondition(!desk.hasUnsavedContents && desk.lastSave == nil && fixture.saveCount == 1)
+        precondition(recovery.revisions == [desk.state!.revision], "only an exact accepted revision can become the recovery baseline")
+        let draftID = UUID(), draftRevision = UUID()
+        desk.registerNoteDraft(draftID) { draftRevision }
+        precondition(desk.closeSnapshot.requiresReview && !desk.hasUnsavedContents,
+            "saving accepted work must not dismiss an unsubmitted editor draft")
+        desk.unregisterNoteDraft(draftID)
+        precondition(!desk.closeSnapshot.requiresReview)
+
+        // Nearby accepted changes coalesce into one write of the final state.
+        desk.apply(kind: 1, subject: 1, start: 1); await idle(desk)
+        precondition(desk.hasUnsavedContents && desk.closeSnapshot.requiresReview)
+        desk.apply(kind: 1, subject: 1, start: 2); await idle(desk)
+        let latest = desk.state!.revision
+        await waitForSaves(2, fixture: fixture, desk: desk)
+        precondition(recovery.revisions.last == latest && !desk.hasUnsavedContents)
+
+        // A manual checkpoint can make close protection clean before the
+        // debounce fires, but local recovery must still catch up to that state.
+        desk.apply(kind: 1, subject: 1, start: 3); await idle(desk)
+        desk.save(path: "/chosen/also-save-manually.fcbdesk", accessLease: nil); await idle(desk)
+        precondition(!desk.hasUnsavedContents)
+        await waitForSaves(4, fixture: fixture, desk: desk)
+        precondition(recovery.revisions.last == desk.state!.revision)
+        let previous = desk.lastRecovery!.id
+
+        desk.disableRecovery()
+        desk.bookmarkLabel = "Accepted work while paused"; desk.bookmark(); await idle(desk)
+        try? await Task.sleep(nanoseconds: 450_000_000)
+        precondition(fixture.saveCount == 4 && desk.hasUnsavedContents && desk.lastRecovery?.id == previous)
+        fixture.returnCanceledSave(); desk.enableRecovery(); await idle(desk)
+        precondition(desk.recoveryFailed && desk.hasUnsavedContents && desk.lastRecovery?.id == previous)
+        let failedAttempts = recovery.attemptCount
+        desk.reload(); await idle(desk)
+        try? await Task.sleep(nanoseconds: 450_000_000)
+        precondition(recovery.attemptCount == failedAttempts,
+            "an unconfirmed write must not be automatically retried for the same accepted revision")
+
+        fixture.returnSuccessfulSave(); fixture.loseNextSaveReply()
+        desk.saveRecoveryNow(); await idle(desk)
+        precondition(desk.recoveryFailed && desk.hasUnsavedContents && desk.lastRecovery?.id == previous)
+        fixture.returnWrongSaveRevision(); desk.saveRecoveryNow(); await idle(desk)
+        precondition(desk.recoveryFailed && desk.hasUnsavedContents && desk.lastRecovery?.id == previous)
+        desk.saveRecoveryNow(); await idle(desk)
+        precondition(!desk.recoveryFailed && !desk.hasUnsavedContents && desk.lastRecovery?.id != previous)
+
+        // Listing and restoration remain explicit, and replacement approval is
+        // bound to the desk/drafts actually reviewed by the user.
+        desk.disableRecovery(); desk.refreshRecoveryCopies(); await idle(desk)
+        let selected = desk.lastRecovery!, reviewed = desk.closeSnapshot
+        precondition(desk.recoveryEntries.contains(selected))
+        desk.bookmarkLabel = "Newer work after restore review"; desk.bookmark(); await idle(desk)
+        let newerRevision = desk.state!.revision
+        desk.restoreRecovery(selected, replacing: reviewed)
+        precondition(!desk.busy && recovery.readCount == 0 && desk.state?.revision == newerRevision)
+        desk.registerNoteDraft(draftID) { draftRevision }
+        desk.restoreRecovery(selected, replacing: desk.closeSnapshot)
+        precondition(!desk.busy && recovery.readCount == 0, "a live note editor cannot be replaced by recovery")
+        desk.unregisterNoteDraft(draftID)
+        fixture.acceptNextRestore(); fixture.loseNextMutationReply()
+        desk.restoreRecovery(selected, replacing: desk.closeSnapshot); await idle(desk)
+        precondition(recovery.readCount == 1 && desk.state?.bookmarks.count == 1 && !desk.hasUnsavedContents,
+            "a lost restore reply is reconciled once against the accepted checkpoint revision")
+        desk.removeRecovery(selected); await idle(desk)
+        precondition(recovery.removeCount == 1 && !desk.recoveryEntries.contains(selected))
+        precondition(desk.lastRecovery == nil && desk.hasUnsavedContents && desk.closeSnapshot.requiresReview,
+            "removing this desk's confirmed copy must restore its close protection")
+
+        desk.enableRecovery(); await idle(desk)
+        desk.refreshRecoveryCopies(); await idle(desk)
+        let uncertainDelete = desk.lastRecovery!
+        recovery.failNextRemovalAfterEffect()
+        desk.removeRecovery(uncertainDelete); await idle(desk)
+        precondition(desk.lastRecovery == nil && desk.hasUnsavedContents,
+            "a deletion may have unpublished the checkpoint before reporting failure")
+        let attemptsBeforeRefresh = recovery.attemptCount
+        desk.refreshRecoveryCopies(); await idle(desk)
+        precondition(!desk.recoveryEntries.contains(uncertainDelete))
+        try? await Task.sleep(nanoseconds: 450_000_000)
+        precondition(recovery.attemptCount == attemptsBeforeRefresh,
+            "deleting recovery must not trigger a surprise automatic rewrite of that revision")
+
+        desk.saveRecoveryNow(); await idle(desk)
+        let externallyDeleted = desk.lastRecovery!
+        recovery.removeExternally(externallyDeleted)
+        desk.refreshRecoveryCopies(); await idle(desk)
+        precondition(desk.lastRecovery == nil && desk.hasUnsavedContents && desk.closeSnapshot.requiresReview,
+            "refresh must revoke a recovery baseline deleted by another window")
+        desk.close()
+
+        let other = AtlasReadingDeskModel(transport: Fixture().transport, recovery: recovery.service)
+        other.start(); await idle(other)
+        precondition(!other.recoveryEnabled, "automatic recovery consent does not transfer to another desk")
+        other.close()
+    }
+
+    @MainActor static func recoveryCancellationAndClose() async {
+        let pausedFixture = Fixture(), pausedRecovery = RecoveryFixture()
+        let paused = AtlasReadingDeskModel(transport: pausedFixture.transport, recovery: pausedRecovery.service)
+        paused.capture(path: "/chosen/source.rs", accessLease: nil); await idle(paused)
+        paused.enableRecovery(); paused.disableRecovery(); await idle(paused)
+        precondition(!paused.recoveryEnabled && paused.hasUnsavedContents && !paused.recoveryFailed)
+        precondition(pausedFixture.saveCount == 0 && pausedRecovery.attemptCount == 0,
+            "pausing recovery must revoke a write that has not entered the worker")
+        paused.close()
+
+        let fixture = Fixture(), recovery = RecoveryFixture()
+        let desk = AtlasReadingDeskModel(transport: fixture.transport, recovery: recovery.service)
+        desk.capture(path: "/chosen/source.rs", accessLease: nil); await idle(desk)
+        desk.enableRecovery(); desk.cancel(); await idle(desk)
+        precondition(fixture.saveCount == 0 && recovery.attemptCount == 0 && desk.hasUnsavedContents,
+            "cancellation before worker admission must not create a recovery destination")
+
+        let started = DispatchSemaphore(value: 0), resume = DispatchSemaphore(value: 0)
+        fixture.gateNextSave(entered: started, resume: resume)
+        desk.saveRecoveryNow(); await entered(started)
+        precondition(desk.recoverySaving && desk.closeSnapshot.requiresReview)
+        desk.cancel(); resume.signal(); await idle(desk)
+        precondition(desk.lastRecovery != nil && !desk.hasUnsavedContents,
+            "cancellation cannot discard the receipt of an entered successful recovery save")
+
+        desk.apply(kind: 1, subject: 1, start: 2); await idle(desk)
+        let closing = DispatchSemaphore(value: 0), drain = DispatchSemaphore(value: 0)
+        fixture.gateNextSave(entered: closing, resume: drain)
+        desk.saveRecoveryNow(); await entered(closing)
+        let previous = desk.lastRecovery!.id
+        desk.close()
+        precondition(fixture.closeCount == 0, "the recovery worker must retain its native handle through close")
+        drain.signal(); await idle(desk)
+        precondition(desk.closed && desk.state == nil && desk.lastRecovery?.id != previous)
+        for _ in 0..<1000 {
+            if fixture.closeCount == 1 { break }
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        precondition(fixture.closeCount == 1 && fixture.saveCount == 2)
+    }
+
+    @MainActor static func interruptedRecovery() async {
+        for lostReply in [false, true] {
+            let fixture = Fixture(), recovery = RecoveryFixture()
+            let desk = AtlasReadingDeskModel(transport: fixture.transport, recovery: recovery.service)
+            desk.capture(path: "/chosen/source.rs", accessLease: nil); await idle(desk)
+            // The engine wrote source-bearing bytes, but its success reply was
+            // lost before publication. They appear only after explicit listing.
+            fixture.loseNextSaveReply(); desk.enableRecovery(); await idle(desk)
+            precondition(desk.recoveryFailed && desk.hasUnsavedContents && desk.lastRecovery == nil)
+            desk.disableRecovery()
+            let interrupted = recovery.addInterruptedCopy()
+            let short = recovery.addInterruptedCopy(checkpointBytes: 8)
+            desk.refreshRecoveryCopies(); await idle(desk)
+            desk.restoreRecovery(short, replacing: desk.closeSnapshot)
+            precondition(!desk.busy && recovery.readCount == 0, "an incomplete header is delete-only")
+            fixture.acceptNextRestore()
+            if lostReply { fixture.loseNextMutationReply() }
+            desk.restoreRecovery(interrupted, replacing: desk.closeSnapshot); await idle(desk)
+            precondition(recovery.readCount == 1 && desk.state?.retainedSources == 1)
+            precondition(desk.lastRecovery?.id == interrupted.id && desk.hasUnsavedContents && desk.closeSnapshot.requiresReview,
+                "a validated interrupted checkpoint must not become a confirmed recovery baseline, even after reconciliation")
+            desk.enableRecovery(); await idle(desk)
+            precondition(desk.lastRecovery?.confirmed == true && !desk.hasUnsavedContents && !desk.recoveryFailed)
+            desk.close()
+        }
+    }
+
+    @MainActor static func restoredStorageRevalidation() async {
+        let fixture = Fixture(), recovery = RecoveryFixture()
+        let desk = AtlasReadingDeskModel(transport: fixture.transport, recovery: recovery.service)
+        desk.capture(path: "/chosen/source.rs", accessLease: nil); await idle(desk)
+        desk.enableRecovery(); await idle(desk)
+        desk.refreshRecoveryCopies(); await idle(desk)
+        let selected = desk.lastRecovery!
+        fixture.acceptNextRestore(); recovery.failNextReadAfterEffect()
+        desk.restoreRecovery(selected, replacing: desk.closeSnapshot); await idle(desk)
+        precondition(desk.state?.retainedSources == 1 && !desk.hasUnverifiedChanges)
+        precondition(desk.recoveryFailed && desk.hasUnsavedContents && desk.closeSnapshot.requiresReview,
+            "accepted restore data cannot prove persistence when the store's post-read verification failed")
+        let before = recovery.attemptCount
+        try? await Task.sleep(nanoseconds: 450_000_000)
+        precondition(recovery.attemptCount == before, "uncertain restore storage requires an explicit recovery retry")
+        desk.saveRecoveryNow(); await idle(desk)
+        precondition(!desk.recoveryFailed && !desk.hasUnsavedContents)
         desk.close()
     }
 

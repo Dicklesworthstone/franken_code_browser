@@ -19,6 +19,7 @@ private final class AtlasDeskFileAccess {
     var project: AtlasProjectBrowserModel? = nil
     @Environment(\.dismiss) private var dismiss
     @State private var confirmRestore = false
+    @State private var showRecovery = false
     @State private var panelNotice = ""
     @State private var noteDraft: AtlasDeskNoteDraft?
     @State private var reattachment: AtlasDeskReattachment?
@@ -57,7 +58,15 @@ private final class AtlasDeskFileAccess {
                 Spacer()
                 Button("Reload state", action: model.reload).disabled(!model.canOperate)
             }
-            Text("Checkpoints contain all retained source bytes, personal labels and full note text, unencrypted. Source files are read only. Save explicitly before closing the app.")
+            if model.supportsRecovery {
+                HStack(alignment: .firstTextBaseline) {
+                    Image(systemName: model.recoveryFailed ? "exclamationmark.triangle" : "clock.arrow.circlepath")
+                    Text(model.recoveryNotice).font(.caption).textSelection(.enabled)
+                    Spacer()
+                    Button("Recovery…") { showRecovery = true }.disabled(model.closed)
+                }.foregroundStyle(model.recoveryFailed ? Color.orange : Color.secondary)
+            }
+            Text("Checkpoints and local recovery copies contain retained source bytes, personal labels and full accepted note text, unencrypted. Unsubmitted editor drafts need separate attention before closing.")
                 .font(.caption2).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(16).frame(minWidth: 900, idealWidth: 1150, minHeight: 600, idealHeight: 740)
@@ -67,6 +76,7 @@ private final class AtlasDeskFileAccess {
         }
         .sheet(item: $noteDraft) { draft in AtlasDeskNoteEditor(model: model, draft: draft) }
         .sheet(item: $comparisonReview) { review in AtlasDeskReattachmentReviewView(model: model, review: review) }
+        .sheet(isPresented: $showRecovery) { AtlasDeskRecoveryView(model: model) }
         .onDisappear { reattachment = nil; comparisonReview = nil; readerTask?.cancel(); readerCapture?.reader.close(); pins.closeAll() }
         .alert("Reattach this saved note?", isPresented: Binding(
             get: { reattachment != nil }, set: { if !$0 { reattachment = nil } }), presenting: reattachment) { target in
@@ -255,7 +265,7 @@ private final class AtlasDeskFileAccess {
         panel.title = "Capture a source file in the reading desk"
         panel.message = "Capture up to 4 MiB of current file bytes. Later reads, bookmarks, notes and saved checkpoints retain this exact capture."
         panel.canChooseFiles = true; panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard model.withAutomaticRecoveryDeferred({ panel.runModal() }) == .OK, let url = panel.url else { return }
         guard let access = AtlasDeskFileAccess(selectedURL: url) else { panelNotice = "The selected file did not grant current read access."; return }
         panelNotice = ""; model.capture(path: url.path, accessLease: access)
     }
@@ -264,7 +274,7 @@ private final class AtlasDeskFileAccess {
         panel.title = "Open a saved reading desk"
         panel.message = "Restore exact saved source bytes, bookmarks, personal notes and history. Source labels in the checkpoint never grant access to working-tree files."
         panel.canChooseFiles = true; panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard model.withAutomaticRecoveryDeferred({ panel.runModal() }) == .OK, let url = panel.url else { return }
         guard let access = AtlasDeskFileAccess(selectedURL: url) else { panelNotice = "The selected checkpoint did not grant current read access."; return }
         panelNotice = ""; model.restore(path: url.path, accessLease: access)
     }
@@ -274,7 +284,7 @@ private final class AtlasDeskFileAccess {
         panel.nameFieldStringValue = "Reading-desk.fcbdesk"
         panel.message = "Includes all \(model.state?.retainedBytes ?? 0) retained source bytes, personal labels and full note text, unencrypted. Choose a new filename; existing checkpoints are preserved."
         panel.canCreateDirectories = true
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard model.withAutomaticRecoveryDeferred({ panel.runModal() }) == .OK, let url = panel.url else { return }
         guard let access = AtlasDeskFileAccess(selectedURL: url) else { panelNotice = "The selected destination did not grant current write access."; return }
         panelNotice = ""; model.save(path: url.path, accessLease: access)
     }
@@ -288,10 +298,137 @@ private final class AtlasDeskFileAccess {
         panel.nameFieldStringValue = "Reading-desk-source.json"
         panel.message = "Includes all \(state.bookmarks.count) bookmark labels and full personal notes, plus up to \(sourceBytes) original bytes from \(target.selectionCount) saved selections, unredacted and unencrypted. Whole selections that exceed the budget are listed as omitted. JSON is limited to 16 MiB. Source labels may contain private paths. Review your notes before sharing. Choose a new filename; existing files are preserved."
         panel.canCreateDirectories = true
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard model.withAutomaticRecoveryDeferred({ panel.runModal() }) == .OK, let url = panel.url else { return }
         guard let access = AtlasDeskFileAccess(selectedURL: url) else { panelNotice = "The selected destination did not grant current write access."; return }
         panelNotice = ""
         model.exportSourcePack(target, limits: limits, path: url.path, accessLease: access)
+    }
+}
+
+private struct AtlasDeskRecoveryReview {
+    let entry: AtlasDeskRecoveryEntry
+    let desk: AtlasDeskCloseSnapshot
+}
+
+/// Recovery remains an explicit local disclosure and restore workflow. Opening
+/// this sheet lists metadata; it does not open a saved source or enable writes.
+@MainActor private struct AtlasDeskRecoveryView: View {
+    @Bindable var model: AtlasReadingDeskModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var restoreReview: AtlasDeskRecoveryReview?
+    @State private var deleteReview: AtlasDeskRecoveryEntry?
+    @State private var needsRefresh = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text("Local reading desk recovery").font(.title2.weight(.semibold))
+                Spacer()
+                Button("Done") { dismiss() }.keyboardShortcut(.cancelAction)
+            }
+            Text("Automatic recovery keeps this desk's captured source bytes, bookmarks, reading locations and accepted notes in the app's private data folder on this Mac. The copies are unencrypted. Text still in a note editor is not included.")
+                .font(.callout)
+            Text("The two latest confirmed copies per desk are kept; interrupted saves may also appear. Storage is limited to eight desks and 256 MiB. Other desks are kept until you delete their copies. Recovery is enabled separately for each open desk.")
+                .font(.caption).foregroundStyle(.secondary)
+            HStack {
+                if model.recoveryEnabled {
+                    Button("Pause automatic recovery", action: model.disableRecovery).disabled(model.closed)
+                    Button(model.recoveryFailed ? "Retry recovery save" : "Save recovery copy now", action: model.saveRecoveryNow)
+                        .disabled(!model.canSaveRecovery)
+                } else {
+                    Button("Enable automatic recovery", action: model.enableRecovery)
+                        .buttonStyle(.borderedProminent).disabled(!model.canOperate)
+                }
+                Spacer()
+                Button("Refresh copies", action: model.refreshRecoveryCopies).disabled(!model.canOperate)
+            }
+            HStack {
+                if model.busy { ProgressView().controlSize(.small); Button("Cancel request", action: model.cancel) }
+                Text(model.recoveryNotice).font(.caption).textSelection(.enabled)
+            }.foregroundStyle(model.recoveryFailed ? Color.orange : Color.secondary)
+            Divider()
+            Text("Saved recovery copies").font(.headline)
+            if model.recoveryEntries.isEmpty {
+                ContentUnavailableView(model.recoveryListing ? "Looking for saved copies…" : "No recovery copies listed",
+                    systemImage: "clock.arrow.circlepath",
+                    description: Text("Enable automatic recovery for this desk, or refresh to look for copies from an earlier session."))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 10) {
+                        ForEach(model.recoveryEntries) { entry in
+                            HStack {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    HStack {
+                                        if !entry.confirmed { Text("Unconfirmed recovery · updated").foregroundStyle(.orange) }
+                                        Text(entry.savedAt, style: .date)
+                                        Text(entry.savedAt, style: .time)
+                                        if model.lastRecovery?.id == entry.id {
+                                            Text(entry.confirmed ? "This desk's saved copy" : "Recovered into this desk")
+                                                .font(.caption).foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    if entry.confirmed {
+                                        Text("\(entry.sourceBytes) retained source bytes · \(entry.checkpointBytes) checkpoint bytes")
+                                            .font(.caption).foregroundStyle(.secondary)
+                                    } else {
+                                        Text(entry.canRestore
+                                            ? "Contents require validation · \(entry.checkpointBytes) checkpoint bytes"
+                                            : "No readable checkpoint within the size limit · delete to free storage")
+                                            .font(.caption).foregroundStyle(.secondary)
+                                    }
+                                }
+                                Spacer()
+                                Button("Open copy…") { reviewRestore(entry) }
+                                    .disabled(!model.canOperate || model.hasOpenNoteEditor || !entry.canRestore)
+                                Button("Delete…", role: .destructive) { deleteReview = entry }
+                                    .disabled(!model.canOperate)
+                            }.padding(.vertical, 5)
+                        }
+                    }
+                }.frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            if model.hasOpenNoteEditor {
+                Text("Finish or dismiss the open note editor before replacing this desk. Its unsubmitted draft is not in a recovery copy.")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+            Text(model.notice).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+            Text("Opening a copy restores its saved bytes after validation. It never reopens saved source paths or grants access to a working tree. A failed or unconfirmed save does not replace your last confirmed copy.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(20).frame(minWidth: 760, idealWidth: 860, minHeight: 540, idealHeight: 640)
+        .onAppear { refreshWhenReady() }
+        .onChange(of: model.lastRecovery?.id) { _, _ in needsRefresh = true; refreshWhenReady() }
+        .onChange(of: model.busy) { _, _ in refreshWhenReady() }
+        .alert("Replace this desk with the selected recovery copy?", isPresented: Binding(
+            get: { restoreReview != nil }, set: { if !$0 { restoreReview = nil } }), presenting: restoreReview) { review in
+            Button("Open recovery copy") { model.restoreRecovery(review.entry, replacing: review.desk) }
+                .disabled(!model.canOperate || model.hasOpenNoteEditor)
+            Button("Cancel", role: .cancel) { }
+        } message: { review in
+            Text("The selected copy will replace this desk's current panes, bookmarks, accepted notes and reading locations after validation. Save a new checkpoint first if you need to preserve the current arrangement. Later changes that are absent from the selected copy will not be restored."
+                + (review.entry.confirmed ? "" : " This interrupted save was not confirmed. If it passes validation, save a new recovery copy or checkpoint before closing."))
+        }
+        .alert("Delete this local recovery copy?", isPresented: Binding(
+            get: { deleteReview != nil }, set: { if !$0 { deleteReview = nil } }), presenting: deleteReview) { entry in
+            Button("Delete recovery copy", role: .destructive) { model.removeRecovery(entry) }
+                .disabled(!model.canOperate)
+            Button("Cancel", role: .cancel) { }
+        } message: { _ in
+            Text("The selected saved copy will be permanently removed. Other recovery copies, manually saved checkpoints and the current open desk are kept. If this is the current desk's only saved copy, save a new checkpoint before closing.")
+        }
+    }
+
+    private func reviewRestore(_ entry: AtlasDeskRecoveryEntry) {
+        guard model.canOperate, !model.hasOpenNoteEditor, entry.canRestore else { return }
+        let snapshot = model.closeSnapshot
+        if model.hasCheckpointContents || snapshot.requiresReview || !entry.confirmed {
+            restoreReview = AtlasDeskRecoveryReview(entry: entry, desk: snapshot)
+        } else { model.restoreRecovery(entry, replacing: snapshot) }
+    }
+    private func refreshWhenReady() {
+        guard needsRefresh, model.canOperate else { return }
+        needsRefresh = false; model.refreshRecoveryCopies()
     }
 }
 
