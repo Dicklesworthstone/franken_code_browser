@@ -2,24 +2,25 @@
 
 //! Whole-file native workspace search over the atlas's existing frozen catalog.
 //! The public stream engine owns decoding, matching and I/O limits. This host
-//! retains only compact receipts and exact literal witnesses. Page/hit delivery
-//! never reopens source or presents a witness as a complete source capture.
+//! retains compact receipts, exact literal witnesses and bounded context from
+//! those same reads. Page/hit delivery never reopens source or presents a
+//! retained range as a complete source capture.
 
 use std::{mem::size_of, path::Path, sync::Arc};
-use fcb::{ArenaOwnerId, ByteLength, QueryGeneration, SourceRevision};
+use fcb::{ArenaOwnerId, ByteLength, ByteRange, QueryGeneration, SourceRevision};
 use fcb::map::LayoutRevision;
 use fcb::map::workspace::retained::RetainedWorkspaceAtlas;
 use fcb::map::workspace::stream_search::{AtlasStreamError, AtlasStreamFile,
     AtlasStreamFileState, AtlasStreamHit, AtlasStreamLimits, AtlasStreamReport,
     AtlasStreamSearch, AtlasStreamState, AtlasStreamStats, AtlasStreamStop};
-use fcb::search::{DetectedEncoding, ExtentConsistency, IndexError, ParsedQuery, ReferenceScanOracle,
-    ResourceAllocationId, ResourceBudget, SearchManifestId, StreamReadState, StreamReadStep, StreamingNeedle};
+use fcb::search::{CaptureRequest, DetectedEncoding, ExtentConsistency, IndexError, ParsedQuery, ReferenceScanOracle,
+    ResourceAllocationId, ResourceBudget, SearchManifestId, StreamContextOptions, StreamReadState, StreamReadStep, StreamingNeedle};
 use fcb::search::workspace::RootGrant;
 use fcb::source::SourceError;
 use fcb::source::path::NormalizedPath;
 use fcb::store::{Sha256, Sha256Digest};
 use fcb_core::ResourceLease;
-use crate::{AppError, EXIT_OK, EXIT_PARTIAL, MANAGED_BYTES, input, workspace};
+use crate::{AppError, EXIT_OK, EXIT_PARTIAL, MANAGED_BYTES, input, stream_context, workspace};
 use crate::output::{Output, OutputError, MAX_RESPONSE_BYTES};
 use super::{HostResponse, atlas_session::{AtlasSession, AtlasSessionError}};
 use super::atlas_search::{AtlasSearchError, AtlasSearchScope, RegionCoverage};
@@ -105,6 +106,15 @@ struct Hit {
     text_start: usize,
     text_len: usize,
     digest: Sha256Digest,
+    context: HitContext,
+}
+
+#[derive(Clone, Copy)]
+struct HitContext {
+    requested: ByteRange,
+    original: ByteRange,
+    start: usize,
+    len: usize,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -219,6 +229,7 @@ struct Snapshot {
     hits: Vec<Hit>,
     witnesses: Vec<u8>,
     matched_text: String,
+    contexts: Vec<u8>,
     diagnostics: Vec<AtlasStreamFile>,
     examined: usize,
     unexamined: usize,
@@ -275,6 +286,7 @@ impl RetainedAtlasStreamSearch {
     pub fn source_bytes_read(&self) -> u64 { self.source_bytes_read }
     pub fn read_calls(&self) -> u64 { self.read_calls }
     pub fn retained_witness_bytes(&self) -> usize { self.accepted.as_ref().map_or(0, |q| q.witnesses.len()) }
+    pub fn retained_context_bytes(&self) -> usize { self.accepted.as_ref().map_or(0, |q| q.contexts.len()) }
 
     /// Exact, case-sensitive decoded text across every catalogued file, even
     /// while the map displays an extension scope. There is no per-file byte
@@ -433,10 +445,14 @@ impl RetainedAtlasStreamSearch {
         let pattern_id = self.next_id()?;
         let report_id = self.next_id()?;
         let worker_id = self.next_id()?;
+        let context_pool_id = self.next_id()?;
+        let context_worker_id = self.next_id()?;
         let result_id = self.next_id()?;
         // Reuse these allocation identities only after the previous callback's
         // admitted output and response have both been dropped.
-        let progress_ids = if publish_progress { Some([self.next_id()?, self.next_id()?]) } else { None };
+        let progress_ids = if publish_progress {
+            Some([self.next_id()?, self.next_id()?, self.next_id()?, self.next_id()?])
+        } else { None };
         let pattern = if let Some(expression) = &scope.expression {
             StreamingNeedle::expression(self.manifest.owner(), &expression.parsed,
                 scope.predicate.case_sensitive(), &self.budget, pattern_id)
@@ -449,7 +465,8 @@ impl RetainedAtlasStreamSearch {
         let root = self.grant.root_path().to_path_buf();
         let mut tally = ProgressTally::default();
         let (scanned, io) = scan(atlas.atlas(), &root, &pattern, first_revision, query, options, ordinals.as_deref(),
-            &self.budget, [report_id, worker_id], &mut canceled, &mut stopped, publish_progress, count_all_matches, start_after,
+            &self.budget, [report_id, worker_id, context_pool_id, context_worker_id],
+            &mut canceled, &mut stopped, publish_progress, count_all_matches, start_after,
             &mut |report, sequence, canceled| {
                 let ids = progress_ids.ok_or(AtlasStreamSearchError::InvalidLimits)?;
                 tally.update(report)?;
@@ -481,14 +498,15 @@ impl RetainedAtlasStreamSearch {
         self.page_response(atlas, &snapshot, "page", start, count, &mut || false)
     }
 
-    /// Return only immutable literal evidence. Context is a separate current
-    /// source observation with independent owner/revision and byte verification.
+    /// Return immutable literal evidence and its bounded same-scan context.
+    /// Source changes after search cannot alter either retained byte sequence.
     pub fn hit(&mut self, atlas: &AtlasSession, generation: u64, position: usize)
         -> Result<HostResponse, AtlasStreamSearchError> {
         self.validate(atlas)?;
         let snapshot = self.snapshot(generation)?.clone();
         let hit = snapshot.hits.get(position).ok_or(AtlasStreamSearchError::MissingHit)?;
         let mut out = self.output(atlas, "hit")?;
+        let context_ids = [self.next_id()?, self.next_id()?];
         snapshot.scope.encode(&mut out)?;
         out.literal(",\"query_generation\":")?; out.integer(snapshot.generation)?;
         out.literal(",\"needle\":")?; out.quoted(&snapshot.needle)?;
@@ -507,6 +525,7 @@ impl RetainedAtlasStreamSearch {
         let bytes = snapshot.witnesses.get(hit.witness_start..hit.witness_start + hit.witness_len)
             .ok_or(AtlasStreamSearchError::MissingHit)?;
         out.hex(bytes)?;
+        stream_context::encode(&mut out, snapshot.context(hit)?, &self.budget, context_ids, &mut || false)?;
         out.literal("},\"additional_source_bytes_read\":\"0\",\"additional_read_calls\":\"0\"}\n")?;
         self.finish(atlas, out, false, &mut || false)
     }
@@ -517,7 +536,7 @@ impl RetainedAtlasStreamSearch {
         let mut out = self.output(atlas, "clear")?;
         out.literal(",\"mode\":\"exact-decoded-literal\"")?;
         out.literal(",\"query_generation\":")?; out.integer(generation)?;
-        out.literal(",\"retained_hits\":\"0\",\"retained_witness_bytes\":\"0\"}\n")?;
+        out.literal(",\"retained_hits\":\"0\",\"retained_witness_bytes\":\"0\",\"retained_context_bytes\":\"0\"}\n")?;
         let response = self.finish(atlas, out, false, &mut || false)?;
         self.accepted = None;
         Ok(response)
@@ -559,7 +578,7 @@ impl RetainedAtlasStreamSearch {
         }
         out.literal(",\"root_path\":")?; out.path(&self.grant.root_path().to_path_buf())?;
         out.literal(",\"scope\":\"catalogued-whole-files\",\"strategy\":\"streaming-whole-file\"")?;
-        out.literal(",\"capture_kind\":\"literal-witnesses-only\",\"source_observation\":\"per-file-streams-not-atomic-workspace\"")?;
+        out.literal(",\"capture_kind\":\"literal-witnesses-with-context\",\"source_observation\":\"per-file-streams-not-atomic-workspace\"")?;
         out.literal(",\"catalogued_files\":")?; out.integer(atlas.atlas().file_count() as u64)?;
         out.literal(",\"discovery_policy\":")?; out.quoted(atlas.atlas().catalog().policy_name())?;
         crate::workspace::rule_output::fields(&mut out, atlas.atlas().catalog())?;
@@ -574,6 +593,7 @@ impl RetainedAtlasStreamSearch {
         }
         self.validate(atlas)?; check(canceled)?;
         let mut out = self.output(atlas, command)?;
+        let context_ids = [self.next_id()?, self.next_id()?];
         snapshot.scope.encode(&mut out)?;
         summary(&mut out, snapshot.summary())?;
         out.literal(",\"terminal\":true,\"selection_available\":true")?;
@@ -584,7 +604,9 @@ impl RetainedAtlasStreamSearch {
         for (position, hit) in snapshot.hits.iter().enumerate().take(end).skip(start) {
             check(canceled)?;
             if position != start { out.literal(",")?; }
-            out.literal("{")?; encode_hit(&mut out, atlas, hit, position)?; out.literal("}")?;
+            out.literal("{")?; encode_hit(&mut out, atlas, hit, position)?;
+            stream_context::encode(&mut out, snapshot.context(hit)?, &self.budget, context_ids, canceled)?;
+            out.literal("}")?;
         }
         out.literal("],\"next_offset\":")?;
         if end < snapshot.hits.len() { out.integer(end as u64)?; } else { out.literal("null")?; }
@@ -601,7 +623,7 @@ impl RetainedAtlasStreamSearch {
     }
     fn progress_response(&self, atlas: &AtlasSession,
         report: &AtlasStreamReport<'_, '_, RetainedWorkspaceAtlas>, options: AtlasStreamSearchOptions,
-        scope: &FrozenScope, tally: &ProgressTally, sequence: u64, allocations: [ResourceAllocationId; 2],
+        scope: &FrozenScope, tally: &ProgressTally, sequence: u64, allocations: [ResourceAllocationId; 4],
         canceled: &mut impl FnMut() -> bool) -> Result<HostResponse, AtlasStreamSearchError> {
         self.validate(atlas)?; check(canceled)?;
         report.validate_delivery(atlas.atlas(), report.generation())?;
@@ -619,12 +641,18 @@ impl RetainedAtlasStreamSearch {
         for (position, &hit) in report.hits().iter().take(count).enumerate() {
             check(canceled)?;
             let selected = report.select_hit(position, atlas.atlas(), report.generation())?;
+            let context = selected.context().ok_or(AtlasStreamSearchError::MissingHit)?;
             let mut digest = Sha256::new(); digest.update(selected.original_bytes());
             let hit = Hit { hit, file: *selected.file_report(), witness_start: 0,
                 witness_len: selected.original_bytes().len(), text_start: 0,
-                text_len: selected.matched_text().len(), digest: digest.finalize() };
+                text_len: selected.matched_text().len(), digest: digest.finalize(),
+                context: HitContext { requested: context.requested_range(), original: context.original_range(),
+                    start: 0, len: context.bytes().len() } };
             if position > 0 { out.literal(",")?; }
-            out.literal("{")?; encode_hit(&mut out, atlas, &hit, position)?; out.literal("}")?;
+            out.literal("{")?; encode_hit(&mut out, atlas, &hit, position)?;
+            stream_context::encode(&mut out, context_for(&hit, report.generation(), context.bytes())?,
+                &self.budget, [allocations[2], allocations[3]], canceled)?;
+            out.literal("}")?;
         }
         out.literal("],\"next_offset\":")?;
         if count < report.hits().len() { out.integer(count as u64)?; } else { out.literal("null")?; }
@@ -660,17 +688,19 @@ impl RetainedAtlasStreamSearch {
 fn scan<'a, C: FnMut() -> bool>(atlas: &'a RetainedWorkspaceAtlas, root: &Path, pattern: &StreamingNeedle,
     first_revision: SourceRevision, generation: QueryGeneration, options: AtlasStreamSearchOptions,
     ordinals: Option<&[usize]>,
-    budget: &ResourceBudget, allocations: [ResourceAllocationId; 2], canceled: &mut C,
+    budget: &ResourceBudget, allocations: [ResourceAllocationId; 4], canceled: &mut C,
     stopped: &mut impl FnMut() -> bool, publish_progress: bool, count_all_matches: bool, start_after: u64,
     progress: &mut impl FnMut(&AtlasStreamReport<'a, 'a, RetainedWorkspaceAtlas>, u64, &mut C)
         -> Result<(), AtlasStreamSearchError>)
     -> (Result<AtlasStreamReport<'a, 'a, RetainedWorkspaceAtlas>, AtlasStreamSearchError>, AtlasStreamStats) {
     let admitted = match ordinals {
         Some(ordinals) => AtlasStreamSearch::new_scoped_page(atlas, pattern, first_revision, generation,
-            options.limits(), ordinals, start_after, count_all_matches, budget, allocations),
+            options.limits(), ordinals, start_after, count_all_matches, budget, [allocations[0], allocations[1]]),
         None => AtlasStreamSearch::new_page(atlas, pattern, first_revision, generation,
-            options.limits(), start_after, count_all_matches, budget, allocations),
-    };
+            options.limits(), start_after, count_all_matches, budget, [allocations[0], allocations[1]]),
+    }.and_then(|job| job.with_context(StreamContextOptions {
+        before_bytes: stream_context::BEFORE_BYTES, after_bytes: stream_context::AFTER_BYTES,
+    }, [allocations[2], allocations[3]]));
     let mut job = match admitted {
         Ok(job) => job,
         Err(error) => return (Err(error.into()), AtlasStreamStats::default()),
@@ -718,6 +748,13 @@ fn scan<'a, C: FnMut() -> bool>(atlas: &'a RetainedWorkspaceAtlas, root: &Path, 
 }
 
 impl Snapshot {
+    fn context(&self, hit: &Hit) -> Result<stream_context::Context<'_>, AtlasStreamSearchError> {
+        let bytes = self.contexts.get(hit.context.start..hit.context.start + hit.context.len)
+            .ok_or(AtlasStreamSearchError::MissingHit)?;
+        let generation = QueryGeneration::new(hit.hit.file().owner(), self.generation)
+            .map_err(|_| AtlasStreamSearchError::IdentityExhausted)?;
+        context_for(hit, generation, bytes)
+    }
     fn summary(&self) -> Summary<'_> {
         Summary { generation: self.generation, needle: &self.needle, options: self.options,
             examined: self.examined, unexamined: self.unexamined, unavailable: self.unavailable,
@@ -725,7 +762,8 @@ impl Snapshot {
             retained_matching_files: self.retained_matching_files, count_all_matches: self.count_all_matches,
             page_start_after: self.page_start_after,
             stats: self.stats, discovery_complete: self.discovery_complete, complete: self.complete,
-            stop: self.stop, retained_hits: self.hits.len(), retained_witness_bytes: self.witnesses.len() }
+            stop: self.stop, retained_hits: self.hits.len(), retained_witness_bytes: self.witnesses.len(),
+            retained_context_bytes: self.contexts.len() }
     }
     fn retain(report: &AtlasStreamReport<'_, '_, RetainedWorkspaceAtlas>, options: AtlasStreamSearchOptions,
         scope: FrozenScope, budget: &ResourceBudget, allocation: ResourceAllocationId, canceled: &mut impl FnMut() -> bool)
@@ -742,6 +780,7 @@ impl Snapshot {
             .and_then(|n| diagnostic_count.checked_mul(size_of::<AtlasStreamFile>()).and_then(|v| n.checked_add(v)))
             .and_then(|n| n.checked_add(report.retained_witness_bytes()))
             .and_then(|n| n.checked_add(report.retained_matched_text_bytes()))
+            .and_then(|n| n.checked_add(report.retained_context_bytes()))
             .and_then(|n| n.checked_add(report.literal().len() + size_of::<Self>() + 2 * size_of::<usize>()))
             .ok_or(AppError::Admission)?;
         let lease = budget.try_reserve_managed(report.generation().owner(), allocation, ByteLength::new(charge as u64))
@@ -749,6 +788,7 @@ impl Snapshot {
         let needle = copy_text(report.literal())?;
         let mut hits = reserve(report.hits().len())?;
         let mut witnesses = reserve(report.retained_witness_bytes())?;
+        let mut contexts = reserve(report.retained_context_bytes())?;
         let mut matched_text = String::new();
         matched_text.try_reserve_exact(report.retained_matched_text_bytes()).map_err(|_| AppError::Admission)?;
         if matched_text.capacity() > report.retained_matched_text_bytes() { return Err(AppError::Admission.into()); }
@@ -778,7 +818,13 @@ impl Snapshot {
                 if text_len > matched_text.capacity() - text_start { return Err(AppError::Admission.into()); }
                 matched_text.push_str(selected.matched_text());
             }
-            hits.push(Hit { hit, file: *selected.file_report(), witness_start, witness_len, text_start, text_len, digest });
+            let context = selected.context().ok_or(AtlasStreamSearchError::MissingHit)?;
+            let context_start = contexts.len();
+            if context.bytes().len() > contexts.capacity() - context_start { return Err(AppError::Admission.into()); }
+            contexts.extend_from_slice(context.bytes());
+            hits.push(Hit { hit, file: *selected.file_report(), witness_start, witness_len, text_start, text_len, digest,
+                context: HitContext { requested: context.requested_range(), original: context.original_range(),
+                    start: context_start, len: context.bytes().len() } });
         }
         let mut unavailable = 0usize;
         let mut unsupported = 0usize;
@@ -797,7 +843,7 @@ impl Snapshot {
         let complete = report.is_complete() && scope.region_complete();
         let count_all_matches = report.count_all_matches();
         let matching_files = report.matching_files_seen();
-        Ok(Self { generation: report.generation().get(), needle, options, scope, hits, witnesses, matched_text, diagnostics,
+        Ok(Self { generation: report.generation().get(), needle, options, scope, hits, witnesses, matched_text, contexts, diagnostics,
             examined: report.files_examined(), unexamined: report.unexamined_files(), unavailable, unsupported, failed, matching_files,
             retained_matching_files, count_all_matches, page_start_after: report.page_start_after(),
             stats: report.stats(), discovery_complete: report.atlas().discovery_complete(), complete,
@@ -826,6 +872,7 @@ struct Summary<'a> {
     stop: Option<AtlasStreamStop>,
     retained_hits: usize,
     retained_witness_bytes: usize,
+    retained_context_bytes: usize,
 }
 #[derive(Default)]
 struct ProgressTally {
@@ -866,7 +913,8 @@ impl ProgressTally {
             retained_matching_files: self.matching_files, count_all_matches: report.count_all_matches(),
             page_start_after: report.page_start_after(),
             stats: report.stats(), discovery_complete: report.atlas().discovery_complete(), complete: false,
-            stop: None, retained_hits: report.hits().len(), retained_witness_bytes: report.retained_witness_bytes() }
+            stop: None, retained_hits: report.hits().len(), retained_witness_bytes: report.retained_witness_bytes(),
+            retained_context_bytes: report.retained_context_bytes() }
     }
 }
 
@@ -893,13 +941,25 @@ fn summary(out: &mut Output, snapshot: Summary<'_>) -> Result<(), AtlasStreamSea
         ("scanned_input_bytes", snapshot.stats.scanned_bytes), ("read_calls", snapshot.stats.read_calls),
         ("interrupted_read_calls", snapshot.stats.interrupted_calls),
         ("peak_input_buffer_bytes", snapshot.stats.peak_input_buffer_bytes as u64),
-        ("retained_witness_bytes", snapshot.retained_witness_bytes as u64)] {
+        ("retained_witness_bytes", snapshot.retained_witness_bytes as u64),
+        ("retained_context_bytes", snapshot.retained_context_bytes as u64)] {
         out.literal(",\"")?; out.literal(key)?; out.literal("\":")?; out.integer(value)?;
     }
     out.literal(",\"limits\":{\"max_matches\":")?; out.integer(snapshot.options.max_matches as u64)?;
     out.literal(",\"max_scan_bytes\":")?; out.integer(snapshot.options.max_scan_bytes)?;
-    out.literal(",\"max_read_calls\":")?; out.integer(snapshot.options.max_read_calls)?; out.literal("}")?;
+    out.literal(",\"max_read_calls\":")?; out.integer(snapshot.options.max_read_calls)?;
+    out.literal(",\"context_before_bytes\":")?; out.integer(stream_context::BEFORE_BYTES as u64)?;
+    out.literal(",\"context_after_bytes\":")?; out.integer(stream_context::AFTER_BYTES as u64)?; out.literal("}")?;
     Ok(())
+}
+fn context_for<'a>(hit: &Hit, generation: QueryGeneration, bytes: &'a [u8])
+    -> Result<stream_context::Context<'a>, AtlasStreamSearchError> {
+    Ok(stream_context::Context {
+        request: CaptureRequest::new(hit.hit.file(), hit.hit.revision()).map_err(|_| AtlasStreamSearchError::MissingHit)?,
+        generation, observed_length: hit.file.observed_length().ok_or(AtlasStreamSearchError::MissingHit)?,
+        encoding: hit.file.encoding(), requested: hit.context.requested, original: hit.context.original,
+        matched: hit.hit.original_range(), bytes,
+    })
 }
 fn encode_hit(out: &mut Output, atlas: &AtlasSession, hit: &Hit, position: usize) -> Result<(), AtlasStreamSearchError> {
     let entry = atlas.atlas().catalog().entry(hit.hit.file()).ok_or(AtlasStreamSearchError::WrongAtlas)?;

@@ -123,8 +123,14 @@ fn raw_lowercase_identifier_and_expression_use_the_same_completed_reports() {
         for name in ["path", "file_id", "revision", "query_generation", "mode", "encoding", "state",
             "whole_file_complete", "count_all_matches", "truncated", "observed_length", "final_length",
             "payload_bytes_read", "scanned_input_bytes", "read_calls", "matches_seen", "stored_hits",
-            "retained_witness_bytes", "literal_text", "literal_original_hex", "hits"] {
+            "retained_witness_bytes", "retained_context_bytes", "retention", "literal_text", "literal_original_hex", "hits"] {
             assert_eq!(file.get(name), expected.get(name), "{ordinal}: {name}");
+        }
+        for hit in file.get("hits").array() {
+            let context = hit.get("context");
+            assert_eq!(context.get("state").text(), "retained");
+            assert_eq!(context.get("match_range"), hit.get("original_range"));
+            assert!(context.get("complete").flag());
         }
     }
 }

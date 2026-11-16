@@ -2,7 +2,7 @@
 
 //! Whole-file content search over an independently progressive catalog.
 //!
-//! The retained catalog pages, one active reader, result witnesses and diagnostic
+//! The retained catalog pages, one active reader, result witnesses, contexts and diagnostic
 //! prefix all have fixed bounds. Visiting more files grows only checked counters.
 //! A file's finalized hits own their raw path and original bytes independently of
 //! catalog eviction. Neither a map layout nor a full-workspace manifest is built.
@@ -16,12 +16,12 @@ mod tests;
 use std::{mem::size_of, path::Path, sync::Arc};
 use fcb::{ArenaOwnerId, ByteLength, ByteRange, FileId, QueryGeneration, SourceRevision};
 use fcb::search::{DetectedEncoding, ExtentConsistency, FileSearch, FileSearchError, FileSearchReport,
-    ParsedQuery, ReferenceScanOracle, StreamReadError, StreamReadOptions, StreamReadState,
+    ParsedQuery, ReferenceScanOracle, ResourceAllocationId, StreamContextOptions, StreamReadError, StreamReadOptions, StreamReadState,
     StreamReadStats, StreamReadStep, StreamingNeedle};
 use fcb::source::{CaptureRequest, NormalizedPath, RootGrant, SourceError};
 use fcb::store::{Sha256, Sha256Digest};
 use fcb_core::ResourceLease;
-use crate::{AppError, input, workspace};
+use crate::{AppError, input, stream_context, workspace};
 use crate::output::OutputError;
 use super::{CatalogDiscoveryPolicy, CatalogSession, CatalogSessionError};
 use super::super::{HostResponse, atlas_search::{AtlasSearchError, AtlasSearchScope},
@@ -33,13 +33,14 @@ use super::super::{HostResponse, atlas_search::{AtlasSearchError, AtlasSearchSco
 /// streaming quantum (at most one 16 KiB successful read and 64 primary hits).
 pub const MAX_CATALOG_STREAM_STEPS: usize = 256;
 const MAX_DIAGNOSTICS: usize = 32;
-// At most 256 retained rows, each with <= 2 * (12 * 1024) witness/text bytes,
+// At most 256 retained rows, each with <= 3 * (12 * 1024) witness/text/context
+// bytes plus 320 neighboring original bytes,
 // a shared <= 2048-byte path and <= 1024 path components; include conservative
 // vector/string growth overlap, the <= 1024-byte query AST, one candidate and
-// Arc/row bookkeeping. This 32 MiB bound is independent of visited file count.
+// Arc/row bookkeeping. This 40 MiB bound is independent of visited file count.
 // Reader/finalized-report, compiled-pattern and output leases are additional
 // reservations from this SAME catalog budget.
-const STATE_BYTES: u64 = 32 * 1024 * 1024;
+const STATE_BYTES: u64 = 40 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CatalogContentSearchMode { Text, Occurrences, Expression }
@@ -124,6 +125,10 @@ struct Hit {
     text_start: usize,
     text_len: usize,
     digest: Sha256Digest,
+    context_requested: ByteRange,
+    context_original: ByteRange,
+    context_start: usize,
+    context_len: usize,
 }
 struct Candidate { file: FileId, path: Arc<NormalizedPath> }
 struct Active { path: Arc<NormalizedPath>, search: FileSearch<'static> }
@@ -154,6 +159,8 @@ pub struct CatalogContentSearchSession {
     hits: Vec<Hit>,
     witnesses: Vec<u8>,
     matched_text: String,
+    contexts: Vec<u8>,
+    context_decode_ids: [ResourceAllocationId; 2],
     diagnostics: Vec<Receipt>,
     eligible: u64,
     excluded: u64,
@@ -228,11 +235,15 @@ impl CatalogContentSearchSession {
         if matched_text.capacity() > bytes { return Err(AppError::Admission.into()); }
         let hits = reserve(limits.max_matches)?;
         let witnesses = reserve(bytes)?;
+        let context_bytes = needle.max_witness_bytes().checked_add(stream_context::BEFORE_BYTES + stream_context::AFTER_BYTES)
+            .and_then(|n| n.checked_mul(limits.max_matches)).ok_or(AppError::Admission)?;
+        let contexts = reserve(context_bytes)?;
+        let context_decode_ids = [catalog.next_id()?, catalog.next_id()?];
         let diagnostics = reserve(MAX_DIAGNOSTICS)?;
         check(&mut canceled)?; catalog.validate_active()?;
         Ok(Self { catalog, generation, options, needle, expression, revision: 1,
             replay_after_revision: None, next_entry: 0, candidate: None, active: None, finished: None,
-            hits, witnesses, matched_text, diagnostics, eligible: 0, excluded: 0,
+            hits, witnesses, matched_text, contexts, context_decode_ids, diagnostics, eligible: 0, excluded: 0,
             expression_scope_files: 0, region_catalogued: 0, examined: 0, incomplete: 0,
             unavailable: 0, unsupported: 0, failed: 0, matching_files: 0, retained_matching_files: 0,
             matches_seen: 0, io: StreamReadStats::default(), stop_reason: None,
@@ -424,9 +435,12 @@ impl CatalogContentSearchSession {
             max_bytes: self.options.limits.max_scan_bytes - self.io.bytes_read,
             max_read_calls: self.options.limits.max_read_calls - self.io.read_calls };
         let id = self.catalog.next_id()?;
+        let context_id = self.catalog.next_id()?;
         let search = FileSearch::new_owned_page(file, request, Arc::clone(&self.needle), options,
             self.options.start_after.saturating_sub(self.matches_seen), self.options.count_all_matches,
-            &self.catalog.budget, id)?;
+            &self.catalog.budget, id)?
+            .with_context(StreamContextOptions { before_bytes: stream_context::BEFORE_BYTES,
+                after_bytes: stream_context::AFTER_BYTES }, &self.catalog.budget, context_id)?;
         self.active = Some(Active { path, search });
         self.candidate = None;
         Ok(())
@@ -443,17 +457,24 @@ impl CatalogContentSearchSession {
         let retained_files = add(self.retained_matching_files, u64::from(!report.hits().is_empty()))?;
         let mut bytes = self.witnesses.len();
         let mut text_bytes = self.matched_text.len();
+        let mut context_bytes = self.contexts.len();
         let shared_exact = self.options.scope.case_sensitive();
-        for (ordinal, _) in report.hits().iter().enumerate() {
+        for (ordinal, hit) in report.hits().iter().enumerate() {
             let original = report.witness_bytes(ordinal)?;
             let text = report.matched_text(ordinal)?;
+            let context = report.context(ordinal)?.ok_or(CatalogContentSearchError::MissingHit)?;
+            if context.match_range() != hit.original_range() || context.original_range().len().get() != context.bytes().len() as u64 {
+                return Err(CatalogContentSearchError::MissingHit);
+            }
+            context_bytes = context_bytes.checked_add(context.bytes().len()).ok_or(AppError::Admission)?;
             if !shared_exact || ordinal == 0 {
                 bytes = bytes.checked_add(original.len()).ok_or(AppError::Admission)?;
                 text_bytes = text_bytes.checked_add(text.len()).ok_or(AppError::Admission)?;
             }
         }
         if self.hits.len() + report.hits().len() > self.hits.capacity()
-            || bytes > self.witnesses.capacity() || text_bytes > self.matched_text.capacity() {
+            || bytes > self.witnesses.capacity() || text_bytes > self.matched_text.capacity()
+            || context_bytes > self.contexts.capacity() {
             return Err(AppError::Admission.into());
         }
         // Validate receipt counter headroom before any hit becomes visible.
@@ -477,8 +498,13 @@ impl CatalogContentSearchSession {
                 if shared_exact { shared = Some(retained); }
                 retained
             };
+            let context = report.context(ordinal).expect("validated context ordinal").expect("admitted same-scan context");
+            let context_start = self.contexts.len();
+            self.contexts.extend_from_slice(context.bytes());
             self.hits.push(Hit { path: Arc::clone(&finished.path), file: receipt, occurrence: hit.occurrence_id(),
-                range: hit.original_range(), witness_start, witness_len, text_start, text_len, digest });
+                range: hit.original_range(), witness_start, witness_len, text_start, text_len, digest,
+                context_requested: context.requested_range(), context_original: context.original_range(),
+                context_start, context_len: context.bytes().len() });
         }
         self.matches_seen = matches; self.matching_files = matching_files; self.retained_matching_files = retained_files;
         self.stop_reason = match report.state() {

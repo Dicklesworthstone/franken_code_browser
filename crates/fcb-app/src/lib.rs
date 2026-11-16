@@ -12,6 +12,7 @@ mod input;
 mod services;
 mod workspace;
 mod whole_file;
+mod stream_context;
 mod snapshot;
 mod snapshot_diff;
 mod trail;

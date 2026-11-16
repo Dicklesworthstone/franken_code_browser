@@ -259,7 +259,8 @@ Ordinary output is human-readable; **`--json`** emits one bounded document with
 schema **`fcb.progressive-search/1`**. **`--stream`** instead emits
 **`fcb.progressive-search-stream/1`** records with `start`, `progress`, `match`
 and exactly one required `terminal`. A match contains a finalized exact byte
-range, matched text and original-byte hex. Progress exposes actual discovery,
+range, matched text, original-byte hex and bounded same-observation context.
+Progress exposes actual discovery,
 scan, retention and omission counters. Numeric fields use canonical decimal
 strings. The existing bounded sink limits each record to 8 MiB and the complete
 stream to 256 MiB; output exhaustion stops further work and reports a partial
@@ -342,7 +343,7 @@ merge observations from separate processes.
 | --- | --- |
 | `start` | Accepted query and explicit source/output budgets, published before source discovery or reads. |
 | `progress` | Discovery, catalog readiness, source opening, or bounded scan progress. Match counts cover finalized files only. The catalog-ready record includes discovery limits, rule diagnostics, and the existing confinement/consistency contract. |
-| `file` | One finalized source observation, with the same exact ranges, literal witnesses, encoding, coverage, truncation, and expression qualification as ordinary whole-file JSON. Unavailable sources have explicit errors. |
+| `file` | One finalized source observation, with the same exact ranges, literal witnesses, bounded retained context, encoding, coverage, truncation, and expression qualification as ordinary whole-file JSON. Unavailable sources have explicit errors. |
 | `terminal` | Final status and exit code, aggregate actual reads, coverage, finalized counts, delivered-file/hit counts, truncation, and any stopping reason. |
 
 No expression candidate hits or candidate counts are published before all
@@ -377,15 +378,53 @@ verification as the existing CLI search routes.
 
 ### Retention and consistency
 
-Streaming results retain **literal witnesses only**, not arbitrary discarded
-source ranges. For expressions, these are primary-occurrence witnesses;
-predicate evaluation does not retain all required/excluded-term source spans. Exact text and raw-byte matches share one immutable encoded
-literal. Unicode lowercase matches retain each occurrence's original spelling
-and encoded bytes, because the source may differ from the query in both
-spelling and byte length. The public `FileSearchReport::retain_hit` can
-materialize an exact `ObservedExtent` for a selected occurrence without
-rereading a changed live file. It never synthesizes neighboring lines, a file digest, or a full
-snapshot. Reading neighboring source is a new observation with a new revision.
+Streaming results retain exact match witnesses and a bounded excerpt around
+each retained hit. The CLI requests **160 original bytes before and 160 after**
+the match, clipped to the declared observed file bounds. These bytes come from
+the same forward read that found the match. Returning results, formatting an
+excerpt or materializing its retained extent does not reopen the file or issue
+additional source reads. Reading source outside these retained ranges requires
+a new observation.
+
+An excerpt can have less following context than requested when the scan stops
+at a byte, read-call or match allowance, fails, or is canceled. Its own
+`complete` flag describes only the bounded requested excerpt; it does not imply
+complete file or query coverage. No extra read is made to complete that suffix.
+Count-only requests retain no match or context payloads.
+
+The same context is included in standalone and frozen-workspace whole-file
+JSON, `fcb.search-stream/1` NDJSON `file` records, and progressive workspace
+JSON and NDJSON `match` records. Human output prints **Same-scan context**.
+The added per-hit `context` object separates these coordinates and values:
+
+| Field | Meaning |
+| --- | --- |
+| `requested_range` | The requested before + match + after interval, clipped to the observed file bounds. |
+| `original_range`, `original_hex` | The exact retained original-byte interval and its lossless bytes. |
+| `complete` | Whether the retained interval fills this bounded request. |
+| `text`, `text_original_range` | Text produced by the existing source decoder and the original bytes it covers; scalar/CRLF guards can trim its edges and the leading BOM is excluded from text. |
+| `match_range`, `match_decoded_range` | The exact original match range and its verified UTF-8 offsets within this excerpt's decoded text. These are not global decoded coordinates. |
+| `text_has_replacements`, `text_unavailable_reason` | Explicit decoding coverage; text coordinates are null when guarded decoding or an exact match mapping is unavailable, while original hex remains available. |
+
+CRLF is preserved in decoded excerpts. Text rendering never rounds a split
+source scalar into a different match, and raw-byte search can retain binary
+context without claiming a text interpretation. Context byte totals and the
+160-byte allowances are reported alongside the existing match counters.
+Schema identifiers remain unchanged: context fields are additive, while the
+standalone `retention` and native host `capture_kind` markers now report
+`"literal-witnesses-with-context"`. Existing match ranges and witness fields
+retain their meanings.
+
+For expressions, results still identify primary-occurrence witnesses; an
+excerpt may contain neighboring terms but does not retain separate evidence
+for every required or excluded predicate. Exact text and raw-byte matches share
+one immutable encoded literal. Unicode lowercase matches retain each occurrence's
+original spelling and encoded bytes, because the source may differ from the
+query in spelling and byte length. The public `FileSearchReport::retain_hit`
+materializes the exact matching bytes; `retain_context` materializes the
+separately admitted surrounding bytes. Core callers opt into context before
+scanning with `with_context`. Neither route constructs a file digest or a full
+immutable source snapshot.
 
 Before/after metadata is taken on the actual open file. Length and modification
 time differences, short reads and missing metadata prevent a complete native
@@ -558,7 +597,8 @@ The default indexed strategy does not accept stdin, byte-window flags, raw-hex
 queries or an encoding override. The explicit whole-file strategy above accepts
 raw bytes and encoding declarations. Neither strategy is a persistent or
 out-of-core posting index: one retains bounded captures and an ephemeral index;
-the other scans continuous source while retaining only literal witnesses.
+the other scans continuous source while retaining match witnesses and bounded
+same-observation context.
 
 ## Later matches in saved archives
 

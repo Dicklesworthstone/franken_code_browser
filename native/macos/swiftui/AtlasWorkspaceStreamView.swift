@@ -243,6 +243,11 @@ import AppKit
             Text(verbatim: hit.displayPath).lineLimit(2).font(.system(.body, design: .monospaced))
             Text("Bytes \(hit.range.start)..<\(hit.range.end) · \(hit.encoding.label)")
                 .font(.caption).foregroundStyle(.secondary)
+            if let context = hit.context, let parts = context.parts {
+                (Text(verbatim: parts.before) + Text(verbatim: parts.match).bold().underline()
+                    + Text(verbatim: parts.after))
+                    .font(.system(.caption, design: .monospaced)).lineLimit(3)
+            }
             if !hit.complete {
                 Text("Partial file observation · \(hit.state) · \(hit.consistency)")
                     .font(.caption).foregroundStyle(.secondary)
@@ -253,25 +258,60 @@ import AppKit
     @ViewBuilder private var selectedMatch: some View {
         VStack(alignment: .leading, spacing: 10) {
             if let witness = model.witness, let report = model.report, report.admits(witness.target) {
-                Text("Retained literal").font(.subheadline.weight(.semibold))
+                Text(witness.context == nil ? "Retained literal" : "Retained search excerpt")
+                    .font(.subheadline.weight(.semibold))
                 Text(verbatim: witness.target.hit.displayPath).font(.system(.caption, design: .monospaced))
                     .textSelection(.enabled).lineLimit(3)
                 Text("Original bytes \(witness.target.hit.range.start)..<\(witness.target.hit.range.end) · \(witness.target.hit.encoding.label)")
                     .font(.caption).foregroundStyle(.secondary)
-                Text("Only this exact matching text and its original bytes were retained. Surrounding source and a whole-file snapshot were not captured.")
-                    .font(.caption).foregroundStyle(.secondary)
+                if let context = witness.context {
+                    Text("The match and this bounded excerpt were retained from the same source read. Selecting or copying them does not reopen the file.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Text("Excerpt bytes \(context.originalRange.start)..<\(context.originalRange.end) · "
+                        + (context.complete ? "requested excerpt complete" : "partial excerpt; the scan stopped before all following bytes were available"))
+                        .font(.caption).foregroundStyle(.secondary)
+                    if let textRange = context.textRange, context.displayText != nil,
+                       textRange != context.originalRange {
+                        Text("Displayed text covers bytes \(textRange.start)..<\(textRange.end). Edge bytes remain available in the original hex.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                } else {
+                    Text("Only this exact matching text and its original bytes were retained. Surrounding source and a whole-file snapshot were not captured.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 if let expression = report.summary.expression {
                     Text(verbatim: "Expression: " + expression.query).font(.caption).textSelection(.enabled)
-                    Text("This is a primary-literal match from a file observation that satisfied the expression. Other predicate text was not retained.")
+                    Text("This is a primary-literal match from a file observation that satisfied the expression. Other predicates were checked across that same file observation.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 ScrollView([.horizontal, .vertical]) {
-                    Text(verbatim: witness.text).font(.system(.body, design: .monospaced)).textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                    VStack(alignment: .leading, spacing: 8) {
+                        if let context = witness.context, let parts = context.parts {
+                            (Text(verbatim: parts.before) + Text(verbatim: parts.match).bold().underline()
+                                + Text(verbatim: parts.after))
+                                .font(.system(.body, design: .monospaced)).textSelection(.enabled)
+                        } else {
+                            Text(verbatim: witness.text).font(.system(.body, design: .monospaced))
+                                .textSelection(.enabled)
+                            if let context = witness.context {
+                                Text("A lossless text excerpt is unavailable at these captured boundaries. The retained original bytes are shown below.")
+                                    .font(.caption).foregroundStyle(.secondary)
+                                Text(verbatim: context.originalHex).font(.system(.caption, design: .monospaced))
+                                    .textSelection(.enabled)
+                            }
+                        }
+                    }.frame(maxWidth: .infinity, alignment: .topLeading)
                 }.frame(minHeight: 100, maxHeight: .infinity)
                 HStack {
                     Button("Copy match") { copy(witness, hex: false) }
                     Button("Copy original hex") { copy(witness, hex: true) }
+                }
+                if let context = witness.context {
+                    HStack {
+                        Button("Copy excerpt") { copyExcerpt(witness, hex: false) }
+                            .disabled(context.displayText == nil)
+                        Button("Copy excerpt hex") { copyExcerpt(witness, hex: true) }
+                    }
                 }
                 Button("Read current context") { model.readCurrentContext(transport: .native) }
                     .disabled(!model.canReadCurrentContext)
@@ -283,7 +323,7 @@ import AppKit
                 }
             } else {
                 ContentUnavailableView("Select a retained match", systemImage: "text.magnifyingglass",
-                    description: Text("Selecting a result reads its retained literal without reopening the file. Current context is a separate explicit read."))
+                    description: Text("Select a result to inspect its captured match and any retained surrounding excerpt. Current context is a separate explicit read."))
                 Spacer(minLength: 0)
             }
         }.padding(.leading, 10)
@@ -297,5 +337,16 @@ import AppKit
             copyNotice = hex ? "Copied exact retained original bytes as hex; no file was reread."
                 : "Copied exact retained matching text; no file was reread."
         } else { copyNotice = "The pasteboard did not accept the retained match." }
+    }
+
+    private func copyExcerpt(_ witness: AtlasWorkspaceStreamWitness, hex: Bool) {
+        guard !model.closed, model.witness?.target == witness.target,
+              model.report?.admits(witness.target) == true, let context = witness.context,
+              let contents = hex ? context.originalHex : context.displayText else { return }
+        NSPasteboard.general.clearContents()
+        if NSPasteboard.general.setString(contents, forType: .string) {
+            copyNotice = hex ? "Copied the retained excerpt's original bytes as hex; no file was reread."
+                : "Copied the displayed retained excerpt with its original line endings; no file was reread."
+        } else { copyNotice = "The pasteboard did not accept the retained excerpt." }
     }
 }

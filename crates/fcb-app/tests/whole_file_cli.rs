@@ -53,6 +53,38 @@ fn bounds(hit: &Json) -> (u64, u64) {
 }
 
 #[test]
+fn whole_file_context_uses_original_utf8_utf16_bytes_and_maps_the_displayed_match() {
+    let temp = Temp::new();
+    for encoding in ["utf8", "utf16le", "utf16be"] {
+        let text = "before Ω\r\nneedle😀\r\nafter";
+        let needle = "needle😀\r\n";
+        let bytes = encoded(&format!("\u{feff}{text}"), encoding);
+        let file = temp.file(&format!("context-{encoding}.rs"), &bytes);
+        let (exit, result) = invoke(&file, &["--whole-file", "--text", needle]);
+        assert_eq!(exit, EXIT_OK);
+        let hit = &result.get("hits").array()[0];
+        let context = hit.get("context");
+        assert_eq!(result.get("retention").text(), "literal-witnesses-with-context");
+        assert_eq!(result.get("retained_context_bytes").number(), bytes.len() as u64);
+        assert_eq!(context.get("original_hex").text(), hex(&bytes));
+        assert_eq!(context.get("match_range"), hit.get("original_range"));
+        assert!(context.get("complete").flag());
+        assert_eq!(context.get("text").text(), text);
+        let matched = context.get("match_decoded_range");
+        assert_eq!(&text[matched.get("start").number() as usize..matched.get("end").number() as usize], needle);
+        assert!(!context.get("text_has_replacements").flag());
+        assert_eq!(context.get("text_unavailable_reason"), &Json::Null);
+    }
+    let file = temp.file("raw-context.bin", b"before\xff\0after");
+    let (exit, raw) = invoke(&file, &["--whole-file", "--raw-hex", "ff00"]);
+    assert_eq!(exit, EXIT_OK);
+    let context = raw.get("hits").array()[0].get("context");
+    assert_eq!(context.get("original_hex").text(), hex(b"before\xff\0after"));
+    assert_eq!(context.get("text"), &Json::Null);
+    assert_eq!(context.get("text_unavailable_reason").text(), "encoding-unavailable");
+}
+
+#[test]
 fn whole_file_mode_reaches_a_large_file_tail_without_weakening_the_window_route() {
     let temp = Temp::new();
     let mut bytes = vec![b'x'; 2 * 1024 * 1024]; bytes.extend_from_slice(b"needle");
@@ -68,7 +100,7 @@ fn whole_file_mode_reaches_a_large_file_tail_without_weakening_the_window_route(
     assert_eq!(whole.get("payload_bytes_read").number(), bytes.len() as u64);
     assert!(whole.get("peak_input_buffer_bytes").number() <= 16 * 1024);
     assert_eq!(whole.get("literal_original_hex").text(), "6e6565646c65");
-    assert_eq!(whole.get("retention").text(), "literal-witnesses-only");
+    assert_eq!(whole.get("retention").text(), "literal-witnesses-with-context");
     assert_eq!(whole.get("hits").array()[0].get("decoded_range"), &Json::Null);
 }
 

@@ -159,6 +159,54 @@ private enum StreamFixture {
         value["next_offset"] = end < hits.count ? String(end) as Any : NSNull()
         return value
     }
+    /// Explicit source bytes supply the fixture oracle. The production engine
+    /// tests separately exercise the circular history and actual file reads.
+    static func withContext(_ report: [String: Any], followingBytes: Int? = nil) -> [String: Any] {
+        var value = report, rows = report["hits"] as! [[String: Any]]
+        var total = 0
+        for index in rows.indices {
+            let row = rows[index], range = row["original_range"] as! [String: String]
+            let start = UInt64(range["start"]!)!, end = UInt64(range["end"]!)!
+            let length = UInt64(row["observed_length"] as! String)!
+            let encoding = AtlasObservedReaderEncoding(rawValue: row["encoding"] as! String)!
+            let unit = encoding == .utf8 ? 1 : 2
+            let beforeBytes = Int(min(start, 160)), requestedAfter = Int(min(length - end, 160))
+            let afterBytes = min(followingBytes ?? requestedAfter, requestedAfter)
+            precondition(beforeBytes % unit == 0 && afterBytes % unit == 0)
+            let literal = row["fixture_spelling"] as? String ?? report["needle"] as! String
+            let before = String(repeating: "p", count: beforeBytes / unit)
+            let after = String(repeating: "s", count: afterBytes / unit)
+            let original = AtlasObservedReaderSearchRequest.originalBytes(before + literal + after, encoding: encoding)
+            let originalStart = start - UInt64(beforeBytes), originalEnd = end + UInt64(afterBytes)
+            precondition(UInt64(original.count) == originalEnd - originalStart)
+            total += original.count
+            var context: [String: Any] = ["state": "retained",
+                "requested_range": ObservedReaderFixture.range(originalStart, end + UInt64(requestedAfter)),
+                "original_range": ObservedReaderFixture.range(originalStart, originalEnd),
+                "match_range": ObservedReaderFixture.range(start, end),
+                "complete": afterBytes == requestedAfter, "original_hex": ObservedReaderFixture.hex(original),
+                "text": NSNull(), "text_original_range": NSNull(), "match_decoded_range": NSNull(),
+                "text_has_replacements": NSNull(), "text_unavailable_reason": "insufficient-scalar-context"]
+            let leftGuard = originalStart == 0 ? 0 : 4, rightGuard = originalEnd == length ? 0 : 4
+            if beforeBytes >= leftGuard && afterBytes >= rightGuard {
+                let prefix = String(before.dropFirst(leftGuard / unit))
+                let text = prefix + literal + String(after.dropLast(rightGuard / unit))
+                context["text"] = text
+                context["text_original_range"] = ObservedReaderFixture.range(originalStart + UInt64(leftGuard),
+                    originalEnd - UInt64(rightGuard))
+                context["match_decoded_range"] = ObservedReaderFixture.range(UInt64(prefix.utf8.count),
+                    UInt64(prefix.utf8.count + literal.utf8.count))
+                context["text_has_replacements"] = false; context["text_unavailable_reason"] = NSNull()
+            }
+            rows[index]["context"] = context
+        }
+        value["hits"] = rows; value["capture_kind"] = "literal-witnesses-with-context"
+        value["retained_context_bytes"] = String(total)
+        var limits = value["limits"] as! [String: String]
+        limits["context_before_bytes"] = "160"; limits["context_after_bytes"] = "160"
+        value["limits"] = limits
+        return value
+    }
     static func witness(_ report: [String: Any], index: Int) -> [String: Any] {
         var value = report; value["command"] = "hit"
         var row = (report["hits"] as! [[String: Any]])[index]
@@ -492,6 +540,7 @@ private final class StreamContextProbe: @unchecked Sendable {
         try countedWireTests()
         try matchWindowWireTests()
         try lowercaseWireTests()
+        try retainedContextWireTests()
         try occurrenceWireTests()
         try expressionWireTests()
         try expressionWindowWireTests()
@@ -521,6 +570,125 @@ private final class StreamContextProbe: @unchecked Sendable {
             try await Task.sleep(for: .milliseconds(5))
         }
         preconditionFailure("Timed out: " + label)
+    }
+    private static func retainedContextWireTests() throws {
+        let owner: UInt64 = 700
+        let catalog = try AtlasWorkspaceStreamCatalog.decode(StreamFixture.json(StreamFixture.catalog(owner)),
+            owner: owner)
+        func decode(_ value: [String: Any], _ request: AtlasWorkspaceStreamRequest) throws -> AtlasWorkspaceStreamReport {
+            let page = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(StreamFixture.page(value)),
+                catalog: catalog, root: catalog.root, request: request)
+            return try .init(summary: page.summary, hits: page.hits)
+        }
+        let cases: [(AtlasObservedReaderEncoding, String, String, Bool)] = [
+            (.utf8, "old", "old", true), (.utf8, "é😀\r\n", "é😀\r\n", true),
+            (.utf16le, "é😀\r\n", "é😀\r\n", true), (.utf16be, "é😀\r\n", "é😀\r\n", true),
+            (.utf8, "σ", "Σ", false), (.utf16le, "σ", "Σ", false)]
+        for (encoding, needle, spelling, sensitive) in cases {
+            let request = try AtlasWorkspaceStreamRequest(needle: needle, caseSensitive: sensitive)
+            let value = StreamFixture.withContext(StreamFixture.report(owner, 1, request, count: 1,
+                encoding: encoding, spellings: [spelling]))
+            let report = try decode(value, request), hit = report.hits[0]
+            let context = hit.context!
+            precondition(report.summary.identity.capturesContext && context.complete)
+            precondition(context.originalRange.start == hit.range.start - 160
+                && context.originalRange.end == hit.range.end + 160)
+            precondition(context.parts!.match.utf8.elementsEqual(spelling.utf8))
+            precondition(report.summary.contextBytes == context.originalRange.count)
+            let witness = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(StreamFixture.witness(value, index: 0)),
+                report: report, root: catalog.root, target: report.target(for: hit))
+            precondition(witness.context == context && context.containsWitness(witness.originalHex, at: hit.range))
+        }
+
+        let request = try AtlasWorkspaceStreamRequest(needle: "old")
+        let good = StreamFixture.withContext(StreamFixture.report(owner, 2, request, count: 1))
+        let accepted = try decode(good, request)
+        func altered(_ change: (inout [String: Any]) -> Void) -> [String: Any] {
+            var value = good, rows = good["hits"] as! [[String: Any]]
+            var context = rows[0]["context"] as! [String: Any]
+            change(&context); rows[0]["context"] = context; value["hits"] = rows
+            return value
+        }
+        let corruptions: [(String, Any)] = [
+            ("state", "missing" as Any), ("complete", false), ("original_hex", "00"),
+            ("text", "unobserved source"), ("text_has_replacements", NSNull()),
+            ("text_unavailable_reason", "encoding-unavailable"),
+            ("match_decoded_range", ObservedReaderFixture.range(0, 3)),
+            ("match_range", ObservedReaderFixture.range(StreamFixture.start + 1, StreamFixture.start + 4)),
+            ("requested_range", ObservedReaderFixture.range(StreamFixture.start - 159, StreamFixture.start + 163)),
+            ("original_range", ObservedReaderFixture.range(StreamFixture.start - 159, StreamFixture.start + 163)),
+            ("text_original_range", ObservedReaderFixture.range(StreamFixture.start - 155, StreamFixture.start + 159))
+        ]
+        for (key, replacement) in corruptions {
+            rejects("retained context " + key) { _ = try decode(altered { $0[key] = replacement }, request) }
+        }
+        for key in ["retained_context_bytes", "capture_kind", "limits"] {
+            var bad = good; bad.removeValue(forKey: key)
+            rejects("missing context authority " + key) { _ = try decode(bad, request) }
+        }
+        var missing = good, missingRows = good["hits"] as! [[String: Any]]
+        missingRows[0].removeValue(forKey: "context"); missing["hits"] = missingRows
+        rejects("new capture kind without excerpt") { _ = try decode(missing, request) }
+        var wrongAccounting = good; wrongAccounting["retained_context_bytes"] = "324"
+        rejects("incorrect context byte total") { _ = try decode(wrongAccounting, request) }
+        var unread = good
+        unread["payload_bytes_read"] = String(StreamFixture.start + 4)
+        unread["scanned_input_bytes"] = String(StreamFixture.start + 4)
+        rejects("context beyond observed input") { _ = try decode(unread, request) }
+        var downgrade = good; downgrade["capture_kind"] = "literal-witnesses-only"
+        rejects("unannounced retained context") { _ = try decode(downgrade, request) }
+        var changedWitness = StreamFixture.witness(good, index: 0)
+        var changedRow = changedWitness["hit"] as! [String: Any]
+        var changedContext = changedRow["context"] as! [String: Any]
+        changedContext["text"] = "changed after publication"
+        changedRow["context"] = changedContext; changedWitness["hit"] = changedRow
+        rejects("different excerpt on hit selection") {
+            _ = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(changedWitness), report: accepted,
+                root: catalog.root, target: accepted.target(for: accepted.hits[0]))
+        }
+
+        // A stopped scan can still preserve the literal while lacking enough
+        // trailing scalar context to decode a surrounding excerpt.
+        let partialRequest = try AtlasWorkspaceStreamRequest(needle: "old", maximumScanBytes: StreamFixture.start + 3)
+        var stopped = StreamFixture.report(owner, 3, partialRequest, count: 1)
+        stopped["search_complete"] = false; stopped["incomplete_files"] = "1"; stopped["stop_reason"] = "byte-limit"
+        stopped["payload_bytes_read"] = String(partialRequest.maximumScanBytes)
+        stopped["scanned_input_bytes"] = String(partialRequest.maximumScanBytes); stopped["read_calls"] = "129"
+        var stoppedRows = stopped["hits"] as! [[String: Any]]
+        stoppedRows[0]["file_complete"] = false; stoppedRows[0]["file_state"] = "byte-limit"
+        stopped["hits"] = stoppedRows
+        let partialValue = StreamFixture.withContext(stopped, followingBytes: 0)
+        let partial = try decode(partialValue, partialRequest), partialContext = partial.hits[0].context!
+        precondition(!partial.summary.complete && !partialContext.complete
+            && partialContext.originalRange.end == partial.hits[0].range.end)
+        precondition(partialContext.displayText == nil && partialContext.unavailableReason == "insufficient-scalar-context")
+        _ = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(StreamFixture.witness(partialValue, index: 0)),
+            report: partial, root: catalog.root, target: partial.target(for: partial.hits[0]))
+        var mismatchedRaw = partialValue, rawRows = partialValue["hits"] as! [[String: Any]]
+        var rawContext = rawRows[0]["context"] as! [String: Any]
+        rawContext["original_hex"] = String((rawContext["original_hex"] as! String).dropLast(6)) + "6e6577"
+        rawRows[0]["context"] = rawContext; mismatchedRaw["hits"] = rawRows
+        let rawReport = try decode(mismatchedRaw, partialRequest)
+        rejects("raw-only excerpt with different literal bytes") {
+            _ = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(StreamFixture.witness(mismatchedRaw, index: 0)),
+                report: rawReport, root: catalog.root, target: rawReport.target(for: rawReport.hits[0]))
+        }
+
+        // The same capability survives progressive discovery and its revision
+        // receipt, without depending on an atlas node or live pathname.
+        let progressiveCatalog = try AtlasWorkspaceStreamCatalog.ready(owner: owner, root: StreamFixture.root)
+        let progressive = StreamFixture.withContext(CatalogStreamFixture.report(owner, 4, request, count: 1))
+        let page = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(CatalogStreamFixture.page(progressive)),
+            catalog: progressiveCatalog, root: catalog.root, request: request, requireTerminal: true)
+        let report = try AtlasWorkspaceStreamReport(summary: page.summary, hits: page.hits)
+        precondition(report.summary.identity.progressive && report.hits[0].context?.complete == true)
+        _ = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(StreamFixture.witness(progressive, index: 0)),
+            report: report, root: catalog.root, target: report.target(for: report.hits[0]))
+
+        let empty = try decode(StreamFixture.withContext(StreamFixture.report(owner, 5, request, count: 0)), request)
+        precondition(empty.summary.contextBytes == 0 && empty.hits.isEmpty)
+        let legacy = try decode(StreamFixture.report(owner, 6, request, count: 1), request)
+        precondition(!legacy.summary.identity.capturesContext && legacy.hits[0].context == nil)
     }
     private static func catalogWireTests() throws {
         let owner: UInt64 = 0xfedcba9876543210

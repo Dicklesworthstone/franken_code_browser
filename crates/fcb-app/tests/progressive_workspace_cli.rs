@@ -128,10 +128,20 @@ fn utf16_lowercase_identifiers_and_raw_paths_keep_exact_witnesses() {
     let (code, result) = invoke(&tree.0, &["--text", "k", "--ignore-case", "--count-all"]);
     assert_eq!(code, EXIT_OK);
     let hits = result.get("hits").array(); assert_eq!(hits.len(), 3);
+    assert_eq!(result.get("capture_kind").text(), "literal-witnesses-with-context");
+    assert_eq!(result.get("retained_context_bytes").number(), 36);
     for ((hit, range), witness) in hits.iter().zip([(2, 4), (6, 8), (10, 12)]).zip(["212a", "004b", "006b"]) {
         assert_eq!(bounds(hit), range); assert_eq!(hit.get("original_hex").text(), witness);
         assert_eq!(hit.get("encoding").text(), "utf16be");
         assert_eq!(hit.get("path").get("hex").text(), "61ff2e7273");
+        let context = hit.get("context");
+        assert_eq!(context.get("original_hex").text(), "feff212a0020004b0020006b");
+        assert_eq!(context.get("text").text(), "K K k");
+        assert!(context.get("complete").flag());
+        assert_eq!(context.get("match_range"), hit.get("original_range"));
+        let matched = context.get("match_decoded_range");
+        let (start, end) = (matched.get("start").number() as usize, matched.get("end").number() as usize);
+        assert_eq!(&context.get("text").text()[start..end], hit.get("matched_text").text());
     }
     assert_eq!(hits.iter().map(|hit| hit.get("matched_text").text()).collect::<Vec<_>>(), ["K", "K", "k"]);
     let (code, streamed) = stream(&tree.0, &["--text", "k", "--ignore-case", "--count-all"]);
@@ -146,6 +156,25 @@ fn utf16_lowercase_identifiers_and_raw_paths_keep_exact_witnesses() {
     assert_eq!(code, EXIT_OK);
     assert_eq!(result.get("hits").array().iter().map(bounds).collect::<Vec<_>>(), [(2, 8), (42, 48)]);
     assert!(!result.get("compiler_resolved").flag());
+}
+
+#[test]
+fn progressive_budget_stops_keep_same_observation_partial_context_in_json_and_stream() {
+    let tree = Tree::new("partial-context");
+    tree.file("a.rs", b"before needle trailing source not observed");
+    let flags = ["--text", "needle", "--max-scan-bytes", "13"];
+    let (code, result) = invoke(&tree.0, &flags);
+    assert_eq!(code, EXIT_PARTIAL);
+    let context = result.get("hits").array()[0].get("context");
+    assert!(!context.get("complete").flag());
+    assert_eq!(context.get("original_hex").text(), "6265666f7265206e6565646c65");
+    assert_eq!(context.get("text"), &Json::Null);
+    assert_eq!(context.get("text_unavailable_reason").text(), "insufficient-scalar-context");
+    let (code, records) = stream(&tree.0, &flags);
+    assert_eq!(code, EXIT_PARTIAL);
+    let row = records.iter().find(|row| row.get("type").text() == "match").unwrap();
+    assert_eq!(row.get("match").get("context"), context);
+    assert_eq!(records.last().unwrap().get("payload_bytes_read").number(), 13);
 }
 
 #[test]

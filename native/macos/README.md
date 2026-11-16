@@ -942,6 +942,39 @@ archive supplies the source. The native attachment, authoring, reader navigation
 and Desk handoff have host, C-boundary and Swift regression fixtures. Independent
 execution and physical-Mac qualification remain pending.
 
+## Comparing retained source ranges
+
+Use **Pin source** in two retained readers, then choose **Compare** in **Pinned
+sources**. The first pin is Before and the second is After. Each source can
+contain up to 4 MiB for this comparison; the comparison uses their retained
+bytes without reopening either live file. Saved-capture **Compare file** uses
+the same reader controls.
+
+**Open pair** selects a reported range on both sides. **Previous change** and
+**Next change** skip equal ranges and include explicitly unresolved ranges;
+the selected row shows its position among the changes. **Show equal ranges**
+also exposes unchanged spans. **Refine** retries a budget-limited comparison
+with the larger bounded allowance. Both source windows are prepared before
+either is installed, so a failed or canceled change navigation preserves the
+previous accepted pair.
+
+Each reader distinguishes the complete compared byte range from the part
+displayed in its bounded page. For a long range, **Range → Show range start**
+and **Show range end** reach its ends. **Copy range** offers the shown text,
+the shown original bytes as hex, or the full range location with capture
+identity. **Keep compared range** preserves the complete target in the Reading
+Desk, including bytes beyond the displayed page. Ordinary page copying remains
+separate from copying the compared range.
+
+Added or removed spans can have an empty side: its point anchor remains empty
+and uses an exact caret when representable. A difference can also split a
+UTF-8 scalar, UTF-16 unit, composed character or CRLF pair. Those byte boundaries
+are not rounded into an approximate text highlight; exact shown bytes and the
+full location remain available. Pages with decoding replacements likewise keep
+their byte evidence without claiming an exact native text selection. These
+comparisons describe the chosen captures and do not establish Git history or
+automatic note relocation.
+
 ## Comparing saved project captures
 
 Choose **Compare Captures** in the toolbar, or **Compare captures…** inside
@@ -966,7 +999,8 @@ previous/next navigation follows the returned page boundaries.
 
 **Read before** and **Read after** open the selected saved member.
 **Compare file** opens both retained versions in the existing byte-comparison
-reader, where bounded change pages navigate each side's original byte ranges.
+reader, with paired range selection and Previous/Next change navigation as
+described above.
 An unavailable member stays visible with its recorded reason. A captured empty
 file remains readable. **Keep in Reading Desk** retains a source for notes,
 bookmarks and checkpoints after the comparison closes.
@@ -1414,7 +1448,9 @@ capture limits. An observation cut short by an I/O limit, Stop or a decoding
 failure cannot provide expression hits. Reaching the observed end establishes predicates over
 those observed bytes; it does not establish an atomic file snapshot. Changed or
 unavailable final metadata remains disclosed and keeps overall coverage partial.
-Only primary literal witnesses are retained, not the other predicates' text.
+Retained result ranges identify primary literal occurrences. Their bounded
+excerpts may include nearby text, but do not retain independent evidence for
+every other required or excluded term.
 
 Expression path and language filters intersect the frozen sidebar location and
 file types before source reads. UTF-8 root-relative paths are filtered directly;
@@ -1460,7 +1496,10 @@ the total source I/O budget, and press **Search**. There is no per-file capture
 ceiling. The scan admits at most 1,048,576 read calls and retains at most 256
 matches. It uses a 16 KiB input buffer. Exact Text, Expression and Occurrences share one
 encoded primary witness per file with retained matches; lowercase Text and Expression retain each
-hit's original spelling and bytes. Complete sources are not retained. While the scan runs,
+hit's original spelling and bytes. Each retained hit also keeps up to 160 original
+bytes before and 160 after the match, from those same reads. Context residency
+stays bounded per match; the scan does not retain a separate whole-file capture.
+While the scan runs,
 the sheet shows cumulative byte/read progress and previews up to the first 32
 matches from finalized file observations. The unfinished file contributes I/O
 progress, but its tentative matches are withheld until its observation finishes.
@@ -1524,10 +1563,25 @@ unexamined files, unsupported text, unavailable files, failed reads, and byte,
 call or match-limit stops, and user-requested stops. Excluded entries include pruned directories; their
 count is not an invented count of all files beneath them.
 
-Select a result to inspect its retained literal. **Copy match** copies that
-decoded spelling; **Copy original hex** copies the exact original encoded bytes.
-These actions do no source I/O and remain meaningful if the working-tree file
-changes. **Read current context** explicitly opens the current canonical pathname
+Result rows show a retained excerpt when its decoded boundaries can be verified.
+Select a result to inspect the excerpt around the highlighted match. The excerpt
+requests 160 original bytes on each side, clipped to the observed file bounds.
+It uses only bytes already read by that search; reaching a byte, read-call or
+match limit never triggers additional reads to fill its suffix. A short suffix
+is labeled **partial excerpt**, independently of file or query completeness.
+
+The displayed text uses scalar and CRLF boundary guards and can cover less than
+the retained original-byte range. Both ranges are shown when they differ. CRLF
+is preserved; a leading BOM is represented in the original bytes and excluded
+from decoded text. **Copy excerpt** copies the verified displayed text, while
+**Copy excerpt hex** preserves every retained excerpt byte, including edge bytes
+that cannot form a text highlight. When guarded decoding is unavailable, the
+literal and original hex remain inspectable. **Copy match** and **Copy original
+hex** continue to copy only the exact match's decoded spelling and encoded bytes.
+Selecting or copying these retained values performs no source I/O and remains
+meaningful after the working-tree file changes or disappears.
+
+**Read current context** explicitly opens the current canonical pathname
 under the current project access grant, creates an independent observed reader,
 and checks the literal's original bytes before highlighting. Changed bytes are
 reported as changed; the earlier result never claims the new file's identity.
@@ -1548,7 +1602,10 @@ describe progressive membership and never invent atlas node or layout identities
 The visible-atlas route retains `fcb_app::host::atlas_stream_search` and
 [`fcb_atlas_stream_search.h`](../../crates/fcb-bridge/include/fcb_atlas_stream_search.h).
 Both reuse the same streaming matcher, expression semantics and exact witness
-representation. Added core, host, C ABI and native cases target large discovery,
+representation. New receipts add per-hit `context` metadata, retain their schema
+identifiers, and report `capture_kind: "literal-witnesses-with-context"`.
+Existing literal witnesses keep their meaning; older witness-only receipts
+remain readable without an invented excerpt. Added core, host, C ABI and native cases target large discovery,
 encoding, original-byte retention, query replacement, cancellation, bounded
 results, counted progress and Stop. They are code-first additions: executable
 Rust/Swift verification and physical-Mac qualification remain pending.

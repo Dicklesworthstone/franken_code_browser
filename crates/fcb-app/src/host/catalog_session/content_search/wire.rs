@@ -5,8 +5,7 @@
 
 use super::*;
 use crate::{EXIT_OK, EXIT_PARTIAL};
-use crate::output::Output;
-use super::super::MAX_CATALOG_RESPONSE_BYTES;
+use crate::output::{Output, MAX_RESPONSE_BYTES};
 
 impl CatalogContentSearchSession {
     pub(super) fn snapshot(&mut self, command: &str, start: usize, count: usize,
@@ -23,7 +22,9 @@ impl CatalogContentSearchSession {
         for (position, hit) in self.hits.iter().enumerate().take(end).skip(start) {
             check(&mut canceled)?;
             if position != start { out.literal(",")?; }
-            out.literal("{")?; encode_hit(&mut out, hit, position)?; out.literal("}")?;
+            out.literal("{")?; encode_hit(&mut out, hit, position)?;
+            self.encode_context(&mut out, hit, &mut canceled)?;
+            out.literal("}")?;
         }
         out.literal("],\"next_offset\":")?;
         if end < self.hits.len() { out.integer(end as u64)?; } else { out.literal("null")?; }
@@ -63,13 +64,16 @@ impl CatalogContentSearchSession {
         out.literal(",\"original_hex\":")?;
         out.hex(self.witnesses.get(hit.witness_start..hit.witness_start + hit.witness_len)
             .ok_or(CatalogContentSearchError::MissingHit)?)?;
+        self.encode_context(&mut out, hit, &mut canceled)?;
         out.literal("},\"additional_source_bytes_read\":\"0\",\"additional_read_calls\":\"0\"}\n")?;
         self.finish(out, &mut canceled)
     }
 
     fn output(&mut self, command: &str) -> Result<Output, CatalogContentSearchError> {
         let id = self.catalog.next_id()?;
-        let mut out = Output::new(self.owner(), MAX_CATALOG_RESPONSE_BYTES, &self.catalog.budget, id)?;
+        // Context carries original hex plus decoded text. Keep the same bounded
+        // response allowance as atlas streaming, independent of catalog pages.
+        let mut out = Output::new(self.owner(), MAX_RESPONSE_BYTES, &self.catalog.budget, id)?;
         out.literal("{\"schema\":\"fcb.catalog-stream/1\",\"status\":\"ok\",\"command\":")?; out.quoted(command)?;
         self.encode_metadata(&mut out)?;
         Ok(out)
@@ -82,7 +86,7 @@ impl CatalogContentSearchSession {
         integer(out, "progress_sequence", self.revision)?;
         out.literal(",\"root_path\":")?; out.path(&self.grant().root_path().to_path_buf())?;
         out.literal(",\"scope\":\"progressively-discovered-whole-files\",\"strategy\":\"streaming-whole-file\",
-            \"capture_kind\":\"literal-witnesses-only\",\"source_observation\":\"per-file-streams-not-atomic-workspace\",
+            \"capture_kind\":\"literal-witnesses-with-context\",\"source_observation\":\"per-file-streams-not-atomic-workspace\",
             \"ordering\":\"provisional-discovery-order\",\"membership\":\"progressive-observation\",\"discovery_policy\":")?;
         out.quoted(self.catalog.discovery_policy().name())?;
         self.catalog.encode_rule_policy(out)?;
@@ -139,6 +143,7 @@ impl CatalogContentSearchSession {
             ("read_calls", self.io.read_calls), ("interrupted_read_calls", self.io.interrupted_calls),
             ("peak_input_buffer_bytes", self.io.peak_buffer_bytes as u64),
             ("retained_witness_bytes", self.witnesses.len() as u64),
+            ("retained_context_bytes", self.contexts.len() as u64),
             ("retained_catalog_pages", self.catalog.pages.len() as u64),
             ("retained_catalog_files", self.catalog.pages.iter().map(|page| page.files.len() as u64).sum())] {
             integer(out, key, value)?;
@@ -147,6 +152,8 @@ impl CatalogContentSearchSession {
         integer(out, "max_scan_bytes", self.options.limits.max_scan_bytes)?;
         integer(out, "max_read_calls", self.options.limits.max_read_calls)?;
         integer(out, "max_steps_per_advance", MAX_CATALOG_STREAM_STEPS as u64)?;
+        integer(out, "context_before_bytes", stream_context::BEFORE_BYTES as u64)?;
+        integer(out, "context_after_bytes", stream_context::AFTER_BYTES as u64)?;
         out.literal("},\"discovery\":{")?;
         let aggregate = self.catalog.aggregate;
         for (position, (key, value)) in [("files", aggregate.files), ("directories", aggregate.directories),
@@ -159,6 +166,17 @@ impl CatalogContentSearchSession {
         }
         out.literal("}")?;
         Ok(())
+    }
+    pub(super) fn retained_context<'a>(&'a self, hit: &Hit) -> Result<stream_context::Context<'a>, CatalogContentSearchError> {
+        let bytes = self.contexts.get(hit.context_start..hit.context_start + hit.context_len)
+            .ok_or(CatalogContentSearchError::MissingHit)?;
+        Ok(stream_context::Context { request: hit.file.request, generation: self.generation,
+            observed_length: hit.file.length.ok_or(CatalogContentSearchError::MissingHit)?, encoding: hit.file.encoding,
+            requested: hit.context_requested, original: hit.context_original, matched: hit.range, bytes })
+    }
+    pub(super) fn encode_context(&self, out: &mut Output, hit: &Hit, canceled: &mut impl FnMut() -> bool)
+        -> Result<(), CatalogContentSearchError> {
+        Ok(stream_context::encode(out, self.retained_context(hit)?, &self.catalog.budget, self.context_decode_ids, canceled)?)
     }
     fn finish(&mut self, out: Output, canceled: &mut impl FnMut() -> bool)
         -> Result<HostResponse, CatalogContentSearchError> {

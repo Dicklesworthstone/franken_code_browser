@@ -4,11 +4,13 @@
 //! Hosts supply authorized open files; this module never resolves a pathname.
 //! One step opens at most one file and drives at most one existing FileSearch
 //! quantum. Source length is absent from retained-memory admission. Completed
-//! files retain compact status/hit records and exact literal witnesses, never
-//! decoder buffers, complete captures, or invented surrounding source.
+//! files retain compact status/hit records, exact literal witnesses and optional
+//! bounded same-scan context, never decoder buffers or complete captures.
 
+mod context;
 mod report;
 mod source;
+pub use context::AtlasStreamContext;
 pub use source::AtlasStreamSource;
 pub use report::{AtlasStreamFile, AtlasStreamFileState, AtlasStreamHit,
     AtlasStreamReport, AtlasStreamSelection, AtlasStreamStats};
@@ -16,7 +18,7 @@ pub use report::{AtlasStreamFile, AtlasStreamFileState, AtlasStreamHit,
 use std::{fs::File, marker::PhantomData, mem::size_of};
 use fcb_core::{ByteLength, QueryGeneration, ResourceAllocationId, ResourceBudget, SourceRevision};
 use crate::search::{CaptureRequest, FileSearch, FileSearchError, FileSearchReport,
-    StreamReadError, StreamReadOptions, StreamReadState, StreamReadStats, StreamReadStep, StreamingMode, StreamingNeedle};
+    StreamContextOptions, StreamReadError, StreamReadOptions, StreamReadState, StreamReadStats, StreamReadStep, StreamingMode, StreamingNeedle};
 use crate::source::{SourceError, path::NormalizedPath};
 use super::{WorkspaceAtlas, WorkspaceAtlasError};
 
@@ -86,6 +88,7 @@ pub struct AtlasStreamSearch<'atlas, 'catalog, 'worker, A: AtlasStreamSource = W
     needle: &'worker StreamingNeedle,
     budget: &'worker ResourceBudget,
     worker_allocation: ResourceAllocationId,
+    context_worker_allocation: Option<ResourceAllocationId>,
     first_revision: SourceRevision,
     active: Option<FileSearch<'worker>>,
 }
@@ -212,10 +215,29 @@ impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 
         }).transpose()?;
         let report = AtlasStreamReport { atlas, generation, limits, count_all_matches, page_start_after: start_after, case_sensitive, mode: needle.mode(), files: reserve(count)?,
             hits: reserve(limits.max_matches)?, matched_files: reserve(witness_files)?,
-            witnesses: reserve(witness_bytes)?, matched_text, selected_ordinals, literal, stats: AtlasStreamStats::default(),
+            witnesses: reserve(witness_bytes)?, matched_text, contexts: None, selected_ordinals, literal, stats: AtlasStreamStats::default(),
             state: if count == 0 { AtlasStreamState::Finished } else { AtlasStreamState::Pending },
             stop: None, _lease: lease, _catalog: PhantomData };
-        Ok(Self { report, needle, budget, worker_allocation: allocations[1], first_revision, active: None })
+        Ok(Self { report, needle, budget, worker_allocation: allocations[1], context_worker_allocation: None,
+            first_revision, active: None })
+    }
+
+    /// Retain bounded neighbors from each file's same read observation. Admit
+    /// before the first step; allocations identify the retained context pool and
+    /// one reusable per-file context worker. No extra source reads are performed.
+    /// Default construction continues to retain literal witnesses alone.
+    pub fn with_context(mut self, options: StreamContextOptions, allocations: [ResourceAllocationId; 2])
+        -> Result<Self, AtlasStreamError> {
+        if self.active.is_some() || !self.report.files.is_empty() || self.report.stats.read_calls != 0
+            || self.report.contexts.is_some() || allocations[0] == allocations[1]
+            || allocations.contains(&self.worker_allocation) {
+            return Err(AtlasStreamError::InvalidLimits);
+        }
+        let contexts = context::Contexts::new(self.report.generation.owner(), self.report.limits.max_matches,
+            self.needle.max_witness_bytes(), options, self.budget, allocations[0])?;
+        self.report.contexts = Some(contexts);
+        self.context_worker_allocation = Some(allocations[1]);
+        Ok(self)
     }
     pub fn state(&self) -> AtlasStreamState { self.report.state }
     /// Only finalized files contribute hit rows. Active-file I/O is already
@@ -286,9 +308,15 @@ impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 
                 max_bytes: self.report.limits.max_bytes - self.report.stats.bytes_read,
                 max_read_calls: self.report.limits.max_read_calls - self.report.stats.read_calls };
             let started = match opened {
-                Ok(file) => FileSearch::new_page(file, request, self.needle, options,
+                Ok(file) => match FileSearch::new_page(file, request, self.needle, options,
                     self.report.page_start_after.saturating_sub(self.report.stats.matches_seen),
-                    self.report.count_all_matches, self.budget, self.worker_allocation),
+                    self.report.count_all_matches, self.budget, self.worker_allocation) {
+                    Ok(search) => Ok(if let Some(allocation) = self.context_worker_allocation {
+                        let context = self.report.contexts.as_ref().ok_or(AtlasStreamError::InvalidLimits)?;
+                        search.with_context(context.options(), self.budget, allocation)?
+                    } else { search }),
+                    Err(error) => Err(error),
+                },
                 Err(e) => Err(FileSearchError::Source(e)),
             };
             match started {
@@ -371,6 +399,11 @@ impl<'atlas, 'catalog, 'worker, A: AtlasStreamSource> AtlasStreamSearch<'atlas, 
             if !self.report.case_sensitive {
                 if text.len() > self.report.matched_text.capacity() - text_start { return Err(AtlasStreamError::ResourceDenied); }
                 self.report.matched_text.push_str(text);
+            }
+            if let Some(contexts) = &mut self.report.contexts {
+                let context = scan.context(ordinal).map_err(FileSearchError::from)?
+                    .ok_or(AtlasStreamError::InvalidHit)?;
+                contexts.push(context, hit.original_range())?;
             }
             self.report.hits.push(AtlasStreamHit { node, request: scan.request(), file_record,
                 occurrence_id: hit.occurrence_id(), original_range: hit.original_range(),

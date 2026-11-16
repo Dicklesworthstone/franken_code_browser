@@ -119,7 +119,7 @@ fn c_stream_finds_large_utf8_and_bom_utf16_files_and_keeps_exact_literal_after_r
     let result = search(handle, "needle", 256, 4 * 1024 * 1024, 4096);
     assert!(result.contains("\"schema\":\"fcb.atlas-stream-search/1\""), "{result}");
     assert!(result.contains("\"search_complete\":true"), "{result}");
-    assert!(result.contains("\"capture_kind\":\"literal-witnesses-only\""));
+    assert!(result.contains("\"capture_kind\":\"literal-witnesses-with-context\""));
     assert_eq!(field(&result, "retained_hits"), 2);
     let generation = field(&result, "query_generation");
     assert!(result.contains(&format!("\"original_range\":{{\"start\":\"{far}\",\"end\":\"{}\"}}", far + 6)));

@@ -477,7 +477,9 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
     func select(_ target: AtlasWorkspaceStreamTarget) {
         guard canSelect, let session, let report, let catalog, report.admits(target) else { return }
         closeContext(); witness = nil
-        let (ticket, flag) = begin("Reading the retained literal without reopening its source file…")
+        let (ticket, flag) = begin(target.hit.context == nil
+            ? "Reading the retained literal without reopening its source file…"
+            : "Reading the retained search excerpt without reopening its source file…")
         task = Task {
             do {
                 let accepted = try await io.perform(cancellation: flag, keepingAlive: [session]) {
@@ -492,7 +494,9 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
                 guard accepts(ticket, flag), self.session === session, reportAuthorized,
                       self.report?.admits(target) == true else { return }
                 witness = accepted; finish(ticket)
-                notice = "Retained literal selected. Its original bytes were copied with no new file read."
+                notice = accepted.context == nil
+                    ? "Retained literal selected. Its original bytes were copied with no new file read."
+                    : "Retained search excerpt selected. The match and surrounding bytes come from the same file observation; no new file read was made."
             } catch { fail(error, ticket: ticket) }
         }
     }

@@ -1,15 +1,16 @@
 #![forbid(unsafe_code)]
 
-//! Compact, capture-honest spatial results. Only literal witness bytes survive;
-//! there is no rereadable whole-file backing and no decoder-scratch lease per file.
+//! Compact, capture-honest spatial results. Literal witnesses and optional bounded
+//! same-scan context survive; there is no rereadable whole-file backing.
 
 use std::{cmp::Ordering, marker::PhantomData};
 use fcb_core::{ByteLength, ByteOffset, ByteRange, FileId, QueryGeneration,
     ResourceAllocationId, ResourceBudget, ResourceLease, SourceRevision};
 use crate::map::{AtlasNodeId, NodeKind};
 use crate::search::{CaptureRequest, DetectedEncoding, ExtentConsistency, FileSearchError,
-    ObservedExtent, StreamReadState, StreamReadStats, StreamingMode};
+    ObservedExtent, StreamContextOptions, StreamReadState, StreamReadStats, StreamingMode};
 use super::{AtlasStreamError, AtlasStreamLimits, AtlasStreamSource, AtlasStreamState, AtlasStreamStop, WorkspaceAtlas};
+use super::context::{AtlasStreamContext, Contexts};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AtlasStreamFileState {
@@ -115,6 +116,7 @@ pub struct AtlasStreamReport<'atlas, 'catalog, A: AtlasStreamSource = WorkspaceA
     pub(super) matched_files: Vec<usize>,
     pub(super) witnesses: Vec<u8>,
     pub(super) matched_text: String,
+    pub(super) contexts: Option<Contexts>,
     /// None preserves the legacy whole-catalog cursor without allocating a
     /// duplicate universe. Some(empty) is an explicit empty query scope.
     pub(super) selected_ordinals: Option<Vec<usize>>,
@@ -163,7 +165,11 @@ impl<'atlas, 'catalog, A: AtlasStreamSource> AtlasStreamReport<'atlas, 'catalog,
     pub fn unexamined_files(&self) -> usize { self.eligible_files() - self.files.len() }
     pub fn retained_witness_bytes(&self) -> usize { self.witnesses.len() }
     pub fn retained_matched_text_bytes(&self) -> usize { self.matched_text.len() }
-    pub fn reserved_bytes(&self) -> u64 { self._lease.info().bytes().get() }
+    pub fn retained_context_bytes(&self) -> usize { self.contexts.as_ref().map_or(0, Contexts::bytes_len) }
+    pub fn context_options(&self) -> Option<StreamContextOptions> { self.contexts.as_ref().map(Contexts::options) }
+    pub fn reserved_bytes(&self) -> u64 {
+        self._lease.info().bytes().get() + self.contexts.as_ref().map_or(0, Contexts::reserved_bytes)
+    }
     pub fn is_complete(&self) -> bool {
         self.state == AtlasStreamState::Finished && self.stop.is_none()
             && self.atlas.discovery_complete() && self.unexamined_files() == 0 && self.stats.incomplete_files == 0
@@ -191,12 +197,13 @@ impl<'atlas, 'catalog, A: AtlasStreamSource> AtlasStreamReport<'atlas, 'catalog,
         let text = if self.case_sensitive { self.literal.as_str() } else {
             self.matched_text.get(hit.text_start..hit.text_start + hit.text_len).ok_or(AtlasStreamError::InvalidHit)?
         };
-        Ok(AtlasStreamSelection { hit, file, original_bytes: bytes, text })
+        let context = self.contexts.as_ref().map(|contexts| contexts.get(position, hit.original_range)).transpose()?;
+        Ok(AtlasStreamSelection { hit, file, original_bytes: bytes, text, context })
     }
     /// Preserve ONLY the selected literal in the existing exact extent reader.
     /// The native consistency remains on this report; extent backing is the
-    /// verified witness. Decoding surrounding context requires a different,
-    /// explicit observation and is not silently performed by this method.
+    /// verified witness. Opted-in same-scan context is available independently
+    /// through `select_hit().context()` and is not widened by this method.
     pub fn retain_hit(&self, position: usize, atlas: &A, generation: QueryGeneration,
         budget: &ResourceBudget, allocation: ResourceAllocationId) -> Result<ObservedExtent, AtlasStreamError> {
         let selection = self.select_hit(position, atlas, generation)?;
@@ -261,12 +268,14 @@ pub struct AtlasStreamSelection<'a> {
     file: &'a AtlasStreamFile,
     original_bytes: &'a [u8],
     text: &'a str,
+    context: Option<AtlasStreamContext<'a>>,
 }
 impl<'a> AtlasStreamSelection<'a> {
     pub fn hit(&self) -> &'a AtlasStreamHit { self.hit }
     pub fn file_report(&self) -> &'a AtlasStreamFile { self.file }
     pub fn original_bytes(&self) -> &'a [u8] { self.original_bytes }
     pub fn matched_text(&self) -> &'a str { self.text }
+    pub const fn context(&self) -> Option<AtlasStreamContext<'a>> { self.context }
 }
 fn subtree_compare(path: &[u8], dir: &[u8]) -> Ordering {
     let common = path.len().min(dir.len());

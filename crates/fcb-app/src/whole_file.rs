@@ -11,13 +11,13 @@ use std::{fs::File, path::Path};
 use fcb::source::path::{NormalizedPath, RawPath};
 use fcb::ByteLength;
 use fcb::search::{CaptureRequest, DetectedEncoding, ExtentConsistency, FileSearch, FileSearchReport,
-    ParsedQuery, ReferenceScanOracle, ResourceBudget, StreamReadOptions, StreamReadState, StreamReadStats, StreamReadStep,
+    ParsedQuery, ReferenceScanOracle, ResourceBudget, StreamContextOptions, StreamReadOptions, StreamReadState, StreamReadStats, StreamReadStep,
     StreamingMode, StreamingNeedle};
 use fcb::search::workspace::WorkspaceCatalog;
 use crate::{AppError, SCHEMA, EXIT_OK, EXIT_NO_MATCH, EXIT_PARTIAL, allocation, owner, generation, revision, file_id};
 use crate::args::{Arguments, Encoding, Needle};
 use crate::output::Output;
-use crate::{input, workspace};
+use crate::{input, stream_context, workspace};
 
 // A second explicit bound even when a user admits a very large source size.
 const MAX_READ_CALLS: u64 = 16 * 1024 * 1024;
@@ -84,7 +84,9 @@ fn scan_with_progress<'needle, C: FnMut() -> bool, E: From<AppError>>(
     mut progress: impl FnMut(StreamReadStats, &mut C) -> Result<(), E>)
     -> Result<FileSearchReport<'needle>, E> {
     let mut scan = FileSearch::new_page(file, request, needle, options, skip_matches,
-        count_all, budget, allocation(41)).map_err(AppError::from)?;
+        count_all, budget, allocation(41)).map_err(AppError::from)?
+        .with_context(StreamContextOptions { before_bytes: stream_context::BEFORE_BYTES,
+            after_bytes: stream_context::AFTER_BYTES }, budget, allocation(43)).map_err(AppError::from)?;
     while scan.state() == StreamReadState::Pending {
         // Read/decoder failures are retained terminal report states. No retry
         // restarts at byte zero and silently double-counts a partial observation.
@@ -121,12 +123,12 @@ pub(crate) fn single(args: &Arguments, out: &mut Output, budget: &ResourceBudget
         if expression(args).is_some() {
             out.literal(",\"scope_files\":\"1\",\"metadata_excluded_files\":\"0\"")?;
         }
-        fields(&report, out, canceled)?;
+        fields(&report, out, budget, canceled)?;
         out.literal("}\n")?;
     } else {
         out.literal("Continuous observed-file search: ")?; out.path(&path)?; out.literal("\n")?;
         expression_human(args, out)?;
-        human(&report, out)?;
+        human(&report, out, budget, canceled)?;
     }
     Ok(exit(&report))
 }
@@ -188,7 +190,7 @@ pub(crate) fn workspace(args: &Arguments, catalog: &WorkspaceCatalog, root: &Pat
         out.literal(",\"metadata_excluded_files\":")?; out.integer(metadata_excluded as u64)?;
         out.literal(",\"files\":[")?;
     } else {
-        out.literal("Streaming workspace search; only literal witnesses are retained\n")?;
+        out.literal("Streaming workspace search; literal witnesses and bounded same-scan context are retained\n")?;
         expression_human(args, out)?;
     }
     for (ordinal, entry) in catalog.entries().iter().enumerate() {
@@ -225,7 +227,7 @@ pub(crate) fn workspace(args: &Arguments, catalog: &WorkspaceCatalog, root: &Pat
                 truncated |= search.hits_truncated();
                 complete &= report.is_complete();
                 if !report.is_complete() { failed += 1; }
-                if args.json { fields(&report, out, canceled)?; } else { human(&report, out)?; }
+                if args.json { fields(&report, out, budget, canceled)?; } else { human(&report, out, budget, canceled)?; }
                 match search.state() {
                     StreamReadState::Truncated => { truncated = true; stopped = Some("match-limit"); }
                     StreamReadState::ByteLimit => stopped = Some("byte-limit"),
@@ -323,7 +325,8 @@ fn window_fields(skip_matches: u64, seen: u64, stored: usize, allow_continuation
     Ok(())
 }
 
-fn fields(report: &FileSearchReport<'_>, out: &mut Output, canceled: &mut impl FnMut() -> bool) -> Result<(), AppError> {
+fn fields(report: &FileSearchReport<'_>, out: &mut Output, budget: &ResourceBudget,
+    canceled: &mut impl FnMut() -> bool) -> Result<(), AppError> {
     let search = report.search();
     out.literal(",\"file_id\":")?; out.integer(search.request().file().get())?;
     out.literal(",\"revision\":")?; out.integer(search.request().revision().get())?;
@@ -355,6 +358,9 @@ fn fields(report: &FileSearchReport<'_>, out: &mut Output, canceled: &mut impl F
     out.literal(",\"stored_hits\":")?; out.integer(search.hits().len() as u64)?;
     window_fields(search.page_start_after(), search.matches_seen(), search.hits().len(), true, out)?;
     out.literal(",\"retained_witness_bytes\":")?; out.integer(search.retained_witness_bytes() as u64)?;
+    out.literal(",\"retained_context_bytes\":")?; out.integer(search.retained_context_bytes() as u64)?;
+    out.literal(",\"context_before_bytes\":")?; out.integer(stream_context::BEFORE_BYTES as u64)?;
+    out.literal(",\"context_after_bytes\":")?; out.integer(stream_context::AFTER_BYTES as u64)?;
     out.literal(",\"unsupported_at\":")?;
     if let Some(offset) = search.unsupported_at() { out.integer(offset.get())?; } else { out.literal("null")?; }
     out.literal(",\"error_code\":")?;
@@ -363,7 +369,7 @@ fn fields(report: &FileSearchReport<'_>, out: &mut Output, canceled: &mut impl F
     out.quoted(match report.consistency() { ExtentConsistency::UnchangedMetadata => "unchanged-metadata-not-atomic",
         ExtentConsistency::ChangedDuringRead => "changed-during-read", ExtentConsistency::ShortRead => "short-read",
         _ => "metadata-unavailable" })?;
-    out.literal(",\"retention\":\"literal-witnesses-only\",\"literal_text\":")?;
+    out.literal(",\"retention\":\"literal-witnesses-with-context\",\"literal_text\":")?;
     if let Some(text) = search.text_literal() { out.quoted(text)?; } else { out.literal("null")?; }
     out.literal(",\"literal_original_hex\":")?;
     if search.hits().is_empty() || search.mode() == StreamingMode::LowercaseText {
@@ -380,12 +386,15 @@ fn fields(report: &FileSearchReport<'_>, out: &mut Output, canceled: &mut impl F
             out.literal(",\"matched_text\":")?; out.quoted(search.matched_text(index)?)?;
             out.literal(",\"original_hex\":")?; out.hex(search.witness_bytes(index)?)?;
         }
+        stream_context::encode(out, retained_context(report, index)?, budget,
+            [allocation(44), allocation(45)], canceled)?;
         out.literal("}")?;
     }
     out.literal("]")?;
     Ok(())
 }
-fn human(report: &FileSearchReport<'_>, out: &mut Output) -> Result<(), AppError> {
+fn human(report: &FileSearchReport<'_>, out: &mut Output, budget: &ResourceBudget,
+    canceled: &mut impl FnMut() -> bool) -> Result<(), AppError> {
     let search = report.search();
     out.literal("  Matching: ")?;
     out.literal(match search.mode() {
@@ -403,9 +412,11 @@ fn human(report: &FileSearchReport<'_>, out: &mut Output) -> Result<(), AppError
             None => "qualification incomplete; candidate matches withheld\n",
         })?;
     }
-    for hit in search.hits() {
+    for (index, hit) in search.hits().iter().enumerate() {
         out.literal("  bytes ")?; out.literal(&hit.original_range().start().get().to_string())?;
         out.literal("..")?; out.literal(&hit.original_range().end().get().to_string())?; out.literal("\n")?;
+        stream_context::human(out, retained_context(report, index)?, budget,
+            [allocation(44), allocation(45)], canceled)?;
     }
     out.literal(if report.is_complete() { "  Complete observed sequence; " } else { "  PARTIAL: " })?;
     out.literal(search.state().code())?;
@@ -416,4 +427,12 @@ fn human(report: &FileSearchReport<'_>, out: &mut Output) -> Result<(), AppError
     if search.hits_truncated() { out.literal(" (additional matches omitted)")?; }
     out.literal("; bytes read ")?; out.literal(&search.stats().bytes_read.to_string())?; out.literal("\n")?;
     Ok(())
+}
+fn retained_context<'a>(report: &'a FileSearchReport<'_>, index: usize) -> Result<stream_context::Context<'a>, AppError> {
+    let search = report.search();
+    let context = search.context(index)?.ok_or(AppError::InvalidRange)?;
+    Ok(stream_context::Context { request: search.request(), generation: search.generation(),
+        observed_length: search.observed_length(), encoding: search.encoding(),
+        requested: context.requested_range(), original: context.original_range(),
+        matched: context.match_range(), bytes: context.bytes() })
 }

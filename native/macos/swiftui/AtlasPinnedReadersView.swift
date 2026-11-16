@@ -80,7 +80,8 @@ import SwiftUI
         .background(.background)
         .sheet(item: $comparison) { pair in
             AtlasReaderComparisonView(beforeLabel: pair.before.label, afterLabel: pair.after.label,
-                before: pair.before.reader, after: pair.after.reader, project: project)
+                before: pair.before.reader, after: pair.after.reader, project: project,
+                canKeep: { _ in canKeep }, keep: keep)
         }
         .onChange(of: readers.entries.map(\.id)) { _, ids in
             if let comparison, !ids.contains(comparison.before.id) || !ids.contains(comparison.after.id) {

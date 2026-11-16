@@ -46,6 +46,97 @@ fn search(service: &mut RetainedAtlasStreamSearch, atlas: &AtlasSession, needle:
 }
 
 #[test]
+fn same_scan_context_preserves_utf8_utf16_boundaries_and_survives_source_replacement() {
+    for encoding in ["utf8", "utf16le", "utf16be"] {
+        let fixture = Fixture::new();
+        let encode = |text: &str| -> Vec<u8> { match encoding {
+            "utf16le" => text.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+            "utf16be" => text.encode_utf16().flat_map(u16::to_be_bytes).collect(),
+            _ => text.as_bytes().to_vec(),
+        } };
+        let needle = "needle😀";
+        let source = format!("\u{feff}{}Ω😀{needle}{} {needle}{}",
+            "a".repeat(16 * 1024 - 5), "α😀".repeat(40), "z".repeat(200));
+        let bytes = encode(&source);
+        fixture.write("context.rs", &bytes);
+        let atlas = fixture.atlas(64);
+        let mut service = RetainedAtlasStreamSearch::new(&atlas).unwrap();
+        let report = json(&service.search_counted(&atlas, needle, opts(), || false).unwrap());
+        assert!(report.get("search_complete").flag());
+        assert_eq!(report.get("capture_kind").text(), "literal-witnesses-with-context");
+        assert_eq!(report.get("limits").get("context_before_bytes").number(), 160);
+        assert_eq!(report.get("limits").get("context_after_bytes").number(), 160);
+        let hits = report.get("hits").array();
+        assert_eq!(hits.len(), 2);
+        let mut retained = 0;
+        for hit in hits {
+            let context = hit.get("context");
+            let (matched_start, matched_end) = bounds(hit.get("original_range"));
+            let requested = (matched_start.saturating_sub(160), (matched_end + 160).min(bytes.len() as u64));
+            assert_eq!(context.get("state").text(), "retained");
+            assert_eq!(bounds(context.get("requested_range")), requested);
+            assert_eq!(bounds(context.get("original_range")), requested);
+            assert_eq!(bounds(context.get("match_range")), (matched_start, matched_end));
+            assert!(context.get("complete").flag());
+            assert_eq!(context.get("original_hex").text(), hex(&bytes[requested.0 as usize..requested.1 as usize]));
+            let (text_start, text_end) = bounds(context.get("text_original_range"));
+            assert!(text_start >= requested.0 && text_end <= requested.1);
+            let original = &bytes[text_start as usize..text_end as usize];
+            let expected = if encoding == "utf8" { std::str::from_utf8(original).unwrap().to_owned() }
+                else {
+                    assert_eq!(original.len() % 2, 0);
+                    let units: Vec<_> = original.chunks_exact(2).map(|pair| if encoding == "utf16le" {
+                        u16::from_le_bytes([pair[0], pair[1]])
+                    } else { u16::from_be_bytes([pair[0], pair[1]]) }).collect();
+                    String::from_utf16(&units).unwrap()
+                };
+            assert_eq!(context.get("text").text(), expected);
+            assert!(!context.get("text_has_replacements").flag());
+            let (start, end) = bounds(context.get("match_decoded_range"));
+            assert_eq!(&context.get("text").text()[start as usize..end as usize], needle);
+            retained += requested.1 - requested.0;
+        }
+        assert_eq!(report.get("retained_context_bytes").number(), retained);
+        assert_eq!(service.retained_context_bytes(), retained as usize);
+        let generation = report.get("query_generation").number();
+        let io = (service.source_bytes_read(), service.read_calls());
+        fixture.write("context.rs", b"a completely different live source");
+        for (position, row) in hits.iter().enumerate() {
+            let replay = json(&service.hit(&atlas, generation, position).unwrap());
+            assert_eq!(replay.get("hit").get("context"), row.get("context"));
+            assert_eq!(replay.get("additional_source_bytes_read").number(), 0);
+        }
+        let page = json(&service.page(&atlas, generation, 0, 2).unwrap());
+        assert_eq!(page.get("hits"), report.get("hits"));
+        assert_eq!(io, (service.source_bytes_read(), service.read_calls()));
+    }
+}
+
+#[test]
+fn a_scan_budget_preserves_partial_context_without_inventing_a_decodable_suffix() {
+    let fixture = Fixture::new();
+    let bytes = b"before needle unread trailing source";
+    fixture.write("partial.rs", bytes);
+    let atlas = fixture.atlas(64);
+    let mut service = RetainedAtlasStreamSearch::new(&atlas).unwrap();
+    let report = json(&service.search(&atlas, "needle",
+        AtlasStreamSearchOptions { max_scan_bytes: 13, ..opts() }, || false).unwrap());
+    assert!(!report.get("search_complete").flag());
+    assert_eq!(report.get("payload_bytes_read").number(), 13);
+    let context = report.get("hits").array()[0].get("context");
+    assert_eq!(bounds(context.get("requested_range")), (0, bytes.len() as u64));
+    assert_eq!(bounds(context.get("original_range")), (0, 13));
+    assert!(!context.get("complete").flag());
+    assert_eq!(context.get("original_hex").text(), hex(&bytes[..13]));
+    assert_eq!(context.get("text"), &Json::Null);
+    assert_eq!(context.get("text_unavailable_reason").text(), "insufficient-scalar-context");
+    fixture.write("partial.rs", b"before needle a newly available suffix");
+    let selected = json(&service.hit(&atlas, report.get("query_generation").number(), 0).unwrap());
+    assert_eq!(selected.get("hit").get("context"), context);
+    assert_eq!(service.source_bytes_read(), 13);
+}
+
+#[test]
 fn whole_identifiers_beyond_capture_limits_keep_original_utf8_and_utf16_witnesses() {
     for encoding in ["utf8", "utf16le", "utf16be"] {
         let fixture = Fixture::new();
@@ -173,7 +264,7 @@ fn file_beyond_both_native_capture_ceilings_is_searchable_with_only_literal_rete
     let report = json(&response);
     assert!(report.get("search_complete").flag());
     assert_eq!(report.get("scope").text(), "catalogued-whole-files");
-    assert_eq!(report.get("capture_kind").text(), "literal-witnesses-only");
+    assert_eq!(report.get("capture_kind").text(), "literal-witnesses-with-context");
     assert_eq!(report.get("payload_bytes_read").number(), length as u64);
     assert_eq!(report.get("scanned_input_bytes").number(), length as u64);
     assert!(report.get("peak_input_buffer_bytes").number() <= 16 * 1024);

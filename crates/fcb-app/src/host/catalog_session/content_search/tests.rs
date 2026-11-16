@@ -66,12 +66,16 @@ fn discovers_a_match_after_twenty_thousand_files_without_retaining_the_visited_c
     assert_eq!(session.hits[1].file.request.file(), late_id);
     assert!(session.catalog.pages.front().unwrap().id > 1, "the early hit's discovery page was evicted");
     assert_eq!(session.witnesses, b"needleneedle");
+    assert_eq!(session.contexts, b"needleneedle");
     let before = session.io;
     fs::write(root.join(early_path), b"replaced early source").unwrap();
     fs::write(root.join(late_path), b"replaced late source").unwrap();
     for position in 0..2 {
         let witness = session.hit(1, session.revision, position, || false).unwrap();
         assert!(witness.as_str().contains("\"original_hex\":\"6e6565646c65\""));
+        assert!(witness.as_str().contains("\"capture_kind\":\"literal-witnesses-with-context\""));
+        assert!(witness.as_str().contains("\"context\":{\"state\":\"retained\""));
+        assert!(witness.as_str().contains("\"text_original_range\":{\"start\":\"0\",\"end\":\"6\"}"));
         assert!(witness.as_str().contains("\"additional_source_bytes_read\":\"0\""));
     }
     assert_eq!(session.io, before);

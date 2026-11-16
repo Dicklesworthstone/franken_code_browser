@@ -111,6 +111,7 @@ impl CatalogContentSearchSession {
         out.literal(",\"original_hex\":")?;
         out.hex(self.witnesses.get(hit.witness_start..hit.witness_start + hit.witness_len)
             .ok_or(CatalogContentSearchError::MissingHit)?)?;
+        self.encode_context(out, hit, &mut || false)?;
         out.literal("}")?;
         Ok(())
     }
@@ -125,6 +126,8 @@ impl CatalogContentSearchSession {
             out.human_text(self.matched_text.get(hit.text_start..hit.text_start + hit.text_len)
                 .ok_or(CatalogContentSearchError::MissingHit)?)?;
             out.literal("\n")?;
+            stream_context::human(out, self.retained_context(hit)?, &self.catalog.budget,
+                self.context_decode_ids, &mut || false)?;
         }
         Ok(())
     }

@@ -66,7 +66,7 @@ fn policy(receipt: &Json, query: &str, primary: &str) {
     assert_eq!(receipt.get("query_syntax").text(), "fcb-bounded-expression/1");
     assert_eq!(receipt.get("predicate_scope").text(), "same-observed-stream");
     assert_eq!(receipt.get("path_filter_domain").text(), "root-relative-utf8-or-escaped-search-key");
-    assert_eq!(receipt.get("capture_kind").text(), "literal-witnesses-only");
+    assert_eq!(receipt.get("capture_kind").text(), "literal-witnesses-with-context");
     assert!(receipt.get("count_all_matches").flag());
     assert_eq!(receipt.get("eligible_files").number(), receipt.get("expression_scope_files").number()
         + receipt.get("expression_excluded_files").number());

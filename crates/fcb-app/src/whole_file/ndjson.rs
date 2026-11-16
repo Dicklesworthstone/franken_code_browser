@@ -405,7 +405,7 @@ fn observe<W: Write, C: FnMut() -> bool>(args: &Arguments, opened: Result<File, 
     };
     sink.emit("file", canceled, |out, canceled| {
         out.literal(",\"file\":{\"path\":")?; out.path(path)?;
-        super::fields(&report, out, canceled)?;
+        super::fields(&report, out, budget, canceled)?;
         out.literal("}")?; Ok(())
     })?;
     summary.delivered_files += 1;
