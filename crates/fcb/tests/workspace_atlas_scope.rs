@@ -111,7 +111,7 @@ fn invalid_extension_sets_are_refused() {
     assert_eq!(AtlasExtensionScope::from_extensions([]), Err(AtlasScopeError::InvalidExtension));
     assert_eq!(AtlasExtensionScope::from_extensions([b"".as_slice()]), Err(AtlasScopeError::InvalidExtension));
     assert_eq!(AtlasExtensionScope::from_extensions([too_long.as_slice()]), Err(AtlasScopeError::InvalidExtension));
-    assert_eq!(AtlasExtensionScope::from_extensions([b"src".as_slice()]), Err(AtlasScopeError::InvalidExtension));
+    assert_eq!(AtlasExtensionScope::from_extensions([b"src/rs".as_slice()]), Err(AtlasScopeError::InvalidExtension));
     assert_eq!(AtlasExtensionScope::from_extensions([b"r.s".as_slice()]), Err(AtlasScopeError::InvalidExtension));
     assert_eq!(AtlasExtensionScope::from_extensions([b"r\x01s".as_slice()]), Err(AtlasScopeError::InvalidExtension));
     let many: Vec<&[u8]> = (0..17).map(|i| match i {
@@ -121,6 +121,47 @@ fn invalid_extension_sets_are_refused() {
         15 => &b"p"[..], _ => &b"q"[..],
     }).collect();
     assert_eq!(AtlasExtensionScope::from_extensions(many), Err(AtlasScopeError::TooManyExtensions));
+}
+
+#[test]
+fn extension_lengths_never_include_inline_storage_padding() {
+    for length in 1..=16 {
+        let token = vec![b'x'; length];
+        let extensions = AtlasExtensionScope::from_extensions([token.as_slice()]).unwrap();
+        assert_eq!(extensions.extensions().collect::<Vec<_>>(), [token.as_slice()]);
+        let scope = AtlasScope::Extensions(extensions);
+        let mut path = b"dir.with.dots/file.".to_vec();
+        path.extend(token.iter().map(u8::to_ascii_uppercase));
+        assert!(scope.matches_path(&path), "length {length}");
+        path.push(b'x');
+        assert!(!scope.matches_path(&path), "longer extension at length {length}");
+        path.pop();
+        path.pop();
+        assert!(!scope.matches_path(&path), "shorter extension at length {length}");
+    }
+
+    // Custom extensions are names, not a language whitelist. A plain "src"
+    // extension is valid; a directory component or a dotfile is not a match.
+    let scope = AtlasScope::Extensions(
+        AtlasExtensionScope::from_extensions([b"src".as_slice()]).unwrap());
+    assert!(scope.matches_path(b"nested/file.SRC"));
+    for path in [b"src".as_slice(), b".src", b"file.src/no-extension", b"file.src/"] {
+        assert!(!scope.matches_path(path));
+    }
+}
+
+#[test]
+fn full_extension_set_accepts_duplicates_without_spending_another_slot() {
+    let tokens: Vec<Vec<u8>> = (b'a'..=b'p').map(|byte| vec![byte]).collect();
+    let canonical = AtlasExtensionScope::from_extensions(tokens.iter().map(Vec::as_slice)).unwrap();
+    let repeated = AtlasExtensionScope::from_extensions(tokens.iter().map(Vec::as_slice)
+        .chain([b"A".as_slice(), b"p", b"A"])).unwrap();
+    assert_eq!(canonical.count(), 16);
+    assert_eq!(canonical, repeated);
+    assert_eq!(AtlasExtensionScope::from_extensions(tokens.iter().map(Vec::as_slice)
+        .chain([b"q".as_slice()])), Err(AtlasScopeError::TooManyExtensions));
+    assert_eq!(AtlasExtensionScope::from_extensions(tokens.iter().map(Vec::as_slice)
+        .chain([b"a/b".as_slice()])), Err(AtlasScopeError::InvalidExtension));
 }
 
 #[test]

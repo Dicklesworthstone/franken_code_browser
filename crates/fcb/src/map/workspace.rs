@@ -114,12 +114,13 @@ impl AtlasExtensionScope {
         let mut scope = Self { count: 0, tokens: [[0; MAX_EXTENSION_BYTES]; MAX_SCOPE_EXTENSIONS],
             lengths: [0; MAX_SCOPE_EXTENSIONS] };
         for token in tokens {
-            if scope.count as usize == MAX_SCOPE_EXTENSIONS { return Err(AtlasScopeError::TooManyExtensions); }
             let folded = fold_extension(token)?;
-            if scope.find(&folded).is_ok() { continue; } // Deduplicate silently.
+            let length = token.len();
+            if scope.find(&folded[..length]).is_ok() { continue; } // Deduplicate silently.
+            if scope.count as usize == MAX_SCOPE_EXTENSIONS { return Err(AtlasScopeError::TooManyExtensions); }
             let slot = scope.count as usize;
-            scope.tokens[slot][..folded.len()].copy_from_slice(&folded);
-            scope.lengths[slot] = folded.len() as u8;
+            scope.tokens[slot] = folded;
+            scope.lengths[slot] = length as u8;
             scope.count += 1;
         }
         if scope.count == 0 { return Err(AtlasScopeError::InvalidExtension); }
@@ -184,7 +185,7 @@ fn fold_extension(token: &[u8]) -> Result<[u8; MAX_EXTENSION_BYTES], AtlasScopeE
         || std::str::from_utf8(token).is_err() {
         return Err(AtlasScopeError::InvalidExtension);
     }
-    fold_into(token, &mut folded).ok_or(AtlasScopeError::InvalidExtension)?;
+    if !fold_into(token, &mut folded) { return Err(AtlasScopeError::InvalidExtension); }
     Ok(folded)
 }
 
