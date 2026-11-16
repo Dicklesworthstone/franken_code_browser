@@ -65,6 +65,7 @@ import Dispatch
         await expressionRecoveryCancellationAndArchiveReplacement()
         await forgedExpressionReceiptsAndLateReadersRetire()
         try structureCoverageAndEvidenceContracts()
+        try await jsxAndTsxSavedDeclarationsKeepRetainedReaderWitnesses()
         try await structuralModesKeepExactReadersAndIndependentState()
         await structureRecoveryCancellationAndArchiveReplacement()
         await forgedStructuralReceiptsAndLateReadersRetire()
@@ -1207,18 +1208,25 @@ import Dispatch
         precondition(occurrences.hits.map(\.hit.start) == [0, 2] && occurrences.hits.map(\.hit.end) == [208, 416])
 
         // Wire admission only; saved-structure CLI tests run the actual extractor.
-        for language in ["java", "csharp", "kotlin"] {
+        // The engine emits distinct JSX/TSX names; request aliases are not wire tags.
+        let supported = ["java", "csharp", "javascript", "typescript", "jsx", "tsx", "cpp"]
+        let unsupported = ["kotlin", "js", "ts", "c", "JSX", "TSX"]
+        for language in supported + unsupported {
             var object = f.structurePage(40, generation: 1)
             var hits = object["hits"] as! [[String: Any]], witness = hits[0]["structure"] as! [String: Any]
             witness["language"] = language; hits[0]["structure"] = witness; object["hits"] = hits
-            if language == "kotlin" {
-                rejected("Unknown saved symbol language accepted") { _ = try decode(object) }
+            if unsupported.contains(language) {
+                rejected("Unknown saved symbol language accepted: \(language)") { _ = try decode(object) }
             } else {
-                let managed = try decode(object)
-                precondition(managed.hits.count == 1 && managed.hits[0].structure.language == language
-                    && managed.hits[0].hit.start == page.hits[0].hit.start
-                    && managed.hits[0].hit.end == page.hits[0].hit.end,
-                    "Java/C# saved declaration admission changed exact selection evidence")
+                let accepted = try decode(object)
+                precondition(accepted.hits.count == 1 && accepted.hits[0].structure.language == language
+                    && accepted.hits[0].hit.matches(page.hits[0].hit)
+                    && accepted.hits[0].structure.name == page.hits[0].structure.name
+                    && accepted.hits[0].structure.evidence == page.hits[0].structure.evidence
+                    && accepted.hits[0].structure.evidenceStart == page.hits[0].structure.evidenceStart
+                    && accepted.hits[0].structure.evidenceEnd == page.hits[0].structure.evidenceEnd
+                    && accepted.complete == page.complete && accepted.unsupported == page.unsupported,
+                    "Supported saved declaration language changed captured evidence or coverage")
             }
         }
 
@@ -1316,6 +1324,70 @@ import Dispatch
         }
         rejected("accepted structural state exceeded its attempted generation") {
             _ = try AtlasSavedInfo.decode(f.encode(f.info(40, structure: 2, structureAttempt: 1)), handle: 40, expectedPath: path)
+        }
+    }
+
+    @MainActor private static func jsxAndTsxSavedDeclarationsKeepRetainedReaderWitnesses() async throws {
+        // Inject only the producer's distinct language tag. The production page,
+        // model, receipt and retained-reader paths still validate every witness.
+        // These transport fixtures do not claim JSX/TSX extraction qualification.
+        for language in ["jsx", "tsx"] {
+            let f = SavedRepositoryFixture(searchVectors: true), base = f.savedTransport
+            let transport = AtlasSavedTransport(create: base.create, run: { owner, request in
+                guard let json = base.run(owner, request) else { return nil }
+                switch request {
+                case .structureSearch, .structureResults, .openStructureHit:
+                    guard var object = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any] else {
+                        return nil
+                    }
+                    if var rows = object["hits"] as? [[String: Any]] {
+                        for index in rows.indices {
+                            guard var witness = rows[index]["structure"] as? [String: Any] else { return nil }
+                            witness["language"] = language; rows[index]["structure"] = witness
+                        }
+                        object["hits"] = rows
+                    }
+                    if var witness = object["structure"] as? [String: Any] {
+                        witness["language"] = language; object["structure"] = witness
+                    }
+                    return f.encode(object)
+                default: return json
+                }
+            }, cancel: base.cancel, close: base.close, retirementFailed: base.retirementFailed,
+                readerDomain: base.readerDomain)
+            let model = AtlasSavedRepositoryModel(transport: transport)
+            model.open(path: "/saved/repository.fcbs", accessLease: nil)
+            await wait("JSX/TSX archive did not open") { !model.busy }
+            model.searchMode = .symbols; model.searchNameMode = .contains
+            model.searchInput = "banana"; model.search()
+            await wait("JSX/TSX declaration search did not finish") { !model.busy }
+            guard let first = model.structurePage else { preconditionFailure("Valid JSX/TSX page was rejected") }
+            precondition(model.structureIsCurrent && first.hits.count == 1
+                && first.hits[0].structure.language == language)
+            model.loadStructureResults(start: 0, from: first)
+            await wait("JSX/TSX metadata page did not finish") { !model.busy }
+            let page = model.structurePage!
+            precondition(page.hits[0].matches(first.hits[0]) && page.generation == first.generation)
+            let reader = try await model.openStructureHit(page.hits[0], from: page, readerTransport: f.readerTransport())
+            precondition(reader.canUseMatch && reader.match?.originalHex == "62616e616e61"
+                && reader.match?.start == 202 && reader.match?.end == 208,
+                "JSX/TSX saved declaration failed to retain its original source bytes")
+
+            for (index, fault) in ["structure-name-mode", "structure-needle", "structure-witness",
+                                   "hit-range", "digest", "live"].enumerated() {
+                f.corruptNext(fault)
+                await refused("JSX/TSX language acceptance relaxed a reader witness: \(fault)") {
+                    _ = try await model.openStructureHit(page.hits[0], from: page, readerTransport: f.readerTransport())
+                }
+                await wait("Rejected JSX/TSX reader did not retire: \(fault)") {
+                    f.calls.contains("reader-close:\(101 + index)")
+                }
+                precondition(model.structureIsCurrent && model.structureGeneration == page.generation)
+            }
+            model.closeArchive()
+            precondition(reader.canUseMatch && !f.calls.contains("LIVE-OPEN"),
+                "Saved JSX/TSX selection depended on a live source or archive lifetime")
+            reader.reader.close(); model.close()
         }
     }
 
