@@ -8,6 +8,122 @@ struct AtlasReaderComparisonTransport: Sendable {
     let compare: @Sendable (UInt64, UInt64, UInt64, UInt64, UInt64) -> String?
 }
 
+/// The full comparison target and its bounded presentation are separate. A
+/// changed range can exceed a page or bisect a scalar; neither case authorizes
+/// widening its copied bytes or claiming the entire range is selected in AppKit.
+struct AtlasReaderComparisonSelection: Sendable {
+    typealias ByteRange = AtlasReaderComparisonReport.Range
+    enum CopyFormat { case shownText, shownHex, location }
+
+    let id = UUID()
+    let identity: AtlasReaderIdentity
+    let range: ByteRange
+    let pageStart, pageEnd: UInt64
+    let shownRange: ByteRange?
+    let nativeRange: NSRange?
+    let shownHex: String?
+    let shownText: String?
+
+    var showsWholeRange: Bool { shownRange == range }
+    var summary: String {
+        let target = range.length == 0 ? "Compared point at byte \(range.start)"
+            : "Compared bytes \(range.start)..<\(range.end) (\(range.length) bytes)"
+        let coverage: String
+        if showsWholeRange { coverage = "" }
+        else if let shownRange { coverage = " · showing \(shownRange.start)..<\(shownRange.end) only" }
+        else { coverage = " · these original bytes are outside the displayed text" }
+        let mapping = nativeRange == nil && shownRange != nil
+            ? " · exact text highlight unavailable at these byte boundaries" : ""
+        return target + coverage + mapping
+    }
+
+    func matches(_ page: AtlasReaderPage) -> Bool {
+        identity.matches(page.identity) && pageStart == page.start && pageEnd == page.end
+    }
+
+    /// Use the admitted page's original bytes. Reverse encoding proves a
+    /// presentation range; it does not decode source or infer text positions in
+    /// malformed input. The shared retained reader remains the decoder owner.
+    static func make(range: ByteRange, identity: AtlasReaderIdentity,
+                     page: AtlasReaderPage) throws -> Self {
+        guard identity.matches(page.identity), range.start <= range.end,
+              range.end <= identity.capturedBytes, page.start <= page.end,
+              page.end <= identity.capturedBytes,
+              page.end - page.start <= AtlasReaderLimits.maximumPageBytes,
+              AtlasReaderWire.validHex(page.originalHex, bytes: page.end - page.start) else {
+            throw AtlasReaderError.invalidResponse
+        }
+        let shown: ByteRange?
+        if range.length == 0 {
+            shown = (page.start...page.end).contains(range.start) ? range : nil
+        } else {
+            let start = max(range.start, page.start), end = min(range.end, page.end)
+            shown = start < end ? .init(start: start, end: end) : nil
+        }
+        let originalHex: String?
+        let native: NSRange?
+        if let shown {
+            let bytes = Array(page.originalHex.utf8)
+            let start = Int(shown.start - page.start) * 2, end = Int(shown.end - page.start) * 2
+            originalHex = String(decoding: bytes[start..<end], as: UTF8.self)
+            native = nativeSelection(shown, in: page)
+        } else { originalHex = nil; native = nil }
+        let text = native.flatMap { Range($0, in: page.text) }.map { String(page.text[$0]) }
+        return Self(identity: identity, range: range, pageStart: page.start, pageEnd: page.end,
+            shownRange: shown, nativeRange: native, shownHex: originalHex, shownText: text)
+    }
+
+    private static func nativeSelection(_ shown: ByteRange, in page: AtlasReaderPage) -> NSRange? {
+        guard !page.hasReplacements else { return nil }
+        let start = shown.start - page.start, end = shown.end - page.start
+        let range: NSRange
+        let utf8Start: UInt64
+        switch page.identity.encoding {
+        case "utf8":
+            guard let first = AtlasReaderPosition.caret(in: page.text, atUTF8: start), first.range != nil,
+                  let last = AtlasReaderPosition.caret(in: page.text, atUTF8: end), last.range != nil else { return nil }
+            range = NSRange(location: first.offset, length: last.offset - first.offset)
+            utf8Start = start
+        case "utf16le", "utf16be":
+            guard start % 2 == 0, end % 2 == 0 else { return nil }
+            let native = page.text as NSString
+            guard end / 2 <= UInt64(native.length) else { return nil }
+            range = NSRange(location: Int(start / 2), length: Int((end - start) / 2))
+            if range.length == 0 {
+                guard range.location == 0 || range.location == native.length
+                    || native.rangeOfComposedCharacterSequence(at: range.location).location == range.location else { return nil }
+            } else {
+                guard native.rangeOfComposedCharacterSequences(for: range) == range,
+                      Range(range, in: page.text) != nil else { return nil }
+            }
+            // The existing verifier uses UTF-16 units for original UTF-16.
+            utf8Start = 0
+        default: return nil
+        }
+        guard (try? AtlasReaderPosition.verifiesSourceOffset(text: page.text,
+            utf8Offset: utf8Start, utf16Offset: range.location, originalHex: page.originalHex,
+            visibleStart: page.start, originalOffset: shown.start,
+            encoding: page.identity.encoding, hasReplacements: false)) == true else { return nil }
+        return range
+    }
+}
+
+/// Both readers reserve a navigation before either page is published. A later
+/// operation, source replacement, or cancellation revokes the reservation.
+struct AtlasReaderComparisonNavigation: Sendable {
+    let operation: UUID
+    let previousNavigation: UUID
+    let identity: AtlasReaderIdentity
+    let range: AtlasReaderComparisonReport.Range
+    let request: AtlasReaderRequest
+}
+
+struct AtlasReaderComparisonPage: Sendable {
+    let navigation: AtlasReaderComparisonNavigation
+    let page: AtlasReaderPage
+    let selection: AtlasReaderComparisonSelection
+}
+
 struct AtlasReaderComparisonLimits: Equatable, Sendable {
     var editDistance: UInt64 = 256
     var work: UInt64 = 8 * 1024 * 1024

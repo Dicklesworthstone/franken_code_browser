@@ -288,8 +288,38 @@ private final class DeskReaderFixture: @unchecked Sendable {
             canceledFixture.calls.contains("reader-close:100") && canceledFixture.calls.contains("desk-close")
         }
         try await nativeSelectionUpdatesExactDeskRange()
+        try await comparedRangeKeepsFullTargetAndPoint()
         try await firstKeepUsesSelectedRangeAndRejectsChangedIntent()
         print("Desk reader transfer, exact native selections, source authority, navigation, stale update and cancellation regressions passed.")
+    }
+
+    @MainActor private static func comparedRangeKeepsFullTargetAndPoint() async throws {
+        let count = AtlasReaderLimits.pageBytes * 2 + 31
+        let fixture = DeskReaderFixture(bytes: Array(repeating: 120, count: Int(count)))
+        let desk = await started(fixture)
+        let capture = try await desk.openReader(pane: 1, transport: fixture.readerTransport())
+        defer { capture.reader.close(); desk.close() }
+        let reader = capture.reader, identity = reader.page!.identity
+        let full = AtlasReaderComparisonReport.Range(start: 17, end: count - 12)
+        precondition(reader.goToComparedRange(full, identity: identity))
+        await wait("compared desk range did not open") { !reader.busy }
+        precondition(reader.currentComparisonSelection?.showsWholeRange == false
+            && reader.rangeForReadingDesk?.start == full.start && reader.rangeForReadingDesk?.end == full.end,
+            "clipped comparison fell back to the current page's range")
+        precondition(capture.keepCurrentPage(in: desk))
+        await wait("full compared range was not kept") { !desk.busy }
+        precondition(desk.state?.active?.location.selection?.start == full.start
+            && desk.state?.active?.location.selection?.end == full.end,
+            "Keep discarded compared bytes beyond the displayed page")
+
+        let point = AtlasReaderComparisonReport.Range(start: count, end: count)
+        precondition(reader.goToComparedRange(point, identity: identity))
+        await wait("compared point did not open") { !reader.busy }
+        precondition(capture.keepCurrentPage(in: desk))
+        await wait("compared point was not kept") { !desk.busy }
+        precondition(desk.state?.active?.location.selection?.start == count
+            && desk.state?.active?.location.selection?.end == count,
+            "Keep widened an insertion/deletion point into a source passage")
     }
 
     @MainActor private static func nativeSelectionUpdatesExactDeskRange() async throws {

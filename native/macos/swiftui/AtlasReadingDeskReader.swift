@@ -128,6 +128,9 @@ extension AtlasPagedReaderModel {
                   selected.pageStart == page.start, selected.pageEnd == page.end else { return nil }
             return (selected.originalStart, selected.originalEnd)
         }
+        if let selected = currentComparisonSelection {
+            return (selected.range.start, selected.range.end)
+        }
         if findIsCurrent, let hit = page.selection, matchHex != nil {
             return (hit.target.start, hit.target.end)
         }

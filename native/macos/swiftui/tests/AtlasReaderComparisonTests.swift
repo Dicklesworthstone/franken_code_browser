@@ -48,6 +48,8 @@ private final class Driver: @unchecked Sendable {
     private var blocked = false
     private var limited = false
     private var corruption: String?
+    private var blockedWindow: UInt64?
+    private var failedWindow: UInt64?
     private let sourceBytes: [UInt8]?
     let domain = UUID()
     let entered = DispatchSemaphore(value: 0)
@@ -58,6 +60,8 @@ private final class Driver: @unchecked Sendable {
     func blockCompare() { lock.lock(); blocked = true; lock.unlock() }
     func limitCompare() { lock.lock(); limited = true; lock.unlock() }
     func corrupt(_ kind: String) { lock.lock(); corruption = kind; lock.unlock() }
+    func blockWindow(_ owner: UInt64) { lock.lock(); blockedWindow = owner; lock.unlock() }
+    func failWindow(_ owner: UInt64) { lock.lock(); failedWindow = owner; lock.unlock() }
 
     private func create() -> UInt64 {
         lock.lock(); defer { lock.unlock() }
@@ -74,9 +78,17 @@ private final class Driver: @unchecked Sendable {
     }
     private func window(_ owner: UInt64, offset: UInt64, bytes: UInt64) -> String? {
         precondition(!Thread.isMainThread)
-        lock.lock(); defer { lock.unlock() }
-        guard let capture = captures[owner], offset <= UInt64(capture.bytes.count) else { return nil }
+        lock.lock()
+        let capture = captures[owner], pause = blockedWindow == owner, fail = failedWindow == owner
+        if pause { blockedWindow = nil }
+        if fail { failedWindow = nil }
         calls.append("window:\(owner):\(offset)")
+        lock.unlock()
+        if pause {
+            entered.signal()
+            precondition(gate.wait(timeout: .now() + .seconds(5)) == .success)
+        }
+        guard !fail, let capture, offset <= UInt64(capture.bytes.count) else { return nil }
         return json(capture.window(owner, offset: offset, limit: bytes))
     }
     private func cancel(_ owner: UInt64) -> Bool {
@@ -250,7 +262,13 @@ private final class Driver: @unchecked Sendable {
             check(before.goToComparedRange(report.spans[2].before, identity: report.before),
                   "accepted before anchor was refused")
             wait("comparison anchor did not navigate") { !before.busy }
-            check(before.page?.start == 4 && before.canGoBack, "comparison navigation lost original byte/history")
+            check(before.currentComparisonSelection?.range == report.spans[2].before
+                && before.nativeSelectionRange == NSRange(location: 4, length: 2),
+                  "comparison navigation lost the range end or exact native selection")
+            let selected = before.currentComparisonSelection!
+            check(before.comparisonCopy(.shownHex, selectionID: selected.id) == hex("be".utf8)
+                && before.comparisonCopy(.shownText, selectionID: selected.id) == "be",
+                  "compared copy included page context or lost captured bytes")
             check(after.navigation == afterNavigation, "before anchor navigated after reader")
             let unchanged = before.navigation
             check(!before.goToComparedRange(report.spans[2].after, identity: report.after),
@@ -362,6 +380,219 @@ private final class Driver: @unchecked Sendable {
                   "comparison model kept a closed-source report")
             model.close(); before.close()
         }
+        testPairedNavigation()
+        testLargeRange()
+        testAtomicNavigation()
+        testRangePresentation()
         print("AtlasReaderComparisonTests: \(checks) assertions passed")
+    }
+
+    private static func readyComparison(_ before: AtlasPagedReaderModel,
+                                        _ after: AtlasPagedReaderModel) -> AtlasReaderComparisonModel {
+        let model = AtlasReaderComparisonModel()
+        model.compare(before: before, after: after)
+        wait("comparison presentation did not finish") { !model.busy }
+        check(model.report != nil, "comparison presentation lost its report")
+        return model
+    }
+
+    private static func testPairedNavigation() {
+        let driver = Driver()
+        let before = opened(driver, path: "before"), after = opened(driver, path: "after")
+        let model = readyComparison(before, after)
+        let opens = driver.log.filter { $0.hasPrefix("open:") }.count
+        model.moveChange(backwards: false, before: before, after: after)
+        wait("first paired change did not open") { !model.busy }
+        check(model.selectedSpanID == 0 && model.changePosition == "Change 1 of 4",
+              "first change lost its accepted ordinal")
+        check(before.nativeSelectionRange == NSRange(location: 0, length: 3)
+            && after.nativeSelectionRange == NSRange(location: 0, length: 3),
+              "paired change did not select both exact ranges")
+        check(!model.canMoveChange(backwards: true) && model.canMoveChange(backwards: false),
+              "changed-range navigation wrapped or skipped its first boundary")
+        let oldSelection = before.currentComparisonSelection!.id
+        model.moveChange(backwards: false, before: before, after: after)
+        wait("next paired change did not open") { !model.busy }
+        check(model.selectedSpanID == 2 && before.nativeSelectionRange == NSRange(location: 4, length: 2)
+            && after.nativeSelectionRange == NSRange(location: 4, length: 1),
+              "Next did not skip equal bytes or preserve different range lengths")
+        check(before.comparisonCopy(.shownHex, selectionID: oldSelection) == nil,
+              "an old compared-range copy action remained authorized")
+        model.open(spanID: 3, before: before, after: after)
+        wait("equal range did not open") { !model.busy }
+        check(model.changePosition == "Equal range selected", "equal range claimed a change ordinal")
+        model.moveChange(backwards: true, before: before, after: after)
+        wait("previous change from equal range did not open") { !model.busy }
+        check(model.selectedSpanID == 2, "Previous from an equal range chose the wrong change")
+        model.open(spanID: 6, before: before, after: after)
+        wait("deletion point did not open") { !model.busy }
+        check(before.currentComparisonSelection?.range == .init(start: 9, end: 10)
+            && after.currentComparisonSelection?.range == .init(start: 9, end: 9)
+            && after.nativeSelectionRange == NSRange(location: 9, length: 0),
+              "deletion point was widened into nonexistent after bytes")
+        check(after.currentComparisonSelection?.shownHex == ""
+            && !model.canMoveChange(backwards: false) && model.changePosition == "Change 4 of 4",
+              "point copy or last change boundary was misrepresented")
+        check(driver.log.filter { $0.hasPrefix("open:") }.count == opens,
+              "changed-range navigation reopened a live source")
+        let navigation = before.navigation
+        check(!before.goToComparedRange(.init(start: 8, end: 7), identity: before.page!.identity)
+            && !before.goToComparedRange(.init(start: 0, end: 11), identity: before.page!.identity)
+            && before.navigation == navigation, "invalid compared bounds changed the reader")
+        let previous = before.currentComparisonSelection!.id
+        before.updateTextSelection(source: before.source!, navigation: before.navigation, range: nil)
+        check(before.currentComparisonSelection == nil
+            && before.comparisonCopy(.location, selectionID: previous) == nil,
+              "a changed native selection kept an older compared-range action")
+        model.close(); before.close(); after.close()
+    }
+
+    private static func testLargeRange() {
+        let count = Int(AtlasReaderLimits.pageBytes * 3 + 37)
+        let driver = Driver(bytes: Array(repeating: 120, count: count))
+        let before = opened(driver, path: "before"), after = opened(driver, path: "after")
+        driver.limitCompare()
+        let model = readyComparison(before, after)
+        model.moveChange(backwards: false, before: before, after: after)
+        wait("large unresolved range did not open") { !model.busy }
+        let selected = before.currentComparisonSelection!
+        check(selected.range == .init(start: 0, end: UInt64(count)) && !selected.showsWholeRange,
+              "large comparison collapsed its full target to the viewport")
+        check(selected.shownRange == .init(start: 0, end: AtlasReaderLimits.pageBytes)
+            && selected.shownHex?.utf8.count == Int(AtlasReaderLimits.pageBytes * 2)
+            && selected.summary.contains("only"),
+              "clipped comparison copied context or claimed complete coverage")
+        check(before.nativeSelectionRange == NSRange(location: 0, length: Int(AtlasReaderLimits.pageBytes)),
+              "large comparison did not select its bounded visible intersection")
+        check(before.comparisonCopy(.location, selectionID: selected.id)?.contains("0..<\(count)") == true,
+              "copied location lost the complete compared range")
+        check(before.goToComparedRange(selected.range, identity: selected.identity, atEnd: true),
+              "large range end was unavailable")
+        wait("large range end did not open") { !before.busy }
+        check(before.currentComparisonSelection?.range == selected.range
+            && before.currentComparisonSelection?.shownRange?.end == UInt64(count)
+            && before.page!.start > 0 && before.canGoBack,
+              "range end navigation truncated its target or lost source history")
+        before.back()
+        wait("Back after range end did not finish") { !before.busy }
+        check(before.page?.start == 0 && before.currentComparisonSelection == nil,
+              "plain source history resurrected a comparison selection")
+        model.close(); before.close(); after.close()
+    }
+
+    private static func testAtomicNavigation() {
+        for action in ["fail-after", "cancel", "navigate-before", "replace-after"] {
+            let driver = Driver()
+            let before = opened(driver, path: "before"), after = opened(driver, path: "after")
+            let model = readyComparison(before, after)
+            model.open(spanID: 0, before: before, after: after)
+            wait("initial paired selection did not open") { !model.busy }
+            let oldBefore = before.navigation, oldAfter = after.navigation
+            let oldSelection = before.currentComparisonSelection!.id
+            if action == "fail-after" { driver.failWindow(after.page!.identity.owner) }
+            else { driver.blockWindow(after.page!.identity.owner) }
+            model.open(spanID: 6, before: before, after: after)
+            if action == "fail-after" {
+                wait("failed paired navigation did not finish") { !model.busy }
+                check(before.navigation == oldBefore && after.navigation == oldAfter
+                    && before.currentComparisonSelection?.id == oldSelection && model.selectedSpanID == 0,
+                      "second-side failure published a partial pair or changed its ordinal")
+            } else {
+                wait("paired navigation did not block on its second side") { driver.entered.wait(timeout: .now()) == .success }
+                check(before.navigation == oldBefore && after.navigation == oldAfter,
+                      "first side published before the second side was ready")
+                switch action {
+                case "cancel":
+                    model.cancel()
+                    check(!before.busy && !after.busy && before.navigation == oldBefore
+                        && after.navigation == oldAfter && model.selectedSpanID == 0,
+                          "canceled pair changed accepted source state")
+                    // A new request queues behind the draining old window.
+                    // Its completion also proves late cancellation cannot
+                    // revoke a newer pair's reservations.
+                    model.moveChange(backwards: false, before: before, after: after)
+                    driver.gate.signal()
+                    wait("pair did not recover after cancellation") { !model.busy }
+                    check(model.selectedSpanID == 2
+                        && before.currentComparisonSelection?.range == .init(start: 4, end: 6),
+                          "late canceled navigation displaced the new change")
+                case "navigate-before":
+                    before.offsetInput = "2"; before.goToByte()
+                    wait("independent navigation did not finish") { !before.busy }
+                    let independent = before.navigation
+                    driver.gate.signal()
+                    wait("obsolete paired navigation did not finish") { !model.busy }
+                    check(before.navigation == independent && before.page?.start == 2
+                        && after.navigation == oldAfter && model.selectedSpanID == 0,
+                          "obsolete pair replaced independent navigation or published its other side")
+                default:
+                    after.open(root: "/project", path: "after", accessLease: nil)
+                    model.validate(before: before.page?.identity, after: after.page?.identity)
+                    driver.gate.signal()
+                    wait("replacement source did not finish") { !after.busy }
+                    check(model.report == nil && before.navigation == oldBefore
+                        && after.currentComparisonSelection == nil,
+                          "old comparison revived a selection after source replacement")
+                }
+            }
+            model.close(); before.close(); after.close()
+        }
+    }
+
+    private static func testRangePresentation() {
+        func selection(_ text: String, bytes: [UInt8], encoding: String = "utf8", start: UInt64 = 0,
+                       target: AtlasReaderComparisonReport.Range, replacements: Bool = false) -> AtlasReaderComparisonSelection {
+            let identity = AtlasReaderIdentity(owner: 1, file: 1, revision: 1,
+                capturedBytes: start + UInt64(bytes.count), pathBytes: Array("/source".utf8),
+                encoding: encoding, displayPath: "/source")
+            let page = AtlasReaderPage(identity: identity, start: start, end: identity.capturedBytes,
+                text: text, originalHex: hex(bytes), firstPhysicalLine: nil, rangeLimited: false,
+                boundariesAdjusted: false, hasReplacements: replacements, highlight: nil,
+                selection: nil, symbolSelection: nil)
+            return try! AtlasReaderComparisonSelection.make(range: target, identity: identity, page: page)
+        }
+        let text = "a😀e\u{301}\r\nz"
+        let bytes = Array(text.utf8)
+        let emoji = selection(text, bytes: bytes, target: .init(start: 1, end: 5))
+        check(emoji.nativeRange == NSRange(location: 1, length: 2)
+            && emoji.shownText == "😀" && emoji.shownHex == hex("😀".utf8),
+              "exact multibyte comparison lost native or original-byte selection")
+        for range in [AtlasReaderComparisonReport.Range(start: 2, end: 4),
+                      .init(start: 5, end: 6), .init(start: 8, end: 9)] {
+            let split = selection(text, bytes: bytes, target: range)
+            check(split.nativeRange == nil && split.shownText == nil
+                && split.shownHex == hex(bytes[Int(range.start)..<Int(range.end)]),
+                  "scalar, composed character or CRLF split rounded a comparison target")
+        }
+        for encoding in ["utf16le", "utf16be"] {
+            let raw = Array(text.data(using: encoding == "utf16le" ? .utf16LittleEndian : .utf16BigEndian)!)
+            let exact = selection(text, bytes: raw, encoding: encoding, target: .init(start: 2, end: 6))
+            check(exact.nativeRange == NSRange(location: 1, length: 2) && exact.shownText == "😀",
+                  "UTF-16 comparison offsets were treated as decoded UTF-8")
+            for range in [AtlasReaderComparisonReport.Range(start: 3, end: 6), .init(start: 2, end: 4)] {
+                let split = selection(text, bytes: raw, encoding: encoding, target: range)
+                check(split.nativeRange == nil && split.shownHex == hex(raw[Int(range.start)..<Int(range.end)]),
+                      "odd UTF-16 byte offset or split surrogate was rounded or lost its original bytes")
+            }
+        }
+        let malformed = selection("a�b", bytes: [97, 255, 98], target: .init(start: 1, end: 2), replacements: true)
+        check(malformed.nativeRange == nil && malformed.shownHex == "ff",
+              "replacement display acquired an unproved exact comparison highlight")
+        let bom = selection("abc", bytes: Array("abc".utf8), start: 3, target: .init(start: 0, end: 3))
+        check(bom.shownRange == nil && bom.shownHex == nil && !bom.showsWholeRange,
+              "undisplayed BOM bytes were substituted with neighboring text")
+        let partialBOM = selection("abc", bytes: Array("abc".utf8), start: 3, target: .init(start: 0, end: 5))
+        check(partialBOM.shownRange == .init(start: 3, end: 5) && partialBOM.shownText == "ab"
+            && partialBOM.shownHex == "6162" && !partialBOM.showsWholeRange,
+              "a partially displayed range concealed its omitted BOM bytes")
+        let mismatched = selection("xxx", bytes: Array("abc".utf8), target: .init(start: 0, end: 2))
+        check(mismatched.nativeRange == nil && mismatched.shownHex == "6162",
+              "unverified decoded text acquired exact original-byte selection authority")
+        let insertion = selection("abc", bytes: Array("abc".utf8), target: .init(start: 0, end: 0))
+        let eof = selection("abc", bytes: Array("abc".utf8), target: .init(start: 3, end: 3))
+        check(insertion.nativeRange == NSRange(location: 0, length: 0)
+            && eof.nativeRange == NSRange(location: 3, length: 0)
+            && insertion.shownHex == "" && eof.showsWholeRange,
+              "insertion/deletion point anchors became nonempty text selections")
     }
 }

@@ -256,6 +256,32 @@ import AppKit
 
     private var sourcePane: some View {
         VStack(spacing: 4) {
+            if let selection = model.currentComparisonSelection {
+                HStack(spacing: 8) {
+                    Text(selection.summary).font(.caption2).foregroundStyle(.secondary)
+                        .lineLimit(3).textSelection(.enabled)
+                    Spacer(minLength: 4)
+                    if !selection.showsWholeRange {
+                        Menu("Range") {
+                            Button("Show range start") {
+                                model.goToComparedRange(selection.range, identity: selection.identity)
+                            }
+                            Button("Show range end") {
+                                model.goToComparedRange(selection.range, identity: selection.identity, atEnd: true)
+                            }
+                        }.disabled(model.busy)
+                    }
+                    Menu("Copy range") {
+                        Button("Copy shown text") { copyComparison(.shownText, selectionID: selection.id) }
+                            .disabled(selection.shownText?.isEmpty != false)
+                        Button("Copy shown original bytes as hex") { copyComparison(.shownHex, selectionID: selection.id) }
+                            .disabled(selection.shownHex?.isEmpty != false)
+                        Button("Copy full range location") { copyComparison(.location, selectionID: selection.id) }
+                    }
+                    .disabled(model.busy)
+                    .help("Text and hex include only the exact compared bytes displayed on this page. The location describes the full compared range, including point anchors.")
+                }.padding(.horizontal, 10).controlSize(.small)
+            }
             if let label = model.referenceSelectionLabel {
                 HStack {
                     Text(label).font(.caption2).foregroundStyle(.secondary)
@@ -408,10 +434,11 @@ import AppKit
                 }
                 if let keep {
                     Button { keep(model) } label: {
-                        Label(model.hasTextSelectionIntent ? "Keep selected text" : "Keep in reading desk", systemImage: "books.vertical")
+                        Label(model.hasTextSelectionIntent ? "Keep selected text"
+                            : (model.currentComparisonSelection != nil ? "Keep compared range" : "Keep in reading desk"), systemImage: "books.vertical")
                     }
                         .disabled(!canKeep || !model.canKeep)
-                        .help("Keep this exact selected range or page, retaining its complete source up to 4 MiB. Add bookmarks or personal notes and save a checkpoint in the Reading Desk.")
+                        .help("Keep this exact selected range or page, retaining its complete source up to 4 MiB. A compared range preserves the full byte target even when only part is displayed. Add bookmarks or personal notes in the Reading Desk.")
                 }
                 Button("Back", action: model.back).disabled(!model.canGoBack)
                     .help("Return to the previous retained byte window")
@@ -568,6 +595,22 @@ import AppKit
         if line != nil { initialLineConsumed?() }
     }
     private enum SelectionCopyFormat { case text, withLocation, originalHex }
+
+    private func copyComparison(_ format: AtlasReaderComparisonSelection.CopyFormat, selectionID: UUID) {
+        guard let value = model.comparisonCopy(format, selectionID: selectionID) else { return }
+        let pasteboard = NSPasteboard.general
+        switch AtlasReaderSelectionClipboard.publish(value, to: pasteboard, expectedChangeCount: pasteboard.changeCount) {
+        case .copied:
+            switch format {
+            case .shownText: copyNotice = "Copied the compared text shown on this page."
+            case .shownHex: copyNotice = "Copied the compared original bytes shown on this page as hex."
+            case .location: copyNotice = "Copied the full compared byte range with its retained capture identity."
+            }
+        case .tooLarge: copyNotice = "This range exceeds the clipboard staging budget; nothing was copied."
+        case .changed: copyNotice = "The clipboard changed before publication. Copy again to replace its newer contents."
+        case .failed: copyNotice = "Clipboard publication failed."
+        }
+    }
 
     private func copySelected(_ format: SelectionCopyFormat) {
         guard !model.busy, !model.resolvingTextSelection,

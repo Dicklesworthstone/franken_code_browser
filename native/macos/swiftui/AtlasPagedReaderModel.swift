@@ -41,6 +41,7 @@ import Observation
     /// A complete count stays valid while paging this same immutable query.
     private var knownFindMatchCount: UInt64?
     private var selectedRange: NSRange?
+    private(set) var comparisonSelection: AtlasReaderComparisonSelection?
     private(set) var textSelection: AtlasReaderTextSelection?
     private(set) var resolvingTextSelection = false
     private(set) var hasTextSelectionIntent = false
@@ -163,6 +164,7 @@ import Observation
         return "Match \(ordinal) of at least \(report.matchesSeen)"
     }
     var nativeSelectionRange: NSRange? {
+        if let selection = currentComparisonSelection { return selection.nativeRange }
         if let position = page?.position { return position.nativeCaretRange }
         if findIsCurrent, page?.selection?.target.generation == findReport?.generation,
            page?.selection != nil { return selectedRange }
@@ -171,6 +173,24 @@ import Observation
         if referencesAreCurrent, let selection = page?.referenceSelection,
            selection.target.pageID == referencePage?.id { return selectedRange }
         return nil
+    }
+    var currentComparisonSelection: AtlasReaderComparisonSelection? {
+        guard let selection = comparisonSelection, let page, selection.matches(page) else { return nil }
+        return selection
+    }
+
+    /// Recheck a retained menu action against the currently displayed range.
+    /// Copying a clipped range is explicitly limited to its shown intersection.
+    func comparisonCopy(_ format: AtlasReaderComparisonSelection.CopyFormat, selectionID: UUID) -> String? {
+        guard !busy, let selection = currentComparisonSelection, selection.id == selectionID else { return nil }
+        switch format {
+        case .shownText: return selection.shownText
+        case .shownHex: return selection.shownHex
+        case .location:
+            let witness = retainedCaptureSHA256.map { "\nCapture SHA-256: \($0)" } ?? ""
+            return "\(selection.identity.displayPath)\nOriginal bytes \(selection.range.start)..<\(selection.range.end)"
+                + witness
+        }
     }
     var matchHex: String? {
         guard findIsCurrent, let selection = page?.selection,
@@ -272,6 +292,7 @@ import Observation
     /// draining task and one newest descriptor bound work during a drag.
     func updateTextSelection(source: AtlasSource, navigation: UUID, range: NSRange?) {
         guard self.source === source, self.navigation == navigation, let page else { return }
+        comparisonSelection = nil
         guard let range, range.length != 0 else {
             clearTextSelection()
             return
@@ -800,14 +821,81 @@ import Observation
         return report
     }
 
-    /// A comparison span is a byte anchor, not a query hit or decoded selection.
-    /// The regular reader may widen its page to complete a scalar/CRLF; its
-    /// existing page/copy UI continues to state those original-byte boundaries.
+    /// Reserve an independently owned reader without publishing a half-opened
+    /// pair. The complete byte target survives a clipped presentation window.
+    func beginComparedRange(_ range: AtlasReaderComparisonReport.Range,
+                           identity: AtlasReaderIdentity, atEnd: Bool = false) throws -> AtlasReaderComparisonNavigation {
+        guard !busy, !pinning, !documentPreview.busy, !resolvingTextSelection,
+              let page, page.identity.matches(identity), range.start <= range.end,
+              range.end <= identity.capturedBytes else { throw AtlasReaderError.invalidInput }
+        let context: UInt64 = 256
+        let offset = atEnd
+            ? range.end - min(range.end, AtlasReaderLimits.pageBytes - context)
+            : range.start - min(range.start, context)
+        let request = AtlasReaderRequest.window(offset: offset, bytes: AtlasReaderLimits.pageBytes)
+        try request.validate(capturedBytes: identity.capturedBytes)
+        let previousNavigation = navigation
+        let ticket = begin()
+        notice = "Opening the compared byte range…"
+        return .init(operation: ticket, previousNavigation: previousNavigation,
+            identity: identity, range: range, request: request)
+    }
+
+    private func acceptsComparedRange(_ target: AtlasReaderComparisonNavigation) -> Bool {
+        busy && operation == target.operation && navigation == target.previousNavigation
+            && page?.identity.matches(target.identity) == true
+    }
+
+    func prepareComparedRange(_ target: AtlasReaderComparisonNavigation) async throws -> AtlasReaderComparisonPage {
+        try Task.checkCancellation()
+        guard acceptsComparedRange(target) else { throw AtlasReaderError.canceled }
+        let next = try await coordinator.read(target.request)
+        try Task.checkCancellation()
+        guard acceptsComparedRange(target), next.identity.matches(target.identity) else { throw AtlasReaderError.canceled }
+        // Only this admitted window is mapped, off the main actor. Canceling
+        // the navigation also revokes a worker that has not started mapping.
+        let mapping = Task.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
+            return try AtlasReaderComparisonSelection.make(range: target.range, identity: target.identity, page: next)
+        }
+        let selection = try await withTaskCancellationHandler(operation: { try await mapping.value },
+            onCancel: { mapping.cancel() })
+        try Task.checkCancellation()
+        guard acceptsComparedRange(target) else { throw AtlasReaderError.canceled }
+        return .init(navigation: target, page: next, selection: selection)
+    }
+
+    func canCommitComparedRange(_ candidate: AtlasReaderComparisonPage) -> Bool {
+        acceptsComparedRange(candidate.navigation) && candidate.selection.matches(candidate.page)
+            && candidate.selection.range == candidate.navigation.range
+            && candidate.page.identity.matches(candidate.navigation.identity)
+    }
+
+    /// The comparison host checks BOTH candidates, then commits both in the
+    /// same MainActor turn, with no suspension between these installations.
+    @discardableResult func commitComparedRange(_ candidate: AtlasReaderComparisonPage) -> Bool {
+        guard canCommitComparedRange(candidate) else { return false }
+        let request = candidate.navigation.request
+        guard install(candidate.page, request: request, moving: history.visit(request)) else { return false }
+        comparisonSelection = candidate.selection
+        finish(candidate.navigation.operation)
+        return true
+    }
+
+    func cancelComparedRange(_ target: AtlasReaderComparisonNavigation) {
+        guard operation == target.operation else { return }
+        cancel()
+    }
+
     @discardableResult func goToComparedRange(_ range: AtlasReaderComparisonReport.Range,
-                                              identity: AtlasReaderIdentity) -> Bool {
-        guard !busy, let page, page.identity.matches(identity), range.start <= range.end,
-              range.end <= identity.capturedBytes else { return false }
-        navigate(.window(offset: range.start, bytes: AtlasReaderLimits.pageBytes))
+                                              identity: AtlasReaderIdentity, atEnd: Bool = false) -> Bool {
+        guard let target = try? beginComparedRange(range, identity: identity, atEnd: atEnd) else { return false }
+        task = Task {
+            do {
+                let candidate = try await prepareComparedRange(target)
+                guard commitComparedRange(candidate) else { throw AtlasReaderError.canceled }
+            } catch { fail(error, ticket: target.operation) }
+        }
         return true
     }
 
@@ -1098,7 +1186,7 @@ import Observation
         refreshInput = nil; refreshImageSource = nil; refreshAccessLease = nil
         isRefreshing = false; refreshedFromDisk = false; forkedCapture = false
         retainedOnly = false
-        page = nil; source = nil; history.reset()
+        page = nil; source = nil; history.reset(); comparisonSelection = nil
         findReport = nil; selectedHitIndex = nil; selectedRange = nil; knownFindMatchCount = nil
         queryWork = false; outlineWork = false; referenceWork = false; positionWork = false
         fileQuery = ""
@@ -1175,6 +1263,7 @@ import Observation
         // revoke it as though the user edited a still-pending location request.
         positionWork = false
         clearTextSelection()
+        comparisonSelection = nil
         self.page = page
         documentPreview.bind(identity: page.identity, sourceOffset: page.start)
         let source = AtlasSource(path: page.identity.displayPath, text: page.text)

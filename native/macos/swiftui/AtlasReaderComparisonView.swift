@@ -1,8 +1,8 @@
 import SwiftUI
 
 /// The user chooses the before/after roles by pin order. Comparison navigates
-/// exact retained byte anchors in the existing readers, so page/search/outline
-/// behavior and original-byte copy continue through the ordinary reader UI.
+/// exact retained ranges in both readers. Full targets remain distinct from
+/// bounded displayed intersections, including insertion/deletion point anchors.
 @MainActor struct AtlasReaderComparisonView: View {
     let beforeLabel: String
     let afterLabel: String
@@ -10,7 +10,7 @@ import SwiftUI
     @Bindable var after: AtlasPagedReaderModel
     var project: AtlasProjectBrowserModel? = nil
     var title = "Compare pinned sources"
-    var roleExplanation = "Before and after are the first and second pins. Ranges use original bytes; opening a range may widen the page to complete text characters."
+    var roleExplanation = "Before and after are the first and second pins. Open a range to select both sides. Byte ranges may split characters; each reader identifies the exact bytes shown."
     var canKeep: ((AtlasPagedReaderModel) -> Bool)? = nil
     var keep: ((AtlasPagedReaderModel) -> Void)? = nil
     @State private var comparison = AtlasReaderComparisonModel()
@@ -44,29 +44,43 @@ import SwiftUI
                 if let report = comparison.report,
                    report.matches(before: before.page?.identity, after: after.page?.identity) {
                     HStack {
-                        Text("\(report.work) / \(report.limits.work) work units").font(.caption2).foregroundStyle(.secondary)
+                        Button { comparison.moveChange(backwards: true, before: before, after: after) } label: {
+                            Label("Previous change", systemImage: "chevron.up")
+                        }
+                        .disabled(!comparison.canMoveChange(backwards: true) || before.busy || after.busy)
+                        Button { comparison.moveChange(backwards: false, before: before, after: after) } label: {
+                            Label("Next change", systemImage: "chevron.down")
+                        }
+                        .disabled(!comparison.canMoveChange(backwards: false) || before.busy || after.busy)
+                        Text(comparison.changePosition).font(.caption)
                         Spacer()
+                        Text("\(report.work) / \(report.limits.work) work units").font(.caption2).foregroundStyle(.secondary)
                         Toggle("Show equal ranges", isOn: $comparison.showsEqual)
                             .toggleStyle(.checkbox).font(.caption)
-                    }
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 6) {
-                            ForEach(comparison.showsEqual ? report.spans : report.changes) { span in
-                                HStack(spacing: 10) {
-                                    Text(span.label).font(.caption.weight(.semibold))
-                                        .frame(width: 130, alignment: .leading)
-                                    Text("\(span.before.start)…\(span.before.end) → \(span.after.start)…\(span.after.end)")
-                                        .font(.system(.caption, design: .monospaced)).lineLimit(1)
-                                    Spacer()
-                                    Button("Before") { before.goToComparedRange(span.before, identity: report.before) }
-                                        .disabled(before.busy || comparison.busy)
-                                        .accessibilityLabel("Open before \(span.label.lowercased()) at byte \(span.before.start)")
-                                    Button("After") { after.goToComparedRange(span.after, identity: report.after) }
-                                        .disabled(after.busy || comparison.busy)
-                                        .accessibilityLabel("Open after \(span.label.lowercased()) at byte \(span.after.start)")
+                    }.controlSize(.small)
+                    ScrollViewReader { scroller in
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 6) {
+                                ForEach(comparison.showsEqual ? report.spans : report.changes) { span in
+                                    HStack(spacing: 10) {
+                                        Image(systemName: comparison.selectedSpanID == span.id ? "arrow.right.circle.fill" : "circle")
+                                            .foregroundStyle(comparison.selectedSpanID == span.id ? Color.accentColor : Color.secondary)
+                                            .accessibilityHidden(true)
+                                        Text(span.label).font(.caption.weight(.semibold))
+                                            .frame(width: 130, alignment: .leading)
+                                        Text("\(span.before.start)..<\(span.before.end) → \(span.after.start)..<\(span.after.end)")
+                                            .font(.system(.caption, design: .monospaced)).lineLimit(1)
+                                        Spacer()
+                                        Button("Open pair") { comparison.open(spanID: span.id, before: before, after: after) }
+                                            .disabled(before.busy || after.busy || comparison.busy)
+                                            .accessibilityLabel("Open both sides of \(span.label.lowercased()), before byte \(span.before.start), after byte \(span.after.start)")
+                                    }.id(span.id)
                                 }
-                            }
-                        }.padding(.vertical, 3)
+                            }.padding(.vertical, 3)
+                        }
+                        .onChange(of: comparison.selectedSpanID) { _, id in
+                            if let id { scroller.scrollTo(id, anchor: .center) }
+                        }
                     }.frame(height: 125)
                 }
             }.padding(.horizontal, 12).padding(.vertical, 8)
