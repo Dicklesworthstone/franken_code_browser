@@ -553,6 +553,32 @@ occurrences, large target ranges, partial coverage, independent generations,
 lost replies, cancellation and stale or forged activation receipts. Executable
 Rust/Swift verification and physical-Mac qualification remain pending.
 
+## Navigating Python declarations
+
+Python **Symbols** search and retained-reader **Outline** recognize `class`,
+`def` and `async def` candidates through the pinned FrankenMarkdown lexer.
+Comments, docstrings, raw/bytes/formatted strings and multiline expression
+contents stay opaque, so declaration-looking text inside them cannot create
+false navigation entries.
+
+The bounded recognizer follows logical statements and indentation iteratively.
+It supports multiline signatures, explicit line continuations, decorators before
+declarations, generic type-parameter headers, nested classes and functions, and
+methods under classes. Names have exact ranges separate from the declaration
+range; copying a declaration includes its recognized indented body. Both UTF-8
+and BOM-marked UTF-16 copies retain the original captured bytes after live files
+change. Live projects, saved repositories and retained readers share the route.
+
+These are **heuristic outline candidates**. Decorators are not resolved,
+assignments and dynamically created definitions are not indexed, and no Python
+code is executed. LF/CRLF input, space/tab indentation, 64 KiB source, 4,096
+physical lines, bounded scopes and bounded output define the supported subset.
+Incomplete strings, mismatched delimiters, unsupported whitespace and incomplete
+declaration headers fail explicitly while the ordinary source reader remains
+available. Unit regressions and a C-ABI retained-reader journey cover opaque
+strings, nested declarations, cancellation and UTF-16 name/body copying;
+executable and physical-Mac qualification remain pending.
+
 ## Navigating Go declarations
 
 **Symbols** search and retained-reader **Outline** now use the shared

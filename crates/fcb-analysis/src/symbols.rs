@@ -9,11 +9,11 @@
 //! original bytes. Markdown stays with its upstream document owner.
 //!
 //! Worker work is bounded by 64 KiB original/decoded source and 4096 lines.
-//! Python also limits indentation to 128 bytes before invoking its recursive
-//! legacy extractor. Rejected files remain available to the ordinary reader.
-//! Rust, JavaScript/JSX, TypeScript/TSX, Go, Swift, Java and C# use pinned upstream
-//! lexers and bounded declaration
-//! recognizers; they do not introduce lexers or compiler-semantic claims.
+//! Rejected files remain available to the ordinary reader. Rust, Python,
+//! JavaScript/JSX, TypeScript/TSX, Go, Swift, Java and C# use pinned upstream
+//! lexers and bounded declaration recognizers; they do not introduce lexers or
+//! compiler-semantic claims. Python bounds declaration scopes and indentation
+//! iteratively without inspecting the contents of opaque multiline strings.
 
 use std::mem::size_of;
 use fcb_core::{ByteLength, ByteRange, DecodedUtf8Offset, DecodedUtf8Range, FileId,
@@ -26,6 +26,7 @@ mod managed;
 mod rust;
 mod javascript;
 mod go;
+mod python;
 
 pub const MAX_SYMBOL_SOURCE_BYTES: usize = 64 * 1024;
 pub const MAX_SYMBOL_ITEMS: usize = 4096;
@@ -161,9 +162,6 @@ impl<'source> CapturedSymbols<'source> {
         if text.len() > MAX_SYMBOL_SOURCE_BYTES { return Err(SymbolError::SourceLimit); }
         let line_count = text.bytes().filter(|&b| b == b'\n').count() + 1;
         if line_count > MAX_LINES { return Err(SymbolError::ComplexityLimit); }
-        if language == SymbolLanguage::Python && text.lines().any(|line| line.len() - line.trim_start().len() > MAX_RECURSIVE_SCOPES) {
-            return Err(SymbolError::ComplexityLimit);
-        }
         let mut line_starts = Vec::new();
         line_starts.try_reserve_exact(line_count).map_err(|_| SymbolError::ResourceDenied)?;
         if line_starts.capacity() > line_count { return Err(SymbolError::ResourceDenied); }
@@ -180,6 +178,8 @@ impl<'source> CapturedSymbols<'source> {
             managed::extract(&map, language, &line_starts, max_items, &mut canceled)?
         } else if language == SymbolLanguage::Go {
             go::extract(&map, &line_starts, max_items, &mut canceled)?
+        } else if language == SymbolLanguage::Python {
+            python::extract(&map, &line_starts, max_items, &mut canceled)?
         } else {
             // Do not pass the caller's display limit into extraction: nested items
             // outside earlier top-level results must not disappear during filtering.
@@ -325,8 +325,7 @@ mod tests {
             let budget = budget(); let outline = build(source, language, 32, &budget);
             let candidate = outline.candidates().iter().find(|candidate| candidate.name() == name).unwrap();
             assert!(outline.source_bytes(candidate.id()).unwrap().windows(name.len()).any(|window| window == name.as_bytes()));
-            if language == SymbolLanguage::Python { assert_eq!(candidate.name_range(), None); }
-            else { assert_eq!(outline.name_bytes(candidate.id()).unwrap().unwrap(), name.as_bytes()); }
+            assert_eq!(outline.name_bytes(candidate.id()).unwrap().unwrap(), name.as_bytes());
         }
     }
     #[test]

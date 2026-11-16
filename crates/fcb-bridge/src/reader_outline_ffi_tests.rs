@@ -107,3 +107,33 @@ fn c_java_and_csharp_outline_aliases_copy_original_utf16_names_after_source_repl
         assert_eq!(fcb_reader_close(r), 1);
     }
 }
+
+#[test]
+fn c_python_outline_ignores_docstrings_and_copies_exact_names_from_retained_source() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    for little in [false, true] {
+        let text = "# 😀\r\nclass Browser:\r\n    '''\r\n    def fake(self): pass\r\n    '''\r\n    async def ouvrir(self):\r\n        return 1\r\n";
+        let encode = |text: &str| text.encode_utf16().flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect::<Vec<_>>();
+        let mut bytes = if little { vec![0xff, 0xfe] } else { vec![0xfe, 0xff] };
+        bytes.extend(encode(text));
+        let (path, reader) = source(&bytes);
+        fs::write(&path, b"class Replacement: pass\n").unwrap();
+        let language = CString::new("python").unwrap();
+        let outline = take(unsafe { fcb_reader_outline(reader, 1, language.as_ptr(), 4096) });
+        assert!(outline.contains("\"retained_symbols\":\"2\""), "{outline}");
+        let name = CString::new("ouvrir").unwrap();
+        let page = take(unsafe { fcb_reader_symbols(reader, 1, name.as_ptr(), 0, 0, 128) });
+        assert!(page.contains("\"symbol_id\":\"2\"") && page.contains("\"name\":\"ouvrir\""), "{page}");
+        let expected = encode("ouvrir").iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let copied = take(fcb_reader_copy_symbol(reader, 1, 2, 0));
+        assert!(copied.contains(&expected), "{copied}");
+        let body = encode("async def ouvrir(self):\r\n        return 1").iter()
+            .map(|byte| format!("{byte:02x}")).collect::<String>();
+        let copied_body = take(fcb_reader_copy_symbol(reader, 1, 2, 1));
+        assert!(copied_body.contains(&body), "{copied_body}");
+        let window = take(fcb_reader_symbol(reader, 1, 2, 128));
+        assert!(window.contains("ouvrir") && !window.contains("Replacement"), "{window}");
+        assert!(window.contains("\"selection_namespace\":\"outline\""));
+        assert_eq!(fcb_reader_close(reader), 1);
+    }
+}
