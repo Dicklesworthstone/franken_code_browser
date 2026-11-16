@@ -6,8 +6,8 @@
 //! Path navigation uses `PathIndex` and `PathSearch` without loading source.
 //! Demand-read `ObservedExtent` values retain only requested source ranges;
 //! `ExtentView` and `ExtentQuery` read/search those bytes without filling holes.
-//! `FileSearch` scans one open file without retaining all its bytes; only exact
-//! literal witnesses can be retained from that observed stream afterward.
+//! `FileSearch` scans one open file without retaining all its bytes. Exact match
+//! witnesses and optional bounded source context remain readable afterward.
 //! All worker operations take explicit bounds; none creates a runtime, window,
 //! filesystem grant, or persistent store.
 //!
@@ -57,7 +57,8 @@ pub mod snapshot_comparison;
 #[cfg(feature = "snapshot")]
 pub mod trail;
 pub use streaming::{ReaderSearch, StreamReadError, StreamReadOptions, StreamReadReport,
-    StreamReadState, StreamReadStats, StreamReadStep, StreamingHit, StreamingMode, StreamingNeedle};
+    StreamReadState, StreamReadStats, StreamReadStep, StreamingHit, StreamingMode, StreamingNeedle,
+    StreamContextOptions, StreamingContext, MAX_STREAM_CONTEXT_SIDE_BYTES, MAX_STREAM_CONTEXT_BYTES};
 pub use file_search::{FileSearch, FileSearchError, FileSearchReport};
 pub use extent_navigation::ExtentActivationError;
 pub use extents::{ExtentConsistency, ExtentError, ExtentReadState, ExtentReadStats,

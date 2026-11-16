@@ -11,7 +11,7 @@ use std::{fs::{File, Metadata}, io::{self, Read}, sync::Arc, time::SystemTime};
 use fcb_core::{ByteLength, QueryGeneration, ResourceAllocationId, ResourceBudget};
 use fcb_source::{CaptureRequest, SourceError};
 use super::{ExtentConsistency, ExtentError, ObservedExtent};
-use super::streaming::{ReaderSearch, StreamReadError, StreamReadOptions, StreamReadReport,
+use super::streaming::{ReaderSearch, StreamContextOptions, StreamReadError, StreamReadOptions, StreamReadReport,
     StreamReadState, StreamReadStats, StreamReadStep, StreamingNeedle};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,6 +103,12 @@ impl<'needle> FileSearch<'needle> {
             options, skip_matches, count_all_matches, budget, allocation)?;
         Ok(FileSearch { search, before })
     }
+    /// Admit bounded source context before the first read, retaining only bytes
+    /// observed by this scan. Context never extends the scan's work budgets.
+    pub fn with_context(self, options: StreamContextOptions, budget: &ResourceBudget,
+        allocation: ResourceAllocationId) -> Result<Self, FileSearchError> {
+        Ok(Self { search: self.search.with_context(options, budget, allocation)?, before: self.before })
+    }
     pub fn state(&self) -> StreamReadState { self.search.state() }
     pub fn stats(&self) -> StreamReadStats { self.search.stats() }
     pub fn generation(&self) -> QueryGeneration { self.search.generation() }
@@ -147,12 +153,25 @@ impl FileSearchReport<'_> {
     /// the bytes; no text outside the hit is synthesized. The returned extent is
     /// host-supplied witness backing, with this report carrying native consistency.
     /// It can be opened through BrowserSession::open_extent after the report/file
-    /// has closed. Surrounding source requires a new explicitly labelled read.
+    /// has closed. `retain_context` can instead use surrounding source admitted
+    /// before this scan; neither method performs another file read.
     pub fn retain_hit(&self, ordinal: usize, budget: &ResourceBudget,
         allocation: ResourceAllocationId) -> Result<ObservedExtent, FileSearchError> {
         let hit = self.report.hits().get(ordinal).ok_or(StreamReadError::InvalidRange)?;
         let request = self.report.request().with_range(hit.original_range())?;
         Ok(ObservedExtent::from_bytes(request, self.report.observed_length(),
             self.report.witness_bytes(ordinal)?, budget, allocation)?)
+    }
+    /// Materialize bounded surrounding original bytes retained by this scan.
+    /// None means context was not requested. Inspect `search().context(ordinal)`
+    /// for requested versus actual range and bounded-context completeness.
+    /// The returned extent carries this observation's identity, even if the live
+    /// file has since changed or disappeared; no native file is reopened.
+    pub fn retain_context(&self, ordinal: usize, budget: &ResourceBudget,
+        allocation: ResourceAllocationId) -> Result<Option<ObservedExtent>, FileSearchError> {
+        let Some(context) = self.report.context(ordinal)? else { return Ok(None); };
+        let request = self.report.request().with_range(context.original_range())?;
+        Ok(Some(ObservedExtent::from_bytes(request, self.report.observed_length(),
+            context.bytes(), budget, allocation)?))
     }
 }

@@ -5,7 +5,7 @@ use std::{fs::{self, File, OpenOptions}, io::{Read, Seek, SeekFrom, Write}, path
     sync::atomic::{AtomicU64, Ordering}};
 use fcb::{ArenaOwnerId, BrowserSession, ByteLength, ByteOffset, ByteRange, FileId, SourceRevision};
 use fcb::search::{CaptureRequest, ExtentConsistency, FileSearch, ResourceAllocationId, ResourceBudget,
-    QueryGeneration, StreamReadOptions, StreamReadState, StreamReadStep, StreamingNeedle};
+    QueryGeneration, StreamContextOptions, StreamReadOptions, StreamReadState, StreamReadStep, StreamingNeedle};
 
 fn owner() -> ArenaOwnerId { ArenaOwnerId::new(1315).unwrap() }
 fn allocation(id: u64) -> ResourceAllocationId { ResourceAllocationId::new(id).unwrap() }
@@ -190,6 +190,36 @@ fn literal_evidence_survives_live_mutation_and_does_not_fabricate_neighboring_by
     let neighbor = ByteRange::new(ByteOffset::new(6), ByteOffset::new(13)).unwrap();
     assert!(view.raw_selection(neighbor).is_err());
     assert_eq!(evidence.request().revision(), request().revision());
+}
+
+#[test]
+fn captured_search_context_remains_readable_after_live_source_changes() {
+    let temp = Temp::new();
+    let original = "before café 😀 needle after";
+    fs::write(temp.file(), original).unwrap();
+    let budget = budget();
+    let (evidence, encoding) = {
+        let pattern = StreamingNeedle::text(owner(), "needle", &budget, allocation(1)).unwrap();
+        let mut query = FileSearch::new(File::open(temp.file()).unwrap(), request(), &pattern,
+            StreamReadOptions::new(generation(1)), &budget, allocation(2)).unwrap()
+            .with_context(StreamContextOptions::default(), &budget, allocation(3)).unwrap();
+        finish(&mut query);
+        let report = query.finish().unwrap();
+        assert!(report.is_complete());
+        assert!(report.search().context(0).unwrap().unwrap().is_complete());
+        // Mutation precedes materialization: a second read would return the
+        // wrong bytes under the original observation identity.
+        fs::write(temp.file(), b"replacement without any searched text").unwrap();
+        (report.retain_context(0, &budget, allocation(4)).unwrap().unwrap(),
+            report.search().encoding().unwrap())
+    };
+    let view = BrowserSession::new(owner()).open_extent(evidence.clone()).unwrap();
+    assert_eq!(evidence.bytes(), original.as_bytes());
+    assert_eq!(evidence.request().revision(), request().revision());
+    let decoded = view.decode(evidence.range(), encoding, generation(1), &budget,
+        allocation(5), || false).unwrap();
+    assert_eq!(decoded.text(), original);
+    assert!(!decoded.has_replacements());
 }
 
 #[test]

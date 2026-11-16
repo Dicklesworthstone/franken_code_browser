@@ -5,8 +5,9 @@
 //! The host explicitly supplies one reader positioned at byte zero and its
 //! observed length. Reads are one continuous observation, not concatenated
 //! independently captured revisions. This does NOT promise an atomic snapshot.
-//! Only successful literal witnesses are retained; every other source byte is
-//! discarded. A report can resolve its hits, never arbitrary old source ranges.
+//! Exact literal witnesses are always retained. Optional bounded context keeps
+//! surrounding original bytes from that SAME observation, without extra reads.
+//! A report can resolve those ranges, never arbitrary old source ranges.
 //!
 //! Matching is the existing overlapping KMP cursor. Text uses the existing
 //! source decoder to validate each complete-scalar window, then searches the
@@ -30,6 +31,9 @@ use fcb_search::normalized::{NormalizedCursor, SourceScalar, Units, matched_text
 
 mod expression;
 use expression::{ExpressionNeedle, ExpressionWork};
+mod context;
+pub use context::{StreamContextOptions, StreamingContext, MAX_STREAM_CONTEXT_SIDE_BYTES, MAX_STREAM_CONTEXT_BYTES};
+use context::{ContextCapture, RetainedContexts};
 
 pub const STREAM_BUFFER_BYTES: usize = 16 * 1024;
 pub const MAX_STREAM_RESULTS: usize = 4096;
@@ -303,6 +307,7 @@ pub struct ReaderSearch<'needle, R: Read> {
     lowercase: Option<LowercaseWork>,
     identifier: Option<IdentifierWork<'needle>>,
     witnesses: Vec<RetainedWitness>,
+    context: Option<ContextCapture>,
     buffer: Vec<u8>,
     base: u64,
     filled: usize,
@@ -414,7 +419,7 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
         let expression_enabled = needle.is_expression();
         let mut search = Self { reader, needle, expression_enabled, request, length, options, count_all_matches, skip_matches, encoding: options.encoding,
             header: 0, initialized: cursor.is_some(), cursor, expression: None, expression_qualified: None,
-            lowercase, identifier, witnesses,
+            lowercase, identifier, witnesses, context: None,
             buffer, base: 0, filled: 0, ready: 0, consumed: 0, eof: false,
             hits: reserve(options.max_matches)?, matches_seen: 0, unsupported_at: None,
             state: StreamReadState::Pending, stats: StreamReadStats::default(), lease };
@@ -453,6 +458,7 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
     fn discard_expression_candidates(&mut self) {
         if self.needle.is_expression() {
             self.hits.clear(); self.witnesses.clear(); self.matches_seen = 0;
+            if let Some(context) = &mut self.context { context.clear(); }
         }
     }
 
@@ -486,9 +492,14 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
                 match self.reader.read(&mut self.buffer[self.filled..self.filled + count]) {
                     Ok(0) => { self.eof = true; break; }
                     Ok(read) if read <= count => {
+                        let start = self.stats.bytes_read;
+                        let local_start = self.filled;
                         self.filled += read; self.stats.bytes_read += read as u64;
                         self.stats.last_step_read = read;
                         self.stats.peak_buffer_bytes = self.stats.peak_buffer_bytes.max(self.filled);
+                        if let Some(context) = &mut self.context {
+                            context.input(start, &self.buffer[local_start..self.filled])?;
+                        }
                         break;
                     }
                     Ok(_) => return Err(StreamReadError::InvalidReadCount),
@@ -521,15 +532,18 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
             for hit in batch.hits {
                 if self.needle.mode == StreamingMode::ExactText && (hit.start < self.header
                     || (self.encoding.is_some_and(|encoding| encoding.is_utf16()) && hit.start % 2 != 0)) { continue; }
-                self.matches_seen += 1;
-                if self.matches_seen <= self.skip_matches { continue; }
+                let occurrence = self.matches_seen.checked_add(1).ok_or(StreamReadError::InvalidLimits)?;
+                if occurrence <= self.skip_matches { self.matches_seen = occurrence; continue; }
                 if self.hits.len() == self.options.max_matches {
+                    self.matches_seen = occurrence;
                     if self.count_all_matches || self.needle.is_expression() { continue; }
                     self.state = StreamReadState::Truncated; break;
                 }
                 let range = ByteRange::new(ByteOffset::new(hit.start), ByteOffset::new(hit.end))
                     .map_err(|_| StreamReadError::InvalidRange)?;
-                self.hits.push(StreamingHit { occurrence: self.matches_seen, range });
+                if let Some(context) = &mut self.context { context.retain(range, self.length)?; }
+                self.hits.push(StreamingHit { occurrence, range });
+                self.matches_seen = occurrence;
             }
         }
         let lower_done = self.lowercase.as_ref().is_none_or(|work| work.pending.is_none()
@@ -617,13 +631,15 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
         if range.len().get() != self.needle.encoded(self.encoding).len() as u64 {
             return Err(StreamReadError::InvalidRange);
         }
-        self.matches_seen = self.matches_seen.checked_add(1).ok_or(StreamReadError::InvalidLimits)?;
-        if self.matches_seen <= self.skip_matches { return Ok(()); }
+        let occurrence = self.matches_seen.checked_add(1).ok_or(StreamReadError::InvalidLimits)?;
+        if occurrence <= self.skip_matches { self.matches_seen = occurrence; return Ok(()); }
         if self.hits.len() < self.options.max_matches {
-            self.hits.push(StreamingHit { occurrence: self.matches_seen, range });
+            if let Some(context) = &mut self.context { context.retain(range, self.length)?; }
+            self.hits.push(StreamingHit { occurrence, range });
         } else if !self.count_all_matches {
             self.state = StreamReadState::Truncated;
         }
+        self.matches_seen = occurrence;
         Ok(())
     }
 
@@ -658,6 +674,7 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
                         let range = ByteRange::new(ByteOffset::new(hit.raw_start), ByteOffset::new(hit.raw_end))
                             .map_err(|_| StreamReadError::InvalidRange)?;
                         if range.len().get() != bytes.len() as u64 { return Err(StreamReadError::InvalidRange); }
+                        if let Some(context) = &mut self.context { context.retain(range, self.length)?; }
                         // Allocation failure must leave a valid retained prefix:
                         // omitted rows below the cap are not cap truncation.
                         self.witnesses.push(RetainedWitness { text, bytes });
@@ -737,6 +754,7 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
             if let Some(bad) = map.spans().iter().find(|span| matches!(span.kind, SpanKind::ReplacementMalformed | SpanKind::EscapedByte)) {
                 self.unsupported_at = Some(ByteOffset::new(bad.raw_start));
                 self.hits.clear(); self.witnesses.clear(); self.matches_seen = 0;
+                if let Some(context) = &mut self.context { context.clear(); }
                 self.state = StreamReadState::UnsupportedText;
             } else if let Some(work) = &mut self.lowercase {
                 work.position = 0;
@@ -777,7 +795,8 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
             generation: self.options.generation, encoding: self.encoding, header: self.header,
             count_all_matches: self.count_all_matches, skip_matches: self.skip_matches,
             expression_qualified: self.expression_qualified, content_predicates_qualified,
-            hits: self.hits, witnesses: self.witnesses, matches_seen: self.matches_seen, unsupported_at: self.unsupported_at,
+            hits: self.hits, witnesses: self.witnesses, context: self.context.map(ContextCapture::finish),
+            matches_seen: self.matches_seen, unsupported_at: self.unsupported_at,
             state: self.state, stats: self.stats, _lease: self.lease };
         Ok((self.reader, report))
     }
@@ -797,6 +816,7 @@ pub struct StreamReadReport<'needle> {
     content_predicates_qualified: Option<bool>,
     hits: Vec<StreamingHit>,
     witnesses: Vec<RetainedWitness>,
+    context: Option<RetainedContexts>,
     matches_seen: u64,
     unsupported_at: Option<ByteOffset>,
     state: StreamReadState,
@@ -847,6 +867,20 @@ impl StreamReadReport<'_> {
     pub fn hits_truncated(&self) -> bool { self.matches_seen > self.hits.len() as u64 }
     pub const fn unsupported_at(&self) -> Option<ByteOffset> { self.unsupported_at }
     pub fn hits(&self) -> &[StreamingHit] { &self.hits }
+    /// Whether bounded surrounding source was admitted before this scan began.
+    pub fn context_options(&self) -> Option<StreamContextOptions> {
+        self.context.as_ref().map(RetainedContexts::options)
+    }
+    /// Surrounding original bytes from the same observation as this stored hit.
+    /// None means context was not requested. An unfinished suffix is explicit
+    /// in its actual/requested ranges; this never rereads or synthesizes source.
+    pub fn context(&self, ordinal: usize) -> Result<Option<StreamingContext<'_>>, StreamReadError> {
+        self.hits.get(ordinal).ok_or(StreamReadError::InvalidRange)?;
+        self.context.as_ref().map(|context| context.get(ordinal)).transpose()
+    }
+    pub fn retained_context_bytes(&self) -> usize {
+        self.context.as_ref().map_or(0, RetainedContexts::bytes)
+    }
     /// Complete over the supplied sequence/length, independent of retained-hit
     /// truncation. This does NOT promise native snapshot stability.
     pub fn input_complete(&self) -> bool { self.state == StreamReadState::Complete }
