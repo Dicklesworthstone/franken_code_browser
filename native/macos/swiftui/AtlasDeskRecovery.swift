@@ -67,7 +67,7 @@ enum AtlasDeskRecoveryError: Error, Equatable, Sendable {
 ///
 /// The core remains the checkpoint serializer and integrity authority. A native
 /// commit record is published only after a successful, decoded core receipt and
-/// matching regular-file length/envelope trailer. Opening a copy still uses the
+/// matching regular-file length and a full receipt-bound checksum. Opening a copy still uses the
 /// core's full checksum and invariant validation. Nothing here reads live sources.
 ///
 /// Store-owned I/O is descriptor-relative and never follows symlinks. The bridge
@@ -75,6 +75,11 @@ enum AtlasDeskRecoveryError: Error, Equatable, Sendable {
 /// directory-identity checks. This private, current-user directory is not a claim
 /// of confinement against a hostile process running as the same user.
 struct AtlasDeskRecoveryStore: Sendable {
+    /// Must validate all bytes through this already-open regular file against
+    /// the core save receipt. Returning normally is the only successful outcome.
+    /// No callback may close the borrowed descriptor or change its cursor.
+    typealias IntegrityVerifier = @Sendable (Int32, UInt64, [UInt8]) throws -> Void
+
     struct Limits: Sendable {
         let maximumSessions: Int
         let maximumBytes: UInt64
@@ -91,21 +96,24 @@ struct AtlasDeskRecoveryStore: Sendable {
 
     let directory: URL
     let limits: Limits
+    private let verifyIntegrity: IntegrityVerifier
     private static let recordLimit = 4096
     private static let markerName = ".fcb-reading-desk-recovery-v1"
     private static let lockName = ".recovery.lock"
     private static let marker = Data("Franken Code Browser reading desk recovery\nversion 1\n".utf8)
 
-    init(directory: URL, limits: Limits = .standard) {
+    init(directory: URL, limits: Limits = .standard,
+        verifyIntegrity: @escaping IntegrityVerifier = { _, _, _ in throw AtlasDeskRecoveryError.unavailable }) {
         self.directory = directory
         self.limits = limits
+        self.verifyIntegrity = verifyIntegrity
     }
 
-    static func applicationSupport() throws -> Self {
+    static func applicationSupport(verifyIntegrity: @escaping IntegrityVerifier) throws -> Self {
         guard let base = FileManager.default.urls(for: .applicationSupportDirectory,
             in: .userDomainMask).first else { throw AtlasDeskRecoveryError.unavailable }
         return Self(directory: base.appendingPathComponent("FrankenCodeBrowser", isDirectory: true)
-            .appendingPathComponent("ReadingDeskRecovery-v1", isDirectory: true))
+            .appendingPathComponent("ReadingDeskRecovery-v1", isDirectory: true), verifyIntegrity: verifyIntegrity)
     }
 
     /// A read never creates storage, prunes copies, or replaces the open desk.
@@ -134,8 +142,10 @@ struct AtlasDeskRecoveryStore: Sendable {
             var inventory = try scan(fd)
             // Finish an interrupted post-commit rotation before allocating any
             // new generation. Only verified older copies of this desk qualify.
-            try retireOlderCopies(session, inventory: inventory, fd: fd)
-            inventory = try scan(fd)
+            if (inventory.records[session]?.count ?? 0) > 2 {
+                try retireOlderCopies(session, inventory: inventory, fd: fd)
+                inventory = try scan(fd)
+            }
             if inventory.generations[session] == nil && inventory.generations.count >= limits.maximumSessions {
                 throw AtlasDeskRecoveryError.sessionLimit
             }
@@ -182,7 +192,11 @@ struct AtlasDeskRecoveryStore: Sendable {
                 }
                 // A cleanup failure cannot turn a confirmed save into a failure.
                 // The next write must finish rotation before allocating again.
-                if let after = try? scan(fd) { try? retireOlderCopies(session, inventory: after, fd: fd) }
+                // Cooperating writers remain excluded by the same lock. Reuse
+                // the fully verified inventory and this just-verified save;
+                // rescanning every payload would repeat the full hash pass.
+                inventory.records[session, default: []].append(stored)
+                try? retireOlderCopies(session, inventory: inventory, fd: fd)
                 return stored.entry
             } catch {
                 if !publicationStarted {
@@ -402,8 +416,20 @@ struct AtlasDeskRecoveryStore: Sendable {
         let trailer = try readRange(file, offset: off_t(bytes - 32), count: 32)
         let hexadecimal = Array("0123456789abcdef".utf8)
         let observed = String(decoding: trailer.flatMap { [hexadecimal[Int($0 >> 4)], hexadecimal[Int($0 & 15)]] }, as: UTF8.self)
+        guard observed == digest, Self.validDigest(digest) else {
+            throw AtlasDeskRecoveryError.invalidCheckpoint
+        }
+        let hexadecimalBytes = Array(digest.utf8)
+        func nibble(_ byte: UInt8) -> UInt8 { byte <= 57 ? byte - 48 : byte - 87 }
+        let expectedDigest = stride(from: 0, to: hexadecimalBytes.count, by: 2).map {
+            nibble(hexadecimalBytes[$0]) << 4 | nibble(hexadecimalBytes[$0 + 1])
+        }
+        // A copied trailer is not evidence that the retained note/source body
+        // still exists intact. Complete verification must precede confirmation,
+        // list selection and any automatic retirement of an earlier good copy.
+        try verifyIntegrity(file, bytes, expectedDigest)
         let after = try fileInfo(file)
-        guard observed == digest, sameFile(before, after), before.st_size == after.st_size else {
+        guard sameFile(before, after), signature(before) == signature(after) else {
             throw AtlasDeskRecoveryError.invalidCheckpoint
         }
     }

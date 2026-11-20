@@ -36,17 +36,6 @@ struct AtlasDeskRecoveryService: Sendable {
     let save: @Sendable (UUID, AtlasDeskState, Writer) throws -> AtlasDeskRecoveryEntry
     let read: @Sendable (AtlasDeskRecoveryEntry, Reader) throws -> String?
     let remove: @Sendable (AtlasDeskRecoveryEntry) throws -> Void
-
-    static let local = Self(list: {
-        try AtlasDeskRecoveryStore.applicationSupport().list()
-    }, save: { session, state, write in
-        try AtlasDeskRecoveryStore.applicationSupport().save(session: session, owner: state.owner,
-            revision: state.revision, sourceBytes: state.retainedBytes, write: write)
-    }, read: { entry, read in
-        try AtlasDeskRecoveryStore.applicationSupport().withCheckpoint(entry, read: read)
-    }, remove: { entry in
-        try AtlasDeskRecoveryStore.applicationSupport().remove(entry)
-    })
 }
 
 /// Holds a native handle until its final worker operation drains. Closing is

@@ -9,6 +9,8 @@
 //! Encoding/decoding are bounded worker operations; the existing envelope's
 //! checksum pass is synchronous, with cancellation checked before and after it.
 
+pub mod integrity;
+
 use super::*;
 use crate::store::envelope::{EnvelopeError, EnvelopeLimits, EnvelopeReader,
     EnvelopeSchema, EnvelopeWriter, Sha256Digest, UnknownPolicy, FRAME_LEN};

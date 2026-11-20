@@ -118,6 +118,17 @@ char *fcb_desk_restore(uint64_t handle, uint64_t expected, uint64_t attempt, con
  * uncertain effect: inspect the destination, never automatically replay. */
 char *fcb_desk_export(uint64_t handle, uint64_t expected, const char *path,
     uint64_t source_bytes, uint64_t output_bytes, uint64_t output_scalars);
+/* Read-only integrity check against a prior successful save receipt. The host
+ * holds a valid readable regular-file descriptor and a 32-byte SHA-256 digest
+ * through return; it must not close/reuse the descriptor concurrently. Streaming
+ * uses <=64 KiB scratch and <=64 MiB input; body, header, trailer and final file
+ * metadata are verified. The shared file cursor and caller's ownership are
+ * unchanged. No source path, desk mutation, restore, or registry slot is used.
+ * Call on a worker. Returns 1 only for full verification, 0 on every failure.
+ * Does not qualify semantic invariants of a new, untrusted checkpoint: use the
+ * normal restore path for that. No deletion may rely on a failed check. */
+uint8_t fcb_desk_checkpoint_verify_fd(int32_t descriptor, uint64_t expected_bytes,
+    const uint8_t *expected_digest);
 uint8_t fcb_desk_cancel(uint64_t handle);
 uint8_t fcb_desk_close(uint64_t handle);
 

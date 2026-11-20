@@ -14,6 +14,27 @@ private let checkpoint = Data(base64Encoded:
 private let digest = "904c942bd40bf93fce3897fcad25a903d193eefbca9fb43475dfe8d65e33cbaf"
 private enum FixtureError: Error { case interrupted }
 
+// Independent oracle for this exact known checkpoint: compare EVERY byte,
+// without relying on the stored trailer or implementing another hash engine.
+// Production supplies the Rust verifier; Rust descriptor/checksum tests exercise
+// that route separately. The storage suite retains its portable injected seam.
+private func verifyFixtureIntegrity(_ descriptor: Int32, _ length: UInt64, _ expected: [UInt8]) throws {
+    guard length == UInt64(checkpoint.count), expected == Array(checkpoint.suffix(32)) else {
+        throw AtlasDeskRecoveryError.invalidCheckpoint
+    }
+    var bytes = [UInt8](repeating: 0, count: checkpoint.count)
+    var offset = 0
+    while offset < bytes.count {
+        let count = bytes.withUnsafeMutableBufferPointer {
+            pread(descriptor, $0.baseAddress!.advanced(by: offset), $0.count - offset, off_t(offset))
+        }
+        if count < 0 && errno == EINTR { continue }
+        guard count > 0 else { throw AtlasDeskRecoveryError.invalidCheckpoint }
+        offset += count
+    }
+    guard Data(bytes) == checkpoint else { throw AtlasDeskRecoveryError.invalidCheckpoint }
+}
+
 private func check(_ condition: Bool, _ message: String = "fixture assertion failed") {
     precondition(condition, message)
 }
@@ -79,6 +100,7 @@ private func fileNames(_ directory: URL) throws -> Set<String> {
             attributes: [.posixPermissions: 0o700])
         try lifecycle(root)
         try failedWrites(root)
+        try bodyCorruptionAndUnavailableVerification(root)
         try quotaAndSessionBound(root)
         try orphanRecovery(root)
         try confinement(root)
@@ -87,7 +109,8 @@ private func fileNames(_ directory: URL) throws -> Set<String> {
 
     private static func store(_ root: URL, _ name: String, sessions: Int = 8) -> AtlasDeskRecoveryStore {
         AtlasDeskRecoveryStore(directory: root.appendingPathComponent(name, isDirectory: true),
-            limits: .init(maximumSessions: sessions, maximumCheckpointBytes: UInt64(checkpoint.count)))
+            limits: .init(maximumSessions: sessions, maximumCheckpointBytes: UInt64(checkpoint.count)),
+            verifyIntegrity: verifyFixtureIntegrity)
     }
 
     private static func lifecycle(_ root: URL) throws {
@@ -109,7 +132,7 @@ private func fileNames(_ directory: URL) throws -> Set<String> {
         check(Set(try store.list().map(\.id)) == Set([second.id, third.id]), "keep latest and previous only")
         check(try Data(contentsOf: unknown) == Data("preserve this unrelated file".utf8))
 
-        let anotherWindow = AtlasDeskRecoveryStore(directory: store.directory, limits: store.limits)
+        let anotherWindow = AtlasDeskRecoveryStore(directory: store.directory, limits: store.limits, verifyIntegrity: verifyFixtureIntegrity)
         let other = try save(anotherWindow, session: UUID(), revision: 1)
         check(try store.list().count == 3, "windows must have separate generation namespaces")
         let restored = try store.withCheckpoint(third) { url in try Data(contentsOf: url) }
@@ -165,6 +188,55 @@ private func fileNames(_ directory: URL) throws -> Set<String> {
         check(try Data(contentsOf: previous.url) == checkpoint)
     }
 
+    private static func bodyCorruptionAndUnavailableVerification(_ root: URL) throws {
+        let store = Self.store(root, "body-corruption"), session = UUID()
+        let previous = try save(store, session: session, revision: 1)
+        let newest = try save(store, session: session, revision: 2)
+        var damaged = checkpoint
+        damaged[32] ^= 1
+        check(damaged.prefix(24) == checkpoint.prefix(24))
+        check(damaged.suffix(32) == checkpoint.suffix(32), "the copied trailer must stay unchanged")
+        writeFixture(damaged, to: newest.url, createOnly: false)
+
+        let listed = try store.list()
+        check(listed.contains(previous))
+        check(listed.contains(where: { $0.id == newest.id && !$0.confirmed }),
+            "a corrupted body cannot retain confirmed status by preserving its checksum trailer")
+        expectError(.invalidCheckpoint) {
+            _ = try store.withCheckpoint(newest) { _ -> Void in preconditionFailure("corrupt confirmed copy entered restore") }
+        }
+        let replacement = try save(store, session: session, revision: 3)
+        check(try Data(contentsOf: previous.url) == checkpoint,
+            "saving after body corruption must preserve the earlier intact recovery copy")
+        check(Set(try store.list().filter(\.confirmed).map(\.id)) == Set([previous.id, replacement.id]))
+        expectError(.generationLimit) { _ = try save(store, session: session, revision: 4) }
+        check(FileManager.default.fileExists(atPath: previous.url.path))
+
+        // Missing or interrupted verification cannot authorize automatic
+        // retirement or a new write, even when header/trailer checks succeeded.
+        let unavailable = AtlasDeskRecoveryStore(directory: store.directory, limits: store.limits)
+        expectError(.unavailable) { _ = try unavailable.list() }
+        expectError(.unavailable) {
+            _ = try unavailable.save(session: session, owner: 4, revision: 4, sourceBytes: 0) { _ in
+                preconditionFailure("unverified existing copies authorized a new write")
+            }
+        }
+        check(try Data(contentsOf: previous.url) == checkpoint)
+
+        let unconfirmed = try store.list().first { $0.id == newest.id }!
+        try store.remove(unconfirmed)
+        let before = try fileNames(store.directory)
+        expectError(.invalidCheckpoint) {
+            _ = try store.save(session: session, owner: 4, revision: 4, sourceBytes: 0) { url in
+                writeFixture(damaged, to: url)
+                return receipt()
+            }
+        }
+        check(try fileNames(store.directory) == before,
+            "a damaged newly written body cannot publish a recovery record or retire a good backup")
+        check(Set(try store.list().map(\.id)) == Set([previous.id, replacement.id]))
+    }
+
     private static func quotaAndSessionBound(_ root: URL) throws {
         let store = Self.store(root, "quota", sessions: 1), firstSession = UUID()
         let entry = try save(store, session: firstSession, revision: 1)
@@ -175,7 +247,7 @@ private func fileNames(_ directory: URL) throws -> Set<String> {
         }
         let bounded = AtlasDeskRecoveryStore(directory: store.directory, limits: .init(maximumSessions: 1,
             maximumBytes: total + 4096 + UInt64(checkpoint.count) - 1,
-            maximumCheckpointBytes: UInt64(checkpoint.count)))
+            maximumCheckpointBytes: UInt64(checkpoint.count)), verifyIntegrity: verifyFixtureIntegrity)
         expectError(.quota) {
             _ = try bounded.save(session: firstSession, owner: 4, revision: 2, sourceBytes: 0) { _ in
                 preconditionFailure("a denied reservation entered the writer")

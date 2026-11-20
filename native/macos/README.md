@@ -580,6 +580,13 @@ evicts another desk's notes to make space. Interrupted or unconfirmed generation
 remain visible for inspection and explicit deletion instead of silently consuming
 all available capacity. Their source-byte count is unknown until core validation.
 
+A confirmed copy must pass a full checksum check against its original save
+receipt, including every captured source and note byte. The core streams this
+check through the already-open file descriptor with at most 64 KiB of scratch
+space. A damaged body with an intact checksum trailer becomes unconfirmed;
+it cannot displace an earlier intact backup during rotation. If verification
+is unavailable, the store cannot confirm or automatically retire those copies.
+
 Use **Refresh copies**, select a copy and choose **Open copy…** to restore. A
 populated desk requires review before replacement, and an open note editor must
 be finished or dismissed first. The core validates saved bytes before adoption;
@@ -590,11 +597,13 @@ the current persistence copy, or an uncertain deletion outcome, restores the
 desk's unsaved-work protection when no other confirmed checkpoint covers it.
 
 Private file permissions, descriptor-relative no-follow operations and a
-cross-process lock protect store-owned I/O. The existing native bridge accepts
-paths and is bracketed by directory identity checks; this is not a confinement
-claim against a hostile process running as the same user. Filesystem and injected
-model regressions cover rotation, quotas, interrupted copies, accepted revisions,
-cancellation, lost replies and close protection. Their execution through the
+cross-process lock protect store-owned I/O. Checksum verification uses the pinned
+file descriptor without changing its cursor. Save and restore still pass paths
+to the native bridge, bracketed by directory identity checks; this is not a
+confinement claim against a hostile process running as the same user. Filesystem
+and injected model regressions cover body corruption, rotation, quotas,
+interrupted copies, accepted revisions, cancellation, lost replies and close
+protection. Their execution through the
 required verifier, app-bundle compilation and physical-Mac qualification remain
 pending. The focused fixtures are in `swiftui/tests/test-desk-recovery-store.sh`
 and `swiftui/tests/test-reading-desk.sh`; the existing desk close, note and reader

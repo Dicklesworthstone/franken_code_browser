@@ -1,5 +1,29 @@
 import Foundation
 
+@_silgen_name("fcb_desk_checkpoint_verify_fd") private func fcb_desk_checkpoint_verify_fd(
+    _ descriptor: Int32, _ bytes: UInt64, _ digest: UnsafePointer<UInt8>?) -> UInt8
+
+private func verifyDeskRecoveryIntegrity(_ descriptor: Int32, _ bytes: UInt64, _ digest: [UInt8]) throws {
+    guard digest.count == 32, digest.withUnsafeBufferPointer({
+        fcb_desk_checkpoint_verify_fd(descriptor, bytes, $0.baseAddress)
+    }) == 1 else { throw AtlasDeskRecoveryError.invalidCheckpoint }
+}
+
+// Native I/O wiring stays beside the other bridge bindings. The model/storage
+// suites supply their own explicit verifier and do not silently accept trailers.
+extension AtlasDeskRecoveryService {
+    static let local = Self(list: {
+        try AtlasDeskRecoveryStore.applicationSupport(verifyIntegrity: verifyDeskRecoveryIntegrity).list()
+    }, save: { session, state, write in
+        try AtlasDeskRecoveryStore.applicationSupport(verifyIntegrity: verifyDeskRecoveryIntegrity).save(session: session, owner: state.owner,
+            revision: state.revision, sourceBytes: state.retainedBytes, write: write)
+    }, read: { entry, read in
+        try AtlasDeskRecoveryStore.applicationSupport(verifyIntegrity: verifyDeskRecoveryIntegrity).withCheckpoint(entry, read: read)
+    }, remove: { entry in
+        try AtlasDeskRecoveryStore.applicationSupport(verifyIntegrity: verifyDeskRecoveryIntegrity).remove(entry)
+    })
+}
+
 @_silgen_name("fcb_desk_create") private func fcb_desk_create() -> UInt64
 @_silgen_name("fcb_desk_start") private func fcb_desk_start(_ h: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_desk_state") private func fcb_desk_state(_ h: UInt64) -> UnsafeMutablePointer<CChar>?
