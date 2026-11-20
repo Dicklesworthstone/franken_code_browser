@@ -165,8 +165,8 @@ pub extern "C" fn fcb_observed_reader_resolve_selection(handle: u64, observation
         Command::ResolveSelection { observation, utf8_start, utf8_end }, || false)))
 }
 
-/// Search one continuous observation of the already opened file. Only exact
-/// literal witnesses are retained, not surrounding source or a whole capture.
+/// Search one continuous observation of the already opened file. Exact matched
+/// bytes and bounded same-scan context are retained, without a whole capture.
 /// # Safety
 /// needle is null or readable NUL-terminated UTF-8 through return. The bounded
 /// input is borrowed only for this call. If supplied, poll/context obey the
@@ -276,13 +276,26 @@ pub unsafe extern "C" fn fcb_observed_reader_find_page(handle: u64, generation: 
     }))
 }
 
-/// Return only the accepted query's retained matched bytes. No source I/O and
+/// Return the accepted query's retained match and bounded context. No source I/O and
 /// no silent substitution from current file contents or another query.
 #[unsafe(no_mangle)]
 pub extern "C" fn fcb_observed_reader_search_hit(handle: u64, generation: u64, position: u64) -> *mut c_char {
     reply(|| answer(handle, |readers| {
         let position = usize::try_from(position).map_err(|_| AccessError::InvalidArgument)?;
         readers.execute(handle, Command::SearchHit { generation, position }, || false)
+    }))
+}
+
+/// Open captured search context as a retained reader page without source I/O.
+/// # Safety
+/// poll/context obey the worker lifetime and non-reentrancy contract of open.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_observed_reader_search_excerpt(handle: u64, generation: u64,
+    hit_index: u64, poll: Option<SearchCancellationCallback>, context: *mut c_void) -> *mut c_char {
+    reply(|| answer(handle, |readers| {
+        let hit_index = usize::try_from(hit_index).map_err(|_| AccessError::InvalidArgument)?;
+        readers.execute(handle, Command::SearchExcerpt { generation, hit_index },
+            || poll.is_some_and(|poll| unsafe { poll(context) != 0 }))
     }))
 }
 

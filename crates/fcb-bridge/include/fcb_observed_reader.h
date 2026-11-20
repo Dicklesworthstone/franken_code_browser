@@ -247,6 +247,21 @@ char *fcb_observed_reader_find_page(uint64_t handle, uint64_t generation,
 char *fcb_observed_reader_search_hit(uint64_t handle, uint64_t generation,
     uint64_t hit_index);
 
+/* Open the accepted hit's captured excerpt in the eight-page reader history.
+ * This performs no stat or source I/O. The returned search-excerpt page has a
+ * fresh page identity, host-supplied-sequence consistency, zero observation and
+ * additional I/O counters, and retained_search_context provenance naming the
+ * original query/observation/occurrence plus requested/actual excerpt ranges.
+ * find_hit.verification is retained-original-search-bytes; this does not verify
+ * the current file. Selection/copy and retained-window replay work after query
+ * replacement until the page is evicted. Incomplete scalar context is refused
+ * without reading missing bytes or changing retained history. Info reports
+ * retained_copied_bytes separately because page copies can exceed source I/O.
+ * poll/context follow the same worker lifetime contract as observe_hit.
+ */
+char *fcb_observed_reader_search_excerpt(uint64_t handle, uint64_t generation,
+    uint64_t hit_index, fcb_observed_reader_poll poll, void *context);
+
 /* Activate an accepted search hit by zero-based index. Context is freshly read
  * from the opened descriptor and its original hit bytes must equal the retained
  * literal witness. Changed/unavailable bytes return an error; old observations

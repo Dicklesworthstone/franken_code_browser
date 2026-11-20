@@ -54,6 +54,93 @@ fn assert_hit(value: &Json, index: usize, start: u64, end: u64) {
 }
 
 #[test]
+fn captured_search_pages_survive_source_and_query_changes_with_exact_selection_and_no_io() {
+    for encoding in [ObservedReaderEncoding::Utf8, ObservedReaderEncoding::Utf16Le, ObservedReaderEncoding::Utf16Be] {
+        for (kind, needle, sensitive) in [
+            (ObservedReaderSearchKind::Text, "é🦀", true),
+            (ObservedReaderSearchKind::Text, "σ", false),
+            (ObservedReaderSearchKind::Occurrences, "NEEDLE", true),
+            (ObservedReaderSearchKind::Expression, "NEEDLE required -absent", true),
+        ] {
+            let source = encoded("\u{feff}before é🦀 Σ NEEDLE required after\r\n", encoding);
+            let fixture = Fixture::new(); fixture.write(&source);
+            let mut reader = fixture.reader();
+            let found = json(&reader.find_with_kind(1, needle, encoding, kind, sensitive, true, 8, 4096, || false).unwrap());
+            let witness = json(&reader.search_hit(1, 0, || false).unwrap());
+            let (start, end) = bounds(witness.get("original_range"));
+            let before = json(&reader.info(|| false).unwrap());
+            fixture.write(b"replacement");
+            let page = json(&reader.open_search_excerpt(1, 0, || false).unwrap());
+            let id = page.get("observation").number();
+            assert!(id > found.get("search_observation").number());
+            assert_eq!(page.get("command").text(), "search-excerpt");
+            assert_eq!(page.get("consistency").text(), "host-supplied-sequence");
+            assert!(!page.get("whole_file_observed").flag());
+            for field in ["observation_source_bytes_read", "observation_read_calls", "additional_source_bytes_read", "additional_read_calls"] {
+                assert_eq!(page.get(field).number(), 0);
+            }
+            assert_eq!(page.get("retained_search_context").get("search_observation"), found.get("search_observation"));
+            assert_eq!(page.get("retained_search_context").get("original_range"), witness.get("context").get("original_range"));
+            assert_eq!(page.get("find_hit").get("verification").text(), "retained-original-search-bytes");
+            assert_eq!(page.get("find_hit").get("original_range"), witness.get("original_range"));
+            let (decoded_start, decoded_end) = bounds(page.get("find_hit").get("decoded_utf8_range"));
+            assert_eq!(&page.get("text").text()[decoded_start as usize..decoded_end as usize], witness.get("text").text());
+            let selected = json(&reader.resolve_selection(id, decoded_start, decoded_end, || false).unwrap());
+            assert_eq!(bounds(selected.get("original_range")), (start, end));
+            assert_eq!(selected.get("original_hex").text(), hex(&source[start as usize..end as usize]));
+            let after = json(&reader.info(|| false).unwrap());
+            assert_eq!(after.get("payload_bytes_read"), before.get("payload_bytes_read"));
+            assert_eq!(after.get("read_calls"), before.get("read_calls"));
+            assert_eq!(after.get("retained_copied_bytes").number(), source.len() as u64);
+            find(&mut reader, 2, "replacement");
+            assert_eq!(reader.open_search_excerpt(1, 0, || false).err(), Some(ObservedReaderError::StaleQuery));
+            let replay = json(&reader.retained_window(id, || false).unwrap());
+            assert_eq!(replay.get("text"), page.get("text"));
+            assert_eq!(replay.get("find_hit"), page.get("find_hit"));
+            assert_eq!(replay.get("retained_search_context"), page.get("retained_search_context"));
+            let copied = json(&reader.copy_range(id, start, end, || false).unwrap());
+            assert_eq!(copied.get("original_hex").text(), hex(&source[start as usize..end as usize]));
+        }
+    }
+}
+
+#[test]
+fn captured_search_page_cancellation_and_missing_scalar_context_preserve_history() {
+    let fixture = Fixture::new(); fixture.write(b"before needle after");
+    let seed = || {
+        let mut reader = fixture.reader();
+        find(&mut reader, 1, "needle");
+        reader.read_window(0, 4, ObservedReaderEncoding::Utf8, || false).unwrap();
+        reader
+    };
+    let mut baseline = seed();
+    let mut gates = 0;
+    baseline.open_search_excerpt(1, 0, || { gates += 1; false }).unwrap();
+    for stop in [1, gates / 2, gates] {
+        let mut reader = seed();
+        let before = json(&reader.info(|| false).unwrap());
+        let mut polls = 0;
+        let error = reader.open_search_excerpt(1, 0, || { polls += 1; polls == stop }).err().unwrap();
+        assert!(error.is_canceled());
+        assert_eq!(json(&reader.info(|| false).unwrap()), before);
+    }
+    let mut reader = seed();
+    reader.search(2, "needle", ObservedReaderEncoding::Utf8, 8, 13, || false).unwrap();
+    let before = json(&reader.info(|| false).unwrap());
+    assert_eq!(reader.open_search_excerpt(2, 0, || false).err(), Some(ObservedReaderError::SearchContextUnavailable));
+    assert_eq!(json(&reader.info(|| false).unwrap()), before);
+    assert_eq!(json(&reader.search_hit(2, 0, || false).unwrap()).get("text").text(), "needle");
+    find(&mut reader, 3, "needle");
+    let first = json(&reader.open_search_excerpt(3, 0, || false).unwrap()).get("observation").number();
+    for _ in 0..8 { reader.open_search_excerpt(3, 0, || false).unwrap(); }
+    let info = json(&reader.info(|| false).unwrap());
+    assert_eq!(info.get("retained_observations").array().len(), 8);
+    assert_eq!(info.get("retained_copied_bytes").number(), 8 * 19);
+    assert_eq!(info.get("retained_payload_bytes"), info.get("retained_copied_bytes"));
+    assert_eq!(reader.retained_window(first, || false).err(), Some(ObservedReaderError::MissingObservation));
+}
+
+#[test]
 fn sparse_source_above_the_complete_capture_limit_has_bounded_search_and_exact_activation() {
     let fixture = Fixture::new();
     let file = OpenOptions::new().read(true).write(true).create_new(true).open(fixture.0.join("source")).unwrap();

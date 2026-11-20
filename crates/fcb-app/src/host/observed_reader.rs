@@ -70,7 +70,7 @@ impl ObservedReaderEncoding {
 pub enum ObservedReaderError {
     App(AppError), Source(SourceError), Extent(ExtentError), View(ExtentViewError),
     InvalidPath, InvalidLimits, InvalidRange, MissingObservation, ObservationChanged,
-    StaleQuery, MissingHit, SearchHitChanged, ExpressionScopeUnsupported, LineMissing, LineScanByteLimit,
+    StaleQuery, MissingHit, SearchHitChanged, SearchContextUnavailable, ExpressionScopeUnsupported, LineMissing, LineScanByteLimit,
     LineOutputByteLimit, LineReadCallLimit, Canceled, IdentityExhausted,
 }
 impl ObservedReaderError {
@@ -97,6 +97,7 @@ impl std::fmt::Display for ObservedReaderError {
             Self::StaleQuery => f.write_str("OBSERVED_READER_STALE_QUERY"),
             Self::MissingHit => f.write_str("OBSERVED_READER_MISSING_HIT"),
             Self::SearchHitChanged => f.write_str("OBSERVED_READER_SEARCH_HIT_CHANGED"),
+            Self::SearchContextUnavailable => f.write_str("OBSERVED_READER_SEARCH_CONTEXT_UNAVAILABLE"),
             Self::ExpressionScopeUnsupported => f.write_str("OBSERVED_READER_EXPRESSION_SCOPE_UNSUPPORTED"),
             Self::LineMissing => f.write_str("OBSERVED_READER_LINE_MISSING"),
             Self::LineScanByteLimit => f.write_str("OBSERVED_READER_LINE_SCAN_BYTE_LIMIT"),
@@ -222,6 +223,8 @@ impl ObservedReaderSession {
         out.literal(",\"cache_capacity\":")?; out.integer(MAX_OBSERVED_READER_OBSERVATIONS as u64)?;
         out.literal(",\"retained_payload_bytes\":")?;
         out.integer(self.observations.iter().flatten().map(|page| page.extent.bytes().len() as u64).sum())?;
+        out.literal(",\"retained_copied_bytes\":")?;
+        out.integer(self.observations.iter().flatten().map(|page| search::copied_context_bytes(page.find_hit.as_ref())).sum())?;
         let mut ids: [u64; MAX_OBSERVED_READER_OBSERVATIONS] = std::array::from_fn(|i|
             self.observations[i].as_ref().map_or(0, |page| page.extent.request().revision().get()));
         ids.sort_unstable();
@@ -446,6 +449,7 @@ fn encode_observation(out: &mut Output, page: &Observation, new_read: bool) -> R
         out.literal(",")?; out.quoted(key)?; out.literal(":")?; out.integer(value)?;
     }
     lines::encode_line_navigation(out, page.line_navigation)?;
+    search::encode_context_origin(out, page.find_hit.as_ref())?;
     Ok(())
 }
 fn whole_observation(extent: &ObservedExtent) -> bool {

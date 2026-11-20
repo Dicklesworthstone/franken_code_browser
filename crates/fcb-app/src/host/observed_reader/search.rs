@@ -7,7 +7,7 @@
 
 use std::{fs::File, mem::size_of, sync::Arc};
 use fcb::{ByteLength, ByteOffset, ByteRange, QueryGeneration, SourceRevision};
-use fcb::search::{CaptureRequest, DetectedEncoding, ExtentConsistency, FileSearch,
+use fcb::search::{CaptureRequest, DetectedEncoding, ExtentConsistency, ExtentReadStats, ExtentWindowRequest, ObservedExtent, FileSearch,
     FileSearchReport, IndexError, ParsedQuery, QueryError, ResourceAllocationId, ResourceBudget, StreamContextOptions, StreamReadOptions,
     StreamReadState, StreamReadStats, StreamReadStep, StreamingHit, StreamingMode, StreamingNeedle};
 use fcb::store::Sha256Digest;
@@ -92,8 +92,11 @@ pub(super) struct FindHit {
     original_range: ByteRange,
     decoded_start: u64,
     decoded_end: u64,
+    retained_context: Option<RetainedContextOrigin>,
 }
 
+#[derive(Clone, Copy)]
+struct RetainedContextOrigin { requested: ByteRange, original: ByteRange }
 
 /// Shared with accepted observed-history pages, without retaining source or the
 /// entire hit table. The parser/AST and its lease outlive query replacement only
@@ -289,6 +292,46 @@ impl ObservedReaderSession {
         self.finish_output(out, EXIT_OK, &mut canceled)
     }
 
+    /// Open the accepted hit's original excerpt as an independently retained
+    /// reader page. This copies captured bytes without stat or source I/O and
+    /// preserves the search observation as explicit provenance. Later query
+    /// replacement cannot revoke the page's bounded history or exact selection.
+    pub fn open_search_excerpt(&mut self, generation: u64, hit_index: usize,
+        mut canceled: impl FnMut() -> bool) -> Result<HostResponse, ObservedReaderError> {
+        let revision = self.next_revision()?;
+        check(&mut canceled)?;
+        let query = self.query.as_ref().filter(|query| query.generation.get() == generation)
+            .ok_or(ObservedReaderError::StaleQuery)?.clone();
+        let hit = *query.hits.get(hit_index).ok_or(ObservedReaderError::MissingHit)?;
+        let context = query.context(hit_index)?;
+        let visible = context.visible_range()?.ok_or(ObservedReaderError::SearchContextUnavailable)?;
+        let requested_bytes = context.bytes.len().max(4);
+        if requested_bytes > MAX_OBSERVED_READER_WINDOW_BYTES { return Err(ObservedReaderError::InvalidLimits); }
+        let [extent_id, decode_id, clipped_decode_id] = self.allocations()?;
+        let request = CaptureRequest::new(self.reader.file_id(), revision)?.with_range(context.original)?;
+        let extent = ObservedExtent::from_bytes(request, context.observed_length, context.bytes, &self.budget, extent_id)?;
+        let sha256 = extent_sha256(context.bytes, &mut canceled)?;
+        let mut candidate = Observation { extent, plan: ExtentWindowRequest { visible, capture: context.original },
+            requested_bytes, encoding: query.encoding, sha256, io: ExtentReadStats::default(),
+            find_hit: None, line_navigation: None };
+        let text = decode(&candidate, &self.budget, [decode_id, clipped_decode_id], &mut canceled)?;
+        let matched = text.source_to_text(hit.original_range()).map_err(|_| ObservedReaderError::SearchContextUnavailable)?;
+        let selection = text.text_selection(matched).map_err(|_| ObservedReaderError::SearchContextUnavailable)?;
+        let (spelling, original, _) = query.witness(hit_index)?;
+        if selection.original_range != hit.original_range() || selection.original_bytes != original
+            || selection.text != spelling || selection.contains_replacements {
+            return Err(ObservedReaderError::SearchContextUnavailable);
+        }
+        candidate.find_hit = Some(FindHit { expression: query.expression.clone(), kind: query.kind,
+            case_sensitive: query.case_sensitive, generation, search_observation: query.request.revision().get(),
+            page_start_after: query.page_start_after, hit_index, occurrence: hit.occurrence_id(),
+            original_range: hit.original_range(), decoded_start: matched.start().get(), decoded_end: matched.end().get(),
+            retained_context: Some(RetainedContextOrigin { requested: context.requested, original: context.original }) });
+        let response = self.page_response_decoded("search-excerpt", &candidate, &text, false, &mut canceled)?;
+        self.accept_observation(candidate);
+        Ok(response)
+    }
+
     /// Read surrounding current bytes as a NEW observation and verify the
     /// retained literal against both original bytes and the shared decoder.
     /// Unlike search_hit, this operation performs bounded source I/O. A changed
@@ -345,7 +388,7 @@ impl ObservedReaderSession {
             generation, search_observation: query.request.revision().get(),
             page_start_after: query.page_start_after,
             hit_index, occurrence: hit.occurrence_id(), original_range: original,
-            decoded_start: decoded.start().get(), decoded_end: decoded.end().get() });
+            decoded_start: decoded.start().get(), decoded_end: decoded.end().get(), retained_context: None });
         let response = self.page_response_decoded("observe-hit", &candidate, &text, true, &mut canceled)?;
         self.accept_observation(candidate);
         Ok(response)
@@ -431,7 +474,9 @@ pub(super) fn encode_find_hit(out: &mut Output, hit: Option<&FindHit>) -> Result
     out.literal(",\"original_range\":")?; out.range(hit.original_range)?;
     out.literal(",\"decoded_utf8_range\":{\"start\":")?; out.integer(hit.decoded_start)?;
     out.literal(",\"end\":")?; out.integer(hit.decoded_end)?;
-    out.literal("},\"witness_verified\":true,\"verification\":\"equal-original-bytes-in-new-observation\"")?;
+    out.literal("},\"witness_verified\":true,\"verification\":")?;
+    out.quoted(if hit.retained_context.is_some() { "retained-original-search-bytes" }
+        else { "equal-original-bytes-in-new-observation" })?;
     encode_mode(out, hit.kind, hit.case_sensitive)?;
     out.literal(",\"token_boundaries_verified\":")?;
     out.boolean(hit.kind == ObservedReaderSearchKind::Occurrences)?;
@@ -439,6 +484,28 @@ pub(super) fn encode_find_hit(out: &mut Output, hit: Option<&FindHit>) -> Result
         expression.encode(out, "original-search-observation", Some(true))?;
         out.literal(",\"expression_revalidated\":false")?;
     }
+    out.literal("}")?;
+    Ok(())
+}
+
+pub(super) fn copied_context_bytes(hit: Option<&FindHit>) -> u64 {
+    hit.and_then(|hit| hit.retained_context).map_or(0, |context| context.original.len().get())
+}
+
+pub(super) fn encode_context_origin(out: &mut Output, hit: Option<&FindHit>) -> Result<(), ObservedReaderError> {
+    out.literal(",\"retained_search_context\":")?;
+    let Some((hit, context)) = hit.and_then(|hit| hit.retained_context.map(|context| (hit, context))) else {
+        out.literal("null")?; return Ok(());
+    };
+    out.literal("{\"query_generation\":")?; out.integer(hit.generation)?;
+    out.literal(",\"search_observation\":")?; out.integer(hit.search_observation)?;
+    out.literal(",\"page_start_after\":")?; out.integer(hit.page_start_after)?;
+    out.literal(",\"hit_index\":")?; out.integer(hit.hit_index as u64)?;
+    out.literal(",\"occurrence_id\":")?; out.integer(hit.occurrence)?;
+    out.literal(",\"match_range\":")?; out.range(hit.original_range)?;
+    out.literal(",\"requested_range\":")?; out.range(context.requested)?;
+    out.literal(",\"original_range\":")?; out.range(context.original)?;
+    out.literal(",\"complete\":")?; out.boolean(context.original == context.requested)?;
     out.literal("}")?;
     Ok(())
 }

@@ -82,6 +82,7 @@ pub(super) enum Command<'a> {
         kind: ObservedReaderSearchKind, case_sensitive: bool, count_all_matches: bool,
         start_after: u64, max_matches: usize, max_scan_bytes: u64 },
     SearchHit { generation: u64, position: usize },
+    SearchExcerpt { generation: u64, hit_index: usize },
     ObserveHit { generation: u64, hit_index: usize, context_bytes: usize, window_bytes: usize },
 }
 
@@ -204,6 +205,7 @@ impl ObservedReaderSessions {
                 reader.find_page(generation, needle, encoding, kind, case_sensitive,
                     count_all_matches, start_after, max_matches, max_scan_bytes, &mut stop),
             Command::SearchHit { generation, position } => reader.search_hit(generation, position, &mut stop),
+            Command::SearchExcerpt { generation, hit_index } => reader.open_search_excerpt(generation, hit_index, &mut stop),
             Command::ObserveHit { generation, hit_index, context_bytes, window_bytes } =>
                 reader.observe_hit(generation, hit_index, context_bytes, window_bytes, &mut stop),
         };

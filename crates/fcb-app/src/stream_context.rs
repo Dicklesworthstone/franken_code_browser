@@ -24,6 +24,16 @@ pub(crate) struct Context<'a> {
 }
 
 impl Context<'_> {
+    pub(crate) fn visible_range(&self) -> Result<Option<ByteRange>, AppError> {
+        self.validate()?;
+        let start = if self.original.start().get() == 0 { 0 }
+            else { self.original.start().get().checked_add(4).ok_or(AppError::InvalidRange)? };
+        let end = if self.original.end().get() == self.observed_length.get() { self.original.end().get() }
+            else { self.original.end().get().saturating_sub(4) };
+        if start > self.matched.start().get() || end < self.matched.end().get() { return Ok(None); }
+        Ok(Some(ByteRange::new(ByteOffset::new(start), ByteOffset::new(end)).map_err(|_| AppError::InvalidRange)?))
+    }
+
     fn validate(&self) -> Result<(), AppError> {
         if self.original.len().get() != self.bytes.len() as u64 || self.matched.is_empty()
             || self.requested.start() > self.original.start() || self.requested.end() < self.original.end()
@@ -42,17 +52,12 @@ impl Context<'_> {
         // Keep four original bytes outside the visible region for the shared
         // decoder's scalar/CRLF boundary rules. A partial suffix may not even
         // cover the match with those guards; raw bytes remain inspectable then.
-        let start = if self.original.start().get() == 0 { 0 }
-            else { self.original.start().get().checked_add(4).ok_or(AppError::InvalidRange)? };
-        let end = if self.original.end().get() == self.observed_length.get() { self.original.end().get() }
-            else { self.original.end().get().saturating_sub(4) };
-        if start > self.matched.start().get() || end < self.matched.end().get() {
+        let Some(visible) = self.visible_range()? else {
             return Ok(Decoded::Unavailable("insufficient-scalar-context"));
-        }
+        };
         let request = self.request.with_range(self.original).map_err(|_| AppError::InvalidRange)?;
         let extent = ObservedExtent::from_bytes(request, self.observed_length, self.bytes, budget, ids[0])?;
         let view = BrowserSession::new(request.file().owner()).open_extent(extent)?;
-        let visible = ByteRange::new(ByteOffset::new(start), ByteOffset::new(end)).map_err(|_| AppError::InvalidRange)?;
         let text = match view.decode(visible, encoding, self.generation, budget, ids[1], &mut *canceled) {
             Ok(text) => text,
             Err(ExtentViewError::ContextUnavailable) => return Ok(Decoded::Unavailable("insufficient-scalar-context")),

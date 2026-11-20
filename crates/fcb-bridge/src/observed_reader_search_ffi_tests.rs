@@ -47,6 +47,42 @@ fn hit(handle: u64, generation: u64, index: u64) -> String {
 }
 
 #[test]
+fn c_captured_excerpt_opens_old_bytes_and_replays_after_find_replacement() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let (root, croot) = root();
+    fs::write(root.join("source"), b"before needle after").unwrap();
+    let handle = open(&croot);
+    let found = find(handle, 1, "needle", 1, 8, 64);
+    let before = take(fcb_observed_reader_info(handle));
+    fs::write(root.join("source"), b"before CHANGE after").unwrap();
+    let page = take(unsafe { fcb_observed_reader_search_excerpt(handle, 1, 0, None, std::ptr::null_mut()) });
+    assert!(page.contains("\"command\":\"search-excerpt\""), "{page}");
+    assert!(page.contains("\"text\":\"before needle after\""));
+    assert!(page.contains("\"verification\":\"retained-original-search-bytes\""));
+    let id = number(&page, "observation");
+    assert!(id > number(&found, "search_observation"));
+    assert_eq!(number(&page, "additional_source_bytes_read"), 0);
+    assert_eq!(number(&page, "observation_read_calls"), 0);
+    let after = take(fcb_observed_reader_info(handle));
+    assert_eq!(number(&after, "payload_bytes_read"), number(&before, "payload_bytes_read"));
+    assert_eq!(number(&after, "retained_copied_bytes"), 19);
+    assert!(find(handle, 2, "CHANGE", 1, 8, 64).contains("\"retained_hits\":\"1\""));
+    let stale = take(unsafe { fcb_observed_reader_search_excerpt(handle, 1, 0, None, std::ptr::null_mut()) });
+    assert!(stale.contains("OBSERVED_READER_STALE_QUERY"));
+    let replay = take(fcb_observed_reader_retained(handle, id));
+    assert!(replay.contains("\"text\":\"before needle after\""));
+    assert!(replay.contains("\"query_generation\":\"1\""));
+    let selected = take(fcb_observed_reader_resolve_selection(handle, id, 7, 13));
+    assert!(selected.contains("\"original_hex\":\"6e6565646c65\""));
+    let canceled = take(unsafe { fcb_observed_reader_search_excerpt(handle, 2, 0,
+        Some(cancel_now), std::ptr::null_mut()) });
+    assert!(canceled.contains("\"exit_code\":\"130\""));
+    assert_eq!(fcb_observed_reader_close(handle), 1);
+    let closed = take(unsafe { fcb_observed_reader_search_excerpt(handle, 2, 0, None, std::ptr::null_mut()) });
+    assert!(closed.contains("OBSERVED_READER_HANDLE_UNKNOWN"));
+}
+
+#[test]
 fn c_retained_search_context_survives_edits_and_byte_limits_without_io() {
     let _guard = FFI_TEST_LOCK.lock().unwrap();
     let (root, croot) = root();
