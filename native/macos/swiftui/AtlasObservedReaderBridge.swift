@@ -46,6 +46,9 @@ private typealias ObservedReaderPoll = @convention(c) (UnsafeMutableRawPointer?)
     _ poll: ObservedReaderPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_observed_reader_search_hit") private func observedReaderSearchHit(
     _ handle: UInt64, _ generation: UInt64, _ index: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_observed_reader_search_excerpt") private func observedReaderSearchExcerpt(
+    _ handle: UInt64, _ generation: UInt64, _ index: UInt64,
+    _ poll: ObservedReaderPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_observed_reader_observe_hit") private func observedReaderObserveHit(
     _ handle: UInt64, _ generation: UInt64, _ index: UInt64, _ contextBytes: UInt64, _ windowBytes: UInt64,
     _ poll: ObservedReaderPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
@@ -134,6 +137,17 @@ extension AtlasObservedReaderTransport {
                         request.countAllMatches ? 1 : 0, request.pageStartAfter,
                         request.maximumMatches, request.maximumScanBytes, poll, context)
                 }
+            }
+        }, openExcerpt: { handle, witness, cancellation in
+            let target = witness.target
+            guard target.identity.owner == handle, target.generation > 0,
+                  target.hit.index < AtlasObservedReaderSearchLimits.matches,
+                  let context = witness.context, context.textRange != nil,
+                  context.containsWitness(witness.originalHex, at: target.hit.range) else {
+                throw AtlasObservedReaderError.invalidInput
+            }
+            return try observedReaderPolling(cancellation) { poll, context in
+                observedReaderSearchExcerpt(handle, target.generation, target.hit.index, poll, context)
             }
         }), lines: { handle, request, cancellation in
             try observedReaderPolling(cancellation) { poll, context in

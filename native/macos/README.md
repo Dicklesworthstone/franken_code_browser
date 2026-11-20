@@ -1676,6 +1676,21 @@ captured text** copies the lossless decoded excerpt; **Copy captured hex** copie
 the original captured bytes, including when text is unavailable. Replacement
 text is never offered as a lossless copy. Hosts with older witness-only receipts
 continue to show their retained matches without claiming captured context.
+
+**Open captured excerpt** opens those same search bytes in the main reader,
+selects the exact match, and adds an independent page to the eight-page history.
+It performs no source reads or metadata checks, even if the file has changed.
+The page retains the original search observation, occurrence and context ranges;
+its new page identity does not imply a fresh observation of the current file.
+Select any complete character range in this page to copy its text, original hex,
+or text with location and original-search provenance. Back/Forward and these
+selection actions remain available after another Find replaces the original
+query. History eviction still applies. Context without safe decoded boundaries
+remains available through captured hex; older transports leave this action
+unavailable. Canceled, stale or refused openings preserve the accepted page.
+Independent history copies are accounted for separately from bytes read from
+the source, within the existing bounded retention allowance.
+
 Copies of the match preserve its original spelling. **Read current
 context** performs a separate bounded read with a fresh observation identity and
 highlights the match only after its retained bytes agree with the new source

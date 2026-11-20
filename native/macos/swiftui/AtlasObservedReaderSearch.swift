@@ -261,6 +261,8 @@ struct AtlasObservedReaderSearchTransport: Sendable {
     /// This does not continue an immutable capture of the previous result page.
     var findPage: (@Sendable (UInt64, AtlasObservedReaderSearchRequest,
         AtlasSearchCancellation) throws -> String?)? = nil
+    var openExcerpt: (@Sendable (UInt64, AtlasObservedReaderSearchWitness,
+        AtlasSearchCancellation) throws -> String?)? = nil
 }
 
 struct AtlasObservedReaderSearchHit: Equatable, Identifiable, Sendable {
@@ -287,6 +289,8 @@ struct AtlasObservedReaderHitNavigation: Equatable, Sendable, Decodable {
     let mode: String?
     let caseSensitive, tokenBoundariesVerified: Bool?
     let expression: AtlasObservedReaderExpression?
+    let verification: String
+    var isCapturedExcerpt: Bool { verification == "retained-original-search-bytes" }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -324,17 +328,70 @@ struct AtlasObservedReaderHitNavigation: Equatable, Sendable, Decodable {
         }
         let (ordinal, overflow) = pageStartAfter.addingReportingOverflow(index)
         let (expectedOccurrence, occurrenceOverflow) = ordinal.addingReportingOverflow(1)
+        verification = try c.decode(String.self, forKey: .verification)
         guard generation > 0, searchObservation > 0, index < AtlasObservedReaderSearchLimits.matches,
               !overflow, !occurrenceOverflow, occurrence == expectedOccurrence,
               originalRange.count > 0, decodedRange.count > 0,
               try c.decode(Bool.self, forKey: .witness_verified),
-              try c.decode(String.self, forKey: .verification) == "equal-original-bytes-in-new-observation" else {
+              ["equal-original-bytes-in-new-observation", "retained-original-search-bytes"].contains(verification) else {
             throw AtlasObservedReaderError.invalidResponse
         }
     }
     private enum CodingKeys: CodingKey {
         case query_generation, search_observation, hit_index, occurrence_id, page_start_after, original_range,
              decoded_utf8_range, witness_verified, verification, mode, case_sensitive, token_boundaries_verified
+    }
+}
+
+struct AtlasObservedReaderRetainedContext: Equatable, Sendable, Decodable {
+    let generation, searchObservation, pageStartAfter, index, occurrence: UInt64
+    let matchRange, requestedRange, originalRange: AtlasObservedByteRange
+    let complete: Bool
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        generation = try c.decode(AtlasObservedReaderWire.Number.self, forKey: .query_generation).value
+        searchObservation = try c.decode(AtlasObservedReaderWire.Number.self, forKey: .search_observation).value
+        pageStartAfter = try c.decode(AtlasObservedReaderWire.Number.self, forKey: .page_start_after).value
+        index = try c.decode(AtlasObservedReaderWire.Number.self, forKey: .hit_index).value
+        occurrence = try c.decode(AtlasObservedReaderWire.Number.self, forKey: .occurrence_id).value
+        matchRange = try c.decode(AtlasObservedByteRange.self, forKey: .match_range)
+        requestedRange = try c.decode(AtlasObservedByteRange.self, forKey: .requested_range)
+        originalRange = try c.decode(AtlasObservedByteRange.self, forKey: .original_range)
+        complete = try c.decode(Bool.self, forKey: .complete)
+        let (ordinal, overflow) = pageStartAfter.addingReportingOverflow(index)
+        let (expected, occurrenceOverflow) = ordinal.addingReportingOverflow(1)
+        guard generation > 0, searchObservation > 0, index < AtlasObservedReaderSearchLimits.matches,
+              !overflow, !occurrenceOverflow, occurrence == expected,
+              matchRange.count > 0, matchRange.count <= UInt64(AtlasObservedReaderSearchLimits.maximumWitnessBytes),
+              requestedRange.contains(originalRange), originalRange.contains(matchRange),
+              originalRange.start == requestedRange.start, complete == (requestedRange == originalRange) else {
+            throw AtlasObservedReaderError.invalidResponse
+        }
+    }
+
+    func validate(page: UInt64, length: UInt64) throws {
+        guard searchObservation < page, matchRange.end <= length,
+              requestedRange.start == matchRange.start - min(matchRange.start, AtlasRetainedSearchContext.beforeBytes),
+              requestedRange.end == matchRange.end + min(length - matchRange.end, AtlasRetainedSearchContext.afterBytes) else {
+            throw AtlasObservedReaderError.invalidResponse
+        }
+    }
+    func matches(_ hit: AtlasObservedReaderHitNavigation) -> Bool {
+        hit.isCapturedExcerpt && generation == hit.generation && searchObservation == hit.searchObservation
+            && pageStartAfter == hit.pageStartAfter && index == hit.index && occurrence == hit.occurrence
+            && matchRange == hit.originalRange
+    }
+    func matches(_ witness: AtlasObservedReaderSearchWitness) -> Bool {
+        guard let context = witness.context else { return false }
+        return generation == witness.target.generation && searchObservation == witness.target.observation
+            && index == witness.target.hit.index && occurrence == witness.target.hit.occurrence
+            && matchRange == witness.target.hit.range && requestedRange == context.requestedRange
+            && originalRange == context.originalRange && complete == context.complete
+    }
+    private enum CodingKeys: CodingKey {
+        case query_generation, search_observation, page_start_after, hit_index, occurrence_id,
+             match_range, requested_range, original_range, complete
     }
 }
 
@@ -683,6 +740,7 @@ struct AtlasObservedReaderSearchWitness: Sendable {
         if page.findHit != nil {
             do {
                 try validateVerifiedContext(page)
+                if page.findHit?.isCapturedExcerpt == true { return .captured(selection: page.verifiedSearchSelection) }
                 return mode == .expression ? .expressionPrimaryVerified(selection: page.verifiedSearchSelection)
                     : .verified(selection: page.verifiedSearchSelection)
             } catch { return .unavailable }
@@ -727,6 +785,22 @@ struct AtlasObservedReaderSearchWitness: Sendable {
         guard start <= raw.count, count <= raw.count - start,
               raw[start..<(start + count)].elementsEqual(originalHex.utf8),
               decoded[Int(selected.decodedRange.start)..<Int(selected.decodedRange.end)].elementsEqual(text.utf8) else {
+            throw AtlasObservedReaderError.invalidResponse
+        }
+        if selected.isCapturedExcerpt {
+            guard let origin = page.observation.retainedSearchContext, origin.matches(self), origin.matches(selected),
+                  let context, let retainedText = context.text, page.visibleRange == context.textRange,
+                  selected.decodedRange == context.matchedTextRange,
+                  page.hasReplacements == context.hasReplacements,
+                  page.text.utf8.elementsEqual(retainedText.utf8) else {
+                throw AtlasObservedReaderError.invalidResponse
+            }
+            let from = Int(page.visibleRange.start - context.originalRange.start) * 2
+            let end = Int(page.visibleRange.end - context.originalRange.start) * 2
+            guard Array(context.originalHex.utf8)[from..<end].elementsEqual(page.originalHex.utf8) else {
+                throw AtlasObservedReaderError.invalidResponse
+            }
+        } else if page.observation.retainedSearchContext != nil {
             throw AtlasObservedReaderError.invalidResponse
         }
     }
@@ -792,16 +866,18 @@ struct AtlasObservedReaderExternalMatch: Sendable {
 }
 
 enum AtlasObservedReaderSearchContext: Equatable, Sendable {
-    case verified(selection: NSRange?), expressionPrimaryVerified(selection: NSRange?), changed, unavailable, tokenBoundariesUnverified
+    case verified(selection: NSRange?), expressionPrimaryVerified(selection: NSRange?), captured(selection: NSRange?), changed, unavailable, tokenBoundariesUnverified
     var selection: NSRange? {
-        switch self { case .verified(let range), .expressionPrimaryVerified(let range): range; default: nil }
+        switch self { case .verified(let range), .expressionPrimaryVerified(let range), .captured(let range): range; default: nil }
     }
     var message: String {
         switch self {
+        case .captured:
+            return "The original search excerpt is open and its exact match is selected. No current file bytes were read; this page remains available in history after later searches."
         case .verified(let selection):
             return selection == nil
                 ? "The matching bytes still agree in this new observation. An exact native text selection could not be verified."
-                : "Matching bytes verified in this new observation and selected. Surrounding context was read now; it was not retained by the earlier search."
+                : "Matching bytes verified in this new observation and selected. Surrounding context was read now as a separate observation."
         case .tokenBoundariesUnverified: return "Matching bytes still agree, but whole-token boundaries were not rechecked. Use Go to verified match to verify this identifier in current context."
         case .expressionPrimaryVerified(let selection):
             return "Primary literal bytes still agree in this new observation. Other required and excluded terms belong to the original search observation and were not rechecked."

@@ -193,6 +193,7 @@ struct AtlasObservedReaderInfo: Sendable {
     let identity: AtlasObservedReaderIdentity
     let initialLength, sourceBytesRead, readCalls, retainedBytes: UInt64
     let retained: [UInt64]
+    var copiedBytes: UInt64 = 0
 
     static func decode(_ json: String?, handle: UInt64, input: AtlasObservedReaderInput,
                        initial: Bool = false) throws -> Self {
@@ -202,23 +203,28 @@ struct AtlasObservedReaderInfo: Sendable {
             let identity = try header.identity(handle: handle, input: input, command: "info")
             let wire = try JSONDecoder().decode(Wire.self, from: data)
             let ids = wire.retained_observations.map(\.value)
+            let copied = wire.retained_copied_bytes?.value ?? 0
             guard wire.cache_capacity.value == UInt64(AtlasObservedReaderLimits.retainedObservations),
                   ids.count <= AtlasObservedReaderLimits.retainedObservations,
                   ids.allSatisfy({ $0 > 0 }), zip(ids, ids.dropFirst()).allSatisfy({ $0.0 < $0.1 }),
                   wire.retained_payload_bytes.value <= UInt64(ids.count)
                     * (AtlasObservedReaderLimits.maximumPageBytes + 2 * AtlasObservedReaderLimits.contextBytes),
-                  wire.retained_payload_bytes.value <= wire.payload_bytes_read.value,
+                  copied <= wire.retained_payload_bytes.value,
+                  copied <= UInt64(ids.count) * (UInt64(AtlasObservedReaderSearchLimits.maximumWitnessBytes)
+                    + AtlasRetainedSearchContext.beforeBytes + AtlasRetainedSearchContext.afterBytes),
+                  wire.retained_payload_bytes.value - copied <= wire.payload_bytes_read.value,
                   !initial || (ids.isEmpty && wire.payload_bytes_read.value == 0 && wire.read_calls.value == 0) else {
                 throw AtlasObservedReaderError.invalidResponse
             }
             return Self(identity: identity, initialLength: wire.initial_observed_length.value,
                 sourceBytesRead: wire.payload_bytes_read.value, readCalls: wire.read_calls.value,
-                retainedBytes: wire.retained_payload_bytes.value, retained: ids)
+                retainedBytes: wire.retained_payload_bytes.value, retained: ids, copiedBytes: copied)
         } catch { throw AtlasObservedReaderError.invalidResponse }
     }
     private struct Wire: Decodable {
         let initial_observed_length, payload_bytes_read, read_calls, cache_capacity, retained_payload_bytes: AtlasObservedReaderWire.Number
         let retained_observations: [AtlasObservedReaderWire.Number]
+        let retained_copied_bytes: AtlasObservedReaderWire.Number?
     }
 }
 
@@ -235,6 +241,7 @@ struct AtlasObservedReaderObservation: Equatable, Sendable {
     let extentSHA256, consistency: String
     let captureFilled, wholeFileObserved: Bool
     let sourceBytesRead, readCalls: UInt64
+    var retainedSearchContext: AtlasObservedReaderRetainedContext? = nil
 }
 
 struct AtlasObservedReaderPage: Sendable {
@@ -265,8 +272,9 @@ struct AtlasObservedReaderPage: Sendable {
     static func decode(_ json: String?, handle: UInt64, input: AtlasObservedReaderInput,
                        request: AtlasObservedReaderRequest? = nil, retained: Self? = nil,
                        hit: AtlasObservedReaderSearchWitness? = nil,
-                       lines: AtlasObservedReaderLineRequest? = nil) throws -> Self {
-        guard [request != nil, retained != nil, lines != nil].filter({ $0 }).count == 1,
+                       lines: AtlasObservedReaderLineRequest? = nil,
+                       capturedHit: AtlasObservedReaderSearchWitness? = nil) throws -> Self {
+        guard [request != nil, retained != nil, lines != nil, capturedHit != nil].filter({ $0 }).count == 1,
               hit == nil || request != nil else {
             throw AtlasObservedReaderError.invalidInput
         }
@@ -274,12 +282,22 @@ struct AtlasObservedReaderPage: Sendable {
         do {
             let header = try JSONDecoder().decode(AtlasObservedReaderWire.Header.self, from: data)
             let identity = try header.identity(handle: handle, input: input,
-                command: retained != nil ? "retained-window" : (lines != nil ? "lines" : (hit != nil ? "observe-hit" : "window")))
+                command: retained != nil ? "retained-window" : (capturedHit != nil ? "search-excerpt"
+                    : (lines != nil ? "lines" : (hit != nil ? "observe-hit" : "window"))))
             let w = try JSONDecoder().decode(Wire.self, from: data)
             guard retained != nil || (w.line_navigation != nil) == (lines != nil),
                   w.line_navigation == nil || w.find_hit == nil else { throw AtlasObservedReaderError.invalidResponse }
             let basis = try JSONDecoder().decode(AtlasObservedReaderWire.Observation.self, from: data)
-            let observation = try basis.value(identity: identity, reads: retained == nil, lineNavigation: w.line_navigation)
+            let observation = try basis.value(identity: identity, reads: retained == nil && capturedHit == nil, lineNavigation: w.line_navigation)
+            guard retained != nil || (observation.retainedSearchContext != nil) == (capturedHit != nil),
+                  w.find_hit?.isCapturedExcerpt == true || observation.retainedSearchContext == nil else {
+                throw AtlasObservedReaderError.invalidResponse
+            }
+            if let origin = observation.retainedSearchContext {
+                guard let selected = w.find_hit, origin.matches(selected), w.line_navigation == nil else {
+                    throw AtlasObservedReaderError.invalidResponse
+                }
+            } else if w.find_hit?.isCapturedExcerpt == true { throw AtlasObservedReaderError.invalidResponse }
             if let lines {
                 guard let navigation = w.line_navigation,
                       try navigation.request(encoding: observation.request.encoding) == lines else {
@@ -315,7 +333,7 @@ struct AtlasObservedReaderPage: Sendable {
                 boundariesAdjusted: w.boundaries_adjusted, firstPhysicalLine: first,
                 text: w.text, originalHex: w.original_hex, hasReplacements: w.has_replacements, nextOffset: next,
                 findHit: w.find_hit, lineNavigation: w.line_navigation)
-            if let hit { try hit.validateVerifiedContext(page) }
+            if let hit = hit ?? capturedHit { try hit.validateVerifiedContext(page) }
             else if retained == nil, w.find_hit != nil { throw AtlasObservedReaderError.invalidResponse }
             guard retained == nil || page.matches(retained!) else { throw AtlasObservedReaderError.invalidResponse }
             return page
@@ -450,7 +468,7 @@ struct AtlasObservedReaderSelection: Sendable, Identifiable {
                     throw AtlasObservedReaderError.invalidResponse
                 }
             }
-            let provenance: [String: Any] = [
+            var provenance: [String: Any] = [
                 "source": "retained-observed-extent", "whole_file_immutable": false,
                 "owner": String(owner), "file_id": String(identity.file), "observation": String(observation.id),
                 "extent_sha256": observation.extentSHA256,
@@ -461,6 +479,16 @@ struct AtlasObservedReaderSelection: Sendable, Identifiable {
                 "encoding": encoding.rawValue, "copy_representation": "logical-unicode",
                 "line_endings": "preserved", "contains_replacements": w.contains_replacements
             ]
+            if let origin = observation.retainedSearchContext {
+                provenance["retained_search_context"] = [
+                    "query_generation": String(origin.generation), "search_observation": String(origin.searchObservation),
+                    "page_start_after": String(origin.pageStartAfter), "hit_index": String(origin.index),
+                    "occurrence_id": String(origin.occurrence), "complete": origin.complete,
+                    "match_range": ["start": String(origin.matchRange.start), "end": String(origin.matchRange.end)],
+                    "requested_range": ["start": String(origin.requestedRange.start), "end": String(origin.requestedRange.end)],
+                    "original_range": ["start": String(origin.originalRange.start), "end": String(origin.originalRange.end)]
+                ] as [String: Any]
+            }
             let location = String(decoding: try JSONSerialization.data(withJSONObject: provenance,
                 options: [.sortedKeys]), as: UTF8.self)
             return Self(id: UUID(), observation: observation, visibleRange: page.visibleRange,
@@ -560,6 +588,7 @@ enum AtlasObservedReaderWire {
         let encoding, encoding_basis, extent_sha256, consistency: String
         let requested_visible_range, requested_capture_range, captured_range: AtlasObservedByteRange
         let requested_capture_filled, whole_file_observed: Bool
+        let retained_search_context: AtlasObservedReaderRetainedContext?
         func value(identity: AtlasObservedReaderIdentity, reads: Bool,
                    lineNavigation: AtlasObservedReaderLineNavigation? = nil) throws -> AtlasObservedReaderObservation {
             guard let kind = AtlasObservedReaderEncoding(rawValue: encoding) else { throw AtlasObservedReaderError.invalidResponse }
@@ -578,14 +607,27 @@ enum AtlasObservedReaderWire {
                   requested_capture_filled == (captured_range == requested_capture_range),
                   !whole_file_observed || (captured_range.start == 0 && captured_range.end == length
                     && consistency == "unchanged-metadata-not-atomic"),
-                  captured_range.count == 0 || observation_read_calls.value > 0,
+                  captured_range.count == 0 || observation_read_calls.value > 0 || retained_search_context != nil,
                   consistency != "unchanged-metadata-not-atomic" || final_observed_length?.value == length,
                   (reads ? (additional_source_bytes_read.value == observation_source_bytes_read.value
                     && additional_read_calls.value == observation_read_calls.value)
                     : (additional_source_bytes_read.value == 0 && additional_read_calls.value == 0)) else {
                 throw AtlasObservedReaderError.invalidResponse
             }
-            if let lineNavigation {
+            if let origin = retained_search_context {
+                try origin.validate(page: observation.value, length: length)
+                let visibleStart = captured_range.start == 0 ? 0 : captured_range.start + 4
+                let visibleEnd = captured_range.end == length ? length : captured_range.end - min(captured_range.end, 4)
+                guard lineNavigation == nil, consistency == "host-supplied-sequence", final_observed_length?.value == length,
+                      origin.originalRange == captured_range, requested_capture_filled, !whole_file_observed,
+                      request.bytes == max(4, captured_range.count),
+                      requested_visible_range.start == visibleStart, requested_visible_range.end == visibleEnd,
+                      requested_visible_range.contains(origin.matchRange),
+                      observation_source_bytes_read.value == 0, observation_read_calls.value == 0,
+                      additional_source_bytes_read.value == 0, additional_read_calls.value == 0 else {
+                    throw AtlasObservedReaderError.invalidResponse
+                }
+            } else if let lineNavigation {
                 guard request.bytes == lineNavigation.maximumSelectedBytes,
                       requested_visible_range.count > 0, requested_capture_filled,
                       (lineNavigation.lastLine - lineNavigation.firstLine + 1 == lineNavigation.requestedLines
@@ -612,7 +654,8 @@ enum AtlasObservedReaderWire {
                 observedLength: length, finalObservedLength: final_observed_length?.value,
                 capturedRange: captured_range, extentSHA256: extent_sha256, consistency: consistency,
                 captureFilled: requested_capture_filled, wholeFileObserved: whole_file_observed,
-                sourceBytesRead: observation_source_bytes_read.value, readCalls: observation_read_calls.value)
+                sourceBytesRead: observation_source_bytes_read.value, readCalls: observation_read_calls.value,
+                retainedSearchContext: retained_search_context)
         }
     }
 }

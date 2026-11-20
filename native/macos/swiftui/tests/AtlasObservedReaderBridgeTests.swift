@@ -65,7 +65,7 @@ import Foundation
         let verifiedHit = try observeHit(handle, witness, request, AtlasSearchCancellation())
         precondition(verifiedHit == expected && count(11) == 1 && allocations() == 12 && frees() == 12)
         let legacy = AtlasObservedReaderSearchTransport(find: search.find, hit: search.hit)
-        precondition(legacy.observeHit == nil && legacy.findPage == nil,
+        precondition(legacy.observeHit == nil && legacy.findPage == nil && legacy.openExcerpt == nil,
             "Existing search-only transports retain their optional capability boundary")
         guard let readLines = transport.lines else { preconditionFailure("Native physical-line transport is missing") }
         let lineRequest = try AtlasObservedReaderLineRequest(firstLine: offset, lines: 4096,
@@ -110,6 +110,23 @@ import Foundation
         }
         precondition(count(11) == beforeInvalid && allocations() == beforeInvalidAllocations)
 
+        guard let openExcerpt = search.openExcerpt else { preconditionFailure("Native captured-excerpt transport is missing") }
+        let capturedRange = try AtlasObservedByteRange(start: target.hit.range.start - 160, end: target.hit.range.end + 160)
+        let capturedText = String(repeating: "x", count: 156) + witness.text + String(repeating: "x", count: 156)
+        var capturedWitness = witness
+        capturedWitness.context = .init(requestedRange: capturedRange, originalRange: capturedRange,
+            complete: true, originalHex: String(repeating: "78", count: 160) + witness.originalHex + String(repeating: "78", count: 160),
+            text: capturedText, textRange: try .init(start: capturedRange.start + 4, end: capturedRange.end - 4),
+            matchedTextRange: try .init(start: 156, end: 156 + UInt64(witness.text.utf8.count)),
+            hasReplacements: false, unavailableReason: nil)
+        let beforeExcerpt = allocations()
+        let openedExcerpt = try openExcerpt(handle, capturedWitness, AtlasSearchCancellation())
+        precondition(openedExcerpt == expected)
+        precondition(count(28) == 1 && allocations() == beforeExcerpt + 1 && allocations() == frees())
+        do { _ = try openExcerpt(handle, witness, AtlasSearchCancellation()); preconditionFailure("Missing captured context crossed the ABI") }
+        catch AtlasObservedReaderError.invalidInput { }
+        precondition(count(28) == 1)
+
         // Every allocating entrypoint shares the actual bounded take/free path.
         let commands: [() throws -> String?] = [
             { try transport.open(handle, input, AtlasSearchCancellation()) },
@@ -125,6 +142,7 @@ import Foundation
             { try resolveSelection(handle, observation, offset + 3, offset + 17) },
             { try search.find(handle, occurrences, AtlasSearchCancellation()) },
             { try findPage(handle, pageRequest, AtlasSearchCancellation()) },
+            { try openExcerpt(handle, capturedWitness, AtlasSearchCancellation()) },
         ]
         for command in commands {
             mode(1)
@@ -145,7 +163,7 @@ import Foundation
 
         // C invokes the supplied callback with its live object context. The
         // transport frees the obsolete reply before throwing cancellation.
-        for operation in 0..<8 {
+        for operation in 0..<9 {
             for lateMode: Int32 in [4, 5] {
                 mode(lateMode)
                 weak var released: AtlasSearchCancellation?
@@ -161,7 +179,8 @@ import Foundation
                         case 4: _ = try readLines(handle, lineRequest, token)
                         case 5: _ = try search.find(handle, occurrences, token)
                         case 6: _ = try transport.open(handle, selectedFile, token)
-                        default: _ = try findPage(handle, pageRequest, token)
+                        case 7: _ = try findPage(handle, pageRequest, token)
+                        default: _ = try openExcerpt(handle, capturedWitness, token)
                         }
                         preconditionFailure("Late canceled read-only delivery was not suppressed")
                     } catch AtlasObservedReaderError.canceled { }

@@ -9,7 +9,7 @@
 enum { CREATE, OPEN, INFO, WINDOW, RETAINED, COPY, CANCEL, CLOSE, POLLS, FIND, HIT, OBSERVE_HIT, LINES, COUNTED_FIND,
     MATCHING_FIND, MATCHING_COUNTED, OCCURRENCES_FIND, OCCURRENCES_COUNTED, RESOLVE_SELECTION, OPEN_FILE,
     PAGED_FIND, PAGED_COUNTED, PAGED_LOWERCASE, PAGED_OCCURRENCES,
-    EXPRESSION_FIND, EXPRESSION_COUNTED, EXPRESSION_LOWERCASE, PAGED_EXPRESSION, COUNTERS };
+    EXPRESSION_FIND, EXPRESSION_COUNTED, EXPRESSION_LOWERCASE, PAGED_EXPRESSION, SEARCH_EXCERPT, COUNTERS };
 static uint32_t counts[COUNTERS], allocations, frees, encoding_bits;
 static int32_t mode;
 static char *owned;
@@ -191,6 +191,11 @@ char *fcb_observed_reader_observe_hit(uint64_t handle, uint64_t generation, uint
     assert(handle == handle_value && generation == observation_value && index == 255);
     assert(context_bytes == 1024 && window_bytes == 65536);
     ++counts[OBSERVE_HIT]; poll_context(poll, context); return response();
+}
+char *fcb_observed_reader_search_excerpt(uint64_t handle, uint64_t generation, uint64_t index,
+    fcb_observed_reader_poll poll, void *context) {
+    assert(handle == handle_value && generation == observation_value && index == 255);
+    ++counts[SEARCH_EXCERPT]; poll_context(poll, context); return response();
 }
 uint8_t fcb_observed_reader_cancel(uint64_t handle) {
     assert(handle == handle_value); ++counts[CANCEL]; return mode == 6 ? 0 : 1;

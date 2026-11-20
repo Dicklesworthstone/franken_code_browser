@@ -191,6 +191,20 @@ fn sparse_source_above_the_complete_capture_limit_has_bounded_search_and_exact_a
     assert_eq!(before, after, "activation cannot even stat or read the live source");
     assert_eq!(reader.copy_range(found.get("search_observation").number(), offset, offset + 7, || false).err(),
         Some(ObservedReaderError::MissingObservation), "a witness is not a retained arbitrary page");
+    assert_eq!(file.write_at(b"edited\n", offset).unwrap(), 7);
+    let captured = json(&reader.open_search_excerpt(1, 0, || false).unwrap());
+    assert_eq!(bounds(captured.get("captured_range")), (offset - 160, length));
+    assert_eq!(bounds(captured.get("visible_range")), (offset - 156, length));
+    assert_eq!(captured.get("find_hit").get("verification").text(), "retained-original-search-bytes");
+    assert_eq!(bounds(captured.get("find_hit").get("decoded_utf8_range")), (156, 163));
+    assert_eq!(captured.get("text"), context.get("text"));
+    let page = captured.get("observation").number();
+    let copied = json(&reader.copy_range(page, offset, offset + 7, || false).unwrap());
+    assert_eq!(copied.get("original_hex").text(), "6e6565646c650a");
+    let retained = json(&reader.info(|| false).unwrap());
+    assert_eq!(retained.get("payload_bytes_read"), before.get("payload_bytes_read"));
+    assert_eq!(retained.get("read_calls"), before.get("read_calls"));
+    assert_eq!(retained.get("retained_copied_bytes").number(), 197);
 }
 
 #[test]

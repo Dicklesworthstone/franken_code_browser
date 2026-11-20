@@ -89,7 +89,8 @@ extension AtlasObservedReaderModel {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("Observation \(observation.id) · original bytes \(page.visibleRange.start)..<\(page.visibleRange.end)")
                             .font(.system(.caption, design: .monospaced))
-                        Text("File length observed before read: \(observation.observedLength) bytes · \(observation.request.encoding.label)")
+                        Text((observation.retainedSearchContext == nil ? "File length observed before read: " : "File length recorded by the original search: ")
+                            + "\(observation.observedLength) bytes · \(observation.request.encoding.label)")
                             .font(.caption).foregroundStyle(.secondary)
                         if let lines = page.lineNavigation {
                             Text("Physical lines \(lines.firstLine)–\(lines.lastLine) · scanned \(lines.scannedInputBytes) bytes · retained \(observation.capturedRange.count) bytes including decoding context")
@@ -452,6 +453,9 @@ extension AtlasObservedReaderModel {
                     .font(.caption2).foregroundStyle(.secondary)
             }
             HStack {
+                Button("Open captured excerpt", action: model.openSearchExcerpt)
+                    .disabled(!model.canOpenSearchExcerpt)
+                    .help("Open the original search bytes in the source reader and history, without reading the current file.")
                 Button("Copy captured text") { copySearchContext(hex: false) }
                     .disabled(!model.canCopySearchWitness || context.displayText == nil)
                 Button("Copy captured hex") { copySearchContext(hex: true) }

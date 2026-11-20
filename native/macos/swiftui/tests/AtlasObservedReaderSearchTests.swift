@@ -101,6 +101,49 @@ private enum ObservedSearchFixture {
         out["retained_context_bytes"] = String(bytes.count * rows.count)
         return out
     }
+
+    static func capturedPage(_ owner: UInt64, _ input: AtlasObservedReaderInput,
+        _ id: UInt64, report: [String: Any], index: Int = 0) throws -> [String: Any] {
+        let row = (report["hits"] as! [[String: Any]])[index]
+        let context = row["context"] as! [String: Any]
+        let captured = context["original_range"] as! [String: String]
+        let visible = context["text_original_range"] as! [String: String]
+        let start = UInt64(captured["start"]!)!, end = UInt64(captured["end"]!)!
+        let visibleStart = UInt64(visible["start"]!)!, visibleEnd = UInt64(visible["end"]!)!
+        let length = UInt64(report["observed_length"] as! String)!
+        let guardedStart = start == 0 ? 0 : start + 4, guardedEnd = end == length ? end : end - 4
+        let request = try AtlasObservedReaderRequest(offset: guardedStart, bytes: max(4, end - start),
+            encoding: AtlasObservedReaderEncoding(rawValue: report["encoding"] as! String)!)
+        let raw = Array((context["original_hex"] as! String).utf8)
+        let hex = String(decoding: raw[Int(visibleStart - start) * 2..<Int(visibleEnd - start) * 2], as: UTF8.self)
+        var page = ObservedReaderFixture.page(owner, input, id, request, length: length,
+            text: context["text"] as! String, originalHex: hex)
+        page["command"] = "search-excerpt"
+        page["requested_visible_range"] = ObservedReaderFixture.range(guardedStart, guardedEnd)
+        page["requested_capture_range"] = captured; page["captured_range"] = captured
+        page["captured_bytes"] = String(end - start); page["visible_range"] = visible
+        page["boundaries_adjusted"] = visible != ObservedReaderFixture.range(guardedStart, guardedEnd)
+        page["has_replacements"] = context["text_has_replacements"]
+        page["consistency"] = "host-supplied-sequence"; page["whole_file_observed"] = false
+        page["next_offset"] = visibleEnd < length ? String(visibleEnd) as Any : NSNull()
+        page["observation_source_bytes_read"] = "0"; page["observation_read_calls"] = "0"
+        page["additional_source_bytes_read"] = "0"; page["additional_read_calls"] = "0"
+        var navigation: [String: Any] = ["query_generation": report["query_generation"]!,
+            "search_observation": report["search_observation"]!, "page_start_after": report["page_start_after"]!,
+            "hit_index": row["index"]!, "occurrence_id": row["occurrence_id"]!,
+            "original_range": row["original_range"]!, "decoded_utf8_range": context["match_decoded_range"]!,
+            "witness_verified": true, "verification": "retained-original-search-bytes",
+            "mode": report["mode"]!, "case_sensitive": report["case_sensitive"]!,
+            "token_boundaries_verified": report["mode"] as? String == "whole-token-occurrences"]
+        for key in ["requested_mode", "realized_mode", "evidence_level", "includes_comments_and_literals",
+                    "compiler_resolved", "semantic_complete"] { navigation[key] = report[key] }
+        page["find_hit"] = navigation
+        page["retained_search_context"] = ["query_generation": report["query_generation"]!,
+            "search_observation": report["search_observation"]!, "page_start_after": report["page_start_after"]!,
+            "hit_index": row["index"]!, "occurrence_id": row["occurrence_id"]!, "match_range": row["original_range"]!,
+            "requested_range": context["requested_range"]!, "original_range": captured, "complete": context["complete"]!]
+        return page
+    }
 }
 
 private final class ObservedSearchProbe: @unchecked Sendable {
@@ -116,10 +159,12 @@ private final class ObservedSearchProbe: @unchecked Sendable {
     private var content = "old\n"
     private var nextFindGate: ObservedReaderGate?, nextHitGate: ObservedReaderGate?, nextWindowGate: ObservedReaderGate?
     private var nextFindReplyGate: ObservedReaderGate?
+    private var nextExcerptGate: ObservedReaderGate?
     private var findFailure = false, staleFind = false, staleWindow = false
     private var verifiedFailure = false, malformedNeighbor = false
     private var active = 0, mostActive = 0, windows = 0, hits = 0
     private var verifiedJumps = 0
+    private var excerptOpens = 0, excerptFailure = false
     private var generations: [UInt64] = []
     private var startAfters: [UInt64] = []
 
@@ -137,6 +182,10 @@ private final class ObservedSearchProbe: @unchecked Sendable {
             AtlasSearchCancellation) throws -> String?)? = paging ? { owner, request, _ in
                 try self.find(owner, request)
             } : nil
+        let excerpt: (@Sendable (UInt64, AtlasObservedReaderSearchWitness,
+            AtlasSearchCancellation) throws -> String?)? = capturesContext ? { owner, witness, _ in
+                try self.openExcerpt(owner, witness)
+            } : nil
         return .init(create: base.create,
             open: { owner, input, flag in
                 let reply = try base.open(owner, input, flag)
@@ -149,7 +198,10 @@ private final class ObservedSearchProbe: @unchecked Sendable {
             cancel: base.cancel, close: base.close, retirementFailed: base.retirementFailed,
             search: .init(find: { owner, request, _ in try self.find(owner, request) },
                 hit: { owner, generation, index in try self.hit(owner, generation, index) },
-                observeHit: verified, findPage: paged))
+                observeHit: verified, findPage: paged, openExcerpt: excerpt),
+            resolveSelection: { owner, observation, start, end in
+                try self.selection(owner, observation, start, end)
+            })
     }
     private func recordOpen(_ owner: UInt64, _ input: AtlasObservedReaderInput) {
         lock.lock(); defer { lock.unlock() }; inputs[owner] = input; revisions[owner] = 0
@@ -159,6 +211,8 @@ private final class ObservedSearchProbe: @unchecked Sendable {
     func blockFindReply(_ gate: ObservedReaderGate) { lock.lock(); nextFindReplyGate = gate; lock.unlock() }
     func blockHit(_ gate: ObservedReaderGate) { lock.lock(); nextHitGate = gate; lock.unlock() }
     func blockWindow(_ gate: ObservedReaderGate) { lock.lock(); nextWindowGate = gate; lock.unlock() }
+    func blockExcerpt(_ gate: ObservedReaderGate) { lock.lock(); nextExcerptGate = gate; lock.unlock() }
+    func failExcerpt() { lock.lock(); excerptFailure = true; lock.unlock() }
     func failFind() { lock.lock(); findFailure = true; lock.unlock() }
     func failVerifiedJump() { lock.lock(); verifiedFailure = true; lock.unlock() }
     func useMalformedNeighbor() { lock.lock(); malformedNeighbor = true; lock.unlock() }
@@ -169,6 +223,7 @@ private final class ObservedSearchProbe: @unchecked Sendable {
     var windowCount: Int { lock.lock(); defer { lock.unlock() }; return windows }
     var hitCount: Int { lock.lock(); defer { lock.unlock() }; return hits }
     var verifiedJumpCount: Int { lock.lock(); defer { lock.unlock() }; return verifiedJumps }
+    var excerptOpenCount: Int { lock.lock(); defer { lock.unlock() }; return excerptOpens }
     var findGenerations: [UInt64] { lock.lock(); defer { lock.unlock() }; return generations }
     var findStartAfters: [UInt64] { lock.lock(); defer { lock.unlock() }; return startAfters }
     private func finish() { lock.lock(); active -= 1; lock.unlock() }
@@ -243,6 +298,25 @@ private final class ObservedSearchProbe: @unchecked Sendable {
         lock.lock(); reports[owner] = report; lock.unlock()
         replyGate?.wait()
         return try ObservedReaderFixture.encode(report)
+    }
+
+    private func openExcerpt(_ owner: UInt64, _ witness: AtlasObservedReaderSearchWitness) throws -> String? {
+        lock.lock()
+        guard let input = inputs[owner], let report = reports[owner],
+              report["query_generation"] as? String == String(witness.target.generation) else {
+            lock.unlock(); return try ObservedReaderFixture.failure(owner, "OBSERVED_READER_STALE_QUERY")
+        }
+        let id = revision(owner), gate = nextExcerptGate, fail = excerptFailure
+        nextExcerptGate = nil; excerptFailure = false; excerptOpens += 1
+        active += 1; mostActive = max(mostActive, active)
+        lock.unlock(); defer { finish() }; gate?.wait()
+        if fail { return try ObservedReaderFixture.failure(owner, "OBSERVED_READER_SEARCH_CONTEXT_UNAVAILABLE") }
+        // Only the accepted report supplies bytes here. A later live edit or
+        // query cannot supply the excerpt for this captured operation.
+        let page = try ObservedSearchFixture.capturedPage(owner, input, id, report: report,
+            index: Int(witness.target.hit.index))
+        lock.lock(); pages[owner, default: [:]][id] = page; lock.unlock()
+        return try ObservedReaderFixture.encode(page)
     }
 
     private func verifiedJump(_ owner: UInt64, _ witness: AtlasObservedReaderSearchWitness,
@@ -320,6 +394,20 @@ private final class ObservedSearchProbe: @unchecked Sendable {
               let range = page["visible_range"] as? [String: String],
               range == ObservedReaderFixture.range(start, end) else { return nil }
         return try ObservedReaderFixture.encode(ObservedReaderFixture.copy(page))
+    }
+    private func selection(_ owner: UInt64, _ observation: UInt64, _ start: UInt64, _ end: UInt64) throws -> String? {
+        lock.lock(); defer { lock.unlock() }
+        guard let page = pages[owner]?[observation], let text = page["text"] as? String,
+              let encoding = AtlasObservedReaderEncoding(rawValue: page["encoding"] as! String),
+              let visible = page["visible_range"] as? [String: String],
+              let base = UInt64(visible["start"]!), start < end, end <= UInt64(text.utf8.count),
+              let prefix = String(bytes: Array(text.utf8).prefix(Int(start)), encoding: .utf8),
+              let selected = String(bytes: Array(text.utf8)[Int(start)..<Int(end)], encoding: .utf8) else { return nil }
+        let originalStart = base + UInt64(AtlasObservedReaderSearchRequest.originalBytes(prefix, encoding: encoding).count)
+        let original = AtlasObservedReaderSearchRequest.originalBytes(selected, encoding: encoding)
+        return try ObservedReaderFixture.encode(ObservedReaderFixture.selection(page, utf8Start: start, utf8End: end,
+            originalStart: originalStart, originalEnd: originalStart + UInt64(original.count), text: selected,
+            originalHex: ObservedReaderFixture.hex(original)))
     }
 }
 
@@ -745,6 +833,8 @@ private final class ObservedSearchProbe: @unchecked Sendable {
     }
 
     @MainActor static func main() async throws {
+        try capturedPageWireTests()
+        try await capturedPageModelTests()
         try retainedContextWireTests()
         try await retainedContextModelTests()
         try pagingWireTests()
@@ -765,6 +855,165 @@ private final class ObservedSearchProbe: @unchecked Sendable {
 
 
 private extension AtlasObservedReaderSearchTests {
+    static func capturedPageWireTests() throws {
+        let owner: UInt64 = 77
+        let input = try AtlasObservedReaderInput(root: "/repo", relativePath: Array("large.txt".utf8))
+        let modes: [(AtlasObservedReaderSearchMode, Bool, String, String)] = [
+            (.text, true, "é🦀", "é🦀"), (.text, false, "σ", "Σ"), (.occurrences, true, "needle", "needle")]
+        for encoding in AtlasObservedReaderEncoding.allCases {
+            for (mode, sensitive, needle, spelling) in modes {
+                let secondPrefix = "pre " + spelling + "\r\npost "
+                let source = secondPrefix + spelling + "\n"
+                let bytes = AtlasObservedReaderSearchRequest.originalBytes(source, encoding: encoding)
+                let start = UInt64(AtlasObservedReaderSearchRequest.originalBytes("pre ", encoding: encoding).count)
+                let second = UInt64(AtlasObservedReaderSearchRequest.originalBytes(secondPrefix, encoding: encoding).count)
+                let request = try AtlasObservedReaderSearchRequest(generation: 3, needle: needle, encoding: encoding,
+                    caseSensitive: sensitive, mode: mode)
+                let reportValue = ObservedSearchFixture.withContext(ObservedSearchFixture.report(owner, input, request,
+                    observation: 9, length: UInt64(bytes.count), offsets: [start, second], spellings: [spelling, spelling]),
+                    source: source, encoding: encoding)
+                let report = try AtlasObservedReaderSearchReport.decode(ObservedReaderFixture.encode(reportValue),
+                    handle: owner, input: input, request: request)
+                let witness = try AtlasObservedReaderSearchWitness.decode(
+                    ObservedReaderFixture.encode(ObservedSearchFixture.witness(reportValue)), handle: owner,
+                    input: input, report: report, target: report.target(for: report.hits[0]))
+                let value = try ObservedSearchFixture.capturedPage(owner, input, 10, report: reportValue)
+                func decode(_ value: [String: Any]) throws -> AtlasObservedReaderPage {
+                    try .decode(ObservedReaderFixture.encode(value), handle: owner, input: input, capturedHit: witness)
+                }
+                let page = try decode(value)
+                precondition(page.text == source && page.originalHex == ObservedReaderFixture.hex(bytes)
+                    && page.observation.sourceBytesRead == 0 && page.observation.readCalls == 0
+                    && page.observation.retainedSearchContext?.searchObservation == report.observation
+                    && page.verifiedSearchSelection == NSRange(location: 4, length: (spelling as NSString).length))
+                precondition(witness.verify(context: page) == .captured(selection: page.verifiedSearchSelection))
+                let restored = try AtlasObservedReaderPage.decode(
+                    ObservedReaderFixture.encode(ObservedReaderFixture.retained(value)),
+                    handle: owner, input: input, retained: page)
+                precondition(restored.matches(page))
+                let copy = try AtlasObservedReaderCopy.decode(ObservedReaderFixture.encode(ObservedReaderFixture.copy(value)),
+                    handle: owner, input: input, page: page)
+                precondition(copy.originalHex == page.originalHex)
+                let selectionRequest = try AtlasObservedReaderSelectionRequest(page: page,
+                    nativeRange: (source as NSString).range(of: "post"))
+                let prefix = "pre " + spelling + "\r\n"
+                let originalStart = UInt64(AtlasObservedReaderSearchRequest.originalBytes(prefix, encoding: encoding).count)
+                let original = AtlasObservedReaderSearchRequest.originalBytes("post", encoding: encoding)
+                let selected = try AtlasObservedReaderSelection.decode(ObservedReaderFixture.encode(
+                    ObservedReaderFixture.selection(value, utf8Start: selectionRequest.utf8Start,
+                        utf8End: selectionRequest.utf8End, originalStart: originalStart,
+                        originalEnd: originalStart + UInt64(original.count), text: "post",
+                        originalHex: ObservedReaderFixture.hex(original))), input: input, request: selectionRequest)
+                precondition(selected.text == "post" && selected.originalRange.start == originalStart
+                    && selected.withLocationText.contains("\"search_observation\":\"9\"")
+                    && selected.withLocationText.contains("\"retained_search_context\""))
+
+                let changes: [(String, Any)] = [("observation", "9"), ("consistency", "unchanged-metadata-not-atomic"),
+                    ("whole_file_observed", true), ("observation_source_bytes_read", "1"),
+                    ("observation_read_calls", "1"), ("additional_source_bytes_read", "1"),
+                    ("retained_search_context", NSNull()), ("text", source.replacingOccurrences(of: "post", with: "new!")),
+                    ("original_hex", "00" + page.originalHex.dropFirst(2))]
+                for (key, replacement) in changes {
+                    var bad = value; bad[key] = replacement
+                    rejects("captured page " + key) { _ = try decode(bad) }
+                }
+                for (key, replacement) in [("query_generation", "4"), ("search_observation", "8"),
+                    ("page_start_after", "1"), ("hit_index", "1"), ("occurrence_id", "2")] {
+                    var bad = value, origin = bad["retained_search_context"] as! [String: Any]
+                    origin[key] = replacement; bad["retained_search_context"] = origin
+                    rejects("captured origin " + key) { _ = try decode(bad) }
+                }
+                var mixed = value, navigation = mixed["find_hit"] as! [String: Any]
+                navigation["decoded_utf8_range"] = ObservedReaderFixture.range(UInt64(secondPrefix.utf8.count),
+                    UInt64(secondPrefix.utf8.count + spelling.utf8.count))
+                mixed["find_hit"] = navigation
+                rejects("same literal at a different captured location") { _ = try decode(mixed) }
+                mixed = value; navigation = mixed["find_hit"] as! [String: Any]
+                navigation["verification"] = "equal-original-bytes-in-new-observation"; mixed["find_hit"] = navigation
+                rejects("fresh verification on retained bytes") { _ = try decode(mixed) }
+                mixed = value; mixed["command"] = "observe-hit"
+                rejects("captured receipt on a fresh-read action") {
+                    _ = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(mixed), handle: owner,
+                        input: input, request: page.observation.request, hit: witness)
+                }
+            }
+        }
+        // Independent history copies can exceed total source I/O, but must be
+        // explicitly accounted for within the bounded retained-page allowance.
+        var info = ObservedReaderFixture.info(owner, input)
+        info["retained_observations"] = ["10", "11"]
+        info["payload_bytes_read"] = "20"; info["read_calls"] = "1"
+        info["retained_payload_bytes"] = "40"; info["retained_copied_bytes"] = "40"
+        let accepted = try AtlasObservedReaderInfo.decode(ObservedReaderFixture.encode(info), handle: owner, input: input)
+        precondition(accepted.retainedBytes == 40 && accepted.copiedBytes == 40 && accepted.sourceBytesRead == 20)
+        for replacement in ["0", "41", String(UInt64.max)] {
+            var bad = info; bad["retained_copied_bytes"] = replacement
+            rejects("copied page accounting " + replacement) {
+                _ = try AtlasObservedReaderInfo.decode(ObservedReaderFixture.encode(bad), handle: owner, input: input)
+            }
+        }
+    }
+
+    @MainActor static func capturedPageModelTests() async throws {
+        let input = try AtlasObservedReaderInput(root: "/repo", relativePath: Array("large.txt".utf8))
+        let probe = ObservedSearchProbe(capturesContext: true)
+        let original = "pre old post old end\n"
+        probe.setContent(original)
+        let model = AtlasObservedReaderModel(transport: probe.transport)
+        model.pageBytes = 4; model.open(.init(input: input, project: UUID(), access: nil))
+        try await wait("captured history reader open") { model.page != nil && !model.busy }
+        let initial = model.page!, windows = probe.windowCount
+        model.searchText = "old"; model.find()
+        try await wait("captured history Find") { model.searchAuthorized && !model.busy }
+        model.nextSearchHit()
+        try await wait("captured history witness") { model.selectedSearchWitness != nil && !model.busy }
+        precondition(model.canOpenSearchExcerpt)
+        probe.failExcerpt(); model.openSearchExcerpt()
+        try await wait("unavailable captured page") { !model.busy }
+        precondition(model.page!.matches(initial) && !model.canBack)
+        probe.setContent("xxx new xxxx new xxx\n")
+        model.openSearchExcerpt()
+        try await wait("captured page opened after source edit") { model.page?.findHit?.isCapturedExcerpt == true && !model.busy }
+        let captured = model.page!
+        precondition(captured.text == original && probe.windowCount == windows && model.canBack
+            && model.searchSelection == NSRange(location: 4, length: 3)
+            && model.searchContext == .captured(selection: model.searchSelection)
+            && model.verifiedPageNotice?.contains("no current file bytes were read") == true)
+        model.updateTextSelection(source: model.source!, navigation: model.navigation, range: NSRange(location: 8, length: 4))
+        try await wait("selection outside captured match") { model.textSelection?.text == "post" }
+        precondition(model.textSelection!.originalRange.start == 8
+            && model.textSelection!.withLocationText.contains("\"retained_search_context\""))
+
+        model.searchText = "new"; model.find()
+        try await wait("new Find replaces original query") { model.searchAuthorized && !model.busy }
+        precondition(model.page!.matches(captured) && model.selectedSearchWitness == nil
+            && model.searchSelection == captured.verifiedSearchSelection && !model.canOpenSearchExcerpt)
+        let hex = await model.copyOriginalHex()
+        precondition(hex == captured.originalHex && probe.windowCount == windows)
+        model.back(); try await wait("back from captured page") { model.page?.observation == initial.observation && !model.busy }
+        model.forward(); try await wait("captured page replay after query replacement") { model.page?.observation == captured.observation && !model.busy }
+        precondition(model.page!.matches(captured) && model.searchSelection == captured.verifiedSearchSelection
+            && probe.windowCount == windows)
+
+        model.nextSearchHit(); try await wait("replacement witness for cancellation") { model.selectedSearchWitness != nil && !model.busy }
+        let canceled = ObservedReaderGate(); probe.blockExcerpt(canceled); model.openSearchExcerpt()
+        try await wait("captured opening entered") { canceled.entered }
+        model.cancel(); canceled.release()
+        try await wait("canceled captured opening drained") { probe.activeCount == 0 }
+        precondition(model.page!.matches(captured) && model.canBack && !model.canForward)
+        let stale = ObservedReaderGate(); probe.blockExcerpt(stale); model.openSearchExcerpt()
+        try await wait("obsolete captured opening entered") { stale.entered }
+        model.searchText = "different"; stale.release()
+        try await wait("obsolete captured opening drained") { probe.activeCount == 0 }
+        precondition(model.page!.matches(captured) && !model.canOpenSearchExcerpt && model.canBack && !model.canForward
+            && probe.windowCount == windows && probe.maximumActive == 1 && probe.excerptOpenCount == 4)
+        model.close(); try await wait("captured history lifetime retired") { probe.lifetime.closedCount == probe.lifetime.createCount }
+
+        let legacy = AtlasObservedReaderModel(transport: ObservedSearchProbe().transport)
+        precondition(!legacy.canOpenSearchExcerpt)
+        legacy.close()
+    }
+
     static func retainedContextWireTests() throws {
         let owner: UInt64 = 77
         let input = try AtlasObservedReaderInput(root: "/repo", relativePath: Array("large.txt".utf8))

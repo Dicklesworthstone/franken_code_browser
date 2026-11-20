@@ -391,6 +391,9 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     }
     var canReadSearchContext: Bool { canSelectSearchHit && selectedSearchWitness != nil }
     var canGoToVerifiedMatch: Bool { canReadSearchContext && transport.search?.observeHit != nil }
+    var canOpenSearchExcerpt: Bool {
+        canCopySearchWitness && selectedSearchWitness?.context?.textRange != nil && transport.search?.openExcerpt != nil
+    }
     var canCopySearchWitness: Bool { canSelectSearchHit && selectedSearchIndex != nil }
     func retainedSearchContextCopy(hex: Bool) -> String? {
         guard canCopySearchWitness, let context = selectedSearchWitness?.context else { return nil }
@@ -402,6 +405,9 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     }
     var verifiedPageNotice: String? {
         guard let hit = page?.findHit else { return nil }
+        if hit.isCapturedExcerpt {
+            return "Captured excerpt from Find observation \(hit.searchObservation), occurrence \(hit.occurrence). The match and surrounding bytes belong to that search; no current file bytes were read."
+        }
         let expressionNotice = hit.expression == nil ? ""
             : " Only primary literal bytes were verified in this page. Other expression predicates belong to the original search observation."
         guard let report = searchReport, hit.generation == report.request.generation,
@@ -418,7 +424,9 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
         var message = "Each range is a separate observation of the opened file object, not an immutable whole-file snapshot. Other bytes remain unknown."
         if let page {
             let observation = page.observation
-            if page.lineNavigation == nil && observation.consistency != "unchanged-metadata-not-atomic" {
+            if let captured = observation.retainedSearchContext {
+                message += " This page copies bytes retained by Find observation \(captured.searchObservation). Its new page identity does not represent a new source read."
+            } else if page.lineNavigation == nil && observation.consistency != "unchanged-metadata-not-atomic" {
                 message += " The file changed, ended early, or its final metadata was unavailable during this observation (\(observation.consistency))."
             }
             if page.hasReplacements { message += " Decoded text contains replacements; original hex preserves the observed bytes." }
@@ -862,6 +870,31 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
         }
     }
 
+    func openSearchExcerpt() {
+        guard canOpenSearchExcerpt, let witness = selectedSearchWitness,
+              searchReport?.admits(witness.target) == true, let session, let input = authority?.input,
+              let openExcerpt = session.transport.search?.openExcerpt else { return }
+        let (ticket, flag) = begin("Opening the original captured excerpt…")
+        searchOperation = true
+        task = Task {
+            do {
+                let page = try await io.perform(cancellation: flag, keepingAlive: [session]) {
+                    try AtlasObservedReaderPage.decode(openExcerpt(session.handle, witness, flag),
+                        handle: session.handle, input: input, capturedHit: witness)
+                }
+                guard accepts(ticket, flag), self.session === session, searchAuthorized,
+                      selectedSearchWitness?.target == witness.target,
+                      searchReport?.admits(witness.target) == true else { return }
+                guard page.observation.id > max(latestObservation, witness.target.observation) else {
+                    throw AtlasObservedReaderError.invalidResponse
+                }
+                install(page, append: true)
+                finish(ticket)
+                notice = "Opened captured excerpt from Find observation \(witness.target.observation), without reading the file. Back/Forward preserves this page and its exact match."
+            } catch { fail(error, ticket: ticket) }
+        }
+    }
+
     /// Only the shared engine may publish this new context after verifying
     /// the old literal and its exact decoded range. A changed hit leaves the
     /// accepted page/history untouched; ordinary current-context reading is
@@ -977,6 +1010,8 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
                     return "Enter one exact identifier without spaces or ASCII punctuation other than _ and $. An identifier cannot start with an ASCII digit."
                 case "OBSERVED_READER_SEARCH_HIT_CHANGED":
                     return "The selected match or its token boundaries changed. The accepted page is unchanged. Run Find again, or read current context explicitly."
+                case "OBSERVED_READER_SEARCH_CONTEXT_UNAVAILABLE":
+                    return "The captured excerpt does not contain enough complete source characters to open a reader page. Its retained match and captured hex remain available."
                 case "OBSERVED_READER_LINE_MISSING":
                     return "The scan reached the end of the opened file before the requested line. The accepted page is unchanged."
                 case "OBSERVED_READER_LINE_SCAN_BYTE_LIMIT":
@@ -1015,7 +1050,8 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
            hit.generation == witness.target.generation, hit.searchObservation == witness.target.observation,
            hit.index == witness.target.hit.index, hit.occurrence == witness.target.hit.occurrence,
            hit.originalRange == witness.target.hit.range {
-            searchContext = hit.expression == nil ? .verified(selection: searchSelection)
+            searchContext = hit.isCapturedExcerpt ? .captured(selection: searchSelection)
+                : hit.expression == nil ? .verified(selection: searchSelection)
                 : .expressionPrimaryVerified(selection: searchSelection)
         }
         offsetInput = String(page.observation.request.offset)
