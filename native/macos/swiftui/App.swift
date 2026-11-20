@@ -339,6 +339,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     @State private var showsReader = false
     @State private var usesPagedReader = false
     @State private var readerHistory = AtlasWorkspaceReaderHistory()
+    @State private var markdownPreview = AtlasMarkdownPreviewPreference()
     @State private var observedReader: AtlasObservedReaderPresentation?
     @State private var workspaceStreamSearch: AtlasWorkspaceStreamPresentation?
     @State private var projectLinks: AtlasProjectLinksPresentation?
@@ -421,6 +422,12 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     private var hasRetainedAtlas: Bool { hasMetadataAtlas && retainedAtlasRevision == atlasRevision }
     private var workspaceReader: AtlasWorkspaceReaderCapture? {
         usesPagedReader ? readerHistory.current : nil
+    }
+    private var canPresentWorkspacePreview: Bool {
+        showsReader && projectViewActive && !loadingProject && !readerHistory.busy
+            && !nativeOpen.showsReader && !showsFileFinder && !showsReadingDesk
+            && !showsSavedRepository && !showsSnapshotComparison
+            && projectLinks == nil && observedReader == nil && workspaceStreamSearch == nil
     }
     private var hasSourcePane: Bool {
         selectedPath != nil || readerHistory.current != nil || readerHistory.busy || !readerHistory.notice.isEmpty
@@ -629,6 +636,11 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             }
             .disabled(!hasSourcePane)
             .help("Show or hide the selectable source reader")
+            Button(action: toggleMarkdownPreview) {
+                Label(markdownPreview.enabled ? "Markdown preview on" : "Markdown preview", systemImage: "doc.richtext")
+            }
+            .keyboardShortcut("r", modifiers: .command)
+            .help("Toggle the selected Markdown file's retained preview (⌘R). While enabled, newly activated Markdown files open in preview; Source returns to the same captured bytes.")
             Button { showsReadingDesk = true } label: {
                 Label("Reading Desk", systemImage: "books.vertical")
             }
@@ -774,7 +786,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             // Returning creates a new native surface whose accepted frame
             // supplies fresh viewport demand; hidden views do no enrichment.
         }
-        .onChange(of: readerHistory.current?.id) { _, _ in
+        .onChange(of: readerHistory.current?.id) { _, visit in
+            markdownPreview.activate(visit)
             if readerHistory.current != nil { presentWorkspaceReader() }
         }
         .onChange(of: snapshotExportSource?.identity) { _, _ in
@@ -1824,7 +1837,13 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             keep: { reader in
                 guard workspaceReader === capture, capture.reader === reader else { return }
                 keepSource(reader)
-            }, project: projectBrowser, searchProject: workspaceSourceProjectSearch(for: capture))
+            }, project: projectBrowser, searchProject: workspaceSourceProjectSearch(for: capture),
+            preferredPreviewRequest: markdownPreview.request(for: capture.id, path: capture.relativePath,
+                active: workspaceReader === capture && canPresentWorkspacePreview),
+            returnedToSource: {
+                guard workspaceReader === capture else { return }
+                markdownPreview.showSource()
+            })
     }
 
     private func workspaceSourceProjectSearch(for capture: AtlasWorkspaceReaderCapture)
@@ -1837,6 +1856,25 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     }
 
     // MARK: Actions
+
+    private func toggleMarkdownPreview() {
+        markdownPreview.toggle()
+        guard markdownPreview.enabled else { return }
+        if readerHistory.busy {
+            status = "Markdown preview enabled. The selected source will open after its capture is ready."
+            return
+        }
+        if let capture = workspaceReader {
+            markdownPreview.activate(capture.id)
+            showsReader = true
+        } else if let path = selectedPath, AtlasMarkdownPreviewPreference.isMarkdown(Array(path.utf8)) {
+            // The existing handoff retains displayed bytes when available;
+            // enabling preview never reopens an already accepted reader.
+            openPagedFile(path)
+        } else {
+            status = "Markdown preview enabled. Open a Markdown file to read its retained preview."
+        }
+    }
 
     private func keepSource(_ reader: AtlasPagedReaderModel) {
         guard readingDesk.canOperate, reader.canKeep,
@@ -1902,6 +1940,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
 
     private func presentWorkspaceReader() {
         guard let capture = readerHistory.current else { return }
+        markdownPreview.activate(capture.id)
         cancelSourceLoad()
         selectedMatch = selectedHit.flatMap { row in
             guard searchIsCurrent,

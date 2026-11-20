@@ -45,6 +45,43 @@ struct AtlasExternalWebLink: Sendable {
     }
 }
 
+/// One window's optional Markdown default. A visit and an explicit preference
+/// change each get a distinct request; repainting or rebuilding a reader does
+/// not. Raw path bytes choose only presentation, never a source-access grant.
+struct AtlasMarkdownPreviewPreference {
+    private(set) var enabled = false
+    private var visit: UUID?
+    private var generation = UUID()
+
+    mutating func toggle() {
+        enabled.toggle()
+        generation = UUID()
+    }
+    mutating func showSource() {
+        guard enabled else { return }
+        enabled = false
+        generation = UUID()
+    }
+    mutating func activate(_ next: UUID?) {
+        guard visit != next else { return }
+        visit = next
+        generation = UUID()
+    }
+    func request(for visit: UUID, path: [UInt8], active: Bool) -> UUID? {
+        guard enabled, active, self.visit == visit, Self.isMarkdown(path) else { return nil }
+        return generation
+    }
+    static func isMarkdown(_ path: [UInt8]) -> Bool {
+        guard !path.isEmpty, path.count <= 16_384, let dot = path.lastIndex(of: 46),
+              path.lastIndex(of: 47).map({ $0 < dot }) ?? true else { return false }
+        let suffix = path.suffix(from: dot + 1)
+        guard (2...8).contains(suffix.count) else { return false }
+        let lower = suffix.map { (65...90).contains($0) ? $0 + 32 : $0 }
+        return lower.elementsEqual("md".utf8) || lower.elementsEqual("markdown".utf8)
+            || lower.elementsEqual("mdown".utf8)
+    }
+}
+
 /// User-facing Markdown navigation over the reader's existing immutable capture.
 /// The injected operation is the retained reader coordinator, not a parser or a
 /// new source provider. Source-only hosts do not prepare a document implicitly.
@@ -85,6 +122,7 @@ struct AtlasExternalWebLink: Sendable {
     @ObservationIgnored private let revoke: @MainActor () -> Void
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var operation = UUID()
+    @ObservationIgnored private var preferredPresentation: UUID?
 
     init(supported: Bool, richSupported: Bool = false, execute: @escaping Execute,
          cancel: @escaping @MainActor () -> Void, revoke: @escaping @MainActor () -> Void) {
@@ -162,6 +200,20 @@ struct AtlasExternalWebLink: Sendable {
             identity = next
         }
         self.sourceOffset = min(sourceOffset, next.capturedBytes)
+    }
+
+    /// Called only by the active reader after an explicit window preference or
+    /// source activation. Consume before starting work so SwiftUI recreation,
+    /// same-capture paging and cancellation cannot restart a pending request.
+    /// Accepted document/layout pages are reused without reflow or file reads.
+    @discardableResult
+    func presentPreferred(_ request: UUID, alreadyPresented: Bool = false) -> Bool {
+        guard identity != nil, preferredPresentation != request else { return false }
+        preferredPresentation = request
+        // An existing sheet or split already satisfies this visit's default.
+        // Do not restart its canceled work or interrupt its pending operation.
+        if !alreadyPresented && !authorized { prepare() }
+        return true
     }
 
     func prepare() {
@@ -537,6 +589,7 @@ struct AtlasExternalWebLink: Sendable {
         cancel(silent: true)
         revoke()
         identity = nil; page = nil; headings = nil; links = nil; source = nil
+        preferredPresentation = nil
         displayPage = nil; displayFonts = []; displayHistory = []; showsStyled = false
         authorized = false; history.reset(); headingHistory = []; linkHistory = []
         sourceOffset = 0; lineInput = "1"; notice = ""

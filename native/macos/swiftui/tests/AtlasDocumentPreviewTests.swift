@@ -416,12 +416,154 @@ import Foundation
                   && m.sourceOffset(for: target, reader: f.identity) == 3,
                   "The matching enclosing-block receipt enables source navigation")
         }
+        await preferredPresentation()
         await anchoredPreparation()
         await documentLinks()
         await externalWebLinks()
         await styledLifecycle()
         await styledDeliveries()
         print("AtlasDocumentPreviewTests: \(checks) checks passed")
+    }
+
+    @MainActor private static func preferredPresentation() async {
+        do {
+            var preference = AtlasMarkdownPreviewPreference()
+            let first = UUID(), second = UUID(), path = Array("docs/README.MD".utf8)
+            preference.activate(first)
+            check(preference.request(for: first, path: path, active: true) == nil,
+                  "Construction and source activation do not implicitly enable Markdown")
+            preference.toggle()
+            let request = preference.request(for: first, path: path, active: true)!
+            preference.activate(first)
+            check(preference.request(for: first, path: path, active: true) == request,
+                  "Repeated presentation of the same visit retains its one-shot request")
+            check(preference.request(for: first, path: path, active: false) == nil
+                  && preference.request(for: second, path: path, active: true) == nil,
+                  "Hidden history and another reader cannot receive the active visit's command")
+            for accepted in ["readme.md", "guide.markdown", "notes.MDOWN", "sub/a.Md"] {
+                check(AtlasMarkdownPreviewPreference.isMarkdown(Array(accepted.utf8)),
+                      "Supported raw Markdown extension remains eligible")
+            }
+            for refused in ["main.swift", "notes.md.old", "folder.md/file", "notes.mḋ", "notes.md/"] {
+                check(!AtlasMarkdownPreviewPreference.isMarkdown(Array(refused.utf8)),
+                      "A different extension or Markdown-looking parent cannot select preview")
+            }
+            check(AtlasMarkdownPreviewPreference.isMarkdown([0xff, 47] + path),
+                  "A display-label decoder is not required to classify raw retained Markdown paths")
+            check(!AtlasMarkdownPreviewPreference.isMarkdown(Array(repeating: 120, count: 16_385)),
+                  "Extension classification is bounded even for invalid host input")
+            preference.activate(second)
+            let other = preference.request(for: second, path: path, active: true)!
+            check(other != request && preference.request(for: first, path: path, active: true) == nil,
+                  "A replacement visit withdraws the old request and owns a new one")
+            preference.activate(first)
+            check(preference.request(for: first, path: path, active: true) != request,
+                  "Deliberate Back navigation is a fresh activation, not a SwiftUI repaint")
+            preference.showSource()
+            check(!preference.enabled && preference.request(for: first, path: path, active: true) == nil,
+                  "Source explicitly withdraws the window default")
+            preference.toggle()
+            let resumed = preference.request(for: first, path: path, active: true)!
+            check(resumed != request, "A later explicit preview command can reopen an accepted visit")
+            preference.activate(nil)
+            check(preference.request(for: first, path: path, active: true) == nil,
+                  "Closing the owning visit withdraws its preview authority")
+        }
+        do {
+            let f = Fixture(), m = f.model(), request = UUID()
+            check(!m.presentPreferred(request) && f.requests.isEmpty,
+                  "A preference has no source authority before a capture is bound")
+            m.bind(identity: f.identity, sourceOffset: 0)
+            check(m.presentPreferred(request), "A bound active reader admits its first preview command")
+            check(!m.presentPreferred(request), "Repeated view updates cannot enqueue duplicate preparation")
+            await wait { !m.busy }
+            let page = m.page!
+            check(f.requests.count == 1 && m.authorized,
+                  "The active reader prepares through the actual retained document operation once")
+            m.bind(identity: f.identity, sourceOffset: 512)
+            check(!m.presentPreferred(request) && m.page?.id == page.id && f.requests.count == 1,
+                  "Same-capture source paging and view recreation preserve accepted preview state")
+            check(m.presentPreferred(UUID()) && m.page?.id == page.id && f.requests.count == 1,
+                  "An explicit warm reopen reuses the same captured flow without parsing or rereading")
+            let target = page.target(at: 0)!
+            m.showSource(target)
+            await wait { !m.busy }
+            check(m.sourceOffset(for: target, reader: f.identity) == 3,
+                  "Source return uses the selected region's verified original-byte anchor")
+            m.cancel(silent: true)
+            check(m.sourceOffset(for: target, reader: f.identity) == 3
+                  && m.sourceOffset(for: target, reader: Fixture.identity(owner: 2)) == nil,
+                  "Closing the sheet preserves a current anchor but cannot lend it to another reader")
+            let before = f.requests.count
+            check(m.presentPreferred(UUID()) && f.requests.count == before
+                  && m.source?.target == target && m.page?.id == page.id,
+                  "Warm preview preserves its selected region and document history")
+            m.next(); await wait { !m.busy }
+            check(m.sourceOffset(for: target, reader: f.identity) == nil,
+                  "A region from an older preview page cannot move the current source")
+        }
+        do {
+            let f = Fixture(), m = f.model(), request = UUID()
+            m.bind(identity: f.identity, sourceOffset: 0)
+            f.held = true
+            check(m.presentPreferred(request), "Initial pending preference is admitted")
+            await wait { f.pending.count == 1 }
+            m.cancel(silent: true)
+            f.release(); await settle()
+            check(m.page == nil && !m.busy && !m.authorized,
+                  "Leaving the active source cannot publish a late prepared preview")
+            check(!m.presentPreferred(request) && f.requests.count == 1,
+                  "A canceled automatic presentation does not restart on a later redraw")
+            f.held = false
+            check(m.presentPreferred(UUID()), "A new explicit request may retry canceled preparation")
+            await wait { !m.busy }
+            check(m.authorized && f.requests.count == 2, "Retry enters the production prepare route once")
+        }
+        do {
+            let f = Fixture(), m = f.model()
+            m.bind(identity: f.identity, sourceOffset: 0)
+            f.held = true
+            m.prepare()
+            await wait { f.pending.count == 1 }
+            let request = UUID()
+            check(m.presentPreferred(request, alreadyPresented: true) && f.requests.count == 1 && m.busy,
+                  "Returning to an existing split acknowledges the default without replacing its pending work")
+            m.cancel(silent: true)
+            f.release(); await settle()
+            check(!m.presentPreferred(request) && f.requests.count == 1,
+                  "Hiding an existing split cannot reopen a modal from the already satisfied default")
+            let next = UUID()
+            check(m.presentPreferred(next, alreadyPresented: true) && !m.busy && f.requests.count == 1,
+                  "A retained canceled split stays canceled when visited again")
+            check(!m.presentPreferred(next), "Closing a canceled split cannot implicitly retry its preparation")
+        }
+        do {
+            let f = Fixture(), m = f.model(), request = UUID()
+            m.bind(identity: f.identity, sourceOffset: 0)
+            f.held = true
+            check(m.presentPreferred(request), "Old capture starts a bounded preparation")
+            await wait { f.pending.count == 1 }
+            f.identity = Fixture.identity(revision: 2)
+            m.bind(identity: f.identity, sourceOffset: 0)
+            f.held = false
+            check(m.presentPreferred(request), "New capture cannot inherit the old request's consumption")
+            await wait { !m.busy }
+            let accepted = m.page!
+            f.release(); await settle()
+            check(m.page?.id == accepted.id && m.page?.inventory.identity.revision == 2,
+                  "A delayed old-capture reply cannot replace the new retained Markdown")
+        }
+        do {
+            for (encoding, bytes) in [("utf16le", UInt64(100)),
+                                       ("utf8", AtlasReaderDocumentLimits.sourceBytes + 1)] {
+                let f = Fixture(), m = f.model(), request = UUID()
+                m.bind(identity: Fixture.identity(bytes: bytes, encoding: encoding), sourceOffset: 0)
+                check(m.presentPreferred(request) && f.requests.isEmpty && !m.busy,
+                      "An unsupported capture shows its existing limitation without source work")
+                check(m.unavailableReason != nil && !m.presentPreferred(request),
+                      "Unavailable preview remains explicit and does not loop on view updates")
+            }
+        }
     }
 
     @MainActor private static func styledLifecycle() async {

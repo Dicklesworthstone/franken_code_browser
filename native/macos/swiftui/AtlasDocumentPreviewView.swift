@@ -10,6 +10,7 @@ import AppKit
     var openSource: AtlasDocumentPreviewModel.SourceNavigation?
     var openLocalLink: AtlasDocumentPreviewModel.LocalNavigation?
     var closePreview: (() -> Void)?
+    var returnToSource: (() -> Void)?
     @Environment(\.dismiss) private var dismiss
     @State private var showsContents = false
     @State private var browsesLinks = false
@@ -80,8 +81,16 @@ import AppKit
                 Button("Hide") { model.cancel(silent: true); closePreview?() }
                     .accessibilityLabel("Hide the split Markdown preview; keep the source reader open")
             } else {
-                Button("Done") { model.cancel(silent: true); dismiss() }
-                    .keyboardShortcut(.cancelAction)
+                if let returnToSource {
+                    Button("Source", action: returnToSource)
+                        .keyboardShortcut("r", modifiers: .command)
+                        .help("Return to this exact retained source, preserving the selected Markdown region (⌘R)")
+                }
+                Button("Done") {
+                    if let returnToSource { returnToSource() }
+                    else { model.cancel(silent: true); dismiss() }
+                }
+                .keyboardShortcut(.cancelAction)
             }
         }
         .padding(10)

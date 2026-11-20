@@ -19,6 +19,8 @@ import AppKit
     private let openLocalLink: AtlasDocumentPreviewModel.LocalNavigation?
     private let project: AtlasProjectBrowserModel?
     private let searchProject: ((AtlasReaderSelectionQuery) -> Void)?
+    private let preferredPreviewRequest: UUID?
+    private let returnedToSource: (() -> Void)?
     @State private var model: AtlasPagedReaderModel
     @State private var didConsumeInitialLine = false
     @State private var readerCommands = AtlasReaderCommands()
@@ -26,6 +28,7 @@ import AppKit
     @State private var showsOutline = false
     @State private var showsReferences = false
     @State private var showsDocument = false
+    @State private var presentingPreferredPreview = false
     @State private var showsSplitPreview = false
     @State private var wrapsLines = false
     @State private var showsLineNumbers = true
@@ -43,7 +46,8 @@ import AppKit
          canKeep: Bool = false, keep: ((AtlasPagedReaderModel) -> Void)? = nil,
          openLocalLink: AtlasDocumentPreviewModel.LocalNavigation? = nil,
          project: AtlasProjectBrowserModel? = nil,
-         searchProject: ((AtlasReaderSelectionQuery) -> Void)? = nil) {
+         searchProject: ((AtlasReaderSelectionQuery) -> Void)? = nil,
+         preferredPreviewRequest: UUID? = nil, returnedToSource: (() -> Void)? = nil) {
         self.root = root
         self.path = path
         self.accessLease = accessLease
@@ -57,6 +61,8 @@ import AppKit
         self.openLocalLink = openLocalLink
         self.project = project
         self.searchProject = searchProject
+        self.preferredPreviewRequest = preferredPreviewRequest
+        self.returnedToSource = returnedToSource
         _model = State(initialValue: AtlasPagedReaderModel(transport: .native, search: .native,
             outline: .native, document: .native, captured: captured, supplied: supplied))
     }
@@ -68,13 +74,16 @@ import AppKit
          keep: ((AtlasPagedReaderModel) -> Void)? = nil,
          openLocalLink: AtlasDocumentPreviewModel.LocalNavigation? = nil,
          project: AtlasProjectBrowserModel? = nil,
-         searchProject: ((AtlasReaderSelectionQuery) -> Void)? = nil) {
+         searchProject: ((AtlasReaderSelectionQuery) -> Void)? = nil,
+         preferredPreviewRequest: UUID? = nil, returnedToSource: (() -> Void)? = nil) {
         root = ""; path = ""; accessLease = nil; initialLine = nil; initialLineConsumed = nil
         ownsModel = false; self.canPin = canPin; self.pin = pin
         self.canKeep = canKeep; self.keep = keep
         self.openLocalLink = openLocalLink
         self.project = project
         self.searchProject = searchProject
+        self.preferredPreviewRequest = preferredPreviewRequest
+        self.returnedToSource = returnedToSource
         _model = State(initialValue: model)
     }
 
@@ -102,12 +111,18 @@ import AppKit
                 }
             }
         }
-        .sheet(isPresented: $showsDocument) {
-            AtlasDocumentPreviewView(model: model.documentPreview, openSource: openPreviewSource, openLocalLink: modalLocalNavigation)
+        .sheet(isPresented: $showsDocument, onDismiss: finishPreferredPreview) {
+            AtlasDocumentPreviewView(model: model.documentPreview, openSource: openPreviewSource,
+                openLocalLink: modalLocalNavigation, returnToSource: returnFromPreview)
         }
         .sheet(isPresented: $showsLinked, onDismiss: closeLinked) { linkedReader }
         .onAppear { if ownsModel { open() } }
-        .onDisappear { closeLinked(); if ownsModel { model.close() }; copyNotice = "" }
+        .onDisappear {
+            withdrawPreferredPreview()
+            closeLinked(); if ownsModel { model.close() }; copyNotice = ""
+        }
+        .onChange(of: preferredPreviewRequest, initial: true) { _, _ in updatePreferredPreview() }
+        .onChange(of: preferredPreviewReady) { _, _ in updatePreferredPreview() }
         .onChange(of: project?.info?.owner) { _, _ in projectChanged() }
         .onChange(of: project?.rootAccessIdentity) { _, _ in projectChanged() }
         .onChange(of: project?.closed) { _, _ in projectChanged() }
@@ -572,7 +587,54 @@ import AppKit
         }.frame(height: 32)
     }
 
+    private var preferredPreviewReady: Bool {
+        model.page != nil && !model.busy && !showsDocument && !showsSplitPreview
+            && !showsLinked && !showsOutline && !showsReferences
+    }
+
+    private func updatePreferredPreview() {
+        guard let request = preferredPreviewRequest else {
+            withdrawPreferredPreview()
+            return
+        }
+        if showsDocument || showsSplitPreview {
+            _ = model.documentPreview.presentPreferred(request, alreadyPresented: true)
+            return
+        }
+        guard preferredPreviewReady, model.documentPreview.presentPreferred(request) else { return }
+        presentingPreferredPreview = true
+        showsDocument = true
+    }
+
+    /// Losing the active workspace visit withdraws only this presentation.
+    /// Its accepted document remains cached with the independent reader.
+    private func withdrawPreferredPreview() {
+        guard presentingPreferredPreview else { return }
+        presentingPreferredPreview = false
+        model.documentPreview.cancel(silent: true)
+        showsDocument = false
+    }
+
+    private func finishPreferredPreview() {
+        guard presentingPreferredPreview else { return }
+        presentingPreferredPreview = false
+        model.documentPreview.cancel(silent: true)
+        returnedToSource?()
+    }
+
+    private func returnFromPreview() {
+        // A chosen preview region can restore its verified original-byte
+        // anchor. Otherwise keep the source page and native selection intact.
+        if let target = model.documentPreview.source?.target { openPreviewSource(target) }
+        model.documentPreview.cancel(silent: true)
+        showsDocument = false
+        finishPreferredPreview()
+    }
+
     private func preparePreview() {
+        // A deliberate sheet/split choice also consumes this visit's default;
+        // closing that choice must not immediately open another preview.
+        if let request = preferredPreviewRequest, model.documentPreview.presentPreferred(request) { return }
         if !model.documentPreview.authorized { model.documentPreview.prepare() }
     }
     private func openPreviewSource(_ target: AtlasReaderDocumentTarget) {
@@ -584,6 +646,7 @@ import AppKit
         model.offsetInput = String(offset)
         model.goToByte()
         showsDocument = false
+        finishPreferredPreview()
     }
     private func open() {
         copyNotice = ""

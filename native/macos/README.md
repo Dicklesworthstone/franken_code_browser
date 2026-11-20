@@ -1788,6 +1788,23 @@ pending; it is not a claim about the already released binary.
 
 ## Styled Markdown preview
 
+In the workspace, select a Markdown file and press **Command-R**, or choose
+**Markdown preview** in the toolbar, to open its retained document preview.
+While enabled, this window opens newly activated `.md`, `.markdown` and `.mdown`
+files in preview. **Source**, **Command-R** inside the preview, or **Done** returns
+to the same captured source and turns off that automatic preference. A currently
+verified Markdown region restores its original-byte anchor; otherwise the source
+page and native selection stay in place. History navigation can present the
+newly active capture; hidden history readers and pins do not open previews.
+
+Reopening a prepared preview reuses its captured document and last preview
+position. Choose **From source page** to resynchronize after independent source
+navigation. Pending work is canceled when its workspace presentation is withdrawn,
+and redraws cannot restart a dismissed request. The selected-file preview uses
+the existing document sheet; rich Markdown inside the Metal atlas parcels remains
+separate work. These native command and presentation changes await executable
+and physical-Mac verification.
+
 Open a retained source file and choose **Markdown**, or **Split preview** to keep
 the source alongside the document. The native reader prepares a **Styled**
 view by default when the host supplies the rich-display capability and the
