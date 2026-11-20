@@ -3,17 +3,17 @@
 //! Native-host composition of the public, bounded FileSearch engine. The last
 //! accepted query owns a small occurrence table and exact original witnesses.
 //! Exact/whole-token queries share a literal; lowercase queries preserve each spelling.
-//! No whole-file capture, source spool, new matcher or inferred context exists.
+//! Bounded surrounding bytes come from the same scan, without source rereads.
 
 use std::{fs::File, mem::size_of, sync::Arc};
 use fcb::{ByteLength, ByteOffset, ByteRange, QueryGeneration, SourceRevision};
 use fcb::search::{CaptureRequest, DetectedEncoding, ExtentConsistency, FileSearch,
-    FileSearchReport, IndexError, ParsedQuery, QueryError, ResourceAllocationId, ResourceBudget, StreamReadOptions,
+    FileSearchReport, IndexError, ParsedQuery, QueryError, ResourceAllocationId, ResourceBudget, StreamContextOptions, StreamReadOptions,
     StreamReadState, StreamReadStats, StreamReadStep, StreamingHit, StreamingMode, StreamingNeedle};
 use fcb::store::Sha256Digest;
 use fcb::search::identifier::{MAX_IDENTIFIER_BYTES, token_scalar};
 use fcb_core::ResourceLease;
-use crate::{AppError, EXIT_OK, EXIT_PARTIAL};
+use crate::{AppError, EXIT_OK, EXIT_PARTIAL, stream_context};
 use crate::output::Output;
 use super::{HostResponse, ObservedReaderEncoding, ObservedReaderError,
     ObservedReaderSession, Observation, MAX_OBSERVED_READER_WINDOW_BYTES, check, decode, extent_sha256};
@@ -69,10 +69,13 @@ pub(super) struct AcceptedSearch {
     sha256: Option<Sha256Digest>,
     witnesses: Vec<SearchWitness>,
     hits: Vec<StreamingHit>,
+    hit_contexts: Vec<HitContext>,
+    context_bytes: Vec<u8>,
     _lease: ResourceLease,
 }
 
 struct SearchWitness { text: String, bytes: Vec<u8>, sha256: Sha256Digest }
+struct HitContext { requested: ByteRange, original: ByteRange, start: usize, len: usize }
 
 /// A verified hit selection belongs to its accepted immutable page. Replacing
 /// the current query cannot erase the provenance needed for history replay.
@@ -138,7 +141,8 @@ impl ObservedReaderSession {
     /// Search the same explicitly opened file from byte zero, under independent
     /// byte/call/result limits. Exact UTF-8/UTF-16 semantics and overlapping hits
     /// come from FileSearch. Whole-file completion is an observed sequence with
-    /// matching metadata, never an atomic snapshot or rereadable old context.
+    /// matching metadata, never an atomic snapshot. Each retained hit also owns
+    /// bounded context from this scan; unretained source is not rereadable.
     ///
     /// A newer attempt consumes its generation and a fresh source observation,
     /// including on cancellation/failure. The previous accepted query remains
@@ -220,7 +224,7 @@ impl ObservedReaderSession {
         // A canceled/failed attempt still spends every actual native read call.
         self.source_bytes_read.checked_add(max_scan_bytes).ok_or(ObservedReaderError::IdentityExhausted)?;
         self.read_calls.checked_add(MAX_OBSERVED_READER_SEARCH_CALLS).ok_or(ObservedReaderError::IdentityExhausted)?;
-        let [pattern_id, worker_id, result_id, expression_id] = self.allocations()?;
+        let [pattern_id, worker_id, result_id, expression_id, context_id] = self.allocations()?;
         let expression = if kind == ObservedReaderSearchKind::Expression {
             Some(Arc::new(FrozenExpression::admit(needle, self.owner(), &self.budget, expression_id)?))
         } else { None };
@@ -243,7 +247,7 @@ impl ObservedReaderSession {
             }) };
         check(&mut canceled)?;
         let file = self.search_file.try_clone().map_err(|_| AppError::Io)?;
-        let (scanned, io) = scan(file, request, &pattern, options, &self.budget, worker_id,
+        let (scanned, io) = scan(file, request, &pattern, options, &self.budget, [worker_id, context_id],
             start_after, count_all_matches, &mut canceled);
         self.source_bytes_read += io.bytes_read; // Headroom was admitted above.
         self.read_calls += io.read_calls;
@@ -260,9 +264,9 @@ impl ObservedReaderSession {
         Ok(response)
     }
 
-    /// Resolve a retained hit without stat, path resolution or source I/O. Only
-    /// the exact literal bytes are available; current surrounding source must
-    /// be requested separately through read_window and receives a NEW revision.
+    /// Resolve a retained hit and its bounded same-scan context without stat,
+    /// path resolution or source I/O. Reading current surrounding source is a
+    /// separate operation and receives a NEW revision.
     pub fn search_hit(&mut self, generation: u64, position: usize,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, ObservedReaderError> {
         check(&mut canceled)?;
@@ -279,6 +283,8 @@ impl ObservedReaderSession {
         out.literal(",\"original_hex\":")?; out.hex(bytes)?;
         out.literal(",\"witness_sha256\":")?;
         out.quoted(&digest.to_hex())?;
+        let context_ids = self.allocations()?;
+        stream_context::encode(&mut out, query.context(position)?, &self.budget, context_ids, &mut canceled)?;
         out.literal(",\"additional_source_bytes_read\":\"0\",\"additional_read_calls\":\"0\"}\n")?;
         self.finish_output(out, EXIT_OK, &mut canceled)
     }
@@ -447,6 +453,7 @@ pub(super) fn encode_search_info(out: &mut Output, query: Option<&AcceptedSearch
     if let Some(query) = query { out.integer(query.request.revision().get())?; } else { out.literal("null")?; }
     out.literal(",\"retained_search_hits\":")?; out.integer(query.map_or(0, |query| query.hits.len() as u64))?;
     out.literal(",\"retained_search_witness_bytes\":")?; out.integer(query.map_or(0, |query| query.witness_bytes() as u64))?;
+    out.literal(",\"retained_search_context_bytes\":")?; out.integer(query.map_or(0, |query| query.context_bytes.len() as u64))?;
     Ok(())
 }
 
@@ -479,10 +486,11 @@ impl AcceptedSearch {
                     .and_then(|n| n.checked_add(search.matched_text(ordinal).ok()?.len())).ok_or(AppError::Admission)?;
             }
         }
-        let charge = search.hits().len().checked_mul(size_of::<StreamingHit>())
+        let charge = search.hits().len().checked_mul(size_of::<StreamingHit>() + size_of::<HitContext>())
             .and_then(|n| n.checked_add(text.len()))
             .and_then(|n| n.checked_add(witness.len()))
             .and_then(|n| n.checked_add(per_hit_charge))
+            .and_then(|n| n.checked_add(search.retained_context_bytes()))
             .and_then(|n| n.checked_add(size_of::<Self>() + 2 * size_of::<usize>())).ok_or(AppError::Admission)?;
         let lease = budget.try_reserve_managed(search.request().file().owner(), allocation, ByteLength::new(charge as u64))
             .map_err(|_| AppError::Admission)?;
@@ -494,6 +502,17 @@ impl AcceptedSearch {
         literal_bytes.extend_from_slice(witness);
         let mut hits = reserve(search.hits().len())?;
         hits.extend_from_slice(search.hits());
+        let mut hit_contexts = reserve(hits.len())?;
+        let mut context_bytes = reserve(search.retained_context_bytes())?;
+        for (ordinal, _) in hits.iter().enumerate() {
+            check(canceled)?;
+            let context = search.context(ordinal).map_err(AppError::from)?.ok_or(ObservedReaderError::InvalidRange)?;
+            let start = context_bytes.len();
+            if context.bytes().len() > context_bytes.capacity() - start { return Err(AppError::Admission.into()); }
+            context_bytes.extend_from_slice(context.bytes());
+            hit_contexts.push(HitContext { requested: context.requested_range(), original: context.original_range(),
+                start, len: context.bytes().len() });
+        }
         let sha256 = if hits.is_empty() || !case_sensitive { None } else { Some(extent_sha256(witness, canceled)?) };
         let mut witnesses = reserve(if case_sensitive { 0 } else { hits.len() })?;
         if !case_sensitive {
@@ -518,7 +537,22 @@ impl AcceptedSearch {
             expression, expression_qualified: search.expression_qualified(),
             page_start_after: search.page_start_after(),
             unsupported_at: search.unsupported_at(), max_matches, max_scan_bytes,
-            literal_text, literal_bytes, sha256, witnesses, hits, _lease: lease })
+            literal_text, literal_bytes, sha256, witnesses, hits, hit_contexts, context_bytes, _lease: lease })
+    }
+    fn context(&self, ordinal: usize) -> Result<stream_context::Context<'_>, ObservedReaderError> {
+        let hit = self.hits.get(ordinal).ok_or(ObservedReaderError::MissingHit)?;
+        let context = self.hit_contexts.get(ordinal).ok_or(ObservedReaderError::MissingHit)?;
+        let end = context.start.checked_add(context.len).ok_or(ObservedReaderError::InvalidRange)?;
+        let bytes = self.context_bytes.get(context.start..end).ok_or(ObservedReaderError::InvalidRange)?;
+        let encoding = match self.encoding {
+            ObservedReaderEncoding::Utf8 => DetectedEncoding::Utf8 { has_bom: context.original.start().get() == 0
+                && bytes.starts_with(&[0xef, 0xbb, 0xbf]) },
+            ObservedReaderEncoding::Utf16Le => DetectedEncoding::Utf16Le,
+            ObservedReaderEncoding::Utf16Be => DetectedEncoding::Utf16Be,
+        };
+        Ok(stream_context::Context { request: self.request, generation: self.generation,
+            observed_length: self.observed_length, encoding: Some(encoding), requested: context.requested,
+            original: context.original, matched: hit.original_range(), bytes })
     }
     fn witness(&self, ordinal: usize) -> Result<(&str, &[u8], Sha256Digest), ObservedReaderError> {
         self.hits.get(ordinal).ok_or(ObservedReaderError::MissingHit)?;
@@ -538,14 +572,17 @@ impl AcceptedSearch {
 }
 
 fn scan<'needle>(file: File, request: CaptureRequest, needle: &'needle StreamingNeedle,
-    options: StreamReadOptions, budget: &ResourceBudget, allocation: ResourceAllocationId,
+    options: StreamReadOptions, budget: &ResourceBudget, allocations: [ResourceAllocationId; 2],
     start_after: u64, count_all_matches: bool, canceled: &mut impl FnMut() -> bool)
     -> (Result<FileSearchReport<'needle>, ObservedReaderError>, StreamReadStats) {
     let mut io = StreamReadStats::default();
     let result = (|| {
         check(canceled)?;
         let mut scan = FileSearch::new_page(file, request, needle, options,
-            start_after, count_all_matches, budget, allocation).map_err(AppError::from)?;
+            start_after, count_all_matches, budget, allocations[0])
+            .and_then(|scan| scan.with_context(StreamContextOptions {
+                before_bytes: stream_context::BEFORE_BYTES, after_bytes: stream_context::AFTER_BYTES,
+            }, budget, allocations[1])).map_err(AppError::from)?;
         while scan.state() == StreamReadState::Pending {
             let step = scan.step(StreamReadStep::default(), options.generation, &mut *canceled);
             io = scan.stats(); // Include attempted I/O even if this step fails.
@@ -583,7 +620,11 @@ fn encode_query(out: &mut Output, query: &AcceptedSearch) -> Result<(), Observed
     out.literal(",\"page_has_more_matches\":")?;
     out.boolean(query.matches_seen.saturating_sub(query.page_start_after) > query.hits.len() as u64)?;
     out.literal(",\"encoding\":")?; out.quoted(query.encoding.code())?;
-    out.literal(",\"encoding_basis\":\"explicit-for-this-search\",\"retention\":\"literal-witnesses-only\",\"observed_length\":")?;
+    out.literal(",\"encoding_basis\":\"explicit-for-this-search\",\"retention\":\"literal-witnesses-and-bounded-context\",\"context_before_bytes\":")?;
+    out.integer(stream_context::BEFORE_BYTES as u64)?;
+    out.literal(",\"context_after_bytes\":")?; out.integer(stream_context::AFTER_BYTES as u64)?;
+    out.literal(",\"retained_context_bytes\":")?; out.integer(query.context_bytes.len() as u64)?;
+    out.literal(",\"observed_length\":")?;
     out.integer(query.observed_length.get())?;
     out.literal(",\"final_observed_length\":")?;
     if let Some(length) = query.final_length { out.integer(length.get())?; } else { out.literal("null")?; }

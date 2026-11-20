@@ -1655,8 +1655,15 @@ those bytes, while changed or unavailable final metadata still keeps the overall
 coverage partial. This does not turn the observation into an atomic snapshot.
 Each result-page rescan evaluates the complete expression again.
 
-Selecting a result retrieves only its retained matched text and original bytes;
-it does not reread the file. Copy preserves that matched spelling. **Read current
+Selecting a result retrieves its retained matched text and original bytes;
+it does not reread the file. The search-hit API also returns up to 160 original
+bytes before and after each match from the same scan. These bounded excerpts
+survive live edits and remain separate from the reader's eight observation
+pages. They have requested and actual ranges, an independent completeness flag,
+original hex, and decoded text and match coordinates when scalar boundaries
+permit. Byte, call and match limits never trigger extra reads to fill context.
+Clipped excerpts can expose original bytes even when decoded text is unavailable.
+Copies of the match preserve its original spelling. **Read current
 context** performs a separate bounded read with a fresh observation identity and
 highlights the match only after its retained bytes agree with the new source
 bytes. If the file changed, the original match remains identifiable and the new

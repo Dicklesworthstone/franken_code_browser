@@ -281,7 +281,7 @@ struct AtlasObservedReaderSearchReport: Sendable {
             ? " The result list retains the first \(hits.count) matches; the count includes later occurrences."
             : ""
         return "Scanned \(scannedInputBytes) of \(observedLength) initially observed bytes; read \(payloadBytesRead) bytes in \(readCalls) calls. "
-            + reason + changed + retained + " Only matching bytes are retained, without surrounding context."
+            + reason + changed + retained + " Matching bytes remain available from the accepted observation."
             + " Rescanning a result page reads current bytes from the beginning and creates a new observation; edits can change occurrence numbers."
             + (request.mode == .occurrences
                 ? " Whole-token spelling matches include comments and literals; compiler references are not established." : "")
@@ -751,7 +751,7 @@ private enum AtlasObservedReaderSearchWire {
             -> (id: UInt64, length: UInt64, finalLength: UInt64?, inputComplete: Bool, searchComplete: Bool) {
             guard query_generation.value == request.generation, search_observation.value > 0,
                   encoding == request.encoding.rawValue, encoding_basis == "explicit-for-this-search",
-                  retention == "literal-witnesses-only",
+                  ["literal-witnesses-only", "literal-witnesses-and-bounded-context"].contains(retention),
                   ["complete-observed-input", "match-limit", "byte-limit", "read-call-limit", "short-read", "unsupported-text"].contains(state),
                   ["unchanged-metadata-not-atomic", "changed-during-read", "short-read", "metadata-unavailable"].contains(consistency),
                   input_complete == (state == "complete-observed-input"),

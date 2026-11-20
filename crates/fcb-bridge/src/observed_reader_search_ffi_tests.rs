@@ -47,6 +47,35 @@ fn hit(handle: u64, generation: u64, index: u64) -> String {
 }
 
 #[test]
+fn c_retained_search_context_survives_edits_and_byte_limits_without_io() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let (root, croot) = root();
+    fs::write(root.join("source"), b"before needle after").unwrap();
+    let handle = open(&croot);
+    let found = find(handle, 1, "needle", 1, 1, 64);
+    assert!(found.contains("\"retention\":\"literal-witnesses-and-bounded-context\""), "{found}");
+    assert_eq!(number(&found, "retained_context_bytes"), 19);
+    let retained = take(fcb_observed_reader_search_hit(handle, 1, 0));
+    assert!(retained.contains("\"context\":{\"state\":\"retained\""), "{retained}");
+    assert!(retained.contains("\"text\":\"before needle after\""));
+    assert!(retained.contains("\"match_decoded_range\":{\"start\":\"7\",\"end\":\"13\"}"));
+    fs::write(root.join("source"), b"newest change other").unwrap();
+    let before = take(fcb_observed_reader_info(handle));
+    assert_eq!(take(fcb_observed_reader_search_hit(handle, 1, 0)), retained);
+    assert_eq!(take(fcb_observed_reader_info(handle)), before);
+    assert!(hit(handle, 1, 0).contains("OBSERVED_READER_SEARCH_HIT_CHANGED"));
+    fs::write(root.join("source"), b"before needle after").unwrap();
+    let limited = find(handle, 2, "needle", 1, 1, 13);
+    assert_eq!(number(&limited, "payload_bytes_read"), 13);
+    let clipped = take(fcb_observed_reader_search_hit(handle, 2, 0));
+    assert!(clipped.contains("\"complete\":false"), "{clipped}");
+    assert!(clipped.contains("\"text_unavailable_reason\":\"insufficient-scalar-context\""));
+    assert!(clipped.contains("\"original_hex\":\"6265666f7265206e6565646c65\""));
+    assert_eq!(number(&clipped, "additional_source_bytes_read"), 0);
+    assert_eq!(fcb_observed_reader_close(handle), 1);
+}
+
+#[test]
 fn c_find_beyond_complete_capture_limit_verifies_fresh_context_and_preserves_history() {
     let _guard = FFI_TEST_LOCK.lock().unwrap();
     let (root, croot) = root();

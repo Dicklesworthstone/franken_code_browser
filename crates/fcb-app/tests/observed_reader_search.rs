@@ -72,7 +72,10 @@ fn sparse_source_above_the_complete_capture_limit_has_bounded_search_and_exact_a
     assert!(found.get("input_complete").flag());
     assert!(!found.get("whole_file_immutable").flag());
     assert_eq!(found.get("source_observation").text(), "open-file-ranges-not-atomic");
-    assert_eq!(found.get("retention").text(), "literal-witnesses-only");
+    assert_eq!(found.get("retention").text(), "literal-witnesses-and-bounded-context");
+    assert_eq!(found.get("context_before_bytes").number(), 160);
+    assert_eq!(found.get("context_after_bytes").number(), 160);
+    assert_eq!(found.get("retained_context_bytes").number(), 197);
     assert_eq!(found.get("observed_length").number(), length);
     assert_eq!(found.get("final_observed_length").number(), length);
     assert_eq!(found.get("payload_bytes_read").number(), length);
@@ -89,6 +92,12 @@ fn sparse_source_above_the_complete_capture_limit_has_bounded_search_and_exact_a
     assert_eq!(witness.get("text").text(), "needle\n");
     assert_eq!(witness.get("original_hex").text(), "6e6565646c650a");
     assert_eq!(witness.get("witness_sha256"), found.get("literal_sha256"));
+    let context = witness.get("context");
+    assert_eq!(bounds(context.get("original_range")), (offset - 160, length));
+    assert_eq!(bounds(context.get("match_range")), (offset, offset + 7));
+    assert!(context.get("complete").flag());
+    assert_eq!(context.get("original_hex").text().len(), 197 * 2);
+    assert_eq!(before.get("retained_search_context_bytes").number(), 197);
     assert_eq!(witness.get("additional_source_bytes_read").number(), 0);
     assert_eq!(witness.get("additional_read_calls").number(), 0);
     let after = json(&reader.info(|| false).unwrap());
@@ -123,6 +132,13 @@ fn utf8_utf16_scalars_and_overlapping_literals_cross_buffers_with_original_byte_
             let witness = json(&reader.search_hit(7, index, || false).unwrap());
             assert_eq!(witness.get("original_hex").text(), hex(&literal));
             assert_eq!(witness.get("text").text(), "🦀a🦀");
+            let context = witness.get("context");
+            let (context_start, context_end) = bounds(context.get("original_range"));
+            assert_eq!((context_start, context_end), (from - 160, bytes.len() as u64));
+            assert_eq!(context.get("original_hex").text(), hex(&bytes[context_start as usize..context_end as usize]));
+            let (decoded_start, decoded_end) = bounds(context.get("match_decoded_range"));
+            assert_eq!(&context.get("text").text()[decoded_start as usize..decoded_end as usize], "🦀a🦀");
+            assert!(!context.get("text_has_replacements").flag());
         }
     }
 }
@@ -163,6 +179,7 @@ fn zero_row_limit_probes_real_hits_and_keeps_count_truncation_and_scan_budget_di
     assert!(!present.get("search_complete").flag());
     assert_eq!(present.get("matches_seen").number(), 1);
     assert_eq!(present.get("retained_hits").number(), 0);
+    assert_eq!(present.get("retained_context_bytes").number(), 0);
     assert_eq!(present.get("literal_original_hex"), &Json::Null);
     assert!(present.get("hits").array().is_empty());
     let limited = json(&reader.search(3, "ana", ObservedReaderEncoding::Utf8, 1, 64, || false).unwrap());
@@ -204,6 +221,16 @@ fn byte_limit_is_not_eof_and_partial_scalars_do_not_become_replacement_matches()
         assert!(!prefix.get("search_complete").flag());
         assert!(!prefix.get("truncated").flag());
         assert_hit(&prefix, 0, start, end);
+        let before = json(&reader.info(|| false).unwrap());
+        let hit = json(&reader.search_hit(2, 0, || false).unwrap());
+        let context = hit.get("context");
+        assert_eq!(bounds(context.get("requested_range")), (0, bytes.len() as u64));
+        assert_eq!(bounds(context.get("original_range")), (0, end));
+        assert_eq!(context.get("original_hex").text(), hex(&bytes[..end as usize]));
+        assert!(!context.get("complete").flag());
+        assert_eq!(context.get("text"), &Json::Null);
+        assert_eq!(context.get("text_unavailable_reason").text(), "insufficient-scalar-context");
+        assert_eq!(json(&reader.info(|| false).unwrap()), before);
         let complete = json(&reader.search(3, "🦀", encoding, 8, bytes.len() as u64, || false).unwrap());
         assert!(complete.get("search_complete").flag());
         assert_hit(&complete, 0, start, end);
@@ -227,6 +254,7 @@ fn malformed_later_input_invalidates_earlier_exact_text_hits_without_claiming_ab
     assert!(!found.get("input_complete").flag());
     assert!(!found.get("truncated").flag());
     assert_eq!(found.get("literal_original_hex"), &Json::Null);
+    assert_eq!(found.get("retained_context_bytes").number(), 0);
     assert_eq!(reader.search_hit(1, 0, || false).err(), Some(ObservedReaderError::MissingHit));
 }
 
@@ -257,6 +285,8 @@ fn live_writes_cannot_replace_witness_bytes_and_current_context_gets_a_fresh_obs
     let witness = json(&reader.search_hit(1, 0, || false).unwrap());
     assert_eq!(witness.get("text").text(), "ana");
     assert_eq!(witness.get("original_hex").text(), "616e61");
+    assert_eq!(witness.get("context").get("text").text(), "banana");
+    assert_eq!(witness.get("context").get("original_hex").text(), hex(b"banana"));
     assert_eq!(bounds(witness.get("original_range")), (1, 4));
     assert_eq!(witness.get("witness_sha256"), found.get("literal_sha256"));
     assert_eq!(witness.get("search_observation"), found.get("search_observation"));
@@ -321,17 +351,57 @@ fn early_mid_scan_and_final_delivery_cancellation_keep_old_hits_and_charge_actua
         assert!(polls >= stop);
         let after = json(&reader.info(|| false).unwrap());
         assert_eq!(before.get("retained_observations"), after.get("retained_observations"));
+        assert_eq!(before.get("retained_search_context_bytes"), after.get("retained_search_context_bytes"));
         let spent = after.get("payload_bytes_read").number() - before.get("payload_bytes_read").number();
         let calls = after.get("read_calls").number() - before.get("read_calls").number();
         if stop == 1 { assert_eq!((spent, calls), (0, 0)); }
         else if stop == gates { assert_eq!(spent, bytes.len() as u64); assert!(calls > 0); }
         else { assert!(spent > 0 && spent < bytes.len() as u64); assert!(calls > 0); }
-        assert_eq!(json(&reader.search_hit(1, 0, || false).unwrap()).get("text").text(), "needle");
+        let retained = json(&reader.search_hit(1, 0, || false).unwrap());
+        assert_eq!(retained.get("text").text(), "needle");
+        assert_eq!(retained.get("context").get("original_hex").text(), hex(b"needle"));
         assert!(reader.search_hit(2, 0, || false).is_err());
         assert!(reader.retained_window(2, || false).is_ok());
         assert_eq!(reader.search(2, "needle", ObservedReaderEncoding::Utf8, 8, 6, || false).err(), Some(ObservedReaderError::StaleQuery));
         let page = json(&reader.read_window(0, 8, ObservedReaderEncoding::Utf8, || false).unwrap());
         assert_eq!(page.get("observation").number(), 4);
+    }
+}
+
+#[test]
+fn retained_context_preserves_mode_spelling_and_canceled_selection_never_reads_source() {
+    for (kind, needle, case_sensitive) in [
+        (ObservedReaderSearchKind::Text, "needle", false),
+        (ObservedReaderSearchKind::Occurrences, "NEEDLE", true),
+        (ObservedReaderSearchKind::Expression, "needle token -absent", false),
+    ] {
+        let source = format!("{}NEEDLE token{}", "x ".repeat(100), " y".repeat(100));
+        let fixture = Fixture::new(); fixture.write(source.as_bytes());
+        let mut reader = fixture.reader();
+        let result = json(&reader.find_with_kind(1, needle, ObservedReaderEncoding::Utf8,
+            kind, case_sensitive, true, 1, 4096, || false).unwrap());
+        assert!(result.get("search_complete").flag());
+        assert_eq!(result.get("retained_hits").number(), 1);
+        assert_eq!(result.get("retained_context_bytes").number(), 326);
+        let before = json(&reader.info(|| false).unwrap());
+        let mut gates = 0;
+        let selected = reader.search_hit(1, 0, || { gates += 1; false }).unwrap();
+        let retained = json(&selected);
+        assert_eq!(retained.get("text").text(), "NEEDLE");
+        let context = retained.get("context");
+        assert_eq!(bounds(context.get("original_range")), (40, 366));
+        assert_eq!(bounds(context.get("match_range")), (200, 206));
+        assert_eq!(context.get("original_hex").text(), hex(&source.as_bytes()[40..366]));
+        let (start, end) = bounds(context.get("match_decoded_range"));
+        assert_eq!(&context.get("text").text()[start as usize..end as usize], "NEEDLE");
+        fixture.write(b"changed");
+        for stop in [1, gates / 2, gates] {
+            let mut polls = 0;
+            let error = reader.search_hit(1, 0, || { polls += 1; polls == stop }).err().unwrap();
+            assert!(error.is_canceled());
+            assert_eq!(json(&reader.info(|| false).unwrap()), before);
+            assert_eq!(reader.search_hit(1, 0, || false).unwrap().as_str(), selected.as_str());
+        }
     }
 }
 
@@ -587,6 +657,10 @@ fn page_skips_counting_and_exhaustion_keep_independent_work_and_retention_limits
     assert_eq!(counted.get("retained_hits").number(), 1);
     assert_eq!(counted.get("hits").array()[0].get("occurrence_id").number(), 3);
     assert_eq!(bounds(counted.get("hits").array()[0].get("original_range")), (8, 11));
+    assert_eq!(counted.get("retained_context_bytes").number(), 13);
+    let selected = json(&reader.search_hit(1, 0, || false).unwrap());
+    assert_eq!(selected.get("context").get("original_hex").text(), hex(b"banana banana"));
+    assert_eq!(bounds(selected.get("context").get("match_range")), (8, 11));
 
     let partial = json(&reader.find_page(2, "ana", ObservedReaderEncoding::Utf8,
         ObservedReaderSearchKind::Text, true, true, 3, 1, 6, || false).unwrap());

@@ -232,10 +232,17 @@ char *fcb_observed_reader_find_page(uint64_t handle, uint64_t generation,
     uint64_t max_scan_bytes, fcb_observed_reader_poll poll, void *context);
 
 /* Zero-based hit_index must belong to the current accepted query generation.
- * Returns exactly the retained literal text/bytes and original-byte range,
- * with no source reread. Surrounding context was NOT retained. A host may
- * explicitly request a new window and verify the witness against those new
- * bytes; it must never label that window as the original search observation.
+ * Returns the retained literal text/bytes and original-byte range, plus bounded
+ * context captured by the same search, with no source reread. Each result admits
+ * up to 160 original bytes before/after the match. Context never extends scan
+ * limits; requested/actual ranges and complete report a clipped suffix. The
+ * context object includes original_hex and, when scalar boundaries permit,
+ * text, text_original_range, match_decoded_range and text_has_replacements.
+ * Unavailable text carries text_unavailable_reason; original bytes remain exact.
+ * Find receipts declare literal-witnesses-and-bounded-context retention and
+ * retained_context_bytes independently of witnesses and observation history.
+ * A host may explicitly request a NEW window and verify the witness against
+ * those bytes; it must never label that window as the old search observation.
  */
 char *fcb_observed_reader_search_hit(uint64_t handle, uint64_t generation,
     uint64_t hit_index);
