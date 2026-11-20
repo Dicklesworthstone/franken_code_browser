@@ -9,8 +9,8 @@ enum AtlasWorkspaceStreamLimits {
     static let maximumScanBytes: UInt64 = 4 * 1024 * 1024 * 1024
     static let readCalls: UInt64 = 1_048_576
     static let responseBytes = 8 * 1024 * 1024
-    static let contextBeforeBytes: UInt64 = 160
-    static let contextAfterBytes: UInt64 = 160
+    static let contextBeforeBytes = AtlasRetainedSearchContext.beforeBytes
+    static let contextAfterBytes = AtlasRetainedSearchContext.afterBytes
 }
 
 enum AtlasWorkspaceStreamMode: String, CaseIterable, Identifiable, Sendable {
@@ -390,124 +390,6 @@ struct AtlasWorkspaceStreamSummary: Equatable, Sendable {
     }
 }
 
-/// A bounded excerpt from the very same source observation as its match.
-/// Original bytes remain authoritative. Reverse encoding only correlates the
-/// engine's text/range receipt; no source decoder or matcher is duplicated here.
-struct AtlasWorkspaceStreamContext: Equatable, Sendable {
-    let requestedRange, originalRange: AtlasObservedByteRange
-    let complete: Bool
-    let originalHex: String
-    let text: String?
-    let textRange, matchedTextRange: AtlasObservedByteRange?
-    let hasReplacements: Bool?
-    let unavailableReason: String?
-
-    static func == (a: Self, b: Self) -> Bool {
-        a.requestedRange == b.requestedRange && a.originalRange == b.originalRange
-            && a.complete == b.complete && a.originalHex == b.originalHex
-            && a.text.map({ Array($0.utf8) }) == b.text.map({ Array($0.utf8) })
-            && a.textRange == b.textRange && a.matchedTextRange == b.matchedTextRange
-            && a.hasReplacements == b.hasReplacements && a.unavailableReason == b.unavailableReason
-    }
-
-    /// Text with replacements remains available as original hex. Only a
-    /// losslessly correlated decoded span can supply a native match highlight.
-    var displayText: String? { hasReplacements == false ? text : nil }
-    var parts: (before: String, match: String, after: String)? {
-        guard let text = displayText, let range = matchedTextRange else { return nil }
-        return Self.split(text, at: range)
-    }
-
-    func containsWitness(_ hex: String, at range: AtlasObservedByteRange) -> Bool {
-        guard originalRange.contains(range) else { return false }
-        let start = Int(range.start - originalRange.start) * 2
-        let end = Int(range.end - originalRange.start) * 2
-        return Array(originalHex.utf8)[start..<end].elementsEqual(hex.utf8)
-    }
-
-    private static func split(_ text: String, at range: AtlasObservedByteRange)
-        -> (before: String, match: String, after: String)? {
-        guard range.end <= UInt64(text.utf8.count) else { return nil }
-        let bytes = Array(text.utf8), start = Int(range.start), end = Int(range.end)
-        guard let before = String(bytes: bytes[..<start], encoding: .utf8),
-              let match = String(bytes: bytes[start..<end], encoding: .utf8),
-              let after = String(bytes: bytes[end...], encoding: .utf8) else { return nil }
-        return (before, match, after)
-    }
-
-    static func decode(_ w: AtlasWorkspaceStreamWire, matched: AtlasObservedByteRange,
-        observedLength: UInt64, encoding: AtlasObservedReaderEncoding,
-        request: AtlasWorkspaceStreamRequest, primary: String) throws -> Self {
-        func range(_ key: String) throws -> AtlasObservedByteRange {
-            let object = try w.object(key)
-            return try AtlasObservedByteRange(start: object.number("start"), end: object.number("end"))
-        }
-        func optionalRange(_ key: String) throws -> AtlasObservedByteRange? {
-            guard w.fields.contains(AtlasWorkspaceStreamWire.Key(key)) else {
-                throw AtlasWorkspaceStreamError.invalidResponse
-            }
-            if try w.fields.decodeNil(forKey: AtlasWorkspaceStreamWire.Key(key)) { return nil }
-            return try range(key)
-        }
-        let requested = try range("requested_range"), original = try range("original_range")
-        let complete = try w.flag("complete"), hex = try w.text("original_hex")
-        let before = min(matched.start, AtlasWorkspaceStreamLimits.contextBeforeBytes)
-        let after = min(observedLength - matched.end, AtlasWorkspaceStreamLimits.contextAfterBytes)
-        guard try w.text("state") == "retained", try range("match_range") == matched,
-              requested.start == matched.start - before, requested.end == matched.end + after,
-              requested.contains(original), original.start == requested.start, original.contains(matched),
-              complete == (requested == original),
-              AtlasObservedReaderWire.validHex(hex, bytes: original.count) else {
-            throw AtlasWorkspaceStreamError.invalidResponse
-        }
-        let text = try w.optionalText("text"), textRange = try optionalRange("text_original_range")
-        let matchedText = try optionalRange("match_decoded_range")
-        guard w.fields.contains(AtlasWorkspaceStreamWire.Key("text_has_replacements")) else {
-            throw AtlasWorkspaceStreamError.invalidResponse
-        }
-        let replacements = try w.fields.decodeIfPresent(Bool.self,
-            forKey: AtlasWorkspaceStreamWire.Key("text_has_replacements"))
-        let unavailable = try w.optionalText("text_unavailable_reason")
-        if let text {
-            guard unavailable == nil, let textRange, let matchedText, let replacements,
-                  original.contains(textRange), textRange.contains(matched),
-                  text.utf8.count <= Int(original.count) * 3,
-                  let parts = split(text, at: matchedText), !parts.match.isEmpty else {
-                throw AtlasWorkspaceStreamError.invalidResponse
-            }
-            // Correlate the literal inside the excerpt even if malformed
-            // surrounding text prevents a lossless whole-excerpt projection.
-            let raw = Array(hex.utf8)
-            let matchStart = Int(matched.start - original.start) * 2
-            let matchEnd = Int(matched.end - original.start) * 2
-            let matchHex = String(decoding: raw[matchStart..<matchEnd], as: UTF8.self)
-            guard AtlasObservedReaderSearchRequest.validWitnessText(parts.match, hex: matchHex,
-                range: matched, needle: primary, encoding: encoding, caseSensitive: request.caseSensitive) else {
-                throw AtlasWorkspaceStreamError.invalidResponse
-            }
-            if !replacements {
-                let start = Int(textRange.start - original.start) * 2
-                let end = Int(textRange.end - original.start) * 2
-                guard AtlasObservedReaderWire.hex(AtlasObservedReaderSearchRequest.originalBytes(text,
-                        encoding: encoding)).utf8.elementsEqual(raw[start..<end]),
-                      UInt64(AtlasObservedReaderSearchRequest.originalBytes(parts.before,
-                        encoding: encoding).count) == matched.start - textRange.start else {
-                    throw AtlasWorkspaceStreamError.invalidResponse
-                }
-            }
-        } else {
-            guard textRange == nil, matchedText == nil, replacements == nil,
-                  unavailable == "insufficient-scalar-context" || unavailable == "match-boundary-unavailable"
-                    || unavailable == "encoding-unavailable" else {
-                throw AtlasWorkspaceStreamError.invalidResponse
-            }
-        }
-        return Self(requestedRange: requested, originalRange: original, complete: complete,
-            originalHex: hex, text: text, textRange: textRange, matchedTextRange: matchedText,
-            hasReplacements: replacements, unavailableReason: unavailable)
-    }
-}
-
 struct AtlasWorkspaceStreamHit: Equatable, Identifiable, Sendable {
     let index, occurrence, file: UInt64
     let node: UInt64?
@@ -520,7 +402,7 @@ struct AtlasWorkspaceStreamHit: Equatable, Identifiable, Sendable {
     let finalLength: UInt64?
     let consistency, state, witnessSHA256: String
     let complete: Bool
-    let context: AtlasWorkspaceStreamContext?
+    let context: AtlasRetainedSearchContext?
     var id: UInt64 { index }
     static func == (a: Self, b: Self) -> Bool {
         a.index == b.index && a.occurrence == b.occurrence && a.file == b.file && a.node == b.node
@@ -570,10 +452,11 @@ struct AtlasWorkspaceStreamHit: Equatable, Identifiable, Sendable {
               consistency != "unchanged-metadata-not-atomic" || final == length,
               complete == (state == "complete-observed-input" && consistency == "unchanged-metadata-not-atomic"),
               AtlasObservedReaderWire.validHex(digest, bytes: 32) else { throw AtlasWorkspaceStreamError.invalidResponse }
-        let context: AtlasWorkspaceStreamContext?
+        let context: AtlasRetainedSearchContext?
         if summary.identity.capturesContext {
-            let retained = try AtlasWorkspaceStreamContext.decode(w.object("context"), matched: range,
-                observedLength: length, encoding: encoding, request: summary.request, primary: summary.primaryNeedle)
+            let wire = try w.fields.decode(AtlasRetainedSearchContext.Wire.self, forKey: AtlasWorkspaceStreamWire.Key("context"))
+            let retained = try AtlasRetainedSearchContext.decode(wire, matched: range,
+                observedLength: length, encoding: encoding, caseSensitive: summary.request.caseSensitive, primary: summary.primaryNeedle)
             guard retained.originalRange.end <= summary.payloadBytes else {
                 throw AtlasWorkspaceStreamError.invalidResponse
             }
@@ -792,7 +675,7 @@ struct AtlasWorkspaceStreamReport: Sendable {
 struct AtlasWorkspaceStreamWitness: Sendable {
     let target: AtlasWorkspaceStreamTarget
     let text, originalHex: String
-    var context: AtlasWorkspaceStreamContext? { target.hit.context }
+    var context: AtlasRetainedSearchContext? { target.hit.context }
     static func decode(_ json: String?, report: AtlasWorkspaceStreamReport, root: String,
                        target: AtlasWorkspaceStreamTarget) throws -> Self {
         let w = try AtlasWorkspaceStreamWire.read(json, owner: target.identity.owner)

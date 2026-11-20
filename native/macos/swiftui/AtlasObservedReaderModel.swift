@@ -391,6 +391,11 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     }
     var canReadSearchContext: Bool { canSelectSearchHit && selectedSearchWitness != nil }
     var canGoToVerifiedMatch: Bool { canReadSearchContext && transport.search?.observeHit != nil }
+    var canCopySearchWitness: Bool { canSelectSearchHit && selectedSearchIndex != nil }
+    func retainedSearchContextCopy(hex: Bool) -> String? {
+        guard canCopySearchWitness, let context = selectedSearchWitness?.context else { return nil }
+        return hex ? context.originalHex : context.displayText
+    }
     var searchCoverage: String? {
         guard let searchReport else { return nil }
         return (searchAuthorized ? "" : "Previous Find results are read-only. Run Find again before navigating them. ") + searchReport.coverage

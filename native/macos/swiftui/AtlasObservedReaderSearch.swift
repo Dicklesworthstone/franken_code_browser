@@ -11,6 +11,136 @@ enum AtlasObservedReaderSearchLimits {
     static let inputBufferBytes: UInt64 = 16 * 1024
 }
 
+/// A bounded excerpt from the very same source observation as its match.
+/// Original bytes remain authoritative. Reverse encoding only correlates the
+/// engine's text/range receipt; no source decoder or matcher is duplicated here.
+struct AtlasRetainedSearchContext: Equatable, Sendable {
+    static let beforeBytes: UInt64 = 160
+    static let afterBytes: UInt64 = 160
+    let requestedRange, originalRange: AtlasObservedByteRange
+    let complete: Bool
+    let originalHex: String
+    let text: String?
+    let textRange, matchedTextRange: AtlasObservedByteRange?
+    let hasReplacements: Bool?
+    let unavailableReason: String?
+
+    static func == (a: Self, b: Self) -> Bool {
+        a.requestedRange == b.requestedRange && a.originalRange == b.originalRange
+            && a.complete == b.complete && a.originalHex == b.originalHex
+            && a.text.map({ Array($0.utf8) }) == b.text.map({ Array($0.utf8) })
+            && a.textRange == b.textRange && a.matchedTextRange == b.matchedTextRange
+            && a.hasReplacements == b.hasReplacements && a.unavailableReason == b.unavailableReason
+    }
+
+    /// Text with replacements remains available as original hex. Only a
+    /// losslessly correlated decoded span can supply a native match highlight.
+    var displayText: String? { hasReplacements == false ? text : nil }
+    var parts: (before: String, match: String, after: String)? {
+        guard let text = displayText, let range = matchedTextRange else { return nil }
+        return Self.split(text, at: range)
+    }
+
+    func containsWitness(_ hex: String, at range: AtlasObservedByteRange) -> Bool {
+        guard originalRange.contains(range) else { return false }
+        let start = Int(range.start - originalRange.start) * 2
+        let end = Int(range.end - originalRange.start) * 2
+        return Array(originalHex.utf8)[start..<end].elementsEqual(hex.utf8)
+    }
+
+    private static func split(_ text: String, at range: AtlasObservedByteRange)
+        -> (before: String, match: String, after: String)? {
+        guard range.end <= UInt64(text.utf8.count) else { return nil }
+        let bytes = Array(text.utf8), start = Int(range.start), end = Int(range.end)
+        guard let before = String(bytes: bytes[..<start], encoding: .utf8),
+              let match = String(bytes: bytes[start..<end], encoding: .utf8),
+              let after = String(bytes: bytes[end...], encoding: .utf8) else { return nil }
+        return (before, match, after)
+    }
+
+    static func decode(_ w: Wire, matched: AtlasObservedByteRange,
+        observedLength: UInt64, encoding: AtlasObservedReaderEncoding,
+        caseSensitive: Bool, primary: String) throws -> Self {
+        guard matched.count > 0, matched.count <= UInt64(AtlasObservedReaderSearchLimits.maximumWitnessBytes),
+              matched.end <= observedLength else { throw AtlasObservedReaderError.invalidResponse }
+        let requested = w.requested_range, original = w.original_range
+        let before = min(matched.start, beforeBytes), after = min(observedLength - matched.end, afterBytes)
+        guard w.state == "retained", w.match_range == matched,
+              requested.start == matched.start - before, requested.end == matched.end + after,
+              requested.contains(original), original.start == requested.start, original.contains(matched),
+              w.complete == (requested == original),
+              AtlasObservedReaderWire.validHex(w.original_hex, bytes: original.count) else {
+            throw AtlasObservedReaderError.invalidResponse
+        }
+        let textRange = w.text_original_range, matchedText = w.match_decoded_range
+        if let text = w.text {
+            guard w.text_unavailable_reason == nil, let textRange, let matchedText, let replacements = w.text_has_replacements,
+                  original.contains(textRange), textRange.contains(matched),
+                  text.utf8.count <= Int(original.count) * 3,
+                  let parts = split(text, at: matchedText), !parts.match.isEmpty else {
+                throw AtlasObservedReaderError.invalidResponse
+            }
+            // Correlate the literal inside the excerpt even if malformed
+            // surrounding text prevents a lossless whole-excerpt projection.
+            let raw = Array(w.original_hex.utf8)
+            let matchStart = Int(matched.start - original.start) * 2
+            let matchEnd = Int(matched.end - original.start) * 2
+            let matchHex = String(decoding: raw[matchStart..<matchEnd], as: UTF8.self)
+            guard AtlasObservedReaderSearchRequest.validWitnessText(parts.match, hex: matchHex,
+                range: matched, needle: primary, encoding: encoding, caseSensitive: caseSensitive) else {
+                throw AtlasObservedReaderError.invalidResponse
+            }
+            if !replacements {
+                let start = Int(textRange.start - original.start) * 2
+                let end = Int(textRange.end - original.start) * 2
+                guard AtlasObservedReaderWire.hex(AtlasObservedReaderSearchRequest.originalBytes(text,
+                        encoding: encoding)).utf8.elementsEqual(raw[start..<end]),
+                      UInt64(AtlasObservedReaderSearchRequest.originalBytes(parts.before,
+                        encoding: encoding).count) == matched.start - textRange.start else {
+                    throw AtlasObservedReaderError.invalidResponse
+                }
+            }
+        } else {
+            guard textRange == nil, matchedText == nil, w.text_has_replacements == nil,
+                  w.text_unavailable_reason == "insufficient-scalar-context" || w.text_unavailable_reason == "match-boundary-unavailable"
+                    || w.text_unavailable_reason == "encoding-unavailable" else {
+                throw AtlasObservedReaderError.invalidResponse
+            }
+        }
+        return Self(requestedRange: requested, originalRange: original, complete: w.complete,
+            originalHex: w.original_hex, text: w.text, textRange: textRange, matchedTextRange: matchedText,
+            hasReplacements: w.text_has_replacements, unavailableReason: w.text_unavailable_reason)
+    }
+
+    struct Wire: Decodable {
+        let state, original_hex: String
+        let requested_range, original_range, match_range: AtlasObservedByteRange
+        let complete: Bool
+        let text, text_unavailable_reason: String?
+        let text_original_range, match_decoded_range: AtlasObservedByteRange?
+        let text_has_replacements: Bool?
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            state = try c.decode(String.self, forKey: .state)
+            original_hex = try c.decode(String.self, forKey: .original_hex)
+            requested_range = try c.decode(AtlasObservedByteRange.self, forKey: .requested_range)
+            original_range = try c.decode(AtlasObservedByteRange.self, forKey: .original_range)
+            match_range = try c.decode(AtlasObservedByteRange.self, forKey: .match_range)
+            complete = try c.decode(Bool.self, forKey: .complete)
+            text = try c.decode(String?.self, forKey: .text)
+            text_unavailable_reason = try c.decode(String?.self, forKey: .text_unavailable_reason)
+            text_original_range = try c.decode(AtlasObservedByteRange?.self, forKey: .text_original_range)
+            match_decoded_range = try c.decode(AtlasObservedByteRange?.self, forKey: .match_decoded_range)
+            text_has_replacements = try c.decode(Bool?.self, forKey: .text_has_replacements)
+        }
+        private enum CodingKeys: CodingKey {
+            case state, original_hex, requested_range, original_range, match_range, complete,
+                 text, text_unavailable_reason, text_original_range, match_decoded_range, text_has_replacements
+        }
+    }
+}
+
 enum AtlasObservedReaderSearchMode: String, CaseIterable, Identifiable, Sendable {
     case text, occurrences, expression
     var id: String { rawValue }
@@ -221,6 +351,7 @@ struct AtlasObservedReaderSearchReport: Sendable {
     let unsupportedAt: UInt64?
     let originalHex, witnessSHA256: String?
     let retainedWitnessBytes: UInt64
+    let retainedContextBytes: UInt64?
     let hits: [AtlasObservedReaderSearchHit]
     let skippedMatches: UInt64
     let pageHasMoreMatches: Bool
@@ -281,7 +412,10 @@ struct AtlasObservedReaderSearchReport: Sendable {
             ? " The result list retains the first \(hits.count) matches; the count includes later occurrences."
             : ""
         return "Scanned \(scannedInputBytes) of \(observedLength) initially observed bytes; read \(payloadBytesRead) bytes in \(readCalls) calls. "
-            + reason + changed + retained + " Matching bytes remain available from the accepted observation."
+            + reason + changed + retained
+            + (retainedContextBytes != nil
+                ? " Matches and bounded surrounding excerpts remain available from the original scan, including after edits."
+                : " Only matching bytes are retained, without surrounding context.")
             + " Rescanning a result page reads current bytes from the beginning and creates a new observation; edits can change occurrence numbers."
             + (request.mode == .occurrences
                 ? " Whole-token spelling matches include comments and literals; compiler references are not established." : "")
@@ -391,6 +525,16 @@ struct AtlasObservedReaderSearchReport: Sendable {
                   w.retained_witness_bytes.map({ $0.value == witnessBytes }) ?? true else {
                 throw AtlasObservedReaderError.invalidResponse
             }
+            if let contextBytes = observation.contextBytes {
+                let minimum = hits.reduce(UInt64(0)) { $0 + $1.range.count }
+                let maximum = hits.reduce(UInt64(0)) {
+                    $0 + min($1.range.start, AtlasRetainedSearchContext.beforeBytes) + $1.range.count
+                        + min(observation.length - $1.range.end, AtlasRetainedSearchContext.afterBytes)
+                }
+                guard contextBytes >= minimum, contextBytes <= maximum else {
+                    throw AtlasObservedReaderError.invalidResponse
+                }
+            }
             return Self(identity: identity, request: request, primaryNeedle: primary, expression: expression,
                 observation: observation.id,
                 observedLength: observation.length, finalObservedLength: observation.finalLength,
@@ -401,7 +545,7 @@ struct AtlasObservedReaderSearchReport: Sendable {
                 readCalls: w.read_calls.value, peakInputBufferBytes: w.peak_input_buffer_bytes.value,
                 matchesSeen: w.matches_seen.value, unsupportedAt: w.unsupported_at?.value,
                 originalHex: w.literal_original_hex, witnessSHA256: w.literal_sha256,
-                retainedWitnessBytes: witnessBytes, hits: hits,
+                retainedWitnessBytes: witnessBytes, retainedContextBytes: observation.contextBytes, hits: hits,
                 skippedMatches: skippedMatches, pageHasMoreMatches: pageHasMoreMatches)
         } catch { throw AtlasObservedReaderError.invalidResponse }
     }
@@ -464,6 +608,7 @@ struct AtlasObservedReaderSearchWitness: Sendable {
     var mode: AtlasObservedReaderSearchMode = .text
     var caseSensitive = true
     var expression: AtlasObservedReaderExpression? = nil
+    var context: AtlasRetainedSearchContext? = nil
 
     static func decode(_ json: String?, handle: UInt64, input: AtlasObservedReaderInput,
                        report: AtlasObservedReaderSearchReport, target: AtlasObservedReaderSearchTarget) throws -> Self {
@@ -491,6 +636,7 @@ struct AtlasObservedReaderSearchWitness: Sendable {
             guard report.admits(target), identity == report.identity, observation.id == report.observation,
                   observation.length == report.observedLength, observation.finalLength == report.finalObservedLength,
                   observation.inputComplete == report.inputComplete, observation.searchComplete == report.searchComplete,
+                  observation.contextBytes == report.retainedContextBytes,
                   common.state == report.state, common.consistency == report.consistency,
                   w.index.value == target.hit.index, w.occurrence_id.value == target.hit.occurrence,
                   w.original_range == target.hit.range,
@@ -500,9 +646,26 @@ struct AtlasObservedReaderSearchWitness: Sendable {
                   w.additional_source_bytes_read.value == 0, w.additional_read_calls.value == 0 else {
                 throw AtlasObservedReaderError.invalidResponse
             }
+            let context: AtlasRetainedSearchContext?
+            if let retainedBytes = report.retainedContextBytes {
+                guard let wire = w.context else { throw AtlasObservedReaderError.invalidResponse }
+                let retained = try AtlasRetainedSearchContext.decode(wire, matched: target.hit.range,
+                    observedLength: report.observedLength, encoding: report.request.encoding,
+                    caseSensitive: report.request.caseSensitive, primary: report.primaryNeedle)
+                guard retained.containsWitness(w.original_hex, at: target.hit.range),
+                      retained.originalRange.end <= report.payloadBytesRead,
+                      retained.originalRange.count <= retainedBytes,
+                      report.hits.count != 1 || retained.originalRange.count == retainedBytes else {
+                    throw AtlasObservedReaderError.invalidResponse
+                }
+                context = retained
+            } else {
+                guard w.context == nil else { throw AtlasObservedReaderError.invalidResponse }
+                context = nil
+            }
             return .init(target: target, encoding: report.request.encoding, text: w.text,
                 originalHex: w.original_hex, sha256: w.witness_sha256, mode: report.request.mode,
-                caseSensitive: report.request.caseSensitive, expression: expression)
+                caseSensitive: report.request.caseSensitive, expression: expression, context: context)
         } catch { throw AtlasObservedReaderError.invalidResponse }
     }
     private struct Wire: Decodable {
@@ -511,6 +674,7 @@ struct AtlasObservedReaderSearchWitness: Sendable {
         let text, original_hex, witness_sha256: String
         let mode: String?
         let case_sensitive: Bool?
+        let context: AtlasRetainedSearchContext.Wire?
     }
 
     /// New context is a separate observation. It may only receive a selection
@@ -747,8 +911,9 @@ private enum AtlasObservedReaderSearchWire {
         let final_observed_length: AtlasObservedReaderWire.Number?
         let encoding, encoding_basis, retention, state, consistency: String
         let input_complete, search_complete: Bool
+        let context_before_bytes, context_after_bytes, retained_context_bytes: AtlasObservedReaderWire.Number?
         func value(request: AtlasObservedReaderSearchRequest) throws
-            -> (id: UInt64, length: UInt64, finalLength: UInt64?, inputComplete: Bool, searchComplete: Bool) {
+            -> (id: UInt64, length: UInt64, finalLength: UInt64?, inputComplete: Bool, searchComplete: Bool, contextBytes: UInt64?) {
             guard query_generation.value == request.generation, search_observation.value > 0,
                   encoding == request.encoding.rawValue, encoding_basis == "explicit-for-this-search",
                   ["literal-witnesses-only", "literal-witnesses-and-bounded-context"].contains(retention),
@@ -758,7 +923,17 @@ private enum AtlasObservedReaderSearchWire {
                   search_complete == (input_complete && consistency == "unchanged-metadata-not-atomic"),
                   consistency != "unchanged-metadata-not-atomic" || final_observed_length?.value == observed_length.value,
                   state != "short-read" || !search_complete else { throw AtlasObservedReaderError.invalidResponse }
-            return (search_observation.value, observed_length.value, final_observed_length?.value, input_complete, search_complete)
+            if retention == "literal-witnesses-and-bounded-context" {
+                guard context_before_bytes?.value == AtlasRetainedSearchContext.beforeBytes,
+                      context_after_bytes?.value == AtlasRetainedSearchContext.afterBytes,
+                      retained_context_bytes != nil else { throw AtlasObservedReaderError.invalidResponse }
+            } else {
+                guard context_before_bytes == nil, context_after_bytes == nil, retained_context_bytes == nil else {
+                    throw AtlasObservedReaderError.invalidResponse
+                }
+            }
+            return (search_observation.value, observed_length.value, final_observed_length?.value, input_complete,
+                search_complete, retained_context_bytes?.value)
         }
     }
 }

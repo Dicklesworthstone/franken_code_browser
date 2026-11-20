@@ -76,12 +76,38 @@ private enum ObservedSearchFixture {
         out["additional_source_bytes_read"] = "0"; out["additional_read_calls"] = "0"
         return out
     }
+
+    static func withContext(_ report: [String: Any], source: String,
+        encoding: AtlasObservedReaderEncoding) -> [String: Any] {
+        let bytes = AtlasObservedReaderSearchRequest.originalBytes(source, encoding: encoding)
+        precondition(bytes.count <= 160 && report["state"] as? String == "complete-observed-input")
+        var out = report, rows = report["hits"] as! [[String: Any]]
+        for index in rows.indices {
+            let range = rows[index]["original_range"] as! [String: String]
+            let start = Int(range["start"]!)!, end = Int(range["end"]!)!
+            let before = ObservedReaderFixture.decodedOriginal(Array(bytes[..<start]), encoding: encoding)
+            let matched = ObservedReaderFixture.decodedOriginal(Array(bytes[start..<end]), encoding: encoding)
+            rows[index]["context"] = ["state": "retained", "complete": true,
+                "requested_range": ObservedReaderFixture.range(0, UInt64(bytes.count)),
+                "original_range": ObservedReaderFixture.range(0, UInt64(bytes.count)), "match_range": range,
+                "original_hex": ObservedReaderFixture.hex(bytes), "text": source,
+                "text_original_range": ObservedReaderFixture.range(0, UInt64(bytes.count)),
+                "match_decoded_range": ObservedReaderFixture.range(UInt64(before.utf8.count), UInt64(before.utf8.count + matched.utf8.count)),
+                "text_has_replacements": false, "text_unavailable_reason": NSNull()] as [String: Any]
+        }
+        out["hits"] = rows
+        out["retention"] = "literal-witnesses-and-bounded-context"
+        out["context_before_bytes"] = "160"; out["context_after_bytes"] = "160"
+        out["retained_context_bytes"] = String(bytes.count * rows.count)
+        return out
+    }
 }
 
 private final class ObservedSearchProbe: @unchecked Sendable {
     let lifetime = ObservedReaderProbe()
     private let verifiedNavigation: Bool
     private let paging: Bool
+    private let capturesContext: Bool
     private let lock = NSLock()
     private var inputs: [UInt64: AtlasObservedReaderInput] = [:]
     private var revisions: [UInt64: UInt64] = [:]
@@ -97,8 +123,8 @@ private final class ObservedSearchProbe: @unchecked Sendable {
     private var generations: [UInt64] = []
     private var startAfters: [UInt64] = []
 
-    init(verifiedNavigation: Bool = false, paging: Bool = true) {
-        self.verifiedNavigation = verifiedNavigation; self.paging = paging
+    init(verifiedNavigation: Bool = false, paging: Bool = true, capturesContext: Bool = false) {
+        self.verifiedNavigation = verifiedNavigation; self.paging = paging; self.capturesContext = capturesContext
     }
 
     var transport: AtlasObservedReaderTransport {
@@ -209,10 +235,11 @@ private final class ObservedSearchProbe: @unchecked Sendable {
         } else { state = count == bytes.count ? "complete-observed-input" : "byte-limit" }
         let retained = Array(allOffsets.dropFirst(Int(skipped)).prefix(Int(request.maximumMatches)))
         let seen = UInt64(allOffsets.count)
-        let report = ObservedSearchFixture.report(owner, input, request, observation: stale ? id - 1 : id,
+        var report = ObservedSearchFixture.report(owner, input, request, observation: stale ? id - 1 : id,
             length: UInt64(bytes.count), offsets: retained, state: state, matchesSeen: seen,
             spellings: retained.map { ObservedReaderFixture.decodedOriginal(
                 Array(bytes[Int($0)..<(Int($0) + needle.count)]), encoding: request.encoding) })
+        if capturesContext { report = ObservedSearchFixture.withContext(report, source: text, encoding: request.encoding) }
         lock.lock(); reports[owner] = report; lock.unlock()
         replyGate?.wait()
         return try ObservedReaderFixture.encode(report)
@@ -718,6 +745,8 @@ private final class ObservedSearchProbe: @unchecked Sendable {
     }
 
     @MainActor static func main() async throws {
+        try retainedContextWireTests()
+        try await retainedContextModelTests()
         try pagingWireTests()
         try await pagingModelTests()
         try await pagingReplacementAuthorityTests()
@@ -736,6 +765,152 @@ private final class ObservedSearchProbe: @unchecked Sendable {
 
 
 private extension AtlasObservedReaderSearchTests {
+    static func retainedContextWireTests() throws {
+        let owner: UInt64 = 77
+        let input = try AtlasObservedReaderInput(root: "/repo", relativePath: Array("large.txt".utf8))
+        for (encoding, needle, spelling, sensitive) in [
+            (AtlasObservedReaderEncoding.utf8, "é🦀\r\n", "é🦀\r\n", true),
+            (.utf16le, "é🦀\r\n", "é🦀\r\n", true), (.utf16be, "é🦀\r\n", "é🦀\r\n", true),
+            (.utf8, "σ", "Σ", false), (.utf16be, "σ", "Σ", false),
+        ] {
+            let request = try AtlasObservedReaderSearchRequest(generation: 1, needle: needle,
+                encoding: encoding, caseSensitive: sensitive)
+            let source = "pre " + spelling + " post"
+            let length = UInt64(AtlasObservedReaderSearchRequest.originalBytes(source, encoding: encoding).count)
+            let offset = UInt64(AtlasObservedReaderSearchRequest.originalBytes("pre ", encoding: encoding).count)
+            let value = ObservedSearchFixture.withContext(ObservedSearchFixture.report(owner, input, request,
+                length: length, offsets: [offset], spellings: [spelling]), source: source, encoding: encoding)
+            let report = try AtlasObservedReaderSearchReport.decode(ObservedReaderFixture.encode(value),
+                handle: owner, input: input, request: request)
+            let witness = try AtlasObservedReaderSearchWitness.decode(ObservedReaderFixture.encode(ObservedSearchFixture.witness(value)),
+                handle: owner, input: input, report: report, target: report.target(for: report.hits[0]))
+            precondition(report.retainedContextBytes == length && witness.context?.complete == true)
+            precondition(witness.context?.displayText?.utf8.elementsEqual(source.utf8) == true)
+            precondition(witness.context?.parts?.match.utf8.elementsEqual(spelling.utf8) == true)
+            precondition(witness.context!.containsWitness(witness.originalHex, at: witness.target.hit.range))
+        }
+
+        let request = try AtlasObservedReaderSearchRequest(generation: 2, needle: "old", encoding: .utf8)
+        let source = "pre old post"
+        let value = ObservedSearchFixture.withContext(ObservedSearchFixture.report(owner, input, request,
+            length: 12, offsets: [4]), source: source, encoding: .utf8)
+        func report(_ value: [String: Any]) throws -> AtlasObservedReaderSearchReport {
+            try .decode(ObservedReaderFixture.encode(value), handle: owner, input: input, request: request)
+        }
+        let accepted = try report(value), selected = ObservedSearchFixture.witness(value)
+        func witness(_ value: [String: Any]) throws -> AtlasObservedReaderSearchWitness {
+            try .decode(ObservedReaderFixture.encode(value), handle: owner, input: input,
+                report: accepted, target: accepted.target(for: accepted.hits[0]))
+        }
+        for key in ["context_before_bytes", "context_after_bytes", "retained_context_bytes"] {
+            var bad = value; bad.removeValue(forKey: key)
+            rejects("missing retained context authority " + key) { _ = try report(bad) }
+        }
+        for (key, replacement) in [("retention", "literal-witnesses-only"), ("context_before_bytes", "159"),
+            ("context_after_bytes", "161"), ("retained_context_bytes", "0"), ("retained_context_bytes", "13")] {
+            var bad = value; bad[key] = replacement
+            rejects("invalid context admission " + key) { _ = try report(bad) }
+        }
+        let changes: [(String, Any)] = [
+            ("state", "current"), ("complete", false), ("original_hex", "00"),
+            ("text", "pre new post"), ("text_has_replacements", NSNull()),
+            ("text_unavailable_reason", "encoding-unavailable"),
+            ("match_range", ObservedReaderFixture.range(5, 8)),
+            ("match_decoded_range", ObservedReaderFixture.range(0, 3)),
+            ("requested_range", ObservedReaderFixture.range(0, 13)),
+            ("original_range", ObservedReaderFixture.range(1, 12)),
+            ("text_original_range", ObservedReaderFixture.range(1, 12)),
+        ]
+        for (key, replacement) in changes {
+            var bad = selected, context = selected["context"] as! [String: Any]
+            context[key] = replacement; bad["context"] = context
+            rejects("mismatched retained context " + key) { _ = try witness(bad) }
+        }
+        for key in ["text", "text_original_range", "match_decoded_range", "text_has_replacements", "text_unavailable_reason"] {
+            var bad = selected, context = selected["context"] as! [String: Any]
+            context.removeValue(forKey: key); bad["context"] = context
+            rejects("missing explicit excerpt field " + key) { _ = try witness(bad) }
+        }
+        var missing = selected; missing.removeValue(forKey: "context")
+        rejects("promised excerpt missing on selection") { _ = try witness(missing) }
+        var changedIdentity = selected; changedIdentity["search_observation"] = "3"
+        rejects("context from another observation") { _ = try witness(changedIdentity) }
+        var changedCount = selected; changedCount["retained_context_bytes"] = "11"
+        rejects("context count differs from accepted report") { _ = try witness(changedCount) }
+        var replacements = selected, replacementContext = selected["context"] as! [String: Any]
+        replacementContext["text_has_replacements"] = true; replacements["context"] = replacementContext
+        let rawOnly = try witness(replacements)
+        precondition(rawOnly.context?.displayText == nil && rawOnly.context?.parts == nil)
+        precondition(rawOnly.context?.originalHex == ObservedReaderFixture.hex(Array(source.utf8)))
+
+        let partialRequest = try AtlasObservedReaderSearchRequest(generation: 3, needle: "old",
+            encoding: .utf8, maximumScanBytes: 7)
+        var partial = ObservedSearchFixture.report(owner, input, partialRequest,
+            length: 12, offsets: [4], state: "byte-limit")
+        partial["retention"] = "literal-witnesses-and-bounded-context"
+        partial["context_before_bytes"] = "160"; partial["context_after_bytes"] = "160"
+        partial["retained_context_bytes"] = "7"
+        let partialReport = try AtlasObservedReaderSearchReport.decode(ObservedReaderFixture.encode(partial),
+            handle: owner, input: input, request: partialRequest)
+        var partialHit = ObservedSearchFixture.witness(partial)
+        partialHit["context"] = ["state": "retained", "complete": false,
+            "requested_range": ObservedReaderFixture.range(0, 12), "original_range": ObservedReaderFixture.range(0, 7),
+            "match_range": ObservedReaderFixture.range(4, 7), "original_hex": "707265206f6c64",
+            "text": NSNull(), "text_original_range": NSNull(), "match_decoded_range": NSNull(),
+            "text_has_replacements": NSNull(), "text_unavailable_reason": "insufficient-scalar-context"] as [String: Any]
+        let clipped = try AtlasObservedReaderSearchWitness.decode(ObservedReaderFixture.encode(partialHit),
+            handle: owner, input: input, report: partialReport, target: partialReport.target(for: partialReport.hits[0]))
+        precondition(clipped.context?.complete == false && clipped.context?.displayText == nil)
+        precondition(clipped.context?.originalHex == "707265206f6c64" && clipped.text == "old")
+    }
+
+    @MainActor static func retainedContextModelTests() async throws {
+        let input = try AtlasObservedReaderInput(root: "/repo", relativePath: Array("large.txt".utf8))
+        let probe = ObservedSearchProbe(capturesContext: true)
+        let original = "pre old post old end\n"
+        probe.setContent(original)
+        let model = AtlasObservedReaderModel(transport: probe.transport)
+        model.pageBytes = 4; model.open(.init(input: input, project: UUID(), access: nil))
+        try await wait("context reader open") { model.page != nil && !model.busy }
+        let page = model.page!, windows = probe.windowCount
+        model.searchText = "old"; model.find()
+        try await wait("context search") { model.searchReport != nil && !model.busy }
+        precondition(model.searchReport!.hits.count == 2 && model.retainedSearchContextCopy(hex: false) == nil)
+        model.nextSearchHit()
+        try await wait("first retained excerpt") { model.selectedSearchWitness != nil && !model.busy }
+        let observation = model.selectedSearchWitness!.target.observation
+        precondition(model.canCopySearchWitness && model.retainedSearchContextCopy(hex: false) == original)
+        precondition(model.retainedSearchContextCopy(hex: true) == ObservedReaderFixture.hex(Array(original.utf8)))
+        probe.setContent("xxx new xxxx new xxx\n")
+        model.nextSearchHit()
+        try await wait("next retained excerpt") { model.selectedSearchWitness?.target.hit.index == 1 && !model.busy }
+        precondition(model.selectedSearchWitness?.context?.parts?.match == "old")
+        precondition(model.selectedSearchWitness?.target.observation == observation)
+        precondition(model.retainedSearchContextCopy(hex: false) == original && probe.windowCount == windows && model.page!.matches(page))
+        model.previousSearchHit()
+        try await wait("previous retained excerpt") { model.selectedSearchWitness?.target.hit.index == 0 && !model.busy }
+        precondition(model.retainedSearchContextCopy(hex: false) == original && probe.windowCount == windows)
+        let gate = ObservedReaderGate(); probe.blockFindReply(gate); model.find()
+        try await wait("context replacement waiting") { gate.entered }
+        model.cancel()
+        precondition(!model.canCopySearchWitness && model.retainedSearchContextCopy(hex: false) == nil
+            && model.retainedSearchContextCopy(hex: true) == nil)
+        gate.release(); try await wait("context replacement drained") { probe.activeCount == 0 }
+        probe.setContent("pre old NEW! old end\n"); model.find()
+        try await wait("new context accepted") { model.searchAuthorized && !model.busy }
+        model.nextSearchHit()
+        try await wait("new context selected") { model.selectedSearchWitness != nil && !model.busy }
+        precondition(model.retainedSearchContextCopy(hex: false) == "pre old NEW! old end\n")
+        let hitGate = ObservedReaderGate(); probe.blockHit(hitGate); model.nextSearchHit()
+        try await wait("obsolete context selection") { hitGate.entered }
+        model.searchText = "different"; hitGate.release()
+        try await wait("obsolete context selection drained") { probe.activeCount == 0 }
+        precondition(model.selectedSearchWitness == nil && !model.canCopySearchWitness)
+        model.close()
+        precondition(model.retainedSearchContextCopy(hex: true) == nil)
+        try await wait("context reader closed") { probe.lifetime.closedCount == probe.lifetime.createCount }
+    }
+
     @MainActor static func pagingModelTests() async throws {
         let input = try AtlasObservedReaderInput(root: "/repo", relativePath: Array("large.txt".utf8))
         let probe = ObservedSearchProbe(verifiedNavigation: true)

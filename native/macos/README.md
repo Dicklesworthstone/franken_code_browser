@@ -1655,14 +1655,18 @@ those bytes, while changed or unavailable final metadata still keeps the overall
 coverage partial. This does not turn the observation into an atomic snapshot.
 Each result-page rescan evaluates the complete expression again.
 
-Selecting a result retrieves its retained matched text and original bytes;
-it does not reread the file. The search-hit API also returns up to 160 original
-bytes before and after each match from the same scan. These bounded excerpts
+Selecting a result displays its retained match and a captured excerpt with the
+match highlighted; it does not reread the file. Each hit retains up to 160 original
+bytes before and after the match from the same scan. These bounded excerpts
 survive live edits and remain separate from the reader's eight observation
 pages. They have requested and actual ranges, an independent completeness flag,
 original hex, and decoded text and match coordinates when scalar boundaries
 permit. Byte, call and match limits never trigger extra reads to fill context.
-Clipped excerpts can expose original bytes even when decoded text is unavailable.
+Clipped excerpts expose original hex when decoded text is unavailable. **Copy
+captured text** copies the lossless decoded excerpt; **Copy captured hex** copies
+the original captured bytes, including when text is unavailable. Replacement
+text is never offered as a lossless copy. Hosts with older witness-only receipts
+continue to show their retained matches without claiming captured context.
 Copies of the match preserve its original spelling. **Read current
 context** performs a separate bounded read with a fresh observation identity and
 highlights the match only after its retained bytes agree with the new source
@@ -1685,7 +1689,8 @@ shared decoder's source map. **Read current context** remains available when the
 intent is to inspect what changed.
 
 Press **Command-F** to focus Find. **Previous match** and **Next match** select
-retained results without rereading source; choose the context action explicitly.
+retained results and their captured excerpts without rereading source; choose
+the current-context action explicitly when a fresh observation is wanted.
 They wrap only when the completed observation's entire match set fits in the
 current page. An incomplete scan or a page that omits earlier or later matches
 does not turn its retained subset into a complete cycle.

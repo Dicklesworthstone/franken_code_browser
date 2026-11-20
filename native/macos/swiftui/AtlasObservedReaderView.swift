@@ -341,7 +341,7 @@ extension AtlasObservedReaderModel {
                                             }
                                         }
                                         .buttonStyle(.plain).disabled(!model.canSelectSearchHit)
-                                        .help("Verify the matching literal retained by this search, without reading the file again")
+                                        .help("Show the match and any excerpt retained by this search, without reading the file again")
                                     }
                                 }.frame(maxWidth: .infinity, alignment: .leading)
                             }.frame(minWidth: 230, maxHeight: 115)
@@ -358,13 +358,18 @@ extension AtlasObservedReaderModel {
                             }.frame(maxHeight: 50)
                             Text(verbatim: "Original hex: " + witness.originalHex)
                                 .font(.system(.caption2, design: .monospaced)).lineLimit(2).textSelection(.enabled)
+                            if let context = witness.context {
+                                retainedSearchContext(context, observation: witness.target.observation)
+                            }
                             if witness.expression != nil {
-                                Text("Required and excluded terms were checked in the original search observation. Reading context rechecks only these primary literal bytes.")
+                                Text("Required and excluded terms were checked in the original search observation. Reading current context rechecks only these primary literal bytes.")
                                     .font(.caption2).foregroundStyle(.secondary)
                             }
                             HStack {
                                 Button("Copy match") { copyWitness(hex: false) }
+                                    .disabled(!model.canCopySearchWitness)
                                 Button("Copy match hex") { copyWitness(hex: true) }
+                                    .disabled(!model.canCopySearchWitness)
                                 Button("Read current context", action: model.readSearchContext)
                                     .disabled(!model.canReadSearchContext)
                                     .help("Read a new observation around this result. Select the match only if its original bytes still agree.")
@@ -386,7 +391,7 @@ extension AtlasObservedReaderModel {
                                 : report.searchComplete
                                 ? "No matches in the observed input. Metadata checks did not detect a change; the scan is not an atomic snapshot."
                                 : "A partial search cannot prove that the unsearched remainder has no matches.")
-                            : "Select a result to verify its retained literal. Read current context is a separate explicit action.")
+                            : "Select a result to read its retained match and any captured excerpt. Read current context is a separate explicit action.")
                             .font(.caption).foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
@@ -422,9 +427,49 @@ extension AtlasObservedReaderModel {
         }
     }
 
+    private func retainedSearchContext(_ context: AtlasRetainedSearchContext, observation: UInt64) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Captured excerpt · search observation \(observation)").font(.caption.bold())
+            Text("Original bytes \(context.originalRange.start)..<\(context.originalRange.end) · "
+                + (context.complete ? "requested excerpt complete" : "partial excerpt"))
+                .font(.caption2).foregroundStyle(.secondary)
+            ScrollView([.horizontal, .vertical]) {
+                if let parts = context.parts {
+                    (Text(verbatim: parts.before) + Text(verbatim: parts.match).bold().underline()
+                        + Text(verbatim: parts.after))
+                        .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                } else {
+                    Text(verbatim: context.originalHex).font(.system(.caption2, design: .monospaced))
+                        .textSelection(.enabled)
+                }
+            }.frame(maxHeight: 130)
+            Text(context.displayText == nil
+                ? "Lossless text is unavailable at these captured boundaries. Original bytes remain available as hex."
+                : "Captured during the original scan. Live edits do not change this excerpt.")
+                .font(.caption2).foregroundStyle(.secondary)
+            if !context.complete {
+                Text("Requested through byte \(context.requestedRange.end); the scan stopped before the full suffix was available.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            HStack {
+                Button("Copy captured text") { copySearchContext(hex: false) }
+                    .disabled(!model.canCopySearchWitness || context.displayText == nil)
+                Button("Copy captured hex") { copySearchContext(hex: true) }
+                    .disabled(!model.canCopySearchWitness)
+            }.controlSize(.small)
+        }
+    }
+
+    private func copySearchContext(hex: Bool) {
+        guard let text = model.retainedSearchContextCopy(hex: hex) else { return }
+        NSPasteboard.general.clearContents()
+        copyNotice = NSPasteboard.general.setString(text, forType: .string)
+            ? "Copied the captured excerpt\(hex ? " as original hexadecimal bytes" : ""); no file reread."
+            : "Clipboard write failed."
+    }
+
     private func copyWitness(hex: Bool) {
-        guard let witness = model.selectedSearchWitness,
-              model.searchReport?.admits(witness.target) == true, !model.closed else { return }
+        guard model.canCopySearchWitness, let witness = model.selectedSearchWitness else { return }
         NSPasteboard.general.clearContents()
         copyNotice = NSPasteboard.general.setString(hex ? witness.originalHex : witness.text, forType: .string)
             ? "Copied the verified retained literal\(hex ? " as original hexadecimal bytes" : ""); no file reread."
