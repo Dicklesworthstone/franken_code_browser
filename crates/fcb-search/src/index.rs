@@ -200,9 +200,10 @@ pub struct IndexStatistics {
 }
 
 /// A capture-bound collection of immutable per-file substring segments.
-/// Query preparation allocates no repository-sized candidate list. Three needle
-/// trigrams are probed per file; exact verification eliminates false positives.
-/// The metadata traversal is O(files), not a claimed global inverted index.
+/// Query preparation allocates no repository-sized candidate list. Up to three
+/// trigrams per required positive term are probed per file, capped at the query
+/// token limit. Exact verification eliminates false positives. The metadata
+/// traversal is O(files), not a claimed global inverted index.
 #[derive(Debug)]
 pub struct EphemeralIndex<'a> {
     manifest: SearchManifest<'a>,
@@ -311,9 +312,11 @@ impl<'a> EphemeralIndex<'a> {
             .ok().map(|index| self.segments[index].coverage)
     }
 
-    /// A false return is an exact negative certificate for the primary needle
-    /// only. True means "verify", never "there is a match". Unknown encodings
-    /// and normalization cannot borrow a byte-index negative certificate.
+    /// A false return certifies the absence of a required positive term.
+    /// True means "verify", never "there is a match". Unknown encodings,
+    /// normalization and uncovered segments cannot borrow byte-index negatives.
+    /// Short terms need verification, but do not disable probes for other terms.
+    /// Exclusions and metadata filters never become required source trigrams.
     pub fn may_match(
         &self, document_index: usize, query: &ParsedQuery, options: &QueryOptions,
     ) -> Result<bool, IndexError> {
@@ -338,11 +341,24 @@ fn may_match_segment(segment: &Segment, grams: &[u32], query: &ParsedQuery,
     options: &QueryOptions) -> Result<bool, IndexError> {
     let needle = query.primary_needle.as_bytes();
     if needle.is_empty() { return Err(QueryError::EmptyNeedle.into()); }
-    if needle.len() < 3 || !compatible_segment(segment, options) { return Ok(true); }
+    if !compatible_segment(segment, options) { return Ok(true); }
     let keys = &grams[segment.start..segment.start + segment.len];
-    let last = needle.len() - 3;
-    for offset in [0, last / 2, last] {
-        if keys.binary_search(&gram(&needle[offset..offset + 3])).is_err() { return Ok(false); }
+    // Required terms are independent necessary conditions. Missing a trigram
+    // from ANY positive term can avoid decoding a file with a common primary
+    // needle. Present grams never establish co-occurrence or an excluded term:
+    // the existing exact verifier still owns those decisions and occurrence IDs.
+    //
+    // Public AST fields may bypass parser validation. Probe at most the normal
+    // token limit even for such a value; ignoring excess terms only admits extra
+    // candidates. Query constructors separately reject malformed/oversized ASTs.
+    for needle in std::iter::once(needle)
+        .chain(query.conjunction_terms.iter().map(|term| term.as_bytes()))
+        .take(crate::MAX_QUERY_TOKENS) {
+        if needle.len() < 3 { continue; }
+        let last = needle.len() - 3;
+        for offset in [0, last / 2, last] {
+            if keys.binary_search(&gram(&needle[offset..offset + 3])).is_err() { return Ok(false); }
+        }
     }
     Ok(true)
 }
