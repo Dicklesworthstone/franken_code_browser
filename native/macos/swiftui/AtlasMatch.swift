@@ -3,12 +3,14 @@ import CoreGraphics
 import CoreText
 import CryptoKit
 
-/// Capture-verified row geometry. These are row bands, not substring glyph bounds:
-/// archived glyph runs intentionally do not carry character-to-glyph mappings.
+/// Capture-verified source rows or explicitly qualified Markdown block geometry.
+/// Neither kind claims substring glyph bounds: source replay has no character-to-
+/// glyph map, and upstream Markdown exposes enclosing original-source blocks.
 struct AtlasMatch {
     let sourceRange: NSRange
     let rowRects: [CGRect]
     let focusRect: CGRect
+    var mapsEnclosingBlocks = false
 
     /// Hash and map a captured file once for all occurrences. Result order and
     /// per-occurrence refusal are identical to resolving each range separately.
@@ -59,6 +61,9 @@ struct AtlasMatch {
     }
 
     private static func geometry(document: AtlasDocument, match: NSRange, sourceLength: Int) -> AtlasMatch? {
+        if document.presentation == .markdown {
+            return documentGeometry(document: document, match: match, sourceLength: sourceLength)
+        }
         let start = match.location, end = match.location + match.length
         var bands: [CGRect] = []
         var focus: CGRect?
@@ -102,4 +107,43 @@ struct AtlasMatch {
         guard let focus, !bands.isEmpty, coveredUntil == end else { return nil }
         return AtlasMatch(sourceRange: match, rowRects: bands, focusRect: focus)
     }
+
+    /// Upstream block evidence can overlap and repeat across display items.
+    /// Require coverage of the entire source match, then retain its qualified
+    /// rectangles without interpreting rendered offsets as original bytes.
+    private static func documentGeometry(document: AtlasDocument, match: NSRange,
+                                         sourceLength: Int) -> AtlasMatch? {
+        var ranges: [NSRange] = [], bands: [CGRect] = []
+        for tile in document.renderTiles {
+            guard let display = tile.display, tile.contentScale.isFinite, tile.contentScale > 0,
+                  [tile.rect.minX, tile.rect.minY, tile.rect.maxX, tile.rect.maxY].allSatisfy(\.isFinite),
+                  tile.rect.width > 0, tile.rect.height > 0 else { return nil }
+            for region in display.sourceRegions {
+                let range = region.sourceRange
+                guard range.location >= 0, range.length > 0, range.location <= sourceLength,
+                      range.length <= sourceLength - range.location else { return nil }
+                let overlap = NSIntersectionRange(range, match)
+                guard overlap.length > 0 else { continue }
+                ranges.append(overlap)
+                let scale = tile.contentScale
+                let rect = CGRect(x: tile.rect.minX + region.rect.minX * scale,
+                    y: tile.rect.minY + region.rect.minY * scale,
+                    width: region.rect.width * scale, height: region.rect.height * scale).intersection(tile.rect)
+                guard [rect.minX, rect.minY, rect.maxX, rect.maxY].allSatisfy(\.isFinite),
+                      !rect.isNull, !rect.isEmpty else { return nil }
+                if !bands.contains(rect) {
+                    guard bands.count < 256 else { return nil }
+                    bands.append(rect)
+                }
+            }
+        }
+        var covered = match.location
+        for range in ranges.sorted(by: { $0.location < $1.location }) {
+            guard range.location <= covered else { return nil }
+            covered = max(covered, range.location + range.length)
+        }
+        guard covered == match.location + match.length, let first = bands.first else { return nil }
+        return AtlasMatch(sourceRange: match, rowRects: bands, focusRect: first, mapsEnclosingBlocks: true)
+    }
+
 }

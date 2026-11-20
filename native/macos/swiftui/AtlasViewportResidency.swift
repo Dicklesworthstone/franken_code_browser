@@ -128,6 +128,7 @@ struct AtlasViewportLayout: Sendable {
     private(set) var isInstalled = false
     private(set) var isLoading = false
     private(set) var isSuspended = false
+    private(set) var markdownPreviewEnabled = false
     private(set) var documents: [String: AtlasDocument] = [:]
     private(set) var tiles: [AtlasTextTile] = []
     private(set) var contentRevision = UUID()
@@ -162,20 +163,53 @@ struct AtlasViewportLayout: Sendable {
         var used: UInt64
     }
 
-    init(limits: AtlasViewportLimits = AtlasViewportLimits(), transport: AtlasViewportSourceTransport = .live) {
+    init(limits: AtlasViewportLimits = AtlasViewportLimits(), transport: AtlasViewportSourceTransport = .live,
+         markdown: AtlasViewportMarkdownTransport? = nil) {
         precondition(limits.valid)
-        self.limits = limits; worker = AtlasViewportWorker(transport: transport)
-        // Source rows can be shared by an explicit scope's old/new placement.
-        // Allow both bounded resident sets plus one full preparation. Older
+        self.limits = limits; worker = AtlasViewportWorker(transport: transport, markdown: markdown)
+        // Source rows, cached Markdown and current placement can have separate
+        // retained lifetimes. Admit all three bounded sets plus preparation. Older
         // accepted/flight frames consume this same finite pool and apply
         // backpressure until their completion releases its lifetime credits.
-        retirement = AtlasNativeRetirement(maximumSlots: limits.documents * 2 + 8,
-            maximumBytes: limits.estimatedBytes * 2 + AtlasViewportLimits.preparationBytes)
+        retirement = AtlasNativeRetirement(maximumSlots: min(520, limits.documents * 3 + 8),
+            maximumBytes: limits.estimatedBytes * 3 + AtlasViewportLimits.preparationBytes)
         retirement.onAvailability { [weak self] in DispatchQueue.main.async { [weak self] in self?.pump() } }
     }
 
     var retainedNativeBytes: Int { retirement.reservedBytes }
     var retainedNativeSlots: Int { retirement.reservedSlots }
+
+    /// An explicit window preference changes only admitted visible Markdown
+    /// demand. Existing captured pixels stay readable until a complete worker
+    /// replacement is accepted; camera/layout/source authority does not change.
+    func setMarkdownPreviewEnabled(_ enabled: Bool) {
+        guard markdownPreviewEnabled != enabled else { return }
+        markdownPreviewEnabled = enabled
+        if let active, active.markdownRequested != wantsMarkdown(active.entry) {
+            active.cancellation.cancel()
+        }
+        for id in wanted {
+            guard let entry = entries[id], AtlasViewportMarkdownTransport.supports(entry.rawPath) else { continue }
+            blocked.remove(id)
+            if current(id), let resident = residents[id] { setState(id, publishedState(resident.prepared)) }
+            else if previewStates[id] != .readerOnly { setState(id, .queued) }
+        }
+        pump()
+    }
+
+    private func wantsMarkdown(_ entry: AtlasProjectCatalog.Entry) -> Bool {
+        markdownPreviewEnabled && AtlasViewportMarkdownTransport.supports(entry.rawPath)
+    }
+    private func current(_ id: UInt64) -> Bool {
+        guard let resident = residents[id], let entry = entries[id] else { return false }
+        return resident.layoutRevision == layoutRevision
+            && resident.prepared.markdownRequested == wantsMarkdown(entry)
+    }
+    private func publishedState(_ prepared: AtlasViewportPreparedSource) -> AtlasViewportPreviewState {
+        if prepared.document.source.text.isEmpty { return .empty }
+        if prepared.document.presentation == .markdown { return .markdown }
+        return prepared.markdownRequested ? .sourceFallback : .ready
+    }
 
     /// Navigation can reveal a matching metadata atlas before any source is
     /// resident. Tying this to tiles would prevent the first visible frame
@@ -315,12 +349,12 @@ struct AtlasViewportLayout: Sendable {
 
     private func pump() {
         pendingCount = wanted.filter { id in
-            residents[id]?.layoutRevision != layoutRevision && previewStates[id] != .readerOnly
+            !current(id) && previewStates[id] != .readerOnly
                 && previewStates[id] != .unavailable && !blocked.contains(id) && active?.entry.id != id
         }.count
         guard isInstalled, !isSuspended, active == nil else { return }
         guard let id = wanted.first(where: {
-            residents[$0]?.layoutRevision != layoutRevision && previewStates[$0] != .readerOnly
+            !current($0) && previewStates[$0] != .readerOnly
                 && previewStates[$0] != .unavailable && !blocked.contains($0)
         }), let entry = entries[id] else { isLoading = false; pendingCount = 0; return }
         guard let credit = retirement.reserve(bytes: AtlasViewportLimits.preparationBytes) else {
@@ -332,7 +366,8 @@ struct AtlasViewportLayout: Sendable {
         let reused = residents[id].flatMap { $0.prepared.rawPath == entry.rawPath ? $0.prepared : nil }
         let work = AtlasViewportWork(root: root, layoutRevision: layoutRevision, entry: entry,
             sourceCacheHandle: sourceCacheHandle, limits: limits, accessLease: accessLease,
-            cacheLease: cacheLease, reuse: reused, retirementLease: credit)
+            cacheLease: cacheLease, reuse: reused, retirementLease: credit,
+            markdownRequested: wantsMarkdown(entry))
         active = work; isLoading = true; pendingCount = max(0, pendingCount - 1); setState(id, .loading)
         worker.submit(work) { [weak self, work] result in self?.finish(work, result: result) }
     }
@@ -342,9 +377,12 @@ struct AtlasViewportLayout: Sendable {
         active = nil; isLoading = false
         guard isInstalled, !isSuspended, layoutRevision == work.layoutRevision,
               root.utf8.elementsEqual(work.root.utf8), let entry = entries[work.entry.id],
-              entry.rawPath == work.entry.rawPath, wanted.contains(entry.id), !work.cancellation.isCanceled else {
+              entry.rawPath == work.entry.rawPath, wanted.contains(entry.id), !work.cancellation.isCanceled,
+              work.markdownRequested == wantsMarkdown(entry) else {
             if layoutRevision == work.layoutRevision, previewStates[work.entry.id] == .loading {
-                setState(work.entry.id, .cold)
+                if current(work.entry.id), let resident = residents[work.entry.id] {
+                    setState(work.entry.id, publishedState(resident.prepared))
+                } else { setState(work.entry.id, .cold) }
             }
             pump(); return
         }
@@ -361,7 +399,7 @@ struct AtlasViewportLayout: Sendable {
                       $0.path.utf8.elementsEqual(entry.rawPath) && $0.parcelRect == AtlasViewportIndex.rect(entry)
                   }) else { setState(entry.id, .unavailable); pump(); return }
             if admit(prepared, for: entry.id) {
-                setState(entry.id, prepared.document.source.text.isEmpty ? .empty : .ready)
+                setState(entry.id, publishedState(prepared))
                 publish()
             } else {
                 setState(entry.id, .capacityLimited); blocked.insert(entry.id)
@@ -426,3 +464,4 @@ struct AtlasViewportLayout: Sendable {
         previewStates[id] = state
     }
 }
+

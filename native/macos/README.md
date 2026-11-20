@@ -1803,22 +1803,54 @@ pending; it is not a claim about the already released binary.
 
 ## Styled Markdown preview
 
-In the workspace, select a Markdown file and press **Command-R**, or choose
-**Markdown preview** in the toolbar, to open its retained document preview.
-While enabled, this window opens newly activated `.md`, `.markdown` and `.mdown`
-files in preview. **Source**, **Command-R** inside the preview, or **Done** returns
-to the same captured source and turns off that automatic preference. A currently
-verified Markdown region restores its original-byte anchor; otherwise the source
-page and native selection stay in place. History navigation can present the
-newly active capture; hidden history readers and pins do not open previews.
+Press **Command-R**, or choose **Markdown preview** in the workspace toolbar,
+to switch visible Markdown atlas parcels between source and rich preview.
+The preference applies to `.md`, `.markdown` and `.mdown` files in this window.
+With Source Reader hidden, the command leaves the atlas in view. Zooming into
+a parcel prepares its preview on the existing bounded source worker; an overview
+does not parse every Markdown file in the project.
 
-Reopening a prepared preview reuses its captured document and last preview
+Atlas previews use the exact accepted capture and FrankenMarkdown's shaped glyph
+IDs, supplied font faces and display geometry. Headings, prose, lists, tables,
+code fences and supported vector decorations keep that upstream layout.
+Preview placement stays within each existing parcel, preserving neighboring
+geometry and camera position. A source/preview/source toggle reuses the retained
+source; a warm return to preview reuses the prepared display. Changing the file
+scope refits those same immutable windows without moving an older frame's tiles.
+
+The initial atlas rich-display allowance is **64 KiB of UTF-8 source**, at a
+fixed 640-point document width and at most 64 retained display windows. A limit,
+unsupported layout, invalid source correspondence or unavailable display service
+keeps the captured source readable and labels the fallback. Optional rich
+content cannot displace a source preview that fits its budget. Image slots
+show labeled placeholders in the atlas; opening the retained reader provides
+the existing separately authorized image route.
+
+Verified query matches use the original captured bytes and digest before mapping
+to enclosing rendered blocks. Block highlights do not claim glyph-exact or
+inline-exact source ranges; unmapped source stays available in the reader.
+Appearance changes recolor accepted geometry without reparsing. Glyph-only
+windows use the existing Metal glyph path; decorated windows retain their
+complete native drawing and bounded raster/detail coverage.
+
+While preview is enabled, an active visible retained reader can open its document
+sheet, and newly opened Markdown captures prefer that preview. **Source**,
+**Command-R** inside the preview, or **Done** returns to the same captured source
+and turns off this window's preview preference. A verified Markdown region
+restores its original-byte anchor; otherwise the source page and native selection
+stay in place. Hidden history readers and pins do not open previews.
+
+Reopening a prepared reader preview reuses its captured document and last preview
 position. Choose **From source page** to resynchronize after independent source
-navigation. Pending work is canceled when its workspace presentation is withdrawn,
-and redraws cannot restart a dismissed request. The selected-file preview uses
-the existing document sheet; rich Markdown inside the Metal atlas parcels remains
-separate work. These native command and presentation changes await executable
-and physical-Mac verification.
+navigation. Pending work is canceled when its presentation is withdrawn.
+Canceled or stale atlas jobs cannot replace a newer project, layout or toggle
+choice, and reader-handle retirement remains bounded even if a close is busy.
+
+Native regression sources cover supplied glyph replay, complete continuation
+pages, exact capture and source-map checks, decorated windows, query geometry,
+warm toggles, visible-only demand, scope reuse, stale replies and retirement.
+These code-first changes await independent strict-RCH executable verification
+and physical-Mac visual, wheel and frame-cadence qualification.
 
 Open a retained source file and choose **Markdown**, or **Split preview** to keep
 the source alongside the document. The native reader prepares a **Styled**

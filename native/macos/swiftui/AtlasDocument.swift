@@ -154,6 +154,88 @@ struct AtlasHighlightCapture: Decodable {
     }
 }
 
+/// Explicit replay of engine-supplied document geometry. Source intervals are
+/// original UTF-16 ranges, separate from rendered glyphs and line numbering.
+struct AtlasTileSourceRegion {
+    let sourceRange: NSRange
+    let rect: CGRect
+}
+
+struct AtlasTileDisplay {
+    struct Row {
+        let origin: CGPoint
+        let bounds: CGRect
+        var clip: CGRect? = nil
+    }
+    struct Vector {
+        let bounds: CGRect
+        let shape: String
+        let role: String
+        let stroke: Double
+    }
+    enum Drawing { case text(Int), vector(Vector) }
+    let height: Double
+    let rows: [Row]
+    let drawings: [Drawing]
+    let sourceRegions: [AtlasTileSourceRegion]
+    var glyphOnly: Bool { drawings.allSatisfy { if case .text = $0 { true } else { false } } }
+    var estimatedBytes: Int { rows.count * 96 + drawings.count * 160 + sourceRegions.count * 64 }
+
+    /// This only replays prepared glyphs and bounded primitives. The engine has
+    /// already parsed, wrapped and shaped the document before publication.
+    func draw(in context: CGContext, lines: [AtlasPreparedLine], palette: AtlasAppearancePalette) {
+        context.saveGState()
+        context.clip(to: CGRect(x: 0, y: 22, width: AtlasTextTile.width, height: max(0, height - 22)))
+        let clip = context.boundingBoxOfClipPath
+        for drawing in drawings {
+            switch drawing {
+            case .text(let index):
+                guard rows.indices.contains(index), lines.indices.contains(index),
+                      rows[index].bounds.insetBy(dx: -4, dy: -4).intersects(clip) else { continue }
+                context.saveGState()
+                if let bounds = rows[index].clip { context.clip(to: bounds) }
+                lines[index].draw(in: context, origin: rows[index].origin, palette: palette)
+                context.restoreGState()
+            case .vector(let value):
+                guard value.bounds.insetBy(dx: -2, dy: -2).intersects(clip) else { continue }
+                let rect = value.bounds
+                context.saveGState()
+                context.setStrokeColor(palette.color(Self.colorRole(value.role)).cgColor)
+                context.setLineWidth(max(palette.increasedContrast ? 1.5 : 0.5, value.stroke))
+                switch value.shape {
+                case "horizontal-rule":
+                    context.move(to: CGPoint(x: rect.minX, y: rect.midY))
+                    context.addLine(to: CGPoint(x: rect.maxX, y: rect.midY))
+                case "quote-accent":
+                    context.move(to: CGPoint(x: rect.midX, y: rect.minY))
+                    context.addLine(to: CGPoint(x: rect.midX, y: rect.maxY))
+                case "checkbox-check":
+                    context.move(to: CGPoint(x: rect.minX, y: rect.midY))
+                    context.addLine(to: CGPoint(x: rect.midX, y: rect.maxY))
+                    context.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
+                case "image-placeholder":
+                    context.setLineDash(phase: 0, lengths: [5, 4])
+                    context.addRect(rect.insetBy(dx: 0.5, dy: 0.5))
+                default: context.addRect(rect)
+                }
+                context.strokePath()
+                context.restoreGState()
+            }
+        }
+        context.restoreGState()
+    }
+
+    static func colorRole(_ role: String) -> String {
+        switch role {
+        case "link": "type"
+        case "muted", "quote", "rule", "border", "table-border": "comment"
+        default: role
+        }
+    }
+}
+
+enum AtlasDocumentPresentation: Equatable, Sendable { case source, markdown }
+
 /// Cached platform-shaped lines. Wheel/drag never tokenize or shape source.
 final class AtlasTextTile {
     private static let renderMutationClock = OSAllocatedUnfairLock(initialState: UInt64(0))
@@ -167,6 +249,7 @@ final class AtlasTextTile {
     var preparedLines: [AtlasPreparedLine]? { didSet { noteRenderMutation() } }
     var preparedHeader: AtlasPreparedLine? { didSet { noteRenderMutation() } }
     let sourceRange: NSRange
+    let display: AtlasTileDisplay?
     var rect = CGRect.zero { didSet { noteRenderMutation() } }
     var parcelRect: CGRect? { didSet { noteRenderMutation() } }
     var parcelFirst = false { didSet { noteRenderMutation() } }
@@ -176,12 +259,17 @@ final class AtlasTextTile {
     // for as long as it can draw the tile, independently of the model's LRU.
     var nativeResidencyOwner: AtlasNativeRetirement.Lease?
     var lineCount: Int { preparedLines?.count ?? lines.count }
-    var height: Double { 22 + Double(lineCount) * Self.lineHeight }
+    var height: Double { display?.height ?? (22 + Double(lineCount) * Self.lineHeight) }
+    var supportsMetalGlyphs: Bool { display?.glyphOnly ?? true }
+    func rowOrigin(_ index: Int) -> CGPoint {
+        display?.rows[index].origin ?? CGPoint(x: 4, y: 34 + Double(index) * Self.lineHeight)
+    }
 
     init(path: String, lines: [CTLine], sourceRange: NSRange, part: Int, retainedHeader: CTLine? = nil) {
         self.path = path
         self.lines = lines
         self.sourceRange = sourceRange
+        display = nil
         let title = (path as NSString).lastPathComponent + (part > 0 ? " · \(part + 1)" : "")
         header = retainedHeader ?? Self.makeHeader(title)
     }
@@ -193,13 +281,15 @@ final class AtlasTextTile {
         ]))
     }
 
-    init(path: String, preparedLines: [AtlasPreparedLine], header: AtlasPreparedLine, sourceRange: NSRange) {
+    init(path: String, preparedLines: [AtlasPreparedLine], header: AtlasPreparedLine, sourceRange: NSRange,
+         display: AtlasTileDisplay? = nil) {
         self.path = path
         self.lines = []
         self.header = nil
         self.preparedLines = preparedLines
         self.preparedHeader = header
         self.sourceRange = sourceRange
+        self.display = display
     }
 
     /// Geometry and canonical run colors stay immutable across appearance changes.
@@ -209,8 +299,12 @@ final class AtlasTextTile {
         context.textPosition = CGPoint(x: 4, y: 12)
         if let header { AtlasPreparedLine.drawRetained(header, in: context, origin: context.textPosition, palette: palette) }
         else { preparedHeader?.draw(in: context, origin: CGPoint(x: 4, y: 12), palette: palette) }
+        if let display {
+            display.draw(in: context, lines: preparedLines ?? [], palette: palette)
+            return
+        }
         for index in visibleRows ?? (0..<lineCount) {
-            context.textPosition = CGPoint(x: 4, y: 34 + Double(index) * Self.lineHeight)
+            context.textPosition = rowOrigin(index)
             if let preparedLines {
                 preparedLines[index].draw(in: context, origin: context.textPosition, palette: palette)
             } else { AtlasPreparedLine.drawRetained(lines[index], in: context, origin: context.textPosition, palette: palette) }
@@ -235,6 +329,9 @@ final class AtlasTextTile {
 final class AtlasDocument {
     let source: AtlasSource
     let capture: AtlasHighlightCapture
+    let presentation: AtlasDocumentPresentation
+    /// Imported font storage and replay maps, in addition to glyph/run costs.
+    let presentationBytes: Int
     let tiles: [AtlasTextTile]
     // Original archive pages never change. Presentation may repartition their
     // already-shaped rows into balanced columns for the current parcel.
@@ -289,8 +386,11 @@ final class AtlasDocument {
         return styled
     }
 
-    init(source: AtlasSource, capture: AtlasHighlightCapture, tiles: [AtlasTextTile], restoredColorLineCount: Int = 0) {
+    init(source: AtlasSource, capture: AtlasHighlightCapture, tiles: [AtlasTextTile], restoredColorLineCount: Int = 0,
+         presentation: AtlasDocumentPresentation = .source, presentationBytes: Int = 0) {
         self.restoredColorLineCount = restoredColorLineCount
+        self.presentation = presentation
+        self.presentationBytes = presentationBytes
         self.source = source
         self.capture = capture
         self.tiles = tiles
@@ -301,6 +401,8 @@ final class AtlasDocument {
         guard glyphLimit >= 0, runLimit >= 0, tileLimit >= 0, capture.text.utf16.count <= glyphLimit,
               capture.validatedRuns() != nil, !canceled() else { return nil }
         self.capture = capture
+        presentation = .source
+        presentationBytes = 0
         restoredColorLineCount = 0
         source = AtlasSource(path: path, text: capture.text)
         let styled = Self.style(capture)

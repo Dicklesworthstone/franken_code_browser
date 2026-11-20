@@ -17,6 +17,11 @@ enum AtlasParcelLayout {
     static func reflow(_ document: AtlasDocument, inside parcel: CGRect) -> [AtlasTextTile]? {
         guard [parcel.minX, parcel.minY, parcel.maxX, parcel.maxY].allSatisfy(\.isFinite),
               parcel.width > 0, parcel.height > 0, document.tiles.count <= 65_536 else { return nil }
+        if document.presentation == .markdown {
+            guard let tiles = displayTiles(document, inside: parcel) else { return nil }
+            document.displayTiles = tiles
+            return tiles
+        }
         guard let first = document.tiles.first else {
             guard document.source.text.isEmpty else { return nil }
             document.displayTiles = []; return []
@@ -74,6 +79,28 @@ enum AtlasParcelLayout {
         }
         document.displayTiles = result
         return result
+    }
+
+    /// Place complete upstream display windows without repartitioning their
+    /// glyph rows. Positions and original-source maps share immutable storage;
+    /// new tile objects keep an older accepted frame's geometry unchanged.
+    private static func displayTiles(_ document: AtlasDocument, inside parcel: CGRect) -> [AtlasTextTile]? {
+        guard document.presentation == .markdown, !document.tiles.isEmpty, document.tiles.count <= 64,
+              [parcel.minX, parcel.minY, parcel.maxX, parcel.maxY].allSatisfy(\.isFinite),
+              parcel.width > 0, parcel.height > 0 else { return nil }
+        var tiles: [AtlasTextTile] = []
+        for original in document.tiles {
+            guard let display = original.display, let lines = original.preparedLines,
+                  let header = original.preparedHeader, display.rows.count == lines.count else { return nil }
+            tiles.append(AtlasTextTile(path: original.path, preparedLines: lines, header: header,
+                sourceRange: original.sourceRange, display: display))
+        }
+        let inset = min(5.0, min(parcel.width, parcel.height) * 0.02)
+        guard let positions = fit(tiles, inside: parcel.insetBy(dx: inset, dy: inset)) else { return nil }
+        for (index, tile) in tiles.enumerated() {
+            tile.rect = positions[index]; tile.parcelRect = parcel; tile.parcelFirst = index == 0
+        }
+        return tiles
     }
 
     /// Only explicit scope changes repack metadata. Source arrival, capture
@@ -148,6 +175,11 @@ enum AtlasParcelLayout {
             let document = documents[path]!
             guard let firstTile = document.tiles.first else { continue }
             guard let parcel = firstTile.parcelRect else { return nil }
+            if document.presentation == .markdown {
+                guard let tiles = displayTiles(document, inside: parcel), tiles.count <= 65536 - total else { return nil }
+                total += tiles.count; assignments.append((document, tiles))
+                continue
+            }
             let inset = min(5.0, min(parcel.width, parcel.height) * 0.02)
             let inner = parcel.insetBy(dx: inset, dy: inset)
             let rowCount = document.tiles.reduce(0) { $0 + $1.lineCount }

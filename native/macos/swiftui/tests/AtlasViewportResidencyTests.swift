@@ -32,6 +32,65 @@ private final class ViewportFixture: @unchecked Sendable {
     }
 }
 
+/// A bounded service adapter fixture, not a Markdown parser. It replays already
+/// prepared rows as an independently mapped display document so these scenarios
+/// exercise the production worker/cache/placement boundary without reader APIs.
+private final class ViewportMarkdownFixture: @unchecked Sendable {
+    enum Behavior { case display, unsupported, overBudget }
+    private let lock = NSLock()
+    private var calls: [(path: String, text: String, source: ObjectIdentifier)] = []
+    private var active = 0, maximum = 0, canceledReturns = 0
+    let firstGate: DispatchSemaphore?
+    let behavior: Behavior
+    init(blockFirst: Bool = false, behavior: Behavior = .display) {
+        firstGate = blockFirst ? DispatchSemaphore(value: 0) : nil
+        self.behavior = behavior
+    }
+    var snapshot: (paths: [String], texts: [String], sources: [ObjectIdentifier], maximum: Int, canceledReturns: Int) {
+        lock.lock(); defer { lock.unlock() }
+        return (calls.map { $0.path }, calls.map { $0.text }, calls.map { $0.source }, maximum, canceledReturns)
+    }
+    var transport: AtlasViewportMarkdownTransport {
+        AtlasViewportMarkdownTransport(prepare: { [self] source, limits, cancellation in
+            precondition(!Thread.isMainThread, "Markdown preparation must stay off the interaction actor")
+            lock.lock()
+            calls.append((source.source.path, source.source.text, ObjectIdentifier(source.source)))
+            let ordinal = calls.count
+            active += 1; maximum = max(maximum, active)
+            lock.unlock()
+            defer { lock.lock(); active -= 1; lock.unlock() }
+            if ordinal == 1, let firstGate { precondition(firstGate.wait(timeout: .now() + 5) == .success) }
+            if cancellation.isCanceled { lock.lock(); canceledReturns += 1; lock.unlock() }
+            // Deliberately return a complete late candidate after cancellation:
+            // the production worker/model must reject it independently.
+            if case .unsupported = behavior { return nil }
+            guard let header = source.tiles.first?.preparedHeader else { return nil }
+            let lines = source.tiles.flatMap { $0.preparedLines ?? [] }
+            guard !lines.isEmpty else { return nil }
+            let rows: [AtlasTileDisplay.Row] = lines.indices.map { index in
+                .init(origin: CGPoint(x: 4, y: 34 + Double(index) * AtlasTextTile.lineHeight),
+                    bounds: CGRect(x: 4, y: 22 + Double(index) * AtlasTextTile.lineHeight,
+                        width: AtlasTextTile.width - 8, height: AtlasTextTile.lineHeight))
+            }
+            let drawings: [AtlasTileDisplay.Drawing] = lines.indices.map { .text($0) }
+            let regions = lines.indices.map {
+                AtlasTileSourceRegion(sourceRange: lines[$0].sourceRange, rect: rows[$0].bounds)
+            }
+            let display = AtlasTileDisplay(height: 22 + Double(lines.count) * AtlasTextTile.lineHeight,
+                rows: rows, drawings: drawings, sourceRegions: regions)
+            let tile = AtlasTextTile(path: source.source.path, preparedLines: lines, header: header,
+                sourceRange: NSRange(location: 0, length: source.source.text.utf16.count), display: display)
+            let bytes: Int
+            // The preview alone is admitted; adding the retained source,
+            // glyphs and fitted display exceeds the combined resident budget.
+            if case .overBudget = behavior { bytes = limits.estimatedBytes - 1 }
+            else { bytes = display.estimatedBytes }
+            return AtlasDocument(source: source.source, capture: source.capture, tiles: [tile],
+                presentation: .markdown, presentationBytes: bytes)
+        })
+    }
+}
+
 private final class ViewportAccess {}
 private final class ReleaseRecord: @unchecked Sendable {
     private let lock = NSLock()
@@ -78,7 +137,13 @@ private final class ReleaseProbe {
         boundedShapingStopsBeforeAnotherTile()
         try await finiteRetirementCreditsAndFinalFrameOwnership()
         try await retirementBackpressureResumesLatestDemand()
-        print("AtlasViewportResidency: 11 real worker/demand/placement/lifetime scenarios passed")
+        try await markdownWarmToggleCachesExactCapture()
+        try await markdownRapidToggleRetainsReadySource()
+        try await markdownScopeRefitPreservesMapsAndRetirement()
+        try await markdownProjectReplacementRejectsOldCandidate()
+        try await markdownFallbackPreservesExactSource()
+        try await markdownDemandIsVisibleOnly()
+        print("AtlasViewportResidency: 17 real worker/demand/placement/lifetime scenarios passed")
     }
 
     static func coldOverviewAndLateParcel() async throws {
@@ -387,4 +452,222 @@ private final class ReleaseProbe {
         model.close(); heldFrames = []
         try await until { model.retainedNativeSlots == 0 }
     }
+
+    static func markdownReady(_ model: AtlasViewportResidency, _ file: AtlasProjectCatalog.Entry) async throws {
+        try await until { model.previewStates[file.id] == .markdown && !model.isLoading }
+        precondition(model.document(forRawPath: file.rawPath)?.presentation == .markdown)
+        precondition(model.tiles.contains { $0.path.utf8.elementsEqual(file.rawPath) && $0.display != nil })
+    }
+
+    static func markdownWarmToggleCachesExactCapture() async throws {
+        let source = ViewportFixture(), markdown = ViewportMarkdownFixture()
+        let model = AtlasViewportResidency(transport: source.transport, markdown: markdown.transport)
+        let file = entry(1, "README.md"), layout = UUID()
+        precondition(model.install(root: "/fixture", entries: [file], layoutRevision: layout, accessLease: nil))
+        model.updateViewport(rect(file), scale: 4, selectedPath: nil)
+        try await ready(model, file)
+        var original: AtlasSource? = model.document(forRawPath: file.rawPath)?.source
+        let sourceCost = model.residentCost
+        precondition(markdown.snapshot.paths.isEmpty && original != nil)
+        model.setMarkdownPreviewEnabled(true)
+        // Optional presentation work does not withdraw the accepted source.
+        precondition(model.document(forRawPath: file.rawPath)?.source === original
+            && model.document(forRawPath: file.rawPath)?.presentation == .source)
+        try await markdownReady(model, file)
+        precondition(model.document(forRawPath: file.rawPath)?.source === original
+            && model.document(forRawPath: file.rawPath)?.capture.text.utf8.elementsEqual(original!.text.utf8) == true)
+        precondition(model.residentCost.sourceBytes == sourceCost.sourceBytes
+            && model.residentCost.estimatedBytes > sourceCost.estimatedBytes,
+            "cached display storage is charged separately while retaining one exact source capture")
+        model.setMarkdownPreviewEnabled(false)
+        try await ready(model, file)
+        precondition(model.document(forRawPath: file.rawPath)?.presentation == .source
+            && model.document(forRawPath: file.rawPath)?.source === original)
+        model.setMarkdownPreviewEnabled(true)
+        try await markdownReady(model, file)
+        precondition(source.snapshot.paths == ["/fixture/README.md"] && markdown.snapshot.paths == ["README.md"],
+            "a warm enable-disable-enable must neither recapture source nor prepare Markdown twice")
+        precondition(markdown.snapshot.sources == [ObjectIdentifier(original!)]
+            && model.layoutRevision == layout && model.tiles.allSatisfy { $0.parcelRect == rect(file) })
+        model.close(); original = nil
+        try await until { model.retainedNativeSlots == 0 && model.retainedNativeBytes == 0 }
+    }
+
+    static func markdownRapidToggleRetainsReadySource() async throws {
+        let source = ViewportFixture(), markdown = ViewportMarkdownFixture(blockFirst: true)
+        let model = AtlasViewportResidency(transport: source.transport, markdown: markdown.transport)
+        let file = entry(1, "rapid.md")
+        precondition(model.install(root: "/fixture", entries: [file], layoutRevision: UUID(), accessLease: nil))
+        model.updateViewport(rect(file), scale: 4, selectedPath: nil)
+        try await ready(model, file)
+        var original: AtlasSource? = model.document(forRawPath: file.rawPath)?.source
+        var originalFrame = model.tiles
+        let oldRects = originalFrame.map(\.rect)
+        model.setMarkdownPreviewEnabled(true)
+        try await until { markdown.snapshot.paths.count == 1 }
+        model.setMarkdownPreviewEnabled(false)
+        model.setMarkdownPreviewEnabled(true)
+        model.setMarkdownPreviewEnabled(false)
+        precondition(model.document(forRawPath: file.rawPath)?.source === original
+            && model.document(forRawPath: file.rawPath)?.presentation == .source
+            && originalFrame.map(\.rect) == oldRects,
+            "rapid mode changes must leave accepted source/frame geometry readable")
+        precondition(source.snapshot.paths.count == 1 && markdown.snapshot.paths.count == 1,
+            "replacement preferences wait for the entered preparation to drain")
+        markdown.firstGate!.signal()
+        try await until { !model.isLoading && model.previewStates[file.id] == .ready }
+        precondition(markdown.snapshot.canceledReturns == 1
+            && model.document(forRawPath: file.rawPath)?.presentation == .source,
+            "a late completed Markdown candidate cannot override the final Source choice")
+        model.setMarkdownPreviewEnabled(true)
+        try await markdownReady(model, file)
+        precondition(markdown.snapshot.paths.count == 2 && markdown.snapshot.maximum == 1
+            && source.snapshot.paths.count == 1 && model.document(forRawPath: file.rawPath)?.source === original)
+        model.setMarkdownPreviewEnabled(false)
+        try await ready(model, file)
+        model.setMarkdownPreviewEnabled(true)
+        try await markdownReady(model, file)
+        precondition(markdown.snapshot.paths.count == 2, "the successful replacement must become the warm cache")
+        model.close(); original = nil; originalFrame = []
+        try await until { model.retainedNativeSlots == 0 && model.retainedNativeBytes == 0 }
+    }
+
+    static func markdownScopeRefitPreservesMapsAndRetirement() async throws {
+        let source = ViewportFixture(), markdown = ViewportMarkdownFixture()
+        let model = AtlasViewportResidency(transport: source.transport, markdown: markdown.transport)
+        let file = entry(1, "scope.markdown"), firstLayout = UUID()
+        model.setMarkdownPreviewEnabled(true)
+        precondition(model.install(root: "/fixture", entries: [file], layoutRevision: firstLayout, accessLease: nil))
+        model.updateViewport(rect(file), scale: 4, selectedPath: nil)
+        try await markdownReady(model, file)
+        var original: AtlasSource? = model.document(forRawPath: file.rawPath)?.source
+        var frame = model.tiles
+        let oldRects = frame.map(\.rect)
+        let oldMappings = frame.map { $0.display!.sourceRegions.map(\.sourceRange) }
+        let moved = entry(1, "scope.markdown", x: 400, y: 200, width: 320, height: 240), nextLayout = UUID()
+        precondition(model.install(root: "/fixture", entries: [moved], layoutRevision: nextLayout,
+            accessLease: nil, preservingCaptures: true))
+        precondition(model.documents.isEmpty && model.tiles.isEmpty)
+        model.updateViewport(rect(moved), scale: 4, selectedPath: nil)
+        try await markdownReady(model, moved)
+        precondition(source.snapshot.paths == ["/fixture/scope.markdown"]
+            && markdown.snapshot.paths == ["scope.markdown"]
+            && model.document(forRawPath: moved.rawPath)?.source === original,
+            "a geometry-only scope repack must reuse the exact source and prepared document")
+        precondition(model.layoutRevision == nextLayout && model.layoutRevision != firstLayout
+            && model.tiles.allSatisfy { $0.parcelRect == rect(moved) })
+        precondition(frame.map(\.rect) == oldRects
+            && frame.map { $0.display!.sourceRegions.map(\.sourceRange) } == oldMappings
+            && model.tiles.map { $0.display!.sourceRegions.map(\.sourceRange) } == oldMappings,
+            "original-source mappings survive refit without mutating the old accepted frame")
+        precondition(!model.tiles.contains { current in frame.contains { $0 === current } })
+        model.close()
+        precondition(model.residentCost == AtlasViewportCost() && model.retainedNativeBytes > 0,
+            "closing the LRU cannot release storage still held by a presented Markdown frame")
+        frame = []
+        precondition(model.retainedNativeSlots > 0, "the independent source anchor retains its charged original capture")
+        withExtendedLifetime(original) {}
+        original = nil
+        try await until { model.retainedNativeSlots == 0 && model.retainedNativeBytes == 0 }
+    }
+
+    static func markdownProjectReplacementRejectsOldCandidate() async throws {
+        let source = ViewportFixture(), markdown = ViewportMarkdownFixture(blockFirst: true)
+        let model = AtlasViewportResidency(transport: source.transport, markdown: markdown.transport)
+        let file = entry(1, "same.md")
+        var grant: ViewportAccess? = ViewportAccess()
+        weak var observedGrant = grant
+        precondition(model.install(root: "/old", entries: [file], layoutRevision: UUID(), accessLease: grant))
+        grant = nil
+        model.updateViewport(rect(file), scale: 4, selectedPath: nil)
+        try await ready(model, file)
+        var oldSource: AtlasSource? = model.document(forRawPath: file.rawPath)?.source
+        model.setMarkdownPreviewEnabled(true)
+        try await until { markdown.snapshot.paths.count == 1 }
+        model.close()
+        let replacement = UUID()
+        precondition(model.install(root: "/new", entries: [file], layoutRevision: replacement, accessLease: nil))
+        model.updateViewport(rect(file), scale: 4, selectedPath: nil)
+        precondition(observedGrant != nil && source.snapshot.paths == ["/old/same.md"]
+            && model.document(forRawPath: file.rawPath) == nil,
+            "a replaced project keeps its entered worker grant but lends no source to the new root")
+        markdown.firstGate!.signal()
+        try await markdownReady(model, file)
+        try await until { observedGrant == nil }
+        precondition(model.root == "/new" && model.layoutRevision == replacement
+            && model.document(forRawPath: file.rawPath)?.source.text.contains("/new/same.md") == true
+            && model.document(forRawPath: file.rawPath)?.source !== oldSource)
+        precondition(source.snapshot.paths == ["/old/same.md", "/new/same.md"]
+            && markdown.snapshot.texts.count == 2
+            && markdown.snapshot.texts[0].contains("/old/same.md")
+            && markdown.snapshot.texts[1].contains("/new/same.md")
+            && markdown.snapshot.sources[0] != markdown.snapshot.sources[1]
+            && markdown.snapshot.canceledReturns == 1,
+            "late old-root display data cannot be applied under a matching filename or slot")
+        model.close(); oldSource = nil
+        try await until { model.retainedNativeSlots == 0 && model.retainedNativeBytes == 0 }
+    }
+
+    static func markdownFallbackPreservesExactSource() async throws {
+        for behavior in [ViewportMarkdownFixture.Behavior.unsupported, .overBudget] {
+            let source = ViewportFixture(), markdown = ViewportMarkdownFixture(behavior: behavior)
+            let model = AtlasViewportResidency(transport: source.transport, markdown: markdown.transport)
+            let file = entry(1, "fallback.mdown")
+            precondition(model.install(root: "/fixture", entries: [file], layoutRevision: UUID(), accessLease: nil))
+            model.updateViewport(rect(file), scale: 4, selectedPath: nil)
+            try await ready(model, file)
+            var original: AtlasSource? = model.document(forRawPath: file.rawPath)?.source
+            model.setMarkdownPreviewEnabled(true)
+            try await until { model.previewStates[file.id] == .sourceFallback && !model.isLoading }
+            precondition(model.document(forRawPath: file.rawPath)?.presentation == .source
+                && model.document(forRawPath: file.rawPath)?.source === original
+                && model.document(forRawPath: file.rawPath)?.capture.text.utf8.elementsEqual(original!.text.utf8) == true,
+                "unsupported or oversized optional display must fall back to the accepted exact source")
+            precondition(model.previewStates[file.id] != .readerOnly && model.previewStates[file.id] != .capacityLimited,
+                "a renderer refusal must not hide source that already fits the budget")
+            model.updateViewport(rect(file), scale: 5, selectedPath: nil)
+            model.updateViewport(rect(file), scale: 6, selectedPath: nil)
+            precondition(!model.isLoading && source.snapshot.paths.count == 1 && markdown.snapshot.paths.count == 1,
+                "fallback is accepted state, not a redraw-driven reread/reparse loop")
+            model.setMarkdownPreviewEnabled(false)
+            try await ready(model, file)
+            precondition(model.document(forRawPath: file.rawPath)?.source === original
+                && source.snapshot.paths.count == 1 && markdown.snapshot.paths.count == 1)
+            model.close(); original = nil
+            try await until { model.retainedNativeSlots == 0 && model.retainedNativeBytes == 0 }
+        }
+    }
+
+    static func markdownDemandIsVisibleOnly() async throws {
+        let source = ViewportFixture(), markdown = ViewportMarkdownFixture()
+        let model = AtlasViewportResidency(transport: source.transport, markdown: markdown.transport)
+        var files = (0..<80).map { entry(UInt64($0 + 1), "doc-\($0).MD", x: Double($0) * 200) }
+        let code = entry(100, "docs.md/source.rs", x: 20_000)
+        files.append(code)
+        precondition(model.install(root: "/fixture", entries: files, layoutRevision: UUID(), accessLease: nil))
+        model.setMarkdownPreviewEnabled(true)
+        model.updateViewport(CGRect(x: 0, y: 0, width: 21_000, height: 120), scale: 0.01, selectedPath: nil)
+        precondition(source.snapshot.paths.isEmpty && markdown.snapshot.paths.isEmpty && !model.isLoading,
+            "enabling Markdown in an overview must not eagerly prepare the project")
+        let last = files[79]
+        model.updateViewport(rect(last), scale: 4, selectedPath: nil)
+        try await markdownReady(model, last)
+        precondition(source.snapshot.paths == ["/fixture/doc-79.MD"] && markdown.snapshot.paths == ["doc-79.MD"])
+        model.updateViewport(rect(code), scale: 4, selectedPath: nil)
+        try await ready(model, code)
+        precondition(model.document(forRawPath: code.rawPath)?.presentation == .source
+            && markdown.snapshot.paths == ["doc-79.MD"], "a Markdown directory name must not classify source files as Markdown")
+        model.setMarkdownPreviewEnabled(false)
+        model.setMarkdownPreviewEnabled(true)
+        precondition(markdown.snapshot.paths == ["doc-79.MD"] && source.snapshot.paths.count == 2,
+            "offscreen residents must not trigger global preference preparation")
+        model.updateViewport(rect(last), scale: 4, selectedPath: nil)
+        try await markdownReady(model, last)
+        precondition(markdown.snapshot.paths.count == 1 && source.snapshot.paths.count == 2,
+            "returning to the retained Markdown capture must reuse its warm display")
+        model.close()
+        try await until { model.retainedNativeSlots == 0 && model.retainedNativeBytes == 0 }
+    }
+
 }
+

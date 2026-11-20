@@ -45,13 +45,15 @@ struct AtlasViewportCost: Equatable, Sendable {
 }
 
 enum AtlasViewportPreviewState: String, Sendable {
-    case cold, queued, loading, ready, empty, readerOnly, unavailable, capacityLimited
+    case cold, queued, loading, ready, markdown, sourceFallback, empty, readerOnly, unavailable, capacityLimited
     var label: String {
         switch self {
         case .cold: return "Zoom in to load source"
         case .queued: return "Source preview queued"
         case .loading: return "Loading source preview"
         case .ready: return "Captured source preview"
+        case .markdown: return "Captured Markdown preview"
+        case .sourceFallback: return "Markdown preview unavailable — captured source shown"
         case .empty: return "Empty captured file"
         case .readerOnly: return "Preview limit — open in reader"
         case .unavailable: return "Preview unavailable — open in reader"
@@ -69,6 +71,23 @@ struct AtlasViewportSourceTransport: Sendable {
     })
 }
 
+/// Native rendering adaptation on the existing viewport worker. A transport
+/// receives the immutable accepted source, never a live path to reopen. Keeping
+/// this seam independent of reader/display types preserves source-only hosts.
+struct AtlasViewportMarkdownTransport: Sendable {
+    let prepare: @Sendable (AtlasDocument, AtlasViewportLimits, AtlasSearchCancellation) -> AtlasDocument?
+
+    static func supports(_ path: [UInt8]) -> Bool {
+        guard !path.isEmpty, path.count <= 16_384, let dot = path.lastIndex(of: 46),
+              path.lastIndex(of: 47).map({ $0 < dot }) ?? true else { return false }
+        let suffix = path.suffix(from: dot + 1)
+        guard (2...8).contains(suffix.count) else { return false }
+        let lower = suffix.map { (65...90).contains($0) ? $0 + 32 : $0 }
+        return lower.elementsEqual("md".utf8) || lower.elementsEqual("markdown".utf8)
+            || lower.elementsEqual("mdown".utf8)
+    }
+}
+
 /// Both documents are immutable after the worker transfers this owner. `base`
 /// has original prepared rows, while `document` has newly fitted display tiles.
 /// A scope change borrows base rows and makes another private display document;
@@ -78,8 +97,12 @@ final class AtlasViewportPreparedSource: @unchecked Sendable {
     let base: AtlasDocument
     let document: AtlasDocument
     let cost: AtlasViewportCost
-    init(rawPath: [UInt8], base: AtlasDocument, document: AtlasDocument, cost: AtlasViewportCost) {
+    let cachedMarkdown: AtlasDocument?
+    let markdownRequested: Bool
+    init(rawPath: [UInt8], base: AtlasDocument, document: AtlasDocument, cost: AtlasViewportCost,
+         cachedMarkdown: AtlasDocument? = nil, markdownRequested: Bool = false) {
         self.rawPath = rawPath; self.base = base; self.document = document; self.cost = cost
+        self.cachedMarkdown = cachedMarkdown; self.markdownRequested = markdownRequested
     }
 }
 
@@ -95,13 +118,16 @@ final class AtlasViewportWork: @unchecked Sendable {
     let cacheLease: AnyObject?
     let reuse: AtlasViewportPreparedSource?
     let retirementLease: AtlasNativeRetirement.Lease
+    let markdownRequested: Bool
     init(root: String, layoutRevision: UUID, entry: AtlasProjectCatalog.Entry,
          sourceCacheHandle: UInt64, limits: AtlasViewportLimits, accessLease: AnyObject?,
-         cacheLease: AnyObject?, reuse: AtlasViewportPreparedSource?, retirementLease: AtlasNativeRetirement.Lease) {
+         cacheLease: AnyObject?, reuse: AtlasViewportPreparedSource?, retirementLease: AtlasNativeRetirement.Lease,
+         markdownRequested: Bool = false) {
         self.root = root; self.layoutRevision = layoutRevision; self.entry = entry
         self.sourceCacheHandle = sourceCacheHandle; self.limits = limits
         self.accessLease = accessLease; self.cacheLease = cacheLease; self.reuse = reuse
         self.retirementLease = retirementLease
+        self.markdownRequested = markdownRequested
     }
 }
 
@@ -115,12 +141,15 @@ enum AtlasViewportWorkResult: Sendable {
 final class AtlasViewportWorker: Sendable {
     private let queue = DispatchQueue(label: "dev.frankencode.browser.viewport-source", qos: .userInitiated)
     private let transport: AtlasViewportSourceTransport
-    init(transport: AtlasViewportSourceTransport) { self.transport = transport }
+    private let markdown: AtlasViewportMarkdownTransport?
+    init(transport: AtlasViewportSourceTransport, markdown: AtlasViewportMarkdownTransport? = nil) {
+        self.transport = transport; self.markdown = markdown
+    }
 
     func submit(_ work: AtlasViewportWork,
                 completion: @escaping @MainActor @Sendable (AtlasViewportWorkResult) -> Void) {
-        queue.async { [transport] in
-            let result = autoreleasepool { Self.prepare(work, transport: transport) }
+        queue.async { [transport, markdown] in
+            let result = autoreleasepool { Self.prepare(work, transport: transport, markdown: markdown) }
             DispatchQueue.main.async {
                 // Keep grants alive through delivery as well as foreign I/O.
                 withExtendedLifetime(work) { completion(result) }
@@ -128,7 +157,8 @@ final class AtlasViewportWorker: Sendable {
         }
     }
 
-    private static func prepare(_ work: AtlasViewportWork, transport: AtlasViewportSourceTransport) -> AtlasViewportWorkResult {
+    private static func prepare(_ work: AtlasViewportWork, transport: AtlasViewportSourceTransport,
+                                markdown: AtlasViewportMarkdownTransport?) -> AtlasViewportWorkResult {
         guard !work.cancellation.isCanceled else { return .canceled }
         guard let path = work.entry.sourcePath, path.utf8.elementsEqual(work.entry.rawPath) else {
             return .refused(.readerOnly)
@@ -202,51 +232,105 @@ final class AtlasViewportWorker: Sendable {
             _ = base.preparationCounts
         }
         guard !work.cancellation.isCanceled else { return .canceled }
-        let document = AtlasDocument(source: base.source, capture: base.capture, tiles: base.tiles)
+        // The immutable base always contains original source rows. Preview is
+        // a separate cache entry, never a substitute written into source-cache
+        // artifacts. Scope changes and warm toggles reuse this exact capture.
+        var cachedMarkdown = reusedSource ? work.reuse?.cachedMarkdown : nil
+        if work.markdownRequested, cachedMarkdown == nil,
+           !(reusedSource && work.reuse?.markdownRequested == true),
+           base.source.text.utf8.count <= 64 * 1024, let markdown {
+            if let prepared = markdown.prepare(base, work.limits, work.cancellation),
+               prepared.presentation == .markdown,
+               prepared.source.path.utf8.elementsEqual(base.source.path.utf8),
+               prepared.capture.text.utf8.elementsEqual(base.capture.text.utf8),
+               prepared.source.text.utf8.elementsEqual(base.source.text.utf8) {
+                cachedMarkdown = prepared
+                _ = prepared.preparationCounts
+            }
+        }
+        guard !work.cancellation.isCanceled else { return .canceled }
         let parcel = CGRect(x: work.entry.x, y: work.entry.y, width: work.entry.width, height: work.entry.height)
-        let display: [AtlasTextTile]
-        if base.source.text.isEmpty { document.displayTiles = []; display = [] }
-        else {
-            guard let fitted = AtlasParcelLayout.reflow(document, inside: parcel) else { return .refused(.readerOnly) }
-            display = fitted
-        }
-        guard display.count <= work.limits.tiles, !work.cancellation.isCanceled else {
-            return work.cancellation.isCanceled ? .canceled : .refused(.readerOnly)
-        }
-        let pixelBudget = min(AtlasViewportLimits.fileRasterPixels, work.limits.pixels)
-        guard display.isEmpty || display.count <= pixelBudget else { return .refused(.capacityLimited) }
-        let perTile = max(1, pixelBudget / max(1, display.count))
-        for tile in display {
-            guard !work.cancellation.isCanceled else { return .canceled }
-            tile.prepareRaster(pixelBudget: perTile)
-        }
-        let counts = base.preparationCounts
-        let pixels = display.reduce(0) { $0 + ($1.raster.map { $0.width * $0.height } ?? 0) }
+        let sourceCounts = base.preparationCounts
         let sourceBytes = base.source.text.utf8.count
-        let tileCount = base.tiles.count + display.count
-        let estimated = sourceBytes * 6 + counts.glyphs * 40 + counts.runs * 256
-            + tileCount * 1024 + pixels * 4 + 4096
-        let cost = AtlasViewportCost(sourceBytes: sourceBytes, glyphs: counts.glyphs, runs: counts.runs,
-            tiles: tileCount, pixels: pixels, estimatedBytes: estimated)
-        guard cost.fits(work.limits) else { return .refused(.capacityLimited) }
+        var refusal: AtlasViewportPreviewState = .readerOnly
+        func fit(_ preview: AtlasDocument?) -> (document: AtlasDocument, display: [AtlasTextTile], cost: AtlasViewportCost)? {
+            guard !work.cancellation.isCanceled else { return nil }
+            let previewCounts = preview?.preparationCounts ?? (glyphs: 0, runs: 0)
+            let extraBytes = preview?.presentationBytes ?? 0
+            guard sourceCounts.glyphs <= work.limits.glyphs, sourceCounts.runs <= work.limits.runs,
+                  previewCounts.glyphs <= work.limits.glyphs - sourceCounts.glyphs,
+                  previewCounts.runs <= work.limits.runs - sourceCounts.runs,
+                  extraBytes >= 0, extraBytes <= work.limits.estimatedBytes else {
+                refusal = .capacityLimited; return nil
+            }
+            let presented = work.markdownRequested ? (preview ?? base) : base
+            let document = AtlasDocument(source: base.source, capture: base.capture, tiles: presented.tiles,
+                presentation: presented.presentation, presentationBytes: presented.presentationBytes)
+            let display: [AtlasTextTile]
+            if base.source.text.isEmpty { document.displayTiles = []; display = [] }
+            else {
+                guard let fitted = AtlasParcelLayout.reflow(document, inside: parcel) else {
+                    refusal = .readerOnly; return nil
+                }
+                display = fitted
+            }
+            let tileCount = base.tiles.count + (preview?.tiles.count ?? 0) + display.count
+            let counts = (glyphs: sourceCounts.glyphs + previewCounts.glyphs,
+                          runs: sourceCounts.runs + previewCounts.runs)
+            let pixelBudget = min(AtlasViewportLimits.fileRasterPixels, work.limits.pixels)
+            let estimatedWithoutRaster = sourceBytes * 6 + counts.glyphs * 40 + counts.runs * 256
+                + tileCount * 1024 + extraBytes + 4096
+            guard tileCount <= work.limits.tiles, display.isEmpty || display.count <= pixelBudget,
+                  estimatedWithoutRaster <= work.limits.estimatedBytes else {
+                refusal = .capacityLimited; return nil
+            }
+            let perTile = max(1, pixelBudget / max(1, display.count))
+            for tile in display {
+                guard !work.cancellation.isCanceled else { return nil }
+                tile.prepareRaster(pixelBudget: perTile)
+            }
+            let pixels = display.reduce(0) { $0 + ($1.raster.map { $0.width * $0.height } ?? 0) }
+            let cost = AtlasViewportCost(sourceBytes: sourceBytes, glyphs: counts.glyphs, runs: counts.runs,
+                tiles: tileCount, pixels: pixels, estimatedBytes: estimatedWithoutRaster + pixels * 4)
+            guard cost.fits(work.limits) else { refusal = .capacityLimited; return nil }
+            return (document, display, cost)
+        }
+        var fitted = fit(cachedMarkdown)
+        if fitted == nil, cachedMarkdown != nil, !work.cancellation.isCanceled {
+            // Optional rich detail may never displace affordable exact source.
+            // One bounded fallback uses the same already accepted base; there
+            // is no recapture, second parse, or retry loop on a later redraw.
+            cachedMarkdown = nil
+            fitted = fit(nil)
+        }
+        guard !work.cancellation.isCanceled else { return .canceled }
+        guard let fitted else { return .refused(refusal) }
+        let document = fitted.document, display = fitted.display, cost = fitted.cost
         _ = document.preparationCounts
         guard !work.cancellation.isCanceled else { return .canceled }
         func storage(_ tile: AtlasTextTile) -> Any {
-            (tile.lines, tile.header, tile.preparedLines, tile.preparedHeader, tile.raster)
+            (tile.lines, tile.header, tile.preparedLines, tile.preparedHeader, tile.raster, tile.display)
         }
         // Storage values contain no document/tile/source objects and cannot
         // point back to this lease. Scope clones may share their inner arrays;
         // both lifetimes remain conservatively charged until their final owner.
-        let payload = (base.source.text, base.capture.runs, base.tiles.map(storage), display.map(storage))
-        guard work.retirementLease.publish(storage: payload, bytes: estimated) else { return .refused(.capacityLimited) }
+        let payload = (base.source.text, base.capture.runs, base.tiles.map(storage),
+                       cachedMarkdown?.tiles.map(storage), display.map(storage))
+        guard work.retirementLease.publish(storage: payload, bytes: cost.estimatedBytes) else { return .refused(.capacityLimited) }
         document.nativeResidencyOwner = work.retirementLease
         for tile in display { tile.nativeResidencyOwner = work.retirementLease }
+        if let cachedMarkdown, cachedMarkdown.nativeResidencyOwner == nil {
+            cachedMarkdown.nativeResidencyOwner = work.retirementLease
+            for tile in cachedMarkdown.tiles { tile.nativeResidencyOwner = work.retirementLease }
+        }
         if !reusedSource {
             base.nativeResidencyOwner = work.retirementLease
             base.source.nativeResidencyOwner = work.retirementLease
             for tile in base.tiles { tile.nativeResidencyOwner = work.retirementLease }
         }
-        return .prepared(AtlasViewportPreparedSource(rawPath: work.entry.rawPath, base: base, document: document, cost: cost))
+        return .prepared(AtlasViewportPreparedSource(rawPath: work.entry.rawPath, base: base,
+            document: document, cost: cost, cachedMarkdown: cachedMarkdown,
+            markdownRequested: work.markdownRequested))
     }
 
     private struct BoundedCapture: Decodable {
@@ -276,3 +360,4 @@ final class AtlasViewportWorker: Sendable {
         }
     }
 }
+

@@ -171,6 +171,11 @@ import os
         var source: [AtlasMetalGlyphRenderer.SceneTile] = []
         source.reserveCapacity(tiles.count)
         for (index, tile) in tiles.enumerated() {
+            // The glyph renderer cannot claim full coverage for vector/image
+            // decorations. Those tiles retain complete native display replay
+            // and bounded raster/detail coverage until a primitive GPU path is
+            // qualified; pure shaped text shares the existing Metal glyph path.
+            guard tile.supportsMetalGlyphs else { continue }
             var lines: [AtlasMetalGlyphRenderer.Line] = []
             let header = tile.preparedHeader ?? tile.header.flatMap { AtlasPreparedLine($0) }
             let rows = tile.preparedLines ?? tile.lines.compactMap { AtlasPreparedLine($0) }
@@ -178,7 +183,7 @@ import os
             lines.reserveCapacity(rows.count + 1)
             lines.append(.init(text: header, origin: CGPoint(x: 4, y: 12), clip: tile.rect))
             for (row, text) in rows.enumerated() {
-                lines.append(.init(text: text, origin: CGPoint(x: 4, y: 34 + Double(row) * AtlasTextTile.lineHeight), clip: tile.rect))
+                lines.append(.init(text: text, origin: tile.rowOrigin(row), clip: tile.rect))
             }
             source.append(.init(id: index, rect: tile.rect, sourceScale: tile.contentScale, lines: lines))
         }

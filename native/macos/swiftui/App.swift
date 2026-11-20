@@ -382,7 +382,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     @State private var sourceTask: Task<Void, Never>?
     @State private var sourceCancellation: AtlasSearchCancellation?
     @State private var sourceSearchRow: AtlasSearchRowID?
-    @State private var atlasResidency = AtlasViewportResidency()
+    @State private var atlasResidency = AtlasViewportResidency(markdown: .native)
     @State private var atlasEntries: [AtlasProjectCatalog.Entry] = []
     @State private var showsCity = false
     @State private var atlasScopeLabel = "All"
@@ -640,7 +640,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 Label(markdownPreview.enabled ? "Markdown preview on" : "Markdown preview", systemImage: "doc.richtext")
             }
             .keyboardShortcut("r", modifiers: .command)
-            .help("Toggle the selected Markdown file's retained preview (⌘R). While enabled, newly activated Markdown files open in preview; Source returns to the same captured bytes.")
+            .help("Toggle Markdown previews in atlas parcels and the retained reader (⌘R). Atlas previews reuse captured bytes and upstream layout; Source returns to those same bytes.")
             Button { showsReadingDesk = true } label: {
                 Label("Reading Desk", systemImage: "books.vertical")
             }
@@ -785,6 +785,9 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             visibleSearchView = nil
             // Returning creates a new native surface whose accepted frame
             // supplies fresh viewport demand; hidden views do no enrichment.
+        }
+        .onChange(of: markdownPreview.enabled) { _, enabled in
+            atlasResidency.setMarkdownPreviewEnabled(enabled)
         }
         .onChange(of: readerHistory.current?.id) { _, visit in
             markdownPreview.activate(visit)
@@ -1860,6 +1863,12 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     private func toggleMarkdownPreview() {
         markdownPreview.toggle()
         guard markdownPreview.enabled else { return }
+        // A window command can enrich the atlas without reopening a reader the
+        // user hid. Its request remains inactive until that pane is shown again.
+        if hasMetadataAtlas && !showsReader {
+            status = "Markdown preview enabled in atlas parcels. Zoom in to read captured previews."
+            return
+        }
         if readerHistory.busy {
             status = "Markdown preview enabled. The selected source will open after its capture is ready."
             return
@@ -1872,7 +1881,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             // enabling preview never reopens an already accepted reader.
             openPagedFile(path)
         } else {
-            status = "Markdown preview enabled. Open a Markdown file to read its retained preview."
+            status = "Markdown preview enabled in atlas parcels. Open a Markdown file to read or navigate its retained preview."
         }
     }
 
