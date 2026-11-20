@@ -157,6 +157,36 @@ char *fcb_reader_hit(uint64_t handle, uint64_t generation, uint64_t index, uint6
 char *fcb_reader_copy_range(uint64_t handle, uint64_t start, uint64_t end);
 char *fcb_reader_copy_hit(uint64_t handle, uint64_t generation, uint64_t index);
 
+/* Stream one exact original-byte range to an explicit NEW destination. Run on
+ * a host worker; this does not reopen a source, decode bytes or copy a monolithic
+ * payload. start/end are half-open ORIGINAL offsets within the retained capture
+ * (up to 32 MiB), independent of the clipboard/window limit. Empty ranges create
+ * empty files. The destination is a readable NUL-terminated UTF-8 ABSOLUTE path,
+ * at most 16384 native bytes. Existing files/symlinks are never overwritten.
+ * Keep the destination's write grant, poll and context valid through return.
+ * Optional poll runs only on this thread: nonzero cancels. It must not block,
+ * unwind or reenter this export. reader_cancel/close also revoke cooperatively;
+ * neither interrupts a blocking syscall nor rolls back a completed effect.
+ *
+ * fcb.reader-export/1 JSON includes immutable owner/file_id/source_revision,
+ * capture_sha256, captured_bytes, original_range, export_bytes=end-start,
+ * destination {encoding:"unix-bytes",hex,display}, export_domain:"original-bytes",
+ * actual bytes_written, status, complete and error. Every integer is a canonical
+ * decimal string. complete means all requested bytes reached the destination,
+ * independently of cancellation or sync failure; it is false for effect "none".
+ * Effects: none, destination-created-incomplete, complete-file-sync-unconfirmed,
+ * complete-file-sync-requested, complete-file-and-parent-sync-requested.
+ * Interrupted destinations remain for inspection. Files are created mode 0600;
+ * no overwrite, source reread, rollback or power-loss qualification is claimed.
+ *
+ * ALWAYS deliver the terminal receipt, including errors and late cancel/close.
+ * Recognized fcb.reader-session/1 argument/admission/registry errors precede
+ * destination effects. Null or malformed/missing delivery is uncertain, never
+ * proof that nothing was written. Inspect the destination; do not retry
+ * automatically. Free each non-null response once with fcb_free_string. */
+char *fcb_reader_export_original_cancelable(uint64_t handle, uint64_t start,
+    uint64_t end, const char *destination, int32_t (*poll)(void *context), void *context);
+
 /* Resolve one nonempty native text selection within a retained reader page.
  * window_start/end are its accepted visible ORIGINAL-byte bounds, at most
  * MAX_SELECTION_WINDOW_BYTES; utf8_start/end are half-open DECODED UTF-8

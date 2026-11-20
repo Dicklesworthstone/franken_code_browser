@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
 //! A retained native-host reading session over ONE immutable source capture.
-//! `open` and explicitly authorized document image acquisition perform I/O.
+//! `open`, explicitly authorized document image acquisition and create-only
+//! original-byte export perform I/O.
 //! Windows, physical-line navigation,
 //! search, outlines, Markdown previews and exact copies use retained bytes.
 //! Live opening and safe supplied captures admit at most 32 MiB in full; this
@@ -17,6 +18,7 @@ mod comparison;
 mod highlight;
 mod position;
 mod selection;
+mod export;
 mod search;
 pub(crate) mod document;
 mod document_display;

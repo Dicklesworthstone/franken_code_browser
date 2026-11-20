@@ -171,6 +171,23 @@ impl ReaderSessions {
         let cells = lock(&self.cells)?;
         cells.iter().flatten().find(|cell| cell.id == handle).cloned().ok_or(AccessError::UnknownHandle)
     }
+    /// Write an explicitly chosen new destination from this immutable capture.
+    /// Unlike read-only delivery, terminal effects survive late cancel/close.
+    /// Cell ownership and its source admission remain pinned through the writer;
+    /// no registry lock encloses filesystem work and no source handle escapes.
+    pub(super) fn export_original(&self, handle: u64, start: u64, end: u64,
+        destination: &Path, mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
+        let cell = self.get(handle)?;
+        let epoch = cell.epoch.load(Ordering::Acquire);
+        let mut state = lock(&cell.state)?;
+        cell.validate(epoch)?;
+        let reader = state.as_mut().ok_or(AccessError::NotOpen)?;
+        // The writer records cancellation in its receipt. There is deliberately
+        // no validation/poll after it: already-created files cannot be undone.
+        reader.export_original(start, end, destination,
+            || cell.validate(epoch).is_err() || canceled()).map_err(AccessError::from)
+    }
+
     /// Explicitly borrow an exact retained source for another host service.
     /// The original cell and its admission survive the callback. The registry
     /// lock never encloses source work; closure/cancellation revoke delivery.
@@ -432,3 +449,7 @@ mod comparison_tests;
 #[cfg(all(test, unix))]
 #[path = "reader_selection_sessions_tests.rs"]
 mod selection_tests;
+
+#[cfg(all(test, unix))]
+#[path = "reader_export_sessions_tests.rs"]
+mod export_tests;
