@@ -2079,6 +2079,38 @@ and `swiftui/tests/test-desk-reader.sh`; the supplied-reader lane covers
 transport capability preservation. These are code-first additions awaiting
 independent strict-RCH execution and physical-Mac qualification.
 
+## Exporting original captured bytes
+
+In a retained source reader, choose **Export bytes…** to save the entire capture,
+the shown page, the selected original bytes, or the full compared range. The
+export sheet also accepts an explicit zero-based start and exclusive end byte.
+Ranges can cross reader pages and exceed the 2 MiB clipboard staging budget;
+the complete retained reader capture can be up to **32 MiB**.
+
+Export uses the accepted immutable capture, even if its original pathname has
+changed. It preserves the exact encoding, BOM, line endings, NULs and malformed
+bytes, without decoding, reopening source or constructing a second complete
+payload. An empty range creates an empty file. This action belongs to the
+complete retained reader; large-file observations remain bounded observations.
+
+Choose a new destination in the native Save panel. Existing destinations are
+never replaced. If the reader, navigation or selected range changes while the
+panel is open, the export must be chosen again from the current source. Once
+writing starts, its captured source and destination access stay retained until
+the operation returns, including after cancellation.
+
+The result distinguishes no destination effect, a created but incomplete file,
+all bytes written, file synchronization, and parent-directory synchronization.
+Canceling can leave a partial or complete file; the displayed result preserves
+the actual written-byte count and completed synchronization steps. A missing
+receipt is reported as unverified, and the app never automatically repeats an
+uncertain write. Inspect the named destination before choosing a new export.
+
+Regression cases cover original encodings and ranges, exports larger than the
+clipboard budget, existing destinations, changed live source, stale selections,
+cancellation and retained-session lifetimes. These code-first additions await
+independent strict-RCH executable and physical-Mac verification.
+
 ## Exact source locations
 
 The paged reader's **Line**, **Column**, and column-unit controls resolve a

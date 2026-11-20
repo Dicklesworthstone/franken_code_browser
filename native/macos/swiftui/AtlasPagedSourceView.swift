@@ -25,6 +25,9 @@ import AppKit
     @State private var didConsumeInitialLine = false
     @State private var readerCommands = AtlasReaderCommands()
     @State private var copyNotice = ""
+    @State private var exporter = AtlasReaderExportModel(transport: .native)
+    @State private var showsExport = false
+    @State private var exportTarget: AtlasReaderExportTarget?
     @State private var showsOutline = false
     @State private var showsReferences = false
     @State private var showsDocument = false
@@ -116,9 +119,15 @@ import AppKit
                 openLocalLink: modalLocalNavigation, returnToSource: returnFromPreview)
         }
         .sheet(isPresented: $showsLinked, onDismiss: closeLinked) { linkedReader }
+        .sheet(isPresented: $showsExport) {
+            if let exportTarget {
+                AtlasReaderExportView(reader: model, exporter: exporter, target: exportTarget)
+            }
+        }
         .onAppear { if ownsModel { open() } }
         .onDisappear {
             withdrawPreferredPreview()
+            exporter.cancel()
             closeLinked(); if ownsModel { model.close() }; copyNotice = ""
         }
         .onChange(of: preferredPreviewRequest, initial: true) { _, _ in updatePreferredPreview() }
@@ -432,6 +441,13 @@ import AppKit
         }
     }
 
+    private func beginExport(_ origin: AtlasReaderExportTarget.Origin) {
+        guard !exporter.busy, exporter.domain != nil, exporter.domain == model.retainedRegistryDomain,
+              let target = model.originalExportTarget(origin) else { return }
+        exportTarget = target
+        showsExport = true
+    }
+
     private func physicalLineBase(_ page: AtlasReaderPage?) -> UInt64? {
         guard let page, !page.text.isEmpty else { return nil }
         if let line = page.firstPhysicalLine, line > 0 { return line }
@@ -455,6 +471,20 @@ import AppKit
                         .disabled(!canKeep || !model.canKeep)
                         .help("Keep this exact selected range or page, retaining its complete source up to 4 MiB. A compared range preserves the full byte target even when only part is displayed. Add bookmarks or personal notes in the Reading Desk.")
                 }
+                Menu("Export bytes…") {
+                    Button("Entire retained file…") { beginExport(.wholeCapture) }
+                    Button("Shown original page…") { beginExport(.page) }
+                    Button("Original byte range…") { beginExport(.page) }
+                    if let selected = model.textSelection {
+                        Button("Selected original bytes…") { beginExport(.textSelection(selected.id)) }
+                    }
+                    if let selected = model.currentComparisonSelection {
+                        Button("Full compared range…") { beginExport(.comparison(selected.id)) }
+                    }
+                }
+                .disabled(exporter.busy || exporter.domain == nil || exporter.domain != model.retainedRegistryDomain
+                    || model.originalExportTarget(.wholeCapture) == nil)
+                .help("Write exact captured bytes to a new file, including ranges larger than a reader page or clipboard budget. The source is never reopened.")
                 Button("Back", action: model.back).disabled(!model.canGoBack)
                     .help("Return to the previous retained byte window")
                 Button("Forward", action: model.forward).disabled(!model.canGoForward)
@@ -589,7 +619,7 @@ import AppKit
 
     private var preferredPreviewReady: Bool {
         model.page != nil && !model.busy && !showsDocument && !showsSplitPreview
-            && !showsLinked && !showsOutline && !showsReferences
+            && !showsLinked && !showsOutline && !showsReferences && !showsExport
     }
 
     private func updatePreferredPreview() {
@@ -669,7 +699,7 @@ import AppKit
             case .shownHex: copyNotice = "Copied the compared original bytes shown on this page as hex."
             case .location: copyNotice = "Copied the full compared byte range with its retained capture identity."
             }
-        case .tooLarge: copyNotice = "This range exceeds the clipboard staging budget; nothing was copied."
+        case .tooLarge: copyNotice = "This range exceeds the clipboard staging budget. Use Export bytes to save its original range to a file; nothing was copied."
         case .changed: copyNotice = "The clipboard changed before publication. Copy again to replace its newer contents."
         case .failed: copyNotice = "Clipboard publication failed."
         }
@@ -701,7 +731,7 @@ import AppKit
         switch AtlasReaderSelectionClipboard.publish(value, to: pasteboard, expectedChangeCount: expectedChange) {
         case .copied: copyNotice = success
         case .tooLarge:
-            copyNotice = "The selection exceeds the 2 MiB clipboard staging budget. Select a smaller passage; nothing was copied."
+            copyNotice = "The selection exceeds the 2 MiB clipboard staging budget. Use Export bytes to save its original range to a file; nothing was copied."
         case .changed:
             copyNotice = "The clipboard changed before publication. Its newer contents were preserved; copy again to replace them."
         case .failed:

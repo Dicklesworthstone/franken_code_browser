@@ -62,6 +62,17 @@ struct AtlasReaderReplacement: Sendable {
     fileprivate let id: UUID
 }
 
+/// Explicit lifetime handoff for an irreversible export. Constructed only by
+/// the current coordinator, this holds its retained session and native grant
+/// while an independent bounded writer drains. It grants no live-file access.
+@MainActor struct AtlasReaderRetainedExportSource {
+    let handle: UInt64
+    let registryDomain: UUID
+    let identity: AtlasReaderIdentity
+    let captureSHA256: String
+    let lifetime: AnyObject
+}
+
 /// A separately authorized service may resolve both the captured file and its
 /// initial source position. Neither value is derived from a display label.
 struct AtlasReaderRetainedInitialization: Sendable {
@@ -269,6 +280,18 @@ private final class AtlasReaderSession: @unchecked Sendable {
     }
     var retainedRegistryDomain: UUID? { session?.transport.comparison?.domain }
     var retainedCaptureSHA256: String? { info?.captureSHA256 }
+
+    /// Freeze one exact accepted session for a caller's explicit file export.
+    /// This is a lifetime transfer, not an I/O operation: the export worker must
+    /// preserve its writer's receipt even after cancellation or reader closure.
+    func retainedExportSource(matching identity: AtlasReaderIdentity, registryDomain: UUID)
+        -> AtlasReaderRetainedExportSource? {
+        guard let source = session, let info, info.identity.matches(identity),
+              source.transport.comparison?.domain == registryDomain,
+              let digest = info.captureSHA256 else { return nil }
+        return AtlasReaderRetainedExportSource(handle: source.handle, registryDomain: registryDomain,
+            identity: info.identity, captureSHA256: digest, lifetime: source)
+    }
 
     /// Open a caller-authorized retained capture into an EMPTY destination in
     /// the same native registry. The initializer runs in the existing reader

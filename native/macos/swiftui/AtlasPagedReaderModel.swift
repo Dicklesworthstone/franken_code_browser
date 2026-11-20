@@ -144,6 +144,14 @@ import Observation
     var canCompare: Bool { page != nil && !busy && !pinning && !documentPreview.busy && !resolvingTextSelection && coordinator.supportsComparison }
     var retainedRegistryDomain: UUID? { coordinator.retainedRegistryDomain }
     var retainedCaptureSHA256: String? { coordinator.retainedCaptureSHA256 }
+    /// Only a ready, currently displayed capture can authorize an export.
+    /// The returned lifetime keeps its immutable source alive off this view.
+    func retainedExportSource(matching identity: AtlasReaderIdentity, registryDomain: UUID)
+        -> AtlasReaderRetainedExportSource? {
+        guard !busy, !pinning, !documentPreview.busy, !resolvingTextSelection,
+              page?.identity.matches(identity) == true else { return nil }
+        return coordinator.retainedExportSource(matching: identity, registryDomain: registryDomain)
+    }
     var canFind: Bool {
         page != nil && coordinator.supportsFind && (findOptions.mode != .expression || coordinator.supportsFindExpression)
     }
