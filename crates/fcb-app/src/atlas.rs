@@ -43,7 +43,7 @@ const HELP: &str = "Repository atlas plans\n\n\
   Whole-file --max-scan-bytes is actual GLOBAL source I/O (default 256 MiB, max 1 TiB).\n\
   --preview-hit N             Read context around a zero-based retained text hit\n\
   --context-bytes N           Context per side (default 256, maximum 16384)\n\
-  --markdown-hit N            Read the hit's captured file as Markdown (UTF-8, 64 KiB cap)\n\
+  --markdown-hit N            Open the hit's mapped Markdown region (UTF-8, 64 KiB cap)\n\
   --markdown-heading SLUG     Start that document at an upstream canonical heading\n\
   --markdown-lines N          Logical Markdown rows (default 40, maximum 1024)\n\
   --respect-ignores OR --include-excluded\n\n\
@@ -57,8 +57,10 @@ only. It rejects capture-limit options and context/Markdown previews: unseen\n\
 bytes cannot become a complete capture. Limits apply across all files.\n\
 Preview reads the SAME searched capture with no additional source I/O. It\n\
 preserves the entire occurrence plus bounded context, not full-line shaping.\n\
-Markdown starts at the document beginning or explicit heading; source matches\n\
-are not fabricated rendered highlights. No link, image, include or network access.\n\
+Markdown starts at the hit's first enclosing mapped row; --markdown-heading\n\
+overrides that anchor. Unmapped syntax or unqualified provenance keeps a labeled\n\
+document-start preview with incomplete navigation. Source matches are not\n\
+rendered highlights. No link, image, include or network access.\n\
 Files retain native byte paths and response-local FileIds. Only catalogued\n\
 regular files and their ancestors are mapped; empty/unavailable directories\n\
 are not a complete directory inventory. Partial discovery stays explicit.\n\

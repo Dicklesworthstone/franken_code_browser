@@ -59,6 +59,76 @@ fn heading_jumps_and_pages_do_not_claim_the_entire_document_is_visible() {
 }
 
 #[test]
+fn original_source_anchor_opens_its_enclosing_region_across_reflow_and_bom() {
+    let source = "\u{feff}# Introduction\n\nEarlier paragraph.\n\n## Details\n\nLocate café and **needle** here.\n";
+    let path = file(source.as_bytes());
+    let anchor = source.find("needle").unwrap().to_string();
+    for width in ["24", "80"] {
+        let (exit, page, err) = invoke(&arguments(&path,
+            &["--json", "--source-byte", &anchor, "--lines", "1", "--width", width]));
+        assert_eq!(exit, EXIT_PARTIAL, "{page} {err}");
+        assert!(err.is_empty());
+        assert!(page.contains("\"navigation\":\"source-region\""));
+        assert!(page.contains(&format!("\"requested_original_anchor\":\"{anchor}\"")));
+        assert!(page.contains("\"requested_location_resolved\":true"));
+        assert!(page.contains("\"source_mapping_qualified\":true"));
+        assert!(page.contains("\"bom_bytes\":\"3\""));
+        assert!(page.contains("\"text\":\"Locate café"));
+        assert!(!page.contains("\"text\":\"Introduction\""), "negative control: do not reset to document start");
+        assert!(page.contains("\"whole_document_visible\":false"));
+        assert!(page.contains(&format!("\"payload_bytes_read\":\"{}\"", source.len())));
+        assert!(page.contains("\"additional_source_bytes_read\":\"0\""));
+    }
+    let (exit, text, err) = invoke(&arguments(&path, &["--source-byte", &anchor, "--lines", "1"]));
+    assert_eq!(exit, EXIT_PARTIAL, "{text} {err}");
+    assert!(text.contains(&format!("Original source byte {anchor}: opened the first row")));
+    assert_eq!(fs::read(path).unwrap(), source.as_bytes());
+}
+
+#[test]
+fn explicit_source_anchors_refuse_invalid_domains_and_unmapped_regions_but_allow_eof() {
+    let source = "\u{feff}# Heading\n\nA café paragraph.\n";
+    let path = file(source.as_bytes());
+    for offset in [0, 1, 2, source.find('é').unwrap() + 1, source.len() + 1] {
+        let (exit, out, err) = invoke(&arguments(&path, &["--json", "--source-byte", &offset.to_string()]));
+        assert_eq!(exit, EXIT_ERROR, "{offset}: {out} {err}");
+        assert!(err.is_empty() && out.contains("DOCUMENT_READ_INVALID_RANGE"));
+        assert!(!out.contains("\"document\":"));
+    }
+    let (exit, out, err) = invoke(&arguments(&path, &["--json", "--source-byte", &source.len().to_string()]));
+    assert_eq!(exit, EXIT_PARTIAL, "{out} {err}");
+    assert!(out.contains("\"navigation\":\"source-end\""));
+    assert!(out.contains("\"requested_location_resolved\":true"));
+    assert!(out.contains("\"lines\":[]"));
+    assert!(out.contains("\"next_rendered_line\":null"));
+    for source in ["   \n", "# Heading\n\ncafé\n"] {
+        let path = file(source.as_bytes());
+        let offset = source.find('é').map_or(1, |at| at + 1).to_string();
+        let (exit, out, _) = invoke(&arguments(&path, &["--json", "--source-byte", &offset]));
+        assert_eq!(exit, EXIT_ERROR, "{out}");
+        assert!(out.contains("DOCUMENT_READ_INVALID_RANGE"));
+        assert!(!out.contains("document-start-unmapped-source"), "explicit anchors cannot silently fall back");
+    }
+}
+
+#[test]
+fn source_anchor_options_are_validated_before_io_and_values_cannot_switch_output_mode() {
+    let path = file(b"# Present\n").with_file_name("missing.md");
+    for options in [vec!["--json", "--source-byte", "0", "--line", "1"],
+        vec!["--json", "--line", "1", "--source-byte", "0"],
+        vec!["--json", "--source-byte", "0", "--heading", "present"],
+        vec!["--json", "--heading", "present", "--source-byte", "0"]] {
+        let (exit, out, err) = invoke(&arguments(&path, &options));
+        assert_eq!(exit, EXIT_ERROR, "{out} {err}");
+        assert!(err.is_empty() && out.contains("CLI_INCOMPATIBLE_OPTIONS"));
+    }
+    let (exit, out, err) = invoke(&arguments(&path, &["--source-byte", "--json"]));
+    assert_eq!(exit, EXIT_ERROR);
+    assert!(out.is_empty() && err.contains("CLI_INVALID_NUMBER"));
+    assert!(!err.contains("\"schema\""), "an invalid value is not an output-mode flag");
+}
+
+#[test]
 fn unqualified_heading_and_copy_actions_refuse_without_disabling_rendered_cli_reading() {
     let source = b"---\ntitle: metadata\n---\n\n# Target\n\nretained body\n";
     let path = file(source);
@@ -68,6 +138,7 @@ fn unqualified_heading_and_copy_actions_refuse_without_disabling_rendered_cli_re
     for options in [
         vec!["--json", "--heading", "target"],
         vec!["--json", "--copy-start", "0", "--copy-end", "6"],
+        vec!["--json", "--source-byte", "32"],
     ] {
         let (exit, refused, err) = invoke(&arguments(&path, &options));
         assert_eq!(exit, EXIT_ERROR, "{refused} {err}");
@@ -111,8 +182,11 @@ fn oversized_and_unsupported_inputs_are_errors_not_prefix_documents() {
     assert_eq!(exit, EXIT_ERROR); assert!(out.contains("DOCUMENT_READ_SOURCE_LIMIT"));
     assert!(!out.contains("\"document_complete\":true"));
     let path = file(&[0xff, 0xfe, b'#', 0, b' ', 0]);
-    let (exit, out, _) = invoke(&arguments(&path, &["--json"]));
-    assert_eq!(exit, EXIT_ERROR); assert!(out.contains("DOCUMENT_READ_INVALID_UTF8"));
+    for options in [vec!["--json"], vec!["--json", "--source-byte", "2"]] {
+        let (exit, out, _) = invoke(&arguments(&path, &options));
+        assert_eq!(exit, EXIT_ERROR); assert!(out.contains("DOCUMENT_READ_INVALID_UTF8"));
+        assert!(!out.contains("\"document\":"));
+    }
 }
 
 #[test]
@@ -162,4 +236,5 @@ fn help_does_not_require_a_source_or_a_runtime() {
     let args = [OsString::from("markdown"), OsString::from("--help"), OsString::from("--json")];
     let (exit, out, err) = invoke(&args); assert_eq!(exit, EXIT_OK); assert!(err.is_empty());
     assert!(out.contains("fcb markdown FILE"));
+    assert!(out.contains("--source-byte"));
 }

@@ -18,14 +18,19 @@ use crate::output::{Output, OutputError, MAX_RESPONSE_BYTES};
 const HELP: &str = "Captured Markdown reading\n\n\
   fcb markdown FILE [--json] [--width N] [--line N] [--lines N]\n\
   fcb markdown FILE --heading SLUG [--lines N] [--json]\n\
+  fcb markdown FILE --source-byte N [--lines N] [--json]\n\
   --max-source-bytes N        Complete source admission (default 65536, max 262144)\n\
   --copy-start N --copy-end N  Rendered UTF-8 byte selection; end exclusive\n\
 Defaults: 100 logical columns, first rendered line 1, 40 rendered lines.\n\
 Rendered line numbers are NOT original source line numbers. Width uses logical\n\
 character cells, not native shaping. UTF-8, including an initial BOM, is supported.\n\
 UTF-16 and malformed UTF-8 are refused; ordinary fcb read remains available.\n\
-Headings use upstream canonical slugs without a leading #. --heading and --line\n\
-are alternatives. Copy returns rendered text and separately labeled enclosing\n\
+Headings use upstream canonical slugs without a leading #. --heading, --line\n\
+and --source-byte are alternatives. Source bytes are zero-based ORIGINAL capture\n\
+offsets, including any BOM; they open the first row of an upstream-mapped region,\n\
+not an exact rendered glyph. Unmapped syntax, BOM/interior UTF-8 bytes and\n\
+unqualified provenance refuse; source EOF opens an empty final window.\n\
+Copy returns rendered text and separately labeled enclosing\n\
 original Markdown, not an invented source concatenation. -- ends options.\n\
 No links, images, includes, network, scripts, repository scan or stdin reads.\n\
 Exit: 0 entire document visible, 3 bounded window, 2 error, 130 canceled.\n\
@@ -37,11 +42,27 @@ pub(crate) struct ViewOptions {
     pub first: usize,
     pub lines: usize,
     pub heading: Option<String>,
+    pub source_byte: Option<u64>,
     pub copy: Option<(usize, usize)>,
+    allow_source_fallback: bool,
 }
 impl Default for ViewOptions {
-    fn default() -> Self { Self { read: Default::default(), first: 0, lines: 40, heading: None, copy: None } }
+    fn default() -> Self { Self { read: Default::default(), first: 0, lines: 40,
+        heading: None, source_byte: None, copy: None, allow_source_fallback: false } }
 }
+impl ViewOptions {
+    /// Automatic search-hit navigation may retain a render-only preview when
+    /// the hit's source region is unmapped. Explicit heading requests stay strict.
+    pub(crate) fn at_source_hit(&self, original: ByteOffset) -> Self {
+        let mut options = self.clone();
+        if options.heading.is_none() {
+            options.source_byte = Some(original.get());
+            options.allow_source_fallback = true;
+        }
+        options
+    }
+}
+pub(crate) struct WrittenDocument { pub complete: bool, pub navigation: &'static str }
 struct Options { path: PathBuf, json: bool, view: ViewOptions }
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Error { App(AppError), Document(DocumentReadError) }
@@ -56,7 +77,8 @@ impl Error {
     }
 }
 fn takes_value(arg: &str) -> bool {
-    matches!(arg, "--width" | "--line" | "--lines" | "--heading" | "--max-source-bytes" | "--copy-start" | "--copy-end")
+    matches!(arg, "--width" | "--line" | "--lines" | "--heading" | "--source-byte"
+        | "--max-source-bytes" | "--copy-start" | "--copy-end")
 }
 fn json_requested(arguments: &[OsString]) -> bool {
     let mut cursor = 0;
@@ -89,6 +111,7 @@ fn parse(arguments: &[OsString]) -> Result<Options, Error> {
         };
         let bit = match option { "--json" => 1, "--width" => 2, "--line" => 4, "--lines" => 8,
             "--heading" => 16, "--max-source-bytes" => 32, "--copy-start" => 64, "--copy-end" => 128,
+            "--source-byte" => 256,
             _ => return Err(ArgumentError::UnknownOption.into()) };
         if seen & bit != 0 { return Err(ArgumentError::DuplicateOption.into()); } seen |= bit;
         if option == "--json" { json = true; continue; }
@@ -98,7 +121,9 @@ fn parse(arguments: &[OsString]) -> Result<Options, Error> {
             if value.is_empty() || value.len() > 4096 { return Err(ArgumentError::Limit.into()); }
             view.heading = Some(value.to_owned()); continue;
         }
-        let value = usize::try_from(args::decimal(value)?).map_err(|_| ArgumentError::Limit)?;
+        let value = args::decimal(value)?;
+        if option == "--source-byte" { view.source_byte = Some(value); continue; }
+        let value = usize::try_from(value).map_err(|_| ArgumentError::Limit)?;
         match option {
             "--width" => view.read.width_columns = u32::try_from(value).map_err(|_| ArgumentError::Limit)?,
             "--line" => view.first = value.checked_sub(1).ok_or(ArgumentError::InvalidNumber)?,
@@ -108,7 +133,7 @@ fn parse(arguments: &[OsString]) -> Result<Options, Error> {
             _ => unreachable!(),
         }
     }
-    if seen & 4 != 0 && view.heading.is_some() { return Err(ArgumentError::IncompatibleOptions.into()); }
+    if (seen & (4 | 16 | 256)).count_ones() > 1 { return Err(ArgumentError::IncompatibleOptions.into()); }
     view.copy = match (start, end) {
         (None, None) => None, (Some(a), Some(b)) if a < b => Some((a, b)),
         _ => return Err(ArgumentError::IncompatibleOptions.into()),
@@ -175,9 +200,9 @@ fn execute(options: Options, out: &mut Output, budget: &ResourceBudget,
         out.literal(",\"read_calls\":")?; out.integer(calls)?;
         out.literal(",\"source_consistency\":\"unchanged-metadata-not-atomic\",\"document\":")?;
     } else { out.literal("Captured Markdown: ")?; out.path(&path)?; out.literal("\n")?; }
-    let entire = write_capture(&capture, &options.view, options.json, out, budget, canceled)?;
+    let written = write_capture(&capture, &options.view, options.json, out, budget, canceled)?;
     if options.json { out.literal("}\n")?; }
-    Ok(if entire { EXIT_OK } else { EXIT_PARTIAL })
+    Ok(if written.complete { EXIT_OK } else { EXIT_PARTIAL })
 }
 
 fn load(path: &Path, limit: usize, budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool)
@@ -214,7 +239,10 @@ fn load(path: &Path, limit: usize, budget: &ResourceBudget, canceled: &mut impl 
 /// Shared by standalone and captured-workspace document routes. Never opens a
 /// path; the caller retains the admitted capture and validates its own grant.
 pub(crate) fn write_capture(capture: &CompleteCapture, options: &ViewOptions, json: bool,
-    out: &mut Output, budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool) -> Result<bool, Error> {
+    out: &mut Output, budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool) -> Result<WrittenDocument, Error> {
+    if options.source_byte.is_some() && (options.heading.is_some() || options.first != 0) {
+        return Err(ArgumentError::IncompatibleOptions.into());
+    }
     let owner = capture.request().file().owner();
     let generation = DocumentGeneration::new(owner, 1).map_err(|_| AppError::InvalidRange)?;
     let reader = DocumentReader::prepare(capture, DocumentId::new(owner, 1).map_err(|_| AppError::InvalidRange)?,
@@ -222,11 +250,35 @@ pub(crate) fn write_capture(capture: &CompleteCapture, options: &ViewOptions, js
     // The shared CLI path must apply the same source-coordinate admission as
     // native Reader/Desk actions. Render-only windows remain available when
     // upstream provenance cannot qualify an exact heading or enclosing copy.
-    if options.heading.is_some() || options.copy.is_some() {
-        reader.qualify_heading_source_ranges(budget, allocation(83), &mut *canceled)?;
+    // Invalid capture coordinates are never a reason to silently start elsewhere.
+    if let Some(original) = options.source_byte {
+        let offset = usize::try_from(original).map_err(|_| DocumentReadError::InvalidRange)?;
+        if offset < reader.source_base() || offset > capture.bytes().len()
+            || !std::str::from_utf8(capture.bytes()).map_err(|_| DocumentReadError::InvalidUtf8)?.is_char_boundary(offset) {
+            return Err(DocumentReadError::InvalidRange.into());
+        }
     }
-    let window = match options.heading.as_deref() {
-        Some(slug) => reader.window_at_heading(slug, options.lines)?, None => reader.window(options.first, options.lines)?,
+    let mut qualified = true;
+    if options.heading.is_some() || options.copy.is_some() || options.source_byte.is_some() {
+        match reader.qualify_heading_source_ranges(budget, allocation(83), &mut *canceled) {
+            Ok(()) => (),
+            Err(DocumentReadError::InvalidOutput) if options.allow_source_fallback && options.copy.is_none() => {
+                qualified = false;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let (window, navigation, located) = match (options.heading.as_deref(), options.source_byte) {
+        (Some(slug), _) => (reader.window_at_heading(slug, options.lines)?, "heading", true),
+        (None, Some(_)) if !qualified => (reader.window(0, options.lines)?, "document-start-unqualified-source", false),
+        (None, Some(original)) => match reader.window_at_source(ByteOffset::new(original), options.lines) {
+            Ok(window) => (window, if original == capture.bytes().len() as u64 { "source-end" } else { "source-region" }, true),
+            Err(DocumentReadError::InvalidRange) if options.allow_source_fallback => {
+                (reader.window(0, options.lines)?, "document-start-unmapped-source", false)
+            }
+            Err(error) => return Err(error.into()),
+        },
+        (None, None) => (reader.window(options.first, options.lines)?, "rendered-line", true),
     };
     if json {
         out.literal("{\"document_schema\":\"fcb.document/1\",\"qualification\":\"implemented-unqualified\",\"native_presented\":false,\"layout_mode\":\"logical-character-cells-not-native-shaping\",\"document_complete\":true,\"asset_policy\":\"no-external-access\",\"additional_source_bytes_read\":\"0\",\"file_id\":")?;
@@ -235,6 +287,13 @@ pub(crate) fn write_capture(capture: &CompleteCapture, options: &ViewOptions, js
         out.literal(",\"document_generation\":")?; out.integer(generation.get())?;
         out.literal(",\"source_bytes\":")?; out.integer(capture.bytes().len() as u64)?;
         out.literal(",\"bom_bytes\":")?; out.integer(reader.source_base() as u64)?;
+        out.literal(",\"navigation\":")?; out.quoted(navigation)?;
+        out.literal(",\"requested_original_anchor\":")?;
+        if let Some(original) = options.source_byte { out.integer(original)?; } else { out.literal("null")?; }
+        out.literal(",\"requested_location_resolved\":")?; out.boolean(located)?;
+        out.literal(",\"source_mapping_qualified\":")?;
+        if options.heading.is_some() || options.copy.is_some() || options.source_byte.is_some() { out.boolean(qualified)?; }
+        else { out.literal("null")?; }
         out.literal(",\"width_columns\":")?; out.integer(u64::from(options.read.width_columns))?;
         out.literal(",\"total_rendered_lines\":")?; out.integer(reader.total_lines() as u64)?;
         out.literal(",\"whole_document_visible\":")?; out.boolean(window.whole_document_visible())?;
@@ -275,6 +334,15 @@ pub(crate) fn write_capture(capture: &CompleteCapture, options: &ViewOptions, js
         out.literal("}")?;
     } else {
         out.literal("Logical Markdown reading; no asset or link access; not native shaped text.\n")?;
+        if let Some(original) = options.source_byte {
+            out.literal("Original source byte ")?; out.literal(&original.to_string())?;
+            out.literal(match navigation {
+                "source-region" => ": opened the first row of its enclosing mapped Markdown region.\n",
+                "source-end" => ": opened the empty document-end window.\n",
+                "document-start-unqualified-source" => ": source mapping is unqualified; showing the document start.\n",
+                _ => ": no mapped Markdown region; showing the document start.\n",
+            })?;
+        }
         for line in window.lines() {
             if canceled() { return Err(AppError::Canceled.into()); }
             out.human_text(&line.rendered_text)?; out.literal("\n")?;
@@ -286,11 +354,11 @@ pub(crate) fn write_capture(capture: &CompleteCapture, options: &ViewOptions, js
             out.human_text(std::str::from_utf8(selected.enclosing_original_bytes).map_err(|_| DocumentReadError::InvalidUtf8)?)?;
             out.literal("\n")?;
         }
-        if !window.whole_document_visible() { out.literal("[bounded document window; use --line/--heading to navigate]\n")?; }
+        if !window.whole_document_visible() { out.literal("[bounded document window; use --line/--heading/--source-byte to navigate]\n")?; }
     }
     if canceled() { return Err(AppError::Canceled.into()); }
     reader.validate_delivery(capture, generation)?;
-    Ok(window.whole_document_visible())
+    Ok(WrittenDocument { complete: window.whole_document_visible() && located, navigation })
 }
 fn rendered_range(out: &mut Output, range: TextSelectionRange) -> Result<(), Error> {
     out.literal("{\"start\":")?; out.integer(range.start as u64)?;
@@ -304,18 +372,40 @@ mod tests {
     #[test]
     fn values_and_delimiters_do_not_change_permissions_or_output_mode() {
         assert!(!json_requested(&argv(&["file", "--heading", "--json"])));
+        assert!(!json_requested(&argv(&["file", "--source-byte", "--json"])));
         assert!(!json_requested(&argv(&["--", "--json"])));
         let options = parse(&argv(&["--heading", "--json", "--", "--stdin"])).unwrap();
         assert_eq!(options.path, PathBuf::from("--stdin")); assert!(!options.json);
+        let options = parse(&argv(&["file", "--source-byte", "0", "--lines", "1"])).unwrap();
+        assert_eq!(options.view.source_byte, Some(0));
+        assert!(!options.view.allow_source_fallback);
     }
     #[test]
     fn incompatible_oversized_or_unrelated_options_are_rejected_before_io() {
         for input in [vec!["file", "--line", "0"], vec!["file", "--lines", "0"],
             vec!["file", "--lines", "1025"], vec!["file", "--width", "513"],
             vec!["file", "--max-source-bytes", "262145"], vec!["file", "--line", "2", "--heading", "x"],
+            vec!["file", "--source-byte", "0", "--heading", "x"],
+            vec!["file", "--heading", "x", "--source-byte", "0"],
+            vec!["file", "--line", "1", "--source-byte", "0"],
+            vec!["file", "--source-byte", "0", "--line", "1"],
+            vec!["file", "--source-byte", "0", "--source-byte", "1"],
+            vec!["file", "--source-byte", "-1"], vec!["file", "--source-byte", "18446744073709551616"],
             vec!["file", "--copy-start", "1"], vec!["file", "--copy-start", "2", "--copy-end", "1"],
             vec!["file", "--stdin"], vec!["file", "--allow-network"], vec!["file", "--json", "--json"]] {
             assert!(parse(&argv(&input)).is_err(), "{input:?}");
         }
+    }
+    #[test]
+    fn implicit_hit_anchors_do_not_replace_explicit_headings() {
+        let options = ViewOptions::default().at_source_hit(ByteOffset::new(42));
+        assert_eq!(options.source_byte, Some(42));
+        assert!(options.allow_source_fallback);
+        let mut options = ViewOptions::default();
+        options.heading = Some("explicit".to_owned());
+        let options = options.at_source_hit(ByteOffset::new(42));
+        assert_eq!(options.heading.as_deref(), Some("explicit"));
+        assert_eq!(options.source_byte, None);
+        assert!(!options.allow_source_fallback);
     }
 }

@@ -148,6 +148,17 @@ readers and exact selection handoff to the Reading Desk. A missing or canceled
 destination preserves the current source and forward history. See
 [project documentation navigation](native/macos/README.md#project-documentation-links-and-backlinks).
 
+**CLI Markdown previews open the selected search region.**
+`fcb atlas . --text needle --markdown-hit 0 --json` starts at the first rendered
+row of the hit's qualified enclosing Markdown region. An explicit
+`--markdown-heading` still selects that heading. Standalone `fcb markdown`
+also accepts `--source-byte N`, a zero-based offset in the original captured
+UTF-8 bytes, including any BOM. Unmapped or unqualified automatic anchors keep
+a labeled document-start preview and a partial result; explicit source-byte
+requests refuse them. Navigation reuses the captured source, performs no extra
+source reads, and does not claim a rendered-text hit highlight. Executable
+regression verification remains pending.
+
 **Go imports connect captured package sources.** Project and saved-repository
 import navigation now recognize single/grouped imports and aliases. A retained
 `go.mod` supplies module-local package candidates, with exact import evidence,
