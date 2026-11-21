@@ -236,6 +236,49 @@ private final class SavedImportFixture: @unchecked Sendable {
         targetRows[0]["resolution_basis"] = "ambiguous-rust-crate-root"
         forgedTarget["links"] = targetRows; reject { _ = try decode(forgedTarget) }
     }
+    private static func goWire(_ f: SavedImportFixture, identity: AtlasSavedIdentity) throws {
+        let decode: ([String: Any]) throws -> AtlasSavedImports = {
+            try AtlasSavedImports.decode(f.base.encode($0), identity: identity, generation: 1,
+                direction: .all, member: nil, start: 0, limit: 64)
+        }
+        var value = f.page(identity.owner, generation: 1)
+        var rows = value["links"] as! [[String: Any]]
+        for i in rows.indices {
+            rows[i]["language"] = "go"; rows[i]["lexical_import_kind"] = "go-import"
+            rows[i]["destination"] = "example.local/project/pkg"
+            rows[i]["resolution_basis"] = "go-module-package-file-candidate"
+            rows[i]["source_path"] = f.base.path(Array("main.go".utf8), "main.go")
+            rows[i]["target_path"] = f.base.path(Array("pkg/a.go".utf8), "pkg/a.go")
+        }
+        value["links"] = rows
+        let page = try decode(value)
+        precondition(page.links[0].canOpenTarget && !page.links[1].canOpenTarget
+            && page.links[0].label == "Go package import"
+            && page.links[0].resolutionLabel.contains("representative Go package file")
+            && page.links[1].resolutionLabel.contains("has no captured bytes"))
+        for (key, wrong) in [("language", "python"), ("lexical_import_kind", "python-from"),
+            ("resolution_basis", "python-relative-module-candidate"), ("resolution_basis", "ambiguous-catalog-target")] {
+            var bad = value, changed = rows
+            changed[0][key] = wrong; bad["links"] = changed; reject { _ = try decode(bad) }
+        }
+        for (basis, label) in [("go-module-context-unavailable", "go.mod context"),
+            ("go-nested-module-boundary", "nested Go module")] {
+            var unresolved = value, changed = rows
+            for i in changed.indices {
+                changed[i]["resolution"] = "unresolved"; changed[i]["resolution_basis"] = basis
+                for key in ["target_member", "target_file_id", "target_revision", "target_digest", "target_path", "target_bytes"] {
+                    changed[i][key] = NSNull()
+                }
+            }
+            unresolved["links"] = changed
+            let edge = try decode(unresolved).links[0]
+            precondition(!edge.canOpenTarget && edge.resolutionLabel.contains(label))
+            changed[0]["target_member"] = "3"; changed[0]["target_file_id"] = "4"
+            changed[0]["target_path"] = f.base.path(Array("pkg/a.go".utf8), "pkg/a.go")
+            unresolved["links"] = changed; reject { _ = try decode(unresolved) }
+        }
+    }
+
     private static func cppWire(_ f: SavedImportFixture, identity: AtlasSavedIdentity) throws {
         let decode: ([String: Any]) throws -> AtlasSavedImports = {
             try AtlasSavedImports.decode(f.base.encode($0), identity: identity, generation: 1,
@@ -351,6 +394,7 @@ private final class SavedImportFixture: @unchecked Sendable {
         }
         let accepted = try decode(f.page(identity.owner, generation: 1))
         try cppWire(f, identity: identity)
+        try goWire(f, identity: identity)
         try javascriptLoadWire(f, identity: identity)
         precondition(accepted.complete && accepted.links[0].sourcePath.bytes == f.base.rawPath)
         precondition(accepted.links[0].canOpenTarget && !accepted.links[1].canOpenTarget)

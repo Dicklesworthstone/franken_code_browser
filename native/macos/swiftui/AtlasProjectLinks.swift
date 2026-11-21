@@ -238,6 +238,10 @@ struct AtlasProjectLink: Identifiable, Sendable, Equatable, Decodable {
     let destination, resolution, destinationSuffix, fragmentResolution: String
     var label: String {
         let status: String
+        if let basis = importEvidence?.resolutionBasis {
+            if basis == "go-module-context-unavailable" { return "Captured go.mod context is unavailable or unsupported" }
+            if basis == "go-nested-module-boundary" { return "Import crosses a nested Go module; no target selected" }
+        }
         let modulePrefix = importEvidence?.resolutionBasis == "rust-use-module-prefix-candidate"
         switch resolution {
         case "captured": status = modulePrefix ? "Captured containing-module candidate"
@@ -253,6 +257,9 @@ struct AtlasProjectLink: Identifiable, Sendable, Equatable, Decodable {
             : "Several catalog targets are possible; no target was selected"
         case "external": status = projection == .imports ? "External specifier; no package resolution or network content" : "External destination; no network content was fetched"
         default: status = projection == .imports ? "No supported catalog target was established" : "Destination could not be resolved within the project"
+        }
+        if importEvidence?.resolutionBasis == "go-module-package-file-candidate" {
+            return status + " · representative Go package file; build constraints are not evaluated"
         }
         return status + (projection == .documentation && destinationSuffix.contains("#")
             ? " · fragment is checked when the target opens" : "")
@@ -364,7 +371,7 @@ struct AtlasProjectLinksCoverage: Equatable, Sendable {
     let files, captured, captureUnavailable, outsideScope, uncaptured: Int
     let examined, pending, scanned, unsupported, sourceLimited: Int
     let diagnostics, linksSeen, retained, steps, lastStepFiles: UInt64
-    let parseBytes, metadataBytes, hashedBytes: UInt64
+    let parseBytes, moduleBytes, metadataBytes, hashedBytes: UInt64
     let building, complete, discoveryComplete, captureRegionComplete, truncated: Bool
     let stop: String?
 
@@ -386,6 +393,8 @@ struct AtlasProjectLinksCoverage: Equatable, Sendable {
         diagnostics = try w.number("parser_diagnostics"); linksSeen = try w.number("links_seen")
         retained = try w.number("retained_links"); steps = try w.number("steps")
         lastStepFiles = try w.number("last_step_files"); parseBytes = try w.number("parsed_source_bytes")
+        if projection == .imports { moduleBytes = try w.number("parsed_module_bytes") }
+        else { moduleBytes = 0 }
         metadataBytes = try w.number("metadata_bytes"); hashedBytes = try w.number("hashed_source_bytes")
         building = try w.flag("relationships_in_progress"); complete = try w.flag("relationships_complete")
         captureRegionComplete = try w.flag("capture_region_complete")
@@ -407,7 +416,9 @@ struct AtlasProjectLinksCoverage: Equatable, Sendable {
               files == captured + captureUnavailable + outsideScope + uncaptured,
               examined == scanned + unsupported + sourceLimited, captured == examined + pending,
               retained <= 4096, retained <= linksSeen, steps <= 4097, lastStepFiles <= 1,
-              parseBytes <= 32 * 1024 * 1024, parseBytes <= basis.sourceBytes, hashedBytes <= basis.sourceBytes,
+              moduleBytes <= 32 * 1024 * 1024, parseBytes <= 32 * 1024 * 1024 - moduleBytes,
+              moduleBytes <= UInt64(scanned) * 65_536,
+              parseBytes <= basis.sourceBytes, hashedBytes <= basis.sourceBytes,
               captureRegionComplete == (basis.captureScope.visibleMissingFiles == 0),
               discoveryComplete == basis.discoveryComplete, building == (stop == nil),
               stop == nil || [terminal, "parse-byte-limit"].contains(stop!) else { throw AtlasProjectLinksError.invalidResponse }
@@ -426,7 +437,7 @@ struct AtlasProjectLinksCoverage: Equatable, Sendable {
               next.lastStepFiles == UInt64(next.examined - examined),
               next.scanned >= scanned, next.unsupported >= unsupported, next.sourceLimited >= sourceLimited,
               next.diagnostics >= diagnostics, next.linksSeen >= linksSeen, next.retained >= retained,
-              next.parseBytes >= parseBytes, next.metadataBytes >= metadataBytes,
+              next.parseBytes >= parseBytes, next.moduleBytes >= moduleBytes, next.metadataBytes >= metadataBytes,
               next.hashedBytes >= hashedBytes, next.captureRegionComplete == captureRegionComplete,
               !truncated || next.truncated else { throw AtlasProjectLinksError.invalidResponse }
     }

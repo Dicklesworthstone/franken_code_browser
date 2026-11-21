@@ -29,6 +29,7 @@ fn summary(out: &mut Output, atlas: &AtlasSession, index: &RetainedIndex, snapsh
         ("max_parse_bytes", snapshot.max_parse_bytes), ("max_source_bytes", MAX_IMPORT_SOURCE_BYTES as u64),
         ("max_metadata_bytes", MAX_ATLAS_IMPORT_METADATA_BYTES as u64), ("metadata_bytes", snapshot.metadata_bytes as u64),
         ("source_bytes_read", 0), ("read_calls", 0), ("parsed_source_bytes", snapshot.parsed_bytes),
+        ("parsed_module_bytes", snapshot.module_bytes),
         ("hashed_source_bytes", snapshot.hashed_bytes), ("source_files", snapshot.eligible as u64),
         ("captured_source_files", snapshot.sources.len() as u64),
         ("capture_unavailable_source_files", snapshot.capture_unavailable as u64),

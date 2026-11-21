@@ -44,6 +44,95 @@ fn utf16(text: &str, big: bool) -> Vec<u8> {
 }
 
 #[test]
+fn saved_go_imports_keep_utf16_evidence_module_candidates_and_offline_readers() {
+    let module = b"module example.local/project\n";
+    let statement = "import alias \"example.local/project/pkg\"";
+    let target = b"package pkg\nconst Value = 7\n";
+    for big in [false, true] {
+        let source = utf16(&format!("package main\r\n{statement}\r\n"), big);
+        let f = Fixture::new(&[entry(b"go.mod", module), entry(b"main.go", &source),
+            entry(b"pkg/a.go", target), entry(b"pkg/z.go", b"package pkg\n")], true);
+        let mut saved = f.open(57980 + u64::from(big) * 10);
+        let result = prepare(&mut saved, 1);
+        assert!(result.get("imports_complete").flag());
+        assert_eq!(result.get("source_members").number(), 3);
+        assert_eq!(result.get("member_bytes_read").number(),
+            (source.len() + module.len() + target.len() + b"package pkg\n".len()) as u64);
+        assert_eq!(result.get("peak_source_bytes").number(), (source.len() + module.len()) as u64);
+        let row = link(&result, b"main.go", "example.local/project/pkg");
+        let id = row.get("link_id").number();
+        assert_eq!(row.get("resolution_basis").text(), "go-module-package-file-candidate");
+        assert_eq!(row.get("target_path").get("hex").text(), hex(b"pkg/a.go"));
+        assert_eq!(range(&source, row.get("evidence_range")), &utf16(statement, big)[2..]);
+        assert_eq!(range(&source, row.get("specifier_range")), &utf16("example.local/project/pkg", big)[2..]);
+        let before = reads(&mut saved);
+        let incoming = json(&saved.import_page(1, Some(row.get("target_member").number()),
+            Direction::Incoming, 0, 64, || false).unwrap());
+        assert_eq!(incoming.get("matching_links").number(), 1);
+        assert_eq!(&incoming.get("links").array()[0], row);
+        assert_eq!(reads(&mut saved), before);
+        let (mut evidence, receipt) = saved.open_import_reader(owner(57981 + u64::from(big) * 10),
+            1, id, Side::Evidence, || false).unwrap();
+        assert_eq!(json(&receipt).get("selection"), row.get("evidence_range"));
+        let (mut reader, receipt) = saved.open_import_reader(owner(57982 + u64::from(big) * 10),
+            1, id, Side::Target, || false).unwrap();
+        assert_eq!(json(&receipt).get("source_digest").text(), Sha256::digest(target).to_hex());
+        assert!(!json(&receipt).get("live_source_reopened").flag());
+        saved.clear_imports(2, || false).unwrap(); drop(saved);
+        fs::rename(&f.path, f.root.join("moved.fcbs")).unwrap();
+        assert_eq!(copy_all(&mut evidence).get("original_hex").text(), hex(&source));
+        assert_eq!(copy_all(&mut reader).get("original_hex").text(), hex(target));
+    }
+}
+
+#[test]
+fn saved_go_missing_metadata_nested_boundaries_and_byte_limits_do_not_guess_targets() {
+    let module = b"module example.local/project\n";
+    let source = b"package main\nimport \"example.local/project/pkg\"\n";
+    let target = b"package pkg\n";
+    let f = Fixture::new(&[entry(b"go.mod", module), entry(b"main.go", source), entry(b"pkg/a.go", target)], true);
+    let mut saved = f.open(58001);
+    let capped = json(&saved.prepare_imports(1, 64, source.len() as u64, || false).unwrap());
+    assert_eq!(capped.get("member_bytes_read").number(), source.len() as u64);
+    assert_eq!(capped.get("source_limited_members").number(), 1);
+    assert_eq!(link(&capped, b"main.go", "example.local/project/pkg").get("resolution_basis").text(),
+        "go-module-context-unavailable");
+    let exact = json(&saved.prepare_imports(2, 64, (module.len() + source.len() + target.len()) as u64, || false).unwrap());
+    assert!(exact.get("imports_complete").flag());
+    assert_eq!(link(&exact, b"main.go", "example.local/project/pkg").get("resolution").text(), "captured");
+    let parent = b"package parent\nimport \"example.local/project/nested/pkg\"\n";
+    let nested = Fixture::new(&[entry(b"go.mod", module), entry(b"main.go", parent),
+        SnapshotEntry { path: b"nested/go.mod", observed_bytes: 50, data: SnapshotData::Unavailable("READ_DENIED") },
+        entry(b"nested/main.go", source), entry(b"nested/pkg/a.go", target), entry(b"pkg/a.go", target)], true);
+    let mut saved = nested.open(58002);
+    let result = prepare(&mut saved, 1);
+    assert_eq!(link(&result, b"main.go", "example.local/project/nested/pkg").get("resolution_basis").text(),
+        "go-nested-module-boundary");
+    let inner = link(&result, b"nested/main.go", "example.local/project/pkg");
+    assert_eq!(inner.get("resolution_basis").text(), "go-module-context-unavailable");
+    assert_eq!(inner.get("target_member"), &Json::Null);
+}
+
+#[test]
+fn corrupt_go_module_cannot_replace_accepted_archive_imports() {
+    let module = b"module example.local/project\n";
+    let source = b"package main\nimport \"example.local/project/pkg\"\n";
+    let target = b"package pkg\n";
+    let f = Fixture::new(&[entry(b"go.mod", module), entry(b"main.go", source), entry(b"pkg/a.go", target)], true);
+    let mut saved = f.open(58011);
+    prepare(&mut saved, 1);
+    let old = json(&saved.import_page(1, None, Direction::All, 0, 64, || false).unwrap());
+    let (mut retained, _) = saved.open_import_reader(owner(58012), 1, 1, Side::Target, || false).unwrap();
+    let at = f.bytes.windows(module.len()).position(|bytes| bytes == module).unwrap();
+    let mut writer = OpenOptions::new().write(true).open(&f.path).unwrap();
+    writer.seek(SeekFrom::Start(at as u64)).unwrap(); writer.write_all(b"X").unwrap(); writer.flush().unwrap();
+    assert!(saved.prepare_imports(2, 64, 1024, || false).is_err());
+    assert_eq!(saved.import_generation(), Some(1));
+    assert_eq!(json(&saved.import_page(1, None, Direction::All, 0, 64, || false).unwrap()), old);
+    assert_eq!(copy_all(&mut retained).get("original_hex").text(), hex(target));
+}
+
+#[test]
 fn saved_cpp_includes_preserve_utf16_evidence_and_independent_offline_readers() {
     let prefix = "// \u{1f980} saved source\r\n";
     let statement = "# include \"detail/café.h\"";

@@ -76,6 +76,12 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
         }
     }
     var resolutionLabel: String {
+        if resolutionBasis == "go-module-context-unavailable" { return "Captured go.mod context is unavailable or unsupported" }
+        if resolutionBasis == "go-nested-module-boundary" { return "Import crosses a nested Go module; no target selected" }
+        if resolutionBasis == "go-module-package-file-candidate" {
+            let availability = canOpenTarget ? "Captured representative Go package file" : "Representative Go package file has no captured bytes"
+            return availability + "; build constraints are not evaluated"
+        }
         let modulePrefix = resolutionBasis == "rust-use-module-prefix-candidate"
         switch resolution {
         case "captured": return modulePrefix ? "Captured containing-module candidate" : "Captured catalog target candidate"
@@ -271,7 +277,8 @@ struct AtlasSavedImports: Sendable {
                   w.matching_links.value <= w.retained_links.value, w.retained_source_payload_bytes.value == 0,
                   w.member_bytes_read.value <= w.max_source_bytes.value,
                   w.peak_source_bytes.value <= min(w.member_bytes_read.value, AtlasSavedImportWire.maximumMemberBytes),
-                  w.member_read_calls.value <= (scanned + unsupported) * AtlasSavedImportWire.maximumMemberReadCalls,
+                  // Each scanned Go source may verify one captured go.mod as well.
+                  w.member_read_calls.value <= (2 * scanned + unsupported) * AtlasSavedImportWire.maximumMemberReadCalls,
                   w.imports_complete == (identity.discoveryComplete && scanned == sources && diagnostic == 0 && !w.truncated),
                   start <= w.matching_links.value,
                   UInt64(w.links.count) <= min(limit, w.matching_links.value - start),

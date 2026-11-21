@@ -778,7 +778,7 @@ physical-Mac verification remain pending.
 
 Open an FCBS archive in **Saved Repository**, choose **Imports**, and select
 **Build imports**. This uses the same Rust, JavaScript/TypeScript/JSX/TSX,
-Python and C/C++ lexical import engine and finite catalog policies as Project relationships.
+Python, C/C++ and Go lexical import engine and finite catalog policies as Project relationships.
 The archive supplies both source evidence and target membership; opening an
 import does not require a working-tree checkout or grant access to live paths.
 
@@ -1284,8 +1284,8 @@ target, even if the live files have since changed.
 
 The shared import engine supports Rust external module/use declarations,
 JavaScript/TypeScript static imports, re-exports and literal load expressions
-(including JSX/TSX), and Python `import` and `from` statements in `.py` and `.pyi`
-files. Python aliases,
+(including JSX/TSX), Python `import` and `from` statements in `.py` and `.pyi`
+files, C/C++ includes, and Go package imports. Python aliases,
 comma-separated imports, parenthesized from-import lists and explicit line
 continuations preserve their original statement evidence. Comments and strings
 are classified by the shared FrankenMarkdown lexer.
@@ -1367,12 +1367,40 @@ backslash-newline (including multiline macros), trigraph, bare-CR line ending,
 or raw-string delimiter outside the upstream-supported subset is counted
 unsupported. Its import coverage stays partial and its source remains readable.
 
+Go single and grouped imports in `.go` files keep aliases, blank imports and
+dot imports in their exact source evidence. Quoted and raw import paths share
+the original UTF-8/UTF-16 byte mapping. With a captured `go.mod`, a path inside
+that module can navigate to the lexicographically first direct `.go` file in
+the package directory, excluding `_test.go` and dot/underscore-prefixed files.
+The row identifies this as a **representative Go package file**. **Imported by**
+attaches to that representative file, not every source file in the package.
+Build tags, operating-system/architecture constraints and compiler bindings are
+not evaluated.
+
+Resolution uses the nearest catalogued `go.mod` and its captured module
+directive. Missing, uncaptured, unsupported or over-budget metadata leaves the
+import explicitly unresolved; the resolver never falls through a nested module
+to its parent. A local import that crosses another catalogued module boundary
+is also unresolved. Imports outside the captured module remain external. The
+policy does not interpret `go.work`, `replace`, vendor trees, module caches or
+escaped path spellings, and does not run Go or fetch dependencies. Include
+`go.mod` in a custom capture scope to enable module-local destinations.
+
+Module metadata is capped at 64 KiB per lookup and shares the 32 MiB aggregate
+work allowance. Project receipts report `parsed_module_bytes` separately from
+`parsed_source_bytes`; both count against the parse limit. Saved-archive reads
+verify the metadata digest, count it in `member_bytes_read`, and keep combined
+source and metadata payloads within 128 KiB. Paging accepted imports performs
+no new source or metadata reads. Evidence and target readers keep their exact
+captured bytes after metadata edits, projection replacement or archive detachment.
+
 The inventory admits 128 KiB per source, 32 MiB of aggregate parsing and 4,096
 retained import occurrences. Unsupported syntax, malformed decoding, parse limits and
 omitted rows remain visible coverage conditions. These limits apply to the
 captured project import browser. The **Saved Repository → Imports** workflow
 applies the same lexical policies to archived members. Rust/Swift regression fixtures cover Rust
-use trees, JavaScript literal loads, Python imports and C/C++ includes, UTF-16
+use trees, JavaScript literal loads, Python imports, C/C++ includes and Go module
+candidates, UTF-16
 coordinates, relative targets, ambiguity, stale captures and native evidence
 validation. Executable and physical-Mac verification remain
 pending.

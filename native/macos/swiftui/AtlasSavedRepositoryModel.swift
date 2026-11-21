@@ -887,7 +887,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
         perform { model, flag in
             guard let lease = model.session else { throw AtlasSavedError.unavailable }
             let generation = try model.nextImportGeneration()
-            model.notice = "Parsing captured Rust, JavaScript, TypeScript and Python import statements…"
+            model.notice = "Parsing captured Rust, JavaScript/TypeScript, Python, C/C++ and Go imports…"
             do {
                 let page = try AtlasSavedImports.decode(await model.run(lease,
                     .prepareImports(generation: generation, imports: AtlasSavedImportWire.maximumLinks,

@@ -295,6 +295,7 @@ extension ProjectLinksFixture {
             "max_source_bytes": "131072", "max_metadata_bytes": "8388608",
             "metadata_bytes": examined == 0 ? "0" : "35000", "source_bytes_read": "0", "read_calls": "0",
             "parsed_source_bytes": examined == 0 ? "0" : (examined == 1 ? "4096" : "4196"),
+            "parsed_module_bytes": "0",
             "hashed_source_bytes": examined == 0 ? "0" : "4196", "capture_region_complete": true,
             "source_files": "2", "captured_source_files": "2", "capture_unavailable_source_files": "0",
             "outside_capture_scope_source_files": "0", "uncaptured_source_files": "0",

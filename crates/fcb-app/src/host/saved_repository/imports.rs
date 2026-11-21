@@ -9,9 +9,9 @@
 
 use std::mem::size_of;
 use fcb::ByteRange;
-use fcb::search::{CaptureRequest, imports::{CapturedImports, ImportError, ImportKind,
-    ImportLanguage, ImportResolutionKind, resolve_import, IMPORT_EXTRACTOR, IMPORT_POLICY,
-    MAX_IMPORT_ITEMS, MAX_IMPORT_SOURCE_BYTES}};
+use fcb::search::{CaptureRequest, imports::{CapturedGoModule, CapturedImports, ImportError, ImportKind,
+    ImportLanguage, ImportResolutionKind, find_go_module, go_package_source, resolve_go_import, resolve_import,
+    IMPORT_EXTRACTOR, IMPORT_POLICY, MAX_GO_MODULE_SOURCE_BYTES, MAX_IMPORT_ITEMS, MAX_IMPORT_SOURCE_BYTES}};
 use super::{ArenaOwnerId, AppError, ByteLength, FileId, HostResponse, Output, OutputError,
     PagedCapture, PagedMemberData, PagedSearchError, QueryGeneration, RawPath,
     ReaderSession, ReaderSessionError, ResourceLease, SavedRepositoryError,
@@ -166,6 +166,40 @@ impl SavedRepositorySession {
                 }
                 Err(error) => return Err(error.into()),
             };
+            // Read only the nearest archived module, through the same verified
+            // member loader as source. Both total I/O and simultaneous source
+            // payloads remain inside the existing import limits.
+            let location = if language == ImportLanguage::Go && imports.facts().iter()
+                .any(|fact| fact.resolution_allowed() && fact.destination() != "C") {
+                let path = self.archive.directory().member(ordinal).ok_or(SavedImportError::MissingImport)?.path;
+                find_go_module(path, |candidate| self.archive.directory().find_path(candidate))
+            } else { None };
+            let module_capture = if let Some(location) = &location {
+                let member = self.archive.directory().member(location.target).ok_or(SavedImportError::MissingImport)?;
+                if let PagedMemberData::Captured { byte_length, digest, .. } = member.data {
+                    if byte_length <= MAX_GO_MODULE_SOURCE_BYTES
+                        && byte_length <= MAX_IMPORT_SOURCE_BYTES - length
+                        && byte_length as u64 <= max_source_bytes.saturating_sub(admitted_bytes) {
+                        let proof = source_proof(owner, location.target, digest, byte_length as u64)?;
+                        let ids = self.allocations()?;
+                        admitted_bytes += byte_length as u64;
+                        let metadata = PagedCapture::load(&mut self.archive, location.target, proof.file, proof.revision,
+                            &self.budget, ids, &mut canceled)?;
+                        candidate.peak_source_bytes = candidate.peak_source_bytes.max((length + byte_length) as u64);
+                        Some((metadata, CaptureRequest::new(proof.file, proof.revision).map_err(|_| AppError::InvalidRange)?))
+                    } else { None }
+                } else { None }
+            } else { None };
+            let module = if let (Some(location), Some((metadata, request))) = (&location, &module_capture) {
+                let [module_parser_id] = self.allocations()?;
+                match CapturedGoModule::build(location.path(), metadata.bytes(), *request,
+                    &self.budget, module_parser_id, &mut canceled) {
+                    Ok(module) => Some(module),
+                    Err(ImportError::UnsupportedEncoding | ImportError::UnsupportedLexicalContext
+                        | ImportError::InvalidEvidence | ImportError::SourceLimit) => None,
+                    Err(error) => return Err(error.into()),
+                }
+            } else { None };
             candidate.scanned += 1;
             if imports.diagnostics() > 0 { candidate.diagnostic_sources += 1; }
             candidate.diagnostics = candidate.diagnostics.checked_add(imports.diagnostics() as u64)
@@ -180,7 +214,26 @@ impl SavedRepositorySession {
                 let text_lease = self.budget.try_reserve_managed(owner, text_id, ByteLength::new(text_charge as u64))
                     .map_err(|_| AppError::Admission)?;
                 let path = self.archive.directory().member(ordinal).ok_or(SavedImportError::MissingImport)?.path;
-                let resolved = resolve_import(path, fact, |candidate| self.archive.directory().find_path(candidate));
+                let mut lookup_canceled = false;
+                let resolved = if language == ImportLanguage::Go {
+                    resolve_go_import(path, fact, module.as_ref(),
+                        |candidate| self.archive.directory().find_path(candidate).is_some(), |prefix| {
+                            let directory = self.archive.directory();
+                            let (mut start, mut end) = (0, directory.len());
+                            while start < end {
+                                let mid = start + (end - start) / 2;
+                                if directory.member(mid)?.path < prefix { start = mid + 1; } else { end = mid; }
+                            }
+                            for ordinal in start..directory.len() {
+                                if canceled() { lookup_canceled = true; return None; }
+                                let member = directory.member(ordinal)?;
+                                if !member.path.starts_with(prefix) { break; }
+                                if go_package_source(prefix, member.path) { return Some(ordinal); }
+                            }
+                            None
+                        })
+                } else { resolve_import(path, fact, |candidate| self.archive.directory().find_path(candidate)) };
+                if lookup_canceled { return Err(ImportError::Canceled.into()); }
                 let (resolution, target_member, target) = match resolved.kind {
                     ImportResolutionKind::Local => {
                         let ordinal = resolved.target.ok_or(SavedImportError::UnresolvedTarget)?;

@@ -5,8 +5,8 @@
 //! FrankenMarkdown owns string/comment/keyword classification. This module
 //! consumes its validated byte spans and recognizes a small source-specific
 //! statement grammar: Rust external mod/use, JS/TS static import/export-from and
-//! literal require/import() expressions, Python import/from statements, and
-//! C/C++ literal include directives.
+//! literal require/import() expressions, Python import/from statements,
+//! C/C++ literal include directives and Go package imports.
 //! It is not a compiler, build graph, package resolver, or replacement lexer.
 //! Every result remains lexical evidence; closed-catalog navigation is explicit.
 //! UTF-8/UTF-16 decoding and evidence conversion use the common source map.

@@ -5,9 +5,9 @@
 //! This independent projection does not alter Markdown relationships. No step,
 //! page or activation opens working-tree source or evaluates project tooling.
 
-use fcb::search::imports::{CapturedImports, ImportError, ImportLanguage, ImportKind,
-    ImportResolutionKind, resolve_import, MAX_IMPORT_SOURCE_BYTES, MAX_IMPORT_ITEMS,
-    IMPORT_EXTRACTOR, IMPORT_POLICY};
+use fcb::search::imports::{CapturedGoModule, CapturedImports, ImportError, ImportLanguage, ImportKind,
+    ImportResolutionKind, find_go_module, go_package_source, resolve_go_import, resolve_import,
+    MAX_GO_MODULE_SOURCE_BYTES, MAX_IMPORT_SOURCE_BYTES, MAX_IMPORT_ITEMS, IMPORT_EXTRACTOR, IMPORT_POLICY};
 use fcb::store::Sha256Digest;
 use super::*;
 
@@ -71,11 +71,13 @@ pub(crate) struct ImportsSnapshot {
     sources: Vec<FileId>, proofs: Vec<SourceProof>, links: Vec<Link>,
     eligible: usize, capture_unavailable: usize, outside_scope: usize, uncaptured: usize,
     examined: usize, scanned: usize, unsupported: usize, source_limited: usize,
-    diagnostics: u64, links_seen: u64, parsed_bytes: u64, hashed_bytes: u64,
+    diagnostics: u64, links_seen: u64, parsed_bytes: u64, module_bytes: u64, hashed_bytes: u64,
     truncated: bool, stop: Option<Stop>, complete: bool, steps: u64, last_files: usize,
     _lease: ResourceLease,
 }
-pub(crate) struct ImportsWork { snapshot: ImportsSnapshot, parser_id: ResourceAllocationId }
+pub(crate) struct ImportsWork {
+    snapshot: ImportsSnapshot, parser_id: ResourceAllocationId, module_parser_id: ResourceAllocationId,
+}
 impl From<ImportError> for AtlasSearchError {
     fn from(error: ImportError) -> Self {
         match error { ImportError::Canceled => Self::Canceled, error => Self::Import(error) }
@@ -99,7 +101,7 @@ impl RetainedAtlasSearch {
             return Err(AtlasSearchError::InvalidLimits);
         }
         check(&mut canceled)?;
-        let [state_id, parser_id] = [self.next_id()?, self.next_id()?];
+        let [state_id, parser_id, module_parser_id] = [self.next_id()?, self.next_id()?, self.next_id()?];
         let index = self.index.as_ref().ok_or(AtlasSearchError::MissingIndex)?;
         if index.generation != index_generation { return Err(AtlasSearchError::StaleIndex); }
         let capacity = index.engine.captured_files();
@@ -113,7 +115,7 @@ impl RetainedAtlasSearch {
             max_links, max_parse_bytes, metadata_bytes: fixed, sources: reserve(capacity)?, proofs: reserve(capacity)?,
             links: reserve(max_links)?, eligible: 0, capture_unavailable: 0, outside_scope: 0, uncaptured: 0,
             examined: 0, scanned: 0, unsupported: 0, source_limited: 0, diagnostics: 0, links_seen: 0,
-            parsed_bytes: 0, hashed_bytes: 0, truncated: false, stop: None, complete: false,
+            parsed_bytes: 0, module_bytes: 0, hashed_bytes: 0, truncated: false, stop: None, complete: false,
             steps: 0, last_files: 0, _lease: lease };
         let catalog = atlas.atlas().catalog();
         for (ordinal, entry) in catalog.entries().iter().enumerate() {
@@ -132,7 +134,7 @@ impl RetainedAtlasSearch {
         }
         self.validate(atlas)?; check(&mut canceled)?;
         let response = self.import_response(atlas, &snapshot, "imports-begin", &mut canceled)?;
-        self.imports_pending = Some(ImportsWork { snapshot, parser_id });
+        self.imports_pending = Some(ImportsWork { snapshot, parser_id, module_parser_id });
         Ok(response)
     }
 
@@ -272,7 +274,7 @@ impl RetainedAtlasSearch {
         let path = entry.path().raw().as_bytes();
         let language = ImportLanguage::from_path(path).ok_or(AtlasSearchError::WrongAtlas)?;
         let bytes = capture.bytes().len() as u64;
-        if bytes > snapshot.max_parse_bytes.saturating_sub(snapshot.parsed_bytes) {
+        if bytes > snapshot.max_parse_bytes.saturating_sub(snapshot.parsed_bytes + snapshot.module_bytes) {
             snapshot.stop = Some(Stop::ParseBytes); return Ok(());
         }
         let qgen = QueryGeneration::new(self.manifest.owner(), snapshot.generation).map_err(|_| AtlasSearchError::IdentityExhausted)?;
@@ -287,13 +289,49 @@ impl RetainedAtlasSearch {
             }
             Err(error) => return Err(error.into()),
         };
+        // The nearest catalog boundary wins even when its metadata was not
+        // captured. Never reopen go.mod or fall through to an enclosing module.
+        let location = if language == ImportLanguage::Go && imports.facts().iter()
+            .any(|fact| fact.resolution_allowed() && fact.destination() != "C") {
+            find_go_module(path, |candidate| find_file(atlas, candidate))
+        } else { None };
+        let module = if let Some(location) = &location {
+            if let Some(metadata) = index.engine.capture(location.target).filter(|capture|
+                capture.bytes().len() <= MAX_GO_MODULE_SOURCE_BYTES
+                    && capture.bytes().len() as u64 <= snapshot.max_parse_bytes
+                        .saturating_sub(snapshot.parsed_bytes + snapshot.module_bytes)) {
+                snapshot.module_bytes += metadata.bytes().len() as u64;
+                match CapturedGoModule::build(location.path(), metadata.bytes(), *metadata.request(),
+                    &self.budget, work.module_parser_id, || canceled() || atlas.validate_active().is_err()) {
+                    Ok(module) => Some(module),
+                    Err(ImportError::UnsupportedEncoding | ImportError::UnsupportedLexicalContext
+                        | ImportError::InvalidEvidence | ImportError::SourceLimit) => None,
+                    Err(error) => return Err(error.into()),
+                }
+            } else { None }
+        } else { None };
         snapshot.scanned += 1;
         snapshot.diagnostics = snapshot.diagnostics.checked_add(imports.diagnostics() as u64).ok_or(AtlasSearchError::IdentityExhausted)?;
         snapshot.links_seen = snapshot.links_seen.checked_add(imports.links_seen()).ok_or(AtlasSearchError::IdentityExhausted)?;
         snapshot.truncated |= imports.truncated();
         for fact in imports.facts() {
             check(canceled)?;
-            let resolved = resolve_import(path, fact, |candidate| find_file(atlas, candidate));
+            let mut lookup_canceled = false;
+            let resolved = if language == ImportLanguage::Go {
+                resolve_go_import(path, fact, module.as_ref(), |candidate| find_file(atlas, candidate).is_some(),
+                    |prefix| {
+                        let catalog = atlas.atlas().catalog();
+                        let start = catalog.entries().partition_point(|entry| entry.path().raw().as_bytes() < prefix);
+                        for (offset, entry) in catalog.entries()[start..].iter().enumerate() {
+                            if canceled() || atlas.validate_active().is_err() { lookup_canceled = true; return None; }
+                            let path = entry.path().raw().as_bytes();
+                            if !path.starts_with(prefix) { break; }
+                            if go_package_source(prefix, path) { return catalog.file_id(start + offset); }
+                        }
+                        None
+                    })
+            } else { resolve_import(path, fact, |candidate| find_file(atlas, candidate)) };
+            if lookup_canceled { return Err(AtlasSearchError::Canceled); }
             let (resolution, target_file) = match resolved.kind {
                 ImportResolutionKind::Local => {
                     let target = resolved.target.ok_or(AtlasSearchError::WrongAtlas)?;

@@ -105,8 +105,90 @@ fn coverage(page: &Json) {
     assert_eq!(page.get("source_bytes_read").number(), 0); assert_eq!(page.get("read_calls").number(), 0);
     assert_eq!(page.get("max_source_bytes").number(), MAX_ATLAS_IMPORT_SOURCE_BYTES as u64);
     assert!(page.get("metadata_bytes").number() <= MAX_ATLAS_IMPORT_METADATA_BYTES as u64);
-    assert!(page.get("parsed_source_bytes").number() <= page.get("max_parse_bytes").number());
+    assert!(page.get("parsed_source_bytes").number() + page.get("parsed_module_bytes").number()
+        <= page.get("max_parse_bytes").number());
     assert!(page.get("retained_links").number() <= page.get("links_seen").number());
+}
+
+#[test]
+fn go_imports_use_captured_modules_and_retain_package_candidate_readers() {
+    let module = b"module example.local/project\n\ngo 1.24\n";
+    let source = b"package main\r\nimport (\r\n util \"example.local/project/pkg\"\r\n _ `example.local/project/pkg`\r\n \"fmt\"\r\n \"example.local/project-other/pkg\"\r\n \"example.local/project/nested/pkg\"\r\n \"example.local/project/missing\"\r\n)\r\n";
+    let target = b"package pkg\nconst Value = 7\n";
+    let mut f = Fixture::new(&[("go.mod", module), ("cmd/app/main.go", source), ("pkg/a.go", target),
+        ("pkg/a_test.go", b"package pkg\n"), ("pkg/_hidden.go", b"package pkg\n"), ("pkg/z.go", b"package pkg\n"),
+        ("nested/go.mod", b"module example.local/nested\n"), ("nested/pkg/a.go", b"package pkg\n")]);
+    f.build(1);
+    // Resolution must use the captured module even when preparation happens
+    // after a working-tree edit to both metadata and the destination.
+    fs::write(f.root.join("go.mod"), b"module changed.local/elsewhere\n").unwrap();
+    fs::write(f.root.join("pkg/a.go"), b"package replacement\n").unwrap();
+    let result = f.prepare(1, 1);
+    assert!(result.get("relationships_complete").flag());
+    assert_eq!(result.get("links_seen").number(), 6);
+    assert_eq!(result.get("parsed_module_bytes").number(), module.len() as u64);
+    let row = link(&result, b"cmd/app/main.go", "example.local/project/pkg");
+    assert_eq!(row.get("language").text(), "go");
+    assert_eq!(row.get("lexical_import_kind").text(), "go-import");
+    assert_eq!(row.get("resolution_basis").text(), "go-module-package-file-candidate");
+    assert_eq!(row.get("target_path").get("hex").text(), hex(b"pkg/a.go"));
+    assert_eq!(range(row.get("evidence_range"), source), b"util \"example.local/project/pkg\"");
+    assert_eq!(range(row.get("specifier_range"), source), b"example.local/project/pkg");
+    let incoming = f.page(1, Direction::Incoming, Some(b"pkg/a.go"), 0, 64);
+    assert_eq!(incoming.get("matching_links").number(), 2);
+    assert_eq!(incoming.get("parsed_module_bytes"), result.get("parsed_module_bytes"));
+    assert_eq!(f.page(1, Direction::Incoming, Some(b"pkg/z.go"), 0, 64).get("matching_links").number(), 0);
+    for (destination, resolution, basis) in [
+        ("fmt", "external", "external-specifier"),
+        ("example.local/project-other/pkg", "external", "external-specifier"),
+        ("example.local/project/nested/pkg", "unresolved", "go-nested-module-boundary"),
+        ("example.local/project/missing", "missing", "no-catalog-target"),
+    ] {
+        let edge = link(&result, b"cmd/app/main.go", destination);
+        assert_eq!(edge.get("resolution").text(), resolution);
+        assert_eq!(edge.get("resolution_basis").text(), basis);
+        assert_eq!(edge.get("target_file_id"), &Json::Null);
+    }
+    let id = row.get("link_id").number();
+    let (evidence, receipt) = f.search.open_import_reader(&f.atlas, owner(72980), 1, id, Side::Evidence, || false).unwrap();
+    assert_eq!(json(&receipt).get("relationship"), row);
+    let (reader, receipt) = f.search.open_import_reader(&f.atlas, owner(72981), 1, id, Side::Target, || false).unwrap();
+    assert_eq!(json(&receipt).get("source_sha256").text(), Sha256::digest(target).to_hex());
+    assert_eq!(json(&receipt).get("additional_source_bytes_read").number(), 0);
+    f.search.clear_index(&f.atlas, 2, || false).unwrap();
+    assert_eq!(evidence.capture().bytes(), source);
+    assert_eq!(reader.capture().bytes(), target);
+}
+
+#[test]
+fn go_module_context_respects_capture_scope_nearest_boundary_and_parse_budget() {
+    let source = b"package main\nimport \"example.local/project/pkg\"\n";
+    let module = b"module example.local/project\n";
+    let mut f = Fixture::new(&[("go.mod", module), ("main.go", source), ("pkg/a.go", b"package pkg\n")]);
+    f.search.prepare_index_scoped(&f.atlas, 1, AtlasSearchScope::from_csv(Some("go"), None).unwrap(),
+        index_options(), || false).unwrap();
+    let scoped = f.prepare(1, 1);
+    let edge = link(&scoped, b"main.go", "example.local/project/pkg");
+    assert_eq!(edge.get("resolution_basis").text(), "go-module-context-unavailable");
+    assert_eq!(edge.get("target_file_id"), &Json::Null);
+    assert_eq!(scoped.get("parsed_module_bytes").number(), 0);
+    f.build(2);
+    f.begin(2, 2, 64, source.len() as u64);
+    let capped = f.finish(2);
+    assert_eq!(capped.get("stop_reason").text(), "parse-byte-limit");
+    assert_eq!(capped.get("parsed_module_bytes").number(), 0);
+    assert_eq!(link(&capped, b"main.go", "example.local/project/pkg").get("resolution_basis").text(),
+        "go-module-context-unavailable");
+    f.begin(3, 2, 64, (source.len() + module.len() + b"package pkg\n".len()) as u64);
+    let exact = f.finish(3);
+    assert!(exact.get("relationships_complete").flag());
+    assert_eq!(link(&exact, b"main.go", "example.local/project/pkg").get("resolution").text(), "captured");
+    let mut nested = Fixture::new(&[("go.mod", module), ("nested/go.mod", b"not a module directive\n"),
+        ("nested/main.go", source), ("pkg/a.go", b"package pkg\n")]);
+    nested.build(1);
+    let page = nested.prepare(1, 1);
+    assert_eq!(link(&page, b"nested/main.go", "example.local/project/pkg").get("resolution_basis").text(),
+        "go-module-context-unavailable");
 }
 
 fn atlas_parcel(atlas: &AtlasSession, path: &[u8]) -> Json {

@@ -148,6 +148,15 @@ readers and exact selection handoff to the Reading Desk. A missing or canceled
 destination preserves the current source and forward history. See
 [project documentation navigation](native/macos/README.md#project-documentation-links-and-backlinks).
 
+**Go imports connect captured package sources.** Project and saved-repository
+import navigation now recognize single/grouped imports and aliases. A retained
+`go.mod` supplies module-local package candidates, with exact import evidence,
+incoming-import lists and independent target readers. Missing metadata and
+nested-module boundaries remain explicit. The target is a representative package
+file; build constraints and Go compiler binding are outside this lexical policy.
+See [project import navigation](native/macos/README.md#project-import-navigation)
+for limits and pending independent verification.
+
 **City uses the same map.** Its buildings retain the current file footprints and IDs;
 height is a bounded logarithmic transform of **observed file bytes**, capped at 1 GiB,
 with explicit unknown and partial-catalog counts. Camera movement does not discover

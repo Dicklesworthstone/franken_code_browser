@@ -192,6 +192,48 @@ import Foundation
         }
     }
 
+    private static func goWire(_ index: AtlasPreparedIndex) throws {
+        var value = ProjectLinksFixture.importPage(owner: index.basis.owner,
+            generation: 1, command: "imports-page")
+        value["parsed_module_bytes"] = "128"
+        var rows = value["links"] as! [[String: Any]]
+        for i in rows.indices {
+            rows[i]["language"] = "go"; rows[i]["lexical_import_kind"] = "go-import"
+            rows[i]["destination"] = "example.local/project/pkg"
+            rows[i]["resolution_basis"] = "go-module-package-file-candidate"
+            rows[i]["source_path"] = ProjectLinksFixture.path("main.go")
+            rows[i]["target_path"] = ProjectLinksFixture.path("pkg/a.go")
+        }
+        value["links"] = rows
+        let page = try decode(value, index: index)
+        precondition(page.links[0].canOpenTarget && page.links[0].evidenceLabel.contains("Go package import")
+            && page.links[0].label.contains("representative Go package file")
+            && page.links[0].label.contains("build constraints are not evaluated"))
+        for (key, wrong) in [("language", "rust"), ("lexical_import_kind", "rust-use"),
+            ("resolution_basis", "python-relative-module-candidate"), ("resolution_basis", "ambiguous-catalog-target")] {
+            var bad = value, changed = rows
+            changed[0][key] = wrong; bad["links"] = changed; refuse(bad, index: index)
+        }
+        for bytes in ["131073", "33554432", "18446744073709551615"] {
+            var bad = value; bad["parsed_module_bytes"] = bytes; refuse(bad, index: index)
+        }
+        for (basis, label) in [("go-module-context-unavailable", "go.mod context"),
+            ("go-nested-module-boundary", "nested Go module")] {
+            var unresolved = value, changed = rows
+            for i in changed.indices {
+                changed[i]["resolution"] = "unresolved"; changed[i]["resolution_basis"] = basis
+                for key in ["target_file_id", "target_path", "target_revision", "target_sha256", "target_bytes"] {
+                    changed[i][key] = NSNull()
+                }
+            }
+            unresolved["links"] = changed
+            let edge = try decode(unresolved, index: index).links[0]
+            precondition(!edge.canOpenTarget && edge.label.contains(label))
+            changed[0]["target_file_id"] = "4"; changed[0]["target_path"] = ProjectLinksFixture.path("pkg/a.go")
+            unresolved["links"] = changed; refuse(unresolved, index: index)
+        }
+    }
+
     /// The C/C++ wire policy never promotes an angle or computed header to a
     /// catalog target, even when a foreign envelope supplies target metadata.
     private static func cppWire(_ index: AtlasPreparedIndex) throws {
@@ -408,6 +450,7 @@ import Foundation
         try wire(index)
         try pythonWire(index)
         try cppWire(index)
+        try goWire(index)
         try javascriptLoadWire(index)
         try rustUseWire(index)
         let live = ProjectLinksFixture(includesImports: true)
