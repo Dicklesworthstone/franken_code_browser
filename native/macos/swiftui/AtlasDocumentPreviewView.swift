@@ -7,6 +7,7 @@ import AppKit
 @MainActor struct AtlasDocumentPreviewView: View {
     @Bindable var model: AtlasDocumentPreviewModel
     var embedded = false
+    var followsSource: Binding<Bool>?
     var openSource: AtlasDocumentPreviewModel.SourceNavigation?
     var openLocalLink: AtlasDocumentPreviewModel.LocalNavigation?
     var closePreview: (() -> Void)?
@@ -65,6 +66,10 @@ import AppKit
             Spacer()
             if embedded {
                 Button(showsContents ? "Hide contents" : "Contents") { showsContents.toggle() }
+                if let followsSource {
+                    Toggle("Follow source", isOn: followsSource)
+                        .help("Follow source page, line, Find and occurrence navigation after the source reader is idle. This uses enclosing Markdown blocks; scrolling within either page remains independent.")
+                }
             }
             TextField("Columns", text: $model.widthInput)
                 .frame(width: 64).textFieldStyle(.roundedBorder)
@@ -106,8 +111,8 @@ import AppKit
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("From source page", action: model.fromSource).disabled(!model.canNavigate)
-                    .help("Locate this source page in the exact logical preview")
+                Button("From source page", action: model.fromSource).disabled(!model.canLocateSource)
+                    .help("Locate the current retained source anchor in this styled layout without reflowing the document")
             } else {
             Button("Back", action: model.back).disabled(!model.canBack)
             Button("Forward", action: model.forward).disabled(!model.canForward)
@@ -119,7 +124,7 @@ import AppKit
                 .onSubmit(model.goToLine)
             Button("Go", action: model.goToLine).disabled(!model.canNavigate)
             Spacer()
-            Button("From source page", action: model.fromSource).disabled(!model.canNavigate)
+            Button("From source page", action: model.fromSource).disabled(!model.canLocateSource)
                 .help("Locate the current source reader's original byte anchor in this document")
             }
         }

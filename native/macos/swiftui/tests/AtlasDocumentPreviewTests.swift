@@ -18,6 +18,7 @@ import Foundation
     var inventory: AtlasReaderDocumentInventory?
     var displayInventory: AtlasDocumentDisplayInventory?
     var totalDisplayItems: UInt64 = 385
+    var qualifiedDisplaySources = true
     var unmappedDisplayItems: Set<UInt64> = []
     var totalLines: UInt64 = 1024
     var unmappedRows: Set<UInt64> = []
@@ -91,7 +92,7 @@ import Foundation
             displayInventory = .init(document: inventory, width: width,
                 bounds: .init(x: 0, y: 0, width: Double(width), height: Double(totalDisplayItems) * 20),
                 totalItems: totalDisplayItems, unresolvedImages: (totalDisplayItems + 1) / 2,
-                qualifiedSources: true, fonts: [])
+                qualifiedSources: qualifiedDisplaySources, fonts: [])
             return .display(display(first: 0), fonts: [])
         case .displayPage(let first): return .display(display(first: first), fonts: nil)
         case .displayFromSource(let offset):
@@ -422,6 +423,8 @@ import Foundation
         await externalWebLinks()
         await styledLifecycle()
         await styledDeliveries()
+        await sourceFollowing()
+        await styledNavigationTransactions()
         print("AtlasDocumentPreviewTests: \(checks) checks passed")
     }
 
@@ -616,14 +619,16 @@ import Foundation
             check(m.showsStyled && m.displayPage?.first == 192,
                   "Switching back to Styled restores the current Text source block")
             m.lineInput = "257"; m.goToLine(); await wait { !m.busy }
-            check(m.page?.first == 256 && !m.showsStyled && m.displayPage == nil,
-                  "Logical row navigation cannot leave an unrelated styled page visible")
+            check(m.page?.first == 256 && m.showsStyled && m.displayPage?.first == 128,
+                  "Logical row navigation restores the corresponding styled block without changing presentation")
+            let callsBeforeStyled = f.requests.count
             m.selectStyled(true); await wait { !m.busy }
-            check(m.displayPage?.first == 128, "Styled retry follows the newly accepted logical row")
+            check(m.displayPage?.first == 128 && f.requests.count == callsBeforeStyled,
+                  "An already synchronized styled page needs no preparation")
             m.prepareLinks(); await wait { !m.busy }
             m.openLink(m.links!.target(id: 2)!); await wait { !m.busy }
-            check(m.page?.first == 0 && m.displayPage == nil && !m.showsStyled && !m.canDisplayBack,
-                  "Accepted document-link navigation retires old styled content and its history")
+            check(m.page?.first == 0 && m.displayPage?.first == 0 && m.showsStyled && !m.canDisplayBack,
+                  "Document-link navigation remaps the retained styled layout and retires only its old page history")
             m.selectStyled(true); await wait { !m.busy }
             let sourcePage = m.displayPage!, sourceItem = sourcePage.items[0]
             var sourceTargets: [AtlasReaderDocumentTarget] = []
@@ -673,6 +678,186 @@ import Foundation
             f.holdDisplay = false; m.selectStyled(true); await wait { !m.busy }
             check(m.page?.first == 64 && m.showsStyled && m.displayPage?.first == 32,
                   "Logical navigation and an explicit styled retry still work after a typography refusal")
+        }
+    }
+
+    @MainActor private static func sourceFollowing() async {
+        do {
+            let f = Fixture(), m = f.model()
+            f.exactSourceRows = true
+            await ready(f, m)
+            let generation = m.page!.inventory.generation, calls = f.requests.count
+            m.setSourceFollowing(true)
+            for anchor in [UInt64(515), 1027, 2051] { m.bind(identity: f.identity, sourceOffset: anchor) }
+            check(f.requests.count == calls && !m.busy,
+                  "Accepted source anchors only queue work until the source owner releases its worker")
+            m.followSourceIfNeeded(); await wait { !m.busy }
+            check(f.lastSourceAnchor == 2051 && m.page?.first == 256
+                  && m.page?.inventory.generation == generation && f.generation == 1,
+                  "One source-follow request consumes the latest exact anchor without preparing or reflowing")
+            let followed = f.requests.count
+            m.followSourceIfNeeded(); await settle()
+            check(f.requests.count == followed, "An accepted anchor cannot trigger an idle retry loop")
+
+            m.bind(identity: f.identity, sourceOffset: 4099)
+            m.openHeading(m.headings!.target(slug: "section-5")!); await wait { !m.busy }
+            let manual = f.requests.count
+            m.followSourceIfNeeded(); await settle()
+            check(m.page?.first == 5 && f.requests.count == manual,
+                  "A deliberate heading action supersedes an older queued source anchor")
+            m.setSourceFollowing(false); m.bind(identity: f.identity, sourceOffset: 1027)
+            m.followSourceIfNeeded(); await settle()
+            check(m.page?.first == 5 && f.requests.count == manual,
+                  "Disabling Follow source keeps the panes independent")
+            m.setSourceFollowing(true); m.followSourceIfNeeded(); await wait { !m.busy }
+            check(m.page?.first == 128 && f.lastSourceAnchor == 1027,
+                  "Re-enabling Follow source uses the current capture's latest anchor")
+        }
+        do {
+            let f = Fixture(), m = f.model()
+            f.exactSourceRows = true
+            await ready(f, m)
+            m.didBecomeIdle = { [weak m] in m?.followSourceIfNeeded() }
+            m.setSourceFollowing(true)
+            f.held = true; m.next(); await wait { f.pending.count == 1 }
+            for anchor in [UInt64(1027), 2051, 3075] { m.bind(identity: f.identity, sourceOffset: anchor) }
+            let calls = f.requests.count
+            m.followSourceIfNeeded()
+            check(f.requests.count == calls && f.cancels == 0,
+                  "Queuing source navigation does not cancel an active deliberate preview operation")
+            f.held = false; f.release(); await wait { !m.busy && m.page?.first == 384 }
+            check(f.lastSourceAnchor == 3075 && f.requests.count == calls + 1,
+                  "The idle callback drains only the latest source anchor after the existing operation")
+        }
+        do {
+            let f = Fixture(), m = f.model()
+            await ready(f, m)
+            m.setSourceFollowing(true); m.followSourceIfNeeded(); await wait { !m.busy }
+            let target = m.page!.target(at: 0)!
+            var navigations = 0
+            m.showSource(target) { received in
+                navigations += 1
+                m.bind(identity: f.identity, sourceOffset: received.line.enclosingOriginal!.start)
+            }
+            await wait { !m.busy }
+            let calls = f.requests.count
+            m.followSourceIfNeeded(); await settle()
+            check(navigations == 1 && f.requests.count == calls && m.source?.target == target,
+                  "A preview-to-source action consumes its echo without remapping or a navigation loop")
+        }
+        for closing in [false, true] {
+            let f = Fixture(), m = f.model()
+            await ready(f, m)
+            let accepted = m.page!.id
+            m.setSourceFollowing(true); m.bind(identity: f.identity, sourceOffset: 1027)
+            f.held = true; m.followSourceIfNeeded(); await wait { f.pending.count == 1 }
+            if closing { m.close() } else { m.setSourceFollowing(false) }
+            let calls = f.requests.count
+            f.release(); await settle(); m.followSourceIfNeeded(); await settle()
+            check(!m.busy && !m.followsSource && f.requests.count == calls
+                  && (closing ? m.page == nil : m.page?.id == accepted),
+                  "Close and Follow source disable withdraw pending work and reject its late publication")
+            check(!m.authorized && (closing ? !m.canLocateSource : m.canLocateSource),
+                  "Canceled automatic Text following cannot reactivate old logical row tokens and can recover without reflow")
+        }
+    }
+
+    @MainActor private static func styledNavigationTransactions() async {
+        do {
+            let f = Fixture(), m = f.model(richSupported: true)
+            f.exactSourceRows = true
+            m.bind(identity: f.identity, sourceOffset: 1027); m.prepare()
+            await wait { !m.busy }
+            m.didBecomeIdle = { [weak m] in m?.followSourceIfNeeded() }
+            m.nextDisplay(); await wait { !m.busy }
+            check(m.displayPage?.first == 192 && m.displayPage?.items.first?.original?.start == 3075,
+                  "The reflow fixture starts at a styled block different from its pending source target")
+            m.bind(identity: f.identity, sourceOffset: 2051)
+            f.held = true; m.widthInput = "80"; m.prepare()
+            await wait { f.pending.count == 1 }
+            m.setSourceFollowing(true)
+            f.held = false; f.release()
+            await wait { !m.busy && m.page?.first == 256 }
+            let typographyPrepares = f.requests.filter { if case .prepareDisplay = $0 { true } else { false } }.count
+            let sourceAnchors = f.requests.compactMap { request -> UInt64? in
+                if case .fromSource(let offset) = request { return offset }; return nil
+            }
+            check(m.showsStyled && m.displayPage?.first == 128 && sourceAnchors.suffix(2).elementsEqual([3075, 2051])
+                  && f.generation == 2 && typographyPrepares == 2,
+                  "Enabling follow during reflow survives internally chained typography preparation and reaches the current source")
+        }
+        do {
+            let f = Fixture(), m = f.model(richSupported: true)
+            f.exactSourceRows = true
+            await ready(f, m)
+            let logical = m.page!, display = m.displayPage!, generation = f.generation
+            let target = logical.target(at: logical.first)!
+            f.holdDisplay = true
+            m.bind(identity: f.identity, sourceOffset: 1027); m.fromSource()
+            await wait { f.pending.count == 1 }
+            check(m.busy && !m.authorized && m.page?.id == logical.id && m.displayPage?.id == display.id,
+                  "Styled navigation retains old pixels read-only until both source maps validate")
+            let calls = f.requests.count
+            m.copy(target, mode: .renderedText) { _ in preconditionFailure("Old logical token copied during remap") }
+            check(f.requests.count == calls, "A two-stage navigation withdraws old row action authority immediately")
+            f.release(); await wait { !m.busy }
+            check(m.authorized && m.showsStyled && m.page?.first == 128 && m.displayPage?.first == 64
+                  && m.displayPage?.inventory.matches(display.inventory) == true && f.generation == generation,
+                  "Source navigation atomically publishes matching logical and styled pages from the existing layout")
+
+            let acceptedPage = m.page!, acceptedDisplay = m.displayPage!
+            m.bind(identity: f.identity, sourceOffset: 2051); m.fromSource()
+            await wait { f.pending.count == 1 }
+            f.reject(.invalidResponse); await wait { !m.busy }
+            check(m.page?.id == acceptedPage.id && m.displayPage?.id == acceptedDisplay.id && m.showsStyled
+                  && !m.authorized && m.canLocateSource && !m.canBack && m.coverage.contains("read-only"),
+                  "A failed styled remap cannot publish half a navigation or reuse the coordinator's retired logical token")
+            f.holdDisplay = false; m.fromSource(); await wait { !m.busy }
+            check(m.authorized && m.showsStyled && m.page?.first == 256 && m.displayPage?.first == 128
+                  && f.generation == generation,
+                  "An explicit source-anchor retry restores action authority without reflow")
+        }
+        do {
+            let f = Fixture(), m = f.model(richSupported: true)
+            f.exactSourceRows = true
+            await ready(f, m)
+            m.setSourceFollowing(true); f.holdDisplay = true
+            m.bind(identity: f.identity, sourceOffset: 1027); m.followSourceIfNeeded()
+            await wait { f.pending.count == 1 }
+            m.bind(identity: f.identity, sourceOffset: 2051)
+            m.bind(identity: f.identity, sourceOffset: 3075); m.followSourceIfNeeded()
+            await wait { f.pending.count == 2 }
+            f.release(1); await wait { !m.busy }
+            let accepted = m.displayPage!.id
+            check(m.page?.first == 384 && m.displayPage?.first == 192 && m.authorized && m.showsStyled,
+                  "Rapid source updates recover from a canceled styled remap using only the latest anchor")
+            let calls = f.requests.count
+            f.release(); await settle(); m.followSourceIfNeeded(); await settle()
+            check(m.displayPage?.id == accepted && f.requests.count == calls && f.generation == 1,
+                  "A late earlier styled response cannot replace the latest source location or restart work")
+        }
+        do {
+            let f = Fixture(), m = f.model(richSupported: true)
+            await ready(f, m)
+            m.setSourceFollowing(true); f.holdDisplay = true
+            m.bind(identity: f.identity, sourceOffset: 1027); m.followSourceIfNeeded()
+            await wait { f.pending.count == 1 }
+            let calls = f.requests.count
+            m.bind(identity: Fixture.identity(revision: 2), sourceOffset: 2051)
+            f.release(); await settle(); m.followSourceIfNeeded(); await settle()
+            check(m.page == nil && m.displayPage == nil && !m.authorized && !m.canLocateSource
+                  && f.requests.count == calls,
+                  "Capture replacement drops the old mapping, pending anchor and recovery authority")
+        }
+        do {
+            let f = Fixture(), m = f.model(richSupported: true)
+            f.qualifiedDisplaySources = false
+            await ready(f, m)
+            let calls = f.requests.count, logical = m.page!.id, display = m.displayPage!.id
+            m.bind(identity: f.identity, sourceOffset: 1027); m.fromSource()
+            check(f.requests.count == calls && m.authorized && m.page?.id == logical && m.displayPage?.id == display
+                  && m.notice.contains("no qualified source mapping"),
+                  "An unqualified styled layout refuses guessed synchronization without changing the accepted pages")
         }
     }
 

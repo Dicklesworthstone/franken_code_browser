@@ -103,6 +103,7 @@ struct AtlasMarkdownPreviewPreference {
     private(set) var displayPage: AtlasDocumentDisplayPage?
     private(set) var displayFonts: [AtlasDocumentDisplayFont] = []
     private(set) var showsStyled = false
+    private(set) var followsSource = false
     private var prefersStyled = true
     private var displayHistory: [UInt64] = []
     private(set) var busy = false
@@ -112,6 +113,10 @@ struct AtlasMarkdownPreviewPreference {
     var lineInput = "1"
     private var identity: AtlasReaderIdentity?
     private var sourceOffset: UInt64 = 0
+    private var pendingSourceFollow: UInt64?
+    private var sourceNavigationEcho: UInt64?
+    private var followingSource = false
+    private var canRestoreNavigation = false
     private var history = AtlasNavigationHistory<UInt64>()
     private var headingHistory: [UInt64] = []
     private var linkHistory: [UInt64] = []
@@ -123,6 +128,9 @@ struct AtlasMarkdownPreviewPreference {
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var operation = UUID()
     @ObservationIgnored private var preferredPresentation: UUID?
+    /// The source owner arbitrates the shared worker. A preview completion may
+    /// wake that owner, but cannot decide that source/selection work is idle.
+    @ObservationIgnored var didBecomeIdle: (@MainActor () -> Void)?
 
     init(supported: Bool, richSupported: Bool = false, execute: @escaping Execute,
          cancel: @escaping @MainActor () -> Void, revoke: @escaping @MainActor () -> Void) {
@@ -150,6 +158,10 @@ struct AtlasMarkdownPreviewPreference {
     }
     var canPrepare: Bool { unavailableReason == nil }
     var canNavigate: Bool { authorized && page != nil && !busy }
+    /// A canceled navigation may have replaced the worker's logical
+    /// page token. Source anchoring needs only the retained inventory, so it
+    /// can recover without reflow while old row/copy actions remain read-only.
+    var canLocateSource: Bool { (authorized || canRestoreNavigation) && page != nil && !busy }
     var canBack: Bool { canNavigate && history.canBack }
     var canForward: Bool { canNavigate && history.canForward }
     var canNext: Bool { canNavigate && page?.next != nil }
@@ -173,7 +185,9 @@ struct AtlasMarkdownPreviewPreference {
                 ?? "Prepare a logical FrankenMarkdown preview from the retained source."
         }
         let inventory = page.inventory
-        let status = authorized ? "" : "Previous preview is read-only; prepare again before navigating or copying. "
+        let status = authorized ? "" : (canRestoreNavigation
+            ? "Previous preview is read-only; use From source page to retry navigation, or prepare again. "
+            : "Previous preview is read-only; prepare again before navigating or copying. ")
         if showsStyled, let display = displayPage {
             let imageSlots = display.items.filter { if case .image = $0.content { return true }; return false }.count
             let imageCoverage = imageSlots == 0 ? "" :
@@ -195,11 +209,46 @@ struct AtlasMarkdownPreviewPreference {
     /// Same-capture source paging changes only the synchronization anchor.
     /// Opening another file/capture revokes every old page and heading target.
     func bind(identity next: AtlasReaderIdentity, sourceOffset: UInt64) {
-        if identity?.matches(next) != true {
+        let sameCapture = identity?.matches(next) == true
+        if !sameCapture {
+            let following = followsSource
             close()
             identity = next
+            followsSource = following
         }
-        self.sourceOffset = min(sourceOffset, next.capturedBytes)
+        let nextOffset = min(sourceOffset, next.capturedBytes)
+        self.sourceOffset = nextOffset
+        // New accepted source navigation supersedes an automatic remap. It
+        // never interrupts a deliberate preview action or starts worker work.
+        if followingSource { cancel(silent: true) }
+        if sourceNavigationEcho == nextOffset {
+            sourceNavigationEcho = nil
+            pendingSourceFollow = nil
+        } else {
+            sourceNavigationEcho = nil
+            pendingSourceFollow = followsSource ? nextOffset : nil
+        }
+    }
+
+    /// A split-pane preference queues one latest capture-bound anchor. The
+    /// enclosing reader calls followSourceIfNeeded only after its worker drains.
+    func setSourceFollowing(_ enabled: Bool) {
+        guard followsSource != enabled else { return }
+        followsSource = enabled
+        if enabled {
+            pendingSourceFollow = identity == nil ? nil : sourceOffset
+        } else {
+            pendingSourceFollow = nil
+            if followingSource { cancel(silent: true) }
+        }
+    }
+    func followSourceIfNeeded() {
+        guard followsSource, canLocateSource, let pendingSourceFollow,
+              let inventory = page?.inventory else { return }
+        // Consume before submission: refusal/cancellation requires another
+        // source navigation or an explicit From source page action, not a loop.
+        self.pendingSourceFollow = nil
+        navigate(.fromSource(offset: max(inventory.sourceBase, pendingSourceFollow)), automaticSourceFollow: true)
     }
 
     /// Called only by the active reader after an explicit window preference or
@@ -255,6 +304,7 @@ struct AtlasMarkdownPreviewPreference {
         // Reflow may commit in Rust before cancellation reaches its response.
         // Keep old pixels readable but revoke their activation/copy immediately.
         authorized = false
+        canRestoreNavigation = false
         source = nil
         links = nil; linkHistory = []
         displayPage = nil; displayFonts = []; displayHistory = []; showsStyled = false
@@ -275,7 +325,7 @@ struct AtlasMarkdownPreviewPreference {
             }
             return .prepared(page, headings)
         }, then: { model in
-            if model.richSupported && model.prefersStyled { model.prepareDisplay() }
+            if model.richSupported && model.prefersStyled { model.prepareDisplay(preservingSourceFollow: true) }
         }) { model, result in
             guard case .prepared(let page, let headings) = result, let identity = model.identity,
                   page.inventory.identity.matches(identity), page.inventory.width == width,
@@ -319,7 +369,34 @@ struct AtlasMarkdownPreviewPreference {
     private func retireDisplayLocation() {
         displayPage = nil; displayHistory = []; showsStyled = false
     }
-    func prepareDisplay() {
+    /// Navigation reuses the accepted shaped layout and bundled fonts. Both
+    /// coordinate domains publish together only after the source remap validates.
+    private static func restoredDisplay(for page: AtlasReaderDocumentPage,
+        inventory: AtlasDocumentDisplayInventory, anchor: UInt64?,
+        fonts: [AtlasDocumentDisplayFont], execute: Execute) async throws -> AtlasDocumentDisplayPage {
+        guard inventory.qualifiedSources, page.inventory.matches(inventory.document) else {
+            throw AtlasReaderError.invalidResponse
+        }
+        let original: UInt64?
+        if let anchor { original = anchor }
+        else if page.first == page.inventory.totalLines { original = page.inventory.identity.capturedBytes }
+        else { original = page.lines.lazy.compactMap(\.enclosingOriginal).first?.start }
+        guard let original, original >= page.inventory.sourceBase,
+              original <= page.inventory.identity.capturedBytes else { throw AtlasReaderError.unavailable }
+        let result = try await execute(.displayFromSource(offset: original))
+        guard case .display(let display, nil) = result, display.inventory.matches(inventory) else {
+            throw AtlasReaderError.invalidResponse
+        }
+        try display.validateFonts(fonts)
+        return display
+    }
+    private func installNavigationPage(_ page: AtlasReaderDocumentPage, display: AtlasDocumentDisplayPage?) {
+        self.page = page; source = nil; lineInput = String(page.first + 1)
+        if let display {
+            displayPage = display; displayHistory = []; showsStyled = prefersStyled
+        } else { retireDisplayLocation() }
+    }
+    func prepareDisplay(preservingSourceFollow: Bool = false) {
         guard richSupported, canNavigate, let page else { return }
         if let reason = styledSourceLimitReason {
             // Keep the accepted logical page and its source/heading authority.
@@ -340,6 +417,7 @@ struct AtlasMarkdownPreviewPreference {
             return
         }
         perform(.prepareDisplay(width: width), notice: "Preparing document typography…",
+            preservingSourceFollow: preservingSourceFollow,
             resolve: { result, execute in
                 guard case .display(let first, let fonts?) = result,
                       first.inventory.document.matches(inventory), first.first == 0 else {
@@ -429,7 +507,7 @@ struct AtlasMarkdownPreviewPreference {
         navigate(first: line - 1)
     }
     func fromSource() {
-        guard canNavigate, let inventory = page?.inventory else { return }
+        guard canLocateSource, let inventory = page?.inventory else { return }
         // A UTF-8 BOM precedes the parser's source domain.
         let offset = max(inventory.sourceBase, sourceOffset)
         navigate(.fromSource(offset: offset))
@@ -487,8 +565,30 @@ struct AtlasMarkdownPreviewPreference {
     }
     func openLink(_ target: AtlasReaderDocumentLinkTarget, openLocal: LocalNavigation? = nil) {
         guard allows(target), let previous = page else { return }
+        let styled = showsStyled && prefersStyled ? displayPage?.inventory : nil
+        if target.link.kind.navigatesWithinCapture, styled?.qualifiedSources == false {
+            notice = "This styled layout has no qualified source mapping. Switch to Text to navigate within the document."
+            return
+        }
+        let fonts = displayFonts
+        var restored: AtlasDocumentDisplayPage?
         let move = history.visit(previous.first)
-        perform(.link(target), notice: "Resolving retained document link…", then: { model in
+        if target.link.kind.navigatesWithinCapture, styled != nil {
+            // Submission can replace the coordinator's logical page before
+            // this task resumes. Keep old pixels but withdraw their actions
+            // until both coordinate domains are accepted together.
+            authorized = false; canRestoreNavigation = true; source = nil
+        }
+        perform(.link(target), notice: "Resolving retained document link…", resolve: { result, execute in
+            guard case .link(let activation) = result, activation.target == target else {
+                throw AtlasReaderError.invalidResponse
+            }
+            if let page = activation.page, let styled {
+                restored = try await Self.restoredDisplay(for: page, inventory: styled,
+                    anchor: target.link.kind == .start ? page.inventory.sourceBase : nil, fonts: fonts, execute: execute)
+            }
+            return result
+        }, then: { model in
             // Recheck after the worker has drained and busy state is released.
             // The host callback may synchronously close or replace this reader.
             guard target.link.kind == .local, model.allows(target) else { return }
@@ -501,9 +601,9 @@ struct AtlasMarkdownPreviewPreference {
             if let page = activation.page {
                 guard target.link.kind.navigatesWithinCapture, page.inventory.matches(previous.inventory),
                       model.history.commit(move, resolved: page.first) else { throw AtlasReaderError.invalidResponse }
-                model.page = page; model.source = nil
-                model.lineInput = String(page.first + 1)
-                model.retireDisplayLocation()
+                model.installNavigationPage(page, display: restored)
+                model.authorized = true
+                model.canRestoreNavigation = false
             } else {
                 guard !target.link.kind.navigatesWithinCapture else { throw AtlasReaderError.invalidResponse }
                 switch target.link.kind {
@@ -526,7 +626,8 @@ struct AtlasMarkdownPreviewPreference {
         // cancel this preview, close its sheet or replace the whole reader.
         perform(.source(target), notice: "Locating enclosing captured Markdown…", then: { model in
             guard let identity = model.identity,
-                  model.sourceOffset(for: target, reader: identity) != nil else { return }
+                  let offset = model.sourceOffset(for: target, reader: identity) else { return }
+            if navigate != nil { model.sourceNavigationEcho = offset }
             navigate?(target)
         }) { model, result in
             guard case .source(let source) = result, source.target == target,
@@ -577,12 +678,18 @@ struct AtlasMarkdownPreviewPreference {
     }
 
     /// Source navigation shares the same worker; interrupt only unfinished
-    /// preview work, retaining accepted preview/heading authority for this file.
+    /// preview work. Accepted pixels remain readable; a submitted source remap
+    /// keeps its retired logical tokens read-only until a fresh page validates.
     func cancel(silent: Bool = false) {
+        pendingSourceFollow = nil
+        cancelOperation(silent: silent)
+    }
+    private func cancelOperation(silent: Bool) {
         operation = UUID()
         if task != nil { task?.cancel(); cancelWork() }
         task = nil
         busy = false
+        followingSource = false
         if !silent { notice = "Preview operation canceled. Accepted source and search state are unchanged." }
     }
     func close() {
@@ -590,6 +697,8 @@ struct AtlasMarkdownPreviewPreference {
         revoke()
         identity = nil; page = nil; headings = nil; links = nil; source = nil
         preferredPresentation = nil
+        followsSource = false; pendingSourceFollow = nil; sourceNavigationEcho = nil
+        canRestoreNavigation = false
         displayPage = nil; displayFonts = []; displayHistory = []; showsStyled = false
         authorized = false; history.reset(); headingHistory = []; linkHistory = []
         sourceOffset = 0; lineInput = "1"; notice = ""
@@ -600,20 +709,48 @@ struct AtlasMarkdownPreviewPreference {
         navigate(.window(first: first))
     }
     private func navigate(_ request: AtlasReaderDocumentRequest,
-                          historyMove: AtlasNavigationHistory<UInt64>.Move? = nil) {
-        guard canNavigate, let previous = page else { return }
+                          historyMove: AtlasNavigationHistory<UInt64>.Move? = nil,
+                          automaticSourceFollow: Bool = false) {
+        let restoring: Bool
+        if case .fromSource = request { restoring = canLocateSource } else { restoring = false }
+        guard canNavigate || restoring, let previous = page else { return }
+        let styled = showsStyled && prefersStyled ? displayPage?.inventory : nil
+        if styled?.qualifiedSources == false {
+            notice = "This styled layout has no qualified source mapping. Switch to Text to navigate within the document."
+            return
+        }
+        let anchor: UInt64?
+        switch request {
+        case .fromSource(let offset): anchor = offset
+        case .heading(let target): anchor = target.heading.original.start
+        default: anchor = nil
+        }
+        let fonts = displayFonts
+        var restored: AtlasDocumentDisplayPage?
         // Heading/source requests resolve their flow row in the shared engine;
         // only that accepted row, never the transient target, enters history.
         let move = historyMove ?? history.visit(previous.first)
-        perform(request, notice: "Reading retained Markdown…") { model, result in
+        if styled != nil || automaticSourceFollow {
+            authorized = false; canRestoreNavigation = true; source = nil
+        }
+        perform(request, notice: automaticSourceFollow ? "Following the retained source location…" : "Reading retained Markdown…",
+            automaticSourceFollow: automaticSourceFollow, resolve: { result, execute in
+                guard case .page(let page) = result, page.inventory.matches(previous.inventory) else {
+                    throw AtlasReaderError.invalidResponse
+                }
+                if let styled {
+                    restored = try await Self.restoredDisplay(for: page, inventory: styled,
+                        anchor: anchor, fonts: fonts, execute: execute)
+                }
+                return result
+            }) { model, result in
             guard case .page(let page) = result, page.inventory.matches(previous.inventory),
                   model.history.commit(move, resolved: page.first) else {
                 throw AtlasReaderError.invalidResponse
             }
-            model.page = page
-            model.source = nil
-            model.lineInput = String(page.first + 1)
-            model.retireDisplayLocation()
+            model.installNavigationPage(page, display: restored)
+            model.authorized = true
+            model.canRestoreNavigation = false
         }
     }
     private func loadHeadings(first: UInt64, goingBack: Bool = false) {
@@ -645,14 +782,22 @@ struct AtlasMarkdownPreviewPreference {
         }
     }
     private func perform(_ request: AtlasReaderDocumentRequest, notice: String,
+                         automaticSourceFollow: Bool = false,
+                         preservingSourceFollow: Bool = false,
                          resolve: (@MainActor (AtlasReaderDocumentResult, Execute) async throws -> AtlasReaderDocumentResult)? = nil,
                          then: (@MainActor (AtlasDocumentPreviewModel) -> Void)? = nil,
                          accept: @escaping @MainActor (AtlasDocumentPreviewModel, AtlasReaderDocumentResult) throws -> Void) {
         guard let identity else { return }
-        cancel(silent: true)
+        cancelOperation(silent: true)
+        // A deliberate preview action takes precedence over an older source
+        // follow request. New source navigation can queue a newer anchor while
+        // this operation is running.
+        if !preservingSourceFollow { pendingSourceFollow = nil }
+        sourceNavigationEcho = nil
         let ticket = UUID()
         operation = ticket
         busy = true
+        followingSource = automaticSourceFollow
         self.notice = notice
         let execute = self.execute
         task = Task { [weak self] in
@@ -671,8 +816,12 @@ struct AtlasMarkdownPreviewPreference {
                 try accept(self, result)
                 if self.operation == ticket {
                     self.busy = false; self.task = nil
+                    self.followingSource = false
                     then?(self)
-                    // No mutation after calling the reentrant host callback.
+                    // A reentrant source callback may have started another
+                    // operation or closed this reader. Only its owner can
+                    // decide whether the shared worker is available again.
+                    if self.operation == ticket { self.didBecomeIdle?() }
                 }
             } catch {
                 guard let self, self.operation == ticket, !Task.isCancelled else { return }
@@ -687,6 +836,8 @@ struct AtlasMarkdownPreviewPreference {
                     }
                 }
                 self.busy = false; self.task = nil
+                self.followingSource = false
+                self.didBecomeIdle?()
             }
         }
     }

@@ -1896,8 +1896,14 @@ restores its original-byte anchor; otherwise the source page and native selectio
 stay in place. Hidden history readers and pins do not open previews.
 
 Reopening a prepared reader preview reuses its captured document and last preview
-position. Choose **From source page** to resynchronize after independent source
-navigation. Pending work is canceled when its presentation is withdrawn.
+position. **Split preview** enables **Follow source** by default. Source paging,
+line/column navigation, Find hits, outline selections and identifier occurrences
+then move the preview to their verified original-byte anchor after the source
+reader finishes. Turn off **Follow source** to navigate the panes independently;
+**From source page** remains an explicit synchronization action in either mode.
+Scrolling within a source or preview page remains independent. This is enclosing
+Markdown-block navigation, not pixel scrolling or a glyph-exact correspondence.
+Pending work is canceled when its presentation is withdrawn.
 Canceled or stale atlas jobs cannot replace a newer project, layout or toggle
 choice, and reader-handle retirement remains bounded even if a close is busy.
 
@@ -1924,8 +1930,21 @@ the accepted display without reparsing or changing its source identity.
 
 **Previous page** and **Next page** move through bounded display pages. Switching
 between Styled and Text, or reflowing a mapped page, restores its enclosing
-captured Markdown block. Click a mapped element, use **Show source**, or use
-its accessibility action to inspect that block; split mode also navigates the
+captured Markdown block. Headings, document links, flow-row jumps and source
+following keep **Styled** selected and use the existing qualified display layout;
+they do not reparse, reshape or reload bundled fonts. Only the latest source
+anchor is queued while another operation is running. Source reads, selected-byte
+mapping and pinning finish before automatic following can use the shared worker.
+Preview-to-source actions consume their matching echo without a navigation loop.
+
+The logical page and matching styled page publish together. If a remap fails or
+is canceled after its submission, the previous pixels remain readable but their
+old row actions are disabled. **From source page**, or the next source navigation
+with Follow source enabled, can retry against the retained layout without reflow.
+An unqualified styled source map keeps the accepted pages in place and explains
+that Text is required for navigation. Closing or replacing the capture withdraws
+pending anchors and old page authority. Click a mapped element, use **Show source**,
+or use its accessibility action to inspect that block; split mode also navigates the
 source pane. This correspondence is at block granularity. It does not claim
 glyph-exact or inline-exact source spans. Text selection and verified copy
 remain available in Text and in the source reader.
@@ -1960,6 +1979,12 @@ host regression `crates/fcb-app/tests/retained_reader_large_document.rs`
 exercises actual larger Markdown parsing and original BOM/CRLF offsets, including
 the exact 256 KiB boundary. These code-first additions await independent
 execution; they do not qualify native drawing or raise the styled-rendering limit.
+
+`tests/test-document-preview.sh` and the selected-file reader cases in
+`tests/test-native-open.sh` include authored source-follow coalescing, worker
+arbitration, Styled navigation, failed/canceled remap recovery and stale-delivery
+regressions. Independent strict-RCH execution and physical-Mac split-pane
+interaction qualification remain pending.
 
 The bundled upstream shaping profile does not cover every writing system or
 combining sequence. Unsupported text leaves Text and the exact source readable.

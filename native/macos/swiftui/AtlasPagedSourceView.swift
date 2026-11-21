@@ -33,6 +33,7 @@ import AppKit
     @State private var showsDocument = false
     @State private var presentingPreferredPreview = false
     @State private var showsSplitPreview = false
+    @State private var followsSource = true
     @State private var wrapsLines = false
     @State private var showsLineNumbers = true
     @State private var showsWhitespace = false
@@ -110,6 +111,7 @@ import AppKit
                 sourcePane.frame(minWidth: 380, maxWidth: .infinity, maxHeight: .infinity)
                 if showsSplitPreview {
                     AtlasDocumentPreviewView(model: model.documentPreview, embedded: true,
+                        followsSource: $followsSource,
                         openSource: openPreviewSource, openLocalLink: localNavigation, closePreview: { showsSplitPreview = false })
                 }
             }
@@ -124,14 +126,20 @@ import AppKit
                 AtlasReaderExportView(reader: model, exporter: exporter, target: exportTarget)
             }
         }
-        .onAppear { if ownsModel { open() } }
+        .onAppear {
+            if ownsModel { open() }
+            updateSourceFollowing()
+        }
         .onDisappear {
+            model.setPreviewSourceFollowing(false)
             withdrawPreferredPreview()
             exporter.cancel()
             closeLinked(); if ownsModel { model.close() }; copyNotice = ""
         }
         .onChange(of: preferredPreviewRequest, initial: true) { _, _ in updatePreferredPreview() }
         .onChange(of: preferredPreviewReady) { _, _ in updatePreferredPreview() }
+        .onChange(of: showsSplitPreview) { _, _ in updateSourceFollowing() }
+        .onChange(of: followsSource) { _, _ in updateSourceFollowing() }
         .onChange(of: project?.info?.owner) { _, _ in projectChanged() }
         .onChange(of: project?.rootAccessIdentity) { _, _ in projectChanged() }
         .onChange(of: project?.closed) { _, _ in projectChanged() }
@@ -589,14 +597,14 @@ import AppKit
                     preparePreview()
                 }
                 .disabled(model.page == nil || model.busy || showsSplitPreview)
-                .help("Preview the same retained capture with headings and source mapping; UTF-8 sources up to 64 KiB")
+                .help("Preview the same retained capture with headings and source mapping; Text up to 256 KiB, Styled up to 64 KiB of UTF-8")
                 Button(showsSplitPreview ? "Hide preview" : "Split preview") {
                     showsSplitPreview.toggle()
                     if showsSplitPreview { preparePreview() }
                     else { model.documentPreview.cancel(silent: true) }
                 }
                 .disabled(model.page == nil || model.busy || showsDocument)
-                .help("Read source and Markdown side by side from one retained capture; each pane scrolls independently")
+                .help("Read source and Markdown side by side; Follow source tracks page, line and search navigation through enclosing Markdown blocks")
                 Button("Previous hit") { model.moveHit(backwards: true) }.disabled(!model.canMoveHit)
                 Button("Next hit") { model.moveHit(backwards: false) }.disabled(!model.canMoveHit)
                 if let position = model.findPositionLabel {
@@ -620,6 +628,9 @@ import AppKit
     private var preferredPreviewReady: Bool {
         model.page != nil && !model.busy && !showsDocument && !showsSplitPreview
             && !showsLinked && !showsOutline && !showsReferences && !showsExport
+    }
+    private func updateSourceFollowing() {
+        model.setPreviewSourceFollowing(showsSplitPreview && followsSource)
     }
 
     private func updatePreferredPreview() {

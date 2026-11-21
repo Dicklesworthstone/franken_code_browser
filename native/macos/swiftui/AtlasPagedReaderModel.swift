@@ -100,6 +100,7 @@ import Observation
     @ObservationIgnored private var pendingPin: AtlasPagedReaderModel?
     private var forkedCapture = false
     private var retainedOnly = false
+    private var previewSourceFollowing = false
 
     init(transport: AtlasReaderTransport, search: AtlasReaderSearchTransport? = nil,
          outline: AtlasReaderOutlineTransport? = nil,
@@ -122,12 +123,27 @@ import Observation
                 && document?.displayFont != nil && document?.displayFromSource != nil,
             execute: { try await coordinator.document($0) },
             cancel: { coordinator.cancel() }, revoke: { coordinator.revokeDocument() })
+        documentPreview.didBecomeIdle = { [weak self] in self?.resumeDeferredReaderWork() }
     }
     deinit { task?.cancel(); textSelectionTask?.cancel() }
 
     var canGoBack: Bool { history.canBack && !busy }
     var canGoForward: Bool { history.canForward && !busy }
     var canGoNext: Bool { page?.nextOffset != nil && !busy }
+    /// The visible split pane opts in. Binding an accepted source page only
+    /// queues its latest anchor; automatic preview work never preempts a source
+    /// navigation, pin, or a canceled selection call that is still draining.
+    func setPreviewSourceFollowing(_ enabled: Bool) {
+        previewSourceFollowing = enabled
+        documentPreview.setSourceFollowing(enabled)
+        resumeDeferredReaderWork()
+    }
+    private func resumeDeferredReaderWork() {
+        startTextSelectionWork()
+        guard !busy, !pinning, !resolvingTextSelection, textSelectionTask == nil,
+              !documentPreview.busy else { return }
+        documentPreview.followSourceIfNeeded()
+    }
     var canRefresh: Bool { page != nil && refreshInput != nil && !busy && !documentPreview.busy }
     /// An explicitly admitted current-file capability, never the page's label.
     /// Forks carry this lease independently; retained-only imports have none.
@@ -303,6 +319,7 @@ import Observation
         comparisonSelection = nil
         guard let range, range.length != 0 else {
             clearTextSelection()
+            resumeDeferredReaderWork()
             return
         }
         if let intent = textSelectionIntent, intent.source === source,
@@ -374,7 +391,7 @@ import Observation
                 if textSelectionLoop == loop {
                     textSelectionLoop = nil
                     textSelectionTask = nil
-                    startTextSelectionWork()
+                    resumeDeferredReaderWork()
                 }
             }
             while !Task.isCancelled, let intent = pendingTextSelection {
@@ -463,6 +480,7 @@ import Observation
                 pendingPin = nil
                 pinOperation = nil
                 pinning = false
+                resumeDeferredReaderWork()
             }
         }
         do {
@@ -1182,9 +1200,10 @@ import Observation
         positionWork = false
         notice = wasRefreshing ? "Refresh canceled. The previous retained source is unchanged."
             : (page == nil ? "Source opening canceled." : "Navigation canceled. The current retained page is unchanged.")
-        startTextSelectionWork()
+        resumeDeferredReaderWork()
     }
     func close() {
+        previewSourceFollowing = false
         clearTextSelection()
         cancelPin()
         documentPreview.close()
@@ -1273,7 +1292,14 @@ import Observation
         clearTextSelection()
         comparisonSelection = nil
         self.page = page
-        documentPreview.bind(identity: page.identity, sourceOffset: page.start)
+        // Search/outline/occurrence windows include context before their exact
+        // target. Follow that verified original anchor, not the context start
+        // and never the native UTF-16 selection or a rendered-flow coordinate.
+        let previewAnchor = page.position?.originalOffset ?? page.selection?.target.start
+            ?? page.symbolSelection?.target.symbol.selectedRange.start
+            ?? page.referenceSelection?.target.occurrence.range.start ?? page.start
+        documentPreview.bind(identity: page.identity, sourceOffset: previewAnchor)
+        documentPreview.setSourceFollowing(previewSourceFollowing)
         let source = AtlasSource(path: page.identity.displayPath, text: page.text)
         self.source = source
         selectedRange = page.selection.flatMap { source.utf16Range(byteStart: $0.utf8Start, byteEnd: $0.utf8End) }
@@ -1292,7 +1318,7 @@ import Observation
     private func finish(_ ticket: UUID) {
         guard operation == ticket else { return }
         busy = false; isRefreshing = false; task = nil; queryWork = false; outlineWork = false; referenceWork = false; positionWork = false
-        startTextSelectionWork()
+        resumeDeferredReaderWork()
     }
     private func fail(_ error: Error, ticket: UUID) {
         guard operation == ticket, !Task.isCancelled else { return }

@@ -4,7 +4,12 @@ import Dispatch
 /// Fixed C-boundary receipts; all admission, transaction, page/document
 /// decoding, refresh, cancellation and retirement use production models.
 private final class FileBoundary: @unchecked Sendable {
+    struct Counts {
+        var documents = 0; var preparations = 0; var fromSource = 0; var displayFromSource = 0
+        var cancellations = 0; var active = 0; var peak = 0
+    }
     private let lock = NSLock()
+    private var counts = Counts()
     private var next: UInt64 = 40
     private var sources: [UInt64: DocumentBoundary] = [:]
     private var paths: [String] = []
@@ -12,8 +17,11 @@ private final class FileBoundary: @unchecked Sendable {
     private var gate: DocumentCallGate?
     private var windowGate: DocumentCallGate?
     private var refuseWindow = false
+    private var displayGate: DocumentCallGate?
+    private var refuseDisplay = false
     var openedPaths: [String] { lock.withLock { paths } }
     var closes: Int { lock.withLock { closed } }
+    var snapshot: Counts { lock.withLock { counts } }
     func blockOpen() -> DocumentCallGate {
         let gate = DocumentCallGate(); lock.withLock { self.gate = gate }; return gate
     }
@@ -21,6 +29,37 @@ private final class FileBoundary: @unchecked Sendable {
         let gate = DocumentCallGate(); lock.withLock { windowGate = gate }; return gate
     }
     func failWindow() { lock.withLock { refuseWindow = true } }
+    func blockDisplayFromSource() -> DocumentCallGate {
+        let gate = DocumentCallGate(); lock.withLock { displayGate = gate }; return gate
+    }
+    func failDisplayFromSource() { lock.withLock { refuseDisplay = true } }
+    private func call(_ command: String, _ body: () -> String?) -> String? {
+        precondition(!Thread.isMainThread)
+        let (blocked, refused): (DocumentCallGate?, Bool) = lock.withLock {
+            counts.active += 1; counts.peak = max(counts.peak, counts.active)
+            if command.hasPrefix("document-") { counts.documents += 1 }
+            if command == "document-prepare" || command == "document-display-prepare" { counts.preparations += 1 }
+            if command == "document-from-source" { counts.fromSource += 1 }
+            if command == "document-display-from-source" { counts.displayFromSource += 1 }
+            switch command {
+            case "open":
+                let blocked = gate; gate = nil
+                return (blocked, false)
+            case "window":
+                let blocked = windowGate, refused = refuseWindow
+                windowGate = nil; refuseWindow = false
+                return (blocked, refused)
+            case "document-display-from-source":
+                let blocked = displayGate, refused = refuseDisplay
+                displayGate = nil; refuseDisplay = false
+                return (blocked, refused)
+            default: return (nil, false)
+            }
+        }
+        defer { lock.withLock { counts.active -= 1 } }
+        blocked?.wait()
+        return refused ? nil : body()
+    }
     private func source(_ owner: UInt64) -> DocumentBoundary { lock.withLock { sources[owner]! } }
     private func create() -> UInt64 {
         lock.withLock {
@@ -31,25 +70,18 @@ private final class FileBoundary: @unchecked Sendable {
     }
     private func open(_ owner: UInt64, path: String, limit: UInt64) -> String? {
         precondition(!Thread.isMainThread && limit == AtlasReaderLimits.captureBytes)
-        let blocked = lock.withLock {
-            paths.append(path); let blocked = gate; gate = nil; return blocked
-        }
-        blocked?.wait()
-        return source(owner).reader.open(owner, path, limit)
+        lock.withLock { paths.append(path) }
+        return call("open") { source(owner).reader.open(owner, path, limit) }
     }
     var reader: AtlasReaderTransport {
         AtlasReaderTransport(create: { [self] in create() },
             open: { [self] in open($0, path: $1, limit: $2) },
             window: { [self] owner, offset, bytes in
-                let (blocked, refused) = lock.withLock {
-                    let blocked = windowGate, refused = refuseWindow
-                    windowGate = nil; refuseWindow = false
-                    return (blocked, refused)
-                }
-                blocked?.wait()
-                return refused ? nil : source(owner).reader.window(owner, offset, bytes)
+                call("window") { source(owner).reader.window(owner, offset, bytes) }
             },
-            lines: { _, _, _, _ in nil }, cancel: { _ in true },
+            lines: { _, _, _, _ in nil }, cancel: { [self] _ in
+                lock.withLock { counts.cancellations += 1 }; return true
+            },
             close: { [self] owner in
                 let retired = source(owner).reader.close(owner)
                 lock.withLock { sources[owner] = nil; closed += 1 }
@@ -85,21 +117,35 @@ private final class FileBoundary: @unchecked Sendable {
     }
     var document: AtlasReaderDocumentTransport {
         var transport = AtlasReaderDocumentTransport(
-            prepare: { [self] in source($0).document.prepare($0, $1, $2) },
-            window: { [self] in source($0).document.window($0, $1, $2, $3) },
-            headings: { [self] in source($0).document.headings($0, $1, $2, $3) },
-            heading: { [self] in source($0).document.heading($0, $1, $2, $3) },
-            fromSource: { [self] in source($0).document.fromSource($0, $1, $2, $3) },
-            source: { [self] in source($0).document.source($0, $1, $2, $3, $4) },
-            copy: { [self] in source($0).document.copy($0, $1, $2, $3, $4, $5) })
+            prepare: { [self] owner, generation, width in
+                call("document-prepare") { source(owner).document.prepare(owner, generation, width) }
+            }, window: { [self] owner, generation, first, count in
+                call("document-window") { source(owner).document.window(owner, generation, first, count) }
+            }, headings: { [self] owner, generation, first, count in
+                call("document-headings") { source(owner).document.headings(owner, generation, first, count) }
+            }, heading: { [self] owner, generation, slug, count in
+                call("document-heading") { source(owner).document.heading(owner, generation, slug, count) }
+            }, fromSource: { [self] owner, generation, offset, count in
+                call("document-from-source") { source(owner).document.fromSource(owner, generation, offset, count) }
+            }, source: { [self] owner, generation, start, end, context in
+                call("document-source") { source(owner).document.source(owner, generation, start, end, context) }
+            }, copy: { [self] owner, generation, start, end, mode in
+                call("document-copy") { source(owner).document.copy(owner, generation, start, end, mode) }
+            })
         transport.prepareDisplay = { [self] owner, generation, width in
-            display(owner, command: "document-display-prepare", generation: generation, width: width)
+            call("document-display-prepare") {
+                display(owner, command: "document-display-prepare", generation: generation, width: width)
+            }
         }
         transport.displayPage = { [self] owner, generation, _, _ in
-            display(owner, command: "document-display-page", generation: generation, width: 640)
+            call("document-display-page") {
+                display(owner, command: "document-display-page", generation: generation, width: 640)
+            }
         }
         transport.displayFromSource = { [self] owner, generation, offset, _ in
-            display(owner, command: "document-display-from-source", generation: generation, width: 640, anchor: offset)
+            call("document-display-from-source") {
+                display(owner, command: "document-display-from-source", generation: generation, width: 640, anchor: offset)
+            }
         }
         transport.displayFont = { _, _, _, _, _ in preconditionFailure("image fixture requested font") }
         transport.imagesAuthorize = { _, _, _, _ in
@@ -123,9 +169,127 @@ private final class FileGrant {}
         try await externalEditorCapabilityRequiresAcceptedPageAndOwnsFileGrant()
         try await failedFirstPage()
         try await canceledOpenRetainsGrantUntilDrain()
-        print("SelectedFileReader: exact capture, file-only Markdown/refresh, editor authority, failed first page, cancellation and grant retirement passed")
+        try await sourceFollowingWaitsForSourceWorker()
+        try await failedStyledNavigationRecoversCopyAuthority()
+        try await canceledStyledFollowCannotPublish()
+        print("SelectedFileReader: exact capture, file-only Markdown/refresh, editor authority, source-follow serialization, Styled recovery, cancellation and grant retirement passed")
     }
     static func input() throws -> AtlasReaderInput { try .init(root: "/project", path: "README.md") }
+
+    static func prepareStyled(_ model: AtlasPagedReaderModel) async throws {
+        try await model.openSelectedFile(input: input(), accessLease: nil)
+        model.documentPreview.widthInput = "80"
+        model.documentPreview.prepare()
+        try await until { !model.documentPreview.busy && model.documentPreview.displayPage != nil }
+        precondition(model.documentPreview.authorized && model.documentPreview.showsStyled)
+    }
+
+    static func sourceFollowingWaitsForSourceWorker() async throws {
+        let wire = FileBoundary(), model = AtlasPagedReaderModel(transport: wire.reader, document: wire.document)
+        try await prepareStyled(model)
+        let preview = model.documentPreview, before = wire.snapshot
+        let source = wire.blockWindow()
+        model.offsetInput = "0"; model.goToByte()
+        try await until { source.hasEntered }
+        let held = wire.snapshot
+        model.setPreviewSourceFollowing(true)
+        // Give a wrongly submitted document task time to cancel or queue behind
+        // the held source call, without releasing that call to hide the race.
+        try await Task.sleep(nanoseconds: 20_000_000)
+        precondition(model.busy && !preview.busy && preview.followsSource)
+        precondition(wire.snapshot.documents == held.documents
+            && wire.snapshot.cancellations == held.cancellations,
+            "enabling source following interrupted an in-flight source operation")
+        source.release()
+        try await until { !model.busy && !preview.busy && wire.snapshot.displayFromSource == before.displayFromSource + 1 }
+        let after = wire.snapshot
+        precondition(after.fromSource == before.fromSource + 1 && after.documents == before.documents + 2)
+        precondition(after.preparations == before.preparations && after.peak == 1 && wire.openedPaths.count == 1,
+            "source following reflowed, reopened, or overlapped the shared worker")
+        precondition(preview.authorized && preview.showsStyled)
+        model.close()
+        try await until { wire.closes == 1 }
+    }
+
+    static func failedStyledNavigationRecoversCopyAuthority() async throws {
+        let wire = FileBoundary(), model = AtlasPagedReaderModel(transport: wire.reader, document: wire.document)
+        try await prepareStyled(model)
+        let preview = model.documentPreview, before = wire.snapshot
+        let page = preview.page!, display = preview.displayPage!, oldTarget = page.target(at: 1)!
+        wire.failDisplayFromSource()
+        preview.lineInput = "65"; preview.goToLine()
+        try await until { !preview.busy }
+        precondition(wire.snapshot.displayFromSource == before.displayFromSource + 1)
+        precondition(preview.page?.id == page.id && preview.displayPage?.id == display.id && preview.showsStyled)
+        precondition(!preview.authorized && !preview.canNavigate && preview.canLocateSource && !preview.canBack,
+            "failed display remap retained authority for the coordinator's replaced logical page")
+        let failed = wire.snapshot.documents
+        preview.copy(oldTarget, mode: .renderedText) { _ in preconditionFailure("obsolete logical page copied") }
+        precondition(!preview.busy && wire.snapshot.documents == failed)
+
+        // The real coordinator has already accepted the intermediate logical
+        // page. Recovery must obtain a fresh token before copy can work again.
+        preview.fromSource()
+        try await until { !preview.busy }
+        precondition(preview.authorized && preview.showsStyled && preview.page?.id != page.id)
+        precondition(preview.displayPage?.id != display.id && !preview.allows(oldTarget))
+        let freshTarget = preview.page!.target(at: 1)!
+        var copied: String?
+        preview.copy(freshTarget, mode: .renderedText) { copied = $0; return true }
+        try await until { !preview.busy }
+        precondition(copied == "A bold line.", "source recovery did not restore coordinator copy authority")
+        precondition(wire.snapshot.preparations == before.preparations
+            && wire.snapshot.peak == 1 && wire.openedPaths.count == 1)
+        model.close()
+        try await until { wire.closes == 1 }
+    }
+
+    static func canceledStyledFollowCannotPublish() async throws {
+        for closing in [false, true] {
+            let wire = FileBoundary(), model = AtlasPagedReaderModel(transport: wire.reader, document: wire.document)
+            try await prepareStyled(model)
+            let preview = model.documentPreview, before = wire.snapshot
+            let page = preview.page!, display = preview.displayPage!, oldTarget = page.target(at: 1)!
+            let remap = wire.blockDisplayFromSource()
+            model.setPreviewSourceFollowing(true)
+            try await until { remap.hasEntered }
+            precondition(preview.busy && !preview.authorized && preview.page?.id == page.id)
+            let held = wire.snapshot
+            if closing { model.close() } else { model.setPreviewSourceFollowing(false) }
+            precondition(!preview.busy && !preview.followsSource && !preview.authorized)
+            if closing {
+                precondition(model.page == nil && preview.page == nil && !preview.canLocateSource)
+                precondition(wire.closes == 0, "closed a session while its display call was in flight")
+            } else {
+                precondition(preview.page?.id == page.id && preview.displayPage?.id == display.id && preview.canLocateSource)
+                preview.copy(oldTarget, mode: .renderedText) { _ in preconditionFailure("canceled Styled follow copied an obsolete row") }
+                precondition(!preview.busy && wire.snapshot.documents == held.documents)
+            }
+            remap.release()
+            try await until { wire.snapshot.active == 0 && (!closing || wire.closes == 1) }
+            try await Task.sleep(nanoseconds: 20_000_000)
+            precondition(wire.snapshot.documents == held.documents && !preview.busy && !preview.followsSource,
+                "late display reply restarted disabled source following")
+            if closing {
+                precondition(preview.page == nil && preview.displayPage == nil && !preview.canLocateSource)
+            } else {
+                precondition(preview.page?.id == page.id && preview.displayPage?.id == display.id
+                    && !preview.authorized && preview.canLocateSource,
+                    "canceled display reply published over the retained read-only preview")
+                preview.fromSource()
+                try await until { !preview.busy }
+                precondition(preview.authorized && preview.showsStyled && preview.page?.id != page.id)
+                var copied: String?
+                preview.copy(preview.page!.target(at: 1)!, mode: .renderedText) { copied = $0; return true }
+                try await until { !preview.busy }
+                precondition(copied == "A bold line." && !preview.allows(oldTarget))
+                model.close()
+                try await until { wire.closes == 1 }
+            }
+            precondition(wire.snapshot.preparations == before.preparations
+                && wire.snapshot.peak == 1 && wire.openedPaths.count == 1)
+        }
+    }
 
     static func fileOnlyRefresh() async throws {
         let wire = FileBoundary(), model = AtlasPagedReaderModel(transport: wire.reader, document: wire.document)
