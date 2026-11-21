@@ -263,8 +263,8 @@ extension ProjectLinksFixture {
 extension ProjectLinksFixture {
     static var importProof: [String: Any] {
         ["projection": "lexical-source-imports", "relationship_kind": "lexical-import",
-         "evidence_precision": "exact-import-source-range", "extractor": "franken-markdown-d6fbd1d5/import-statements-v5",
-         "resolver": "fcb-closed-catalog-imports-v5", "extraction_policy": "rust-use-tree-js-literal-loads-python-cpp-v5",
+         "evidence_precision": "exact-import-source-range", "extractor": "franken-markdown-d6fbd1d5/import-statements-v6",
+         "resolver": "fcb-closed-catalog-imports-v6", "extraction_policy": "rust-use-tree-js-literal-loads-python-cpp-go-v6",
          "compiler_resolved": false, "semantic_complete": false]
     }
     static func importRow(_ id: UInt64) -> [String: Any] {

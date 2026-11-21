@@ -28,8 +28,8 @@ private final class SavedImportFixture: @unchecked Sendable {
         ["projection": "lexical-source-imports", "relationship_kind": "lexical-import",
          "evidence_precision": "exact-import-source-range", "resolution_domain": "declared-catalog-candidates",
          "compiler_resolved": false, "semantic_complete": false,
-         "extractor": "franken-markdown-d6fbd1d5/import-statements-v5",
-         "extraction_policy": "rust-use-tree-js-literal-loads-python-cpp-v5", "resolver": "fcb-closed-catalog-imports-v5"]
+         "extractor": "franken-markdown-d6fbd1d5/import-statements-v6",
+         "extraction_policy": "rust-use-tree-js-literal-loads-python-cpp-go-v6", "resolver": "fcb-closed-catalog-imports-v6"]
     }
     func link(_ id: UInt64) -> [String: Any] {
         let target = base.members[id == 1 ? 3 : 4]

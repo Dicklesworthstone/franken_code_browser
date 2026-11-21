@@ -6,6 +6,9 @@
 use super::{ImportFact, ImportKind, ImportLanguage};
 
 mod rust;
+mod go;
+pub use go::{CapturedGoModule, GoModuleLocation, find_go_module, go_package_source,
+    resolve_go_import, MAX_GO_MODULE_SOURCE_BYTES};
 
 pub const MAX_IMPORT_RESOLUTION_PATH_BYTES: usize = 16 * 1024;
 
@@ -66,6 +69,9 @@ pub fn resolve_import<T: Copy + Eq>(
     use ImportResolutionKind::{External, Missing, Unresolved};
     if !valid_source_path(source_path) {
         return ImportResolution::without(Unresolved, "unsupported-specifier");
+    }
+    if fact.kind() == ImportKind::GoImport {
+        return resolve_go_import(source_path, fact, None, |_| false, |_| None);
     }
     if fact.kind() == ImportKind::RustUse {
         return rust::resolve_use(source_path, fact, &mut lookup);
