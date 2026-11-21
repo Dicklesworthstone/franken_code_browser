@@ -44,6 +44,69 @@ fn utf16(text: &str, big: bool) -> Vec<u8> {
 }
 
 #[test]
+fn saved_java_imports_preserve_utf16_evidence_and_offline_source_readers() {
+    let statement = "import example.Tool;";
+    let target = b"package example; public class Tool { public static final int VALUE = 7; }\n";
+    for big in [false, true] {
+        let source = utf16(&format!("// \u{1f980} archived Java\r\npackage app;\r\n{statement}\r\nimport static example.Tool.VALUE;\r\nimport example.*;\r\nclass Main {{}}\r\n"), big);
+        let f = Fixture::new(&[entry(b"src/main/java/app/Main.java", &source),
+            entry(b"src/main/java/example/Tool.java", target)], true);
+        let mut saved = f.open(58040 + u64::from(big) * 10);
+        let page = prepare(&mut saved, 1);
+        assert!(page.get("imports_complete").flag());
+        assert_eq!(page.get("source_members").number(), 2);
+        assert_eq!(page.get("links_seen").number(), 3);
+        let row = link(&page, b"src/main/java/app/Main.java", "example.Tool");
+        assert_eq!(row.get("language").text(), "java");
+        assert_eq!(row.get("lexical_import_kind").text(), "java-import");
+        assert_eq!(row.get("resolution_basis").text(), "java-source-file-candidate");
+        assert_eq!(range(&source, row.get("evidence_range")), &utf16(statement, big)[2..]);
+        assert_eq!(range(&source, row.get("specifier_range")), &utf16("example.Tool", big)[2..]);
+        assert_eq!(row.get("target_path").get("hex").text(), hex(b"src/main/java/example/Tool.java"));
+        let wildcard = link(&page, b"src/main/java/app/Main.java", "example.*");
+        assert_eq!(wildcard.get("resolution_basis").text(), "unresolved-java-wildcard");
+        assert_eq!(wildcard.get("target_member"), &Json::Null);
+        let before = reads(&mut saved);
+        let incoming = json(&saved.import_page(1, Some(row.get("target_member").number()),
+            Direction::Incoming, 0, 64, || false).unwrap());
+        assert_eq!(incoming.get("matching_links").number(), 2);
+        assert_eq!(reads(&mut saved), before);
+        let id = row.get("link_id").number();
+        let (mut evidence, receipt) = saved.open_import_reader(owner(58041 + u64::from(big) * 10),
+            1, id, Side::Evidence, || false).unwrap();
+        assert_eq!(json(&receipt).get("selection"), row.get("evidence_range"));
+        let (mut reader, receipt) = saved.open_import_reader(owner(58042 + u64::from(big) * 10),
+            1, id, Side::Target, || false).unwrap();
+        assert_eq!(json(&receipt).get("source_digest").text(), Sha256::digest(target).to_hex());
+        assert!(!json(&receipt).get("live_source_reopened").flag());
+        saved.clear_imports(2, || false).unwrap(); drop(saved);
+        fs::rename(&f.path, f.root.join("moved-java.fcbs")).unwrap();
+        assert_eq!(copy_all(&mut evidence).get("original_hex").text(), hex(&source));
+        assert_eq!(copy_all(&mut reader).get("original_hex").text(), hex(target));
+    }
+}
+
+#[test]
+fn saved_java_unavailable_and_ambiguous_targets_never_acquire_reader_authority() {
+    let source = b"import absent.Tool;\nimport duplicate.Tool;\nclass Main {}\n";
+    let target = b"package duplicate; class Tool {}\n";
+    let f = Fixture::new(&[entry(b"src/main/java/app/Main.java", source),
+        SnapshotEntry { path: b"src/main/java/absent/Tool.java", observed_bytes: 50,
+            data: SnapshotData::Unavailable("READ_DENIED") },
+        entry(b"duplicate/Tool.java", target), entry(b"src/main/java/duplicate/Tool.java", target)], true);
+    let mut saved = f.open(58060);
+    let page = prepare(&mut saved, 1);
+    assert!(!page.get("imports_complete").flag());
+    for (destination, resolution, basis) in [("absent.Tool", "unavailable", "java-source-file-candidate"),
+        ("duplicate.Tool", "ambiguous", "ambiguous-catalog-target")] {
+        let row = link(&page, b"src/main/java/app/Main.java", destination);
+        assert_eq!(row.get("resolution").text(), resolution);
+        assert_eq!(row.get("resolution_basis").text(), basis);
+        assert!(saved.open_import_reader(owner(58061), 1, row.get("link_id").number(), Side::Target, || false).is_err());
+    }
+}
+
+#[test]
 fn saved_go_imports_keep_utf16_evidence_module_candidates_and_offline_readers() {
     let module = b"module example.local/project\n";
     let statement = "import alias \"example.local/project/pkg\"";
@@ -210,7 +273,7 @@ fn saved_rust_use_tree_pages_preserve_leaf_identity_and_original_utf16_evidence(
         let result = prepare(&mut saved, 1);
         assert!(result.get("imports_complete").flag());
         assert_eq!(result.get("links_seen").number(), 5);
-        assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v6");
+        assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v7");
         let rows = result.get("links").array();
         for (index, (destination, spelling)) in [
             ("crate::shared", "self"), ("crate::shared::Thing", "Thing"),
@@ -293,8 +356,8 @@ fn shared_language_extractors_publish_exact_occurrences_and_metadata_only_revers
     assert_eq!(result.get("import_generation").number(), 7);
     assert_eq!(result.get("projection").text(), "lexical-source-imports");
     assert_eq!(result.get("evidence_precision").text(), "exact-import-source-range");
-    assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v6");
-    assert_eq!(result.get("extraction_policy").text(), "rust-use-tree-js-literal-loads-python-cpp-go-v6");
+    assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v7");
+    assert_eq!(result.get("extraction_policy").text(), "rust-use-tree-js-literal-loads-python-cpp-go-java-v7");
     assert_eq!(result.get("completeness_scope").text(), "parsed-source-imports-in-saved-manifest");
     assert!(!result.get("compiler_resolved").flag());
     assert!(!result.get("semantic_complete").flag());

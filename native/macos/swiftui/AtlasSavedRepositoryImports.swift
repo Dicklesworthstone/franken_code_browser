@@ -20,9 +20,9 @@ enum AtlasSavedImportWire {
         guard w.projection == "lexical-source-imports", w.relationship_kind == "lexical-import",
               w.evidence_precision == "exact-import-source-range",
               w.resolution_domain == "declared-catalog-candidates",
-              w.extractor == "franken-markdown-d6fbd1d5/import-statements-v6",
-              w.extraction_policy == "rust-use-tree-js-literal-loads-python-cpp-go-v6",
-              w.resolver == "fcb-closed-catalog-imports-v6",
+              w.extractor == "franken-markdown-d6fbd1d5/import-statements-v7",
+              w.extraction_policy == "rust-use-tree-js-literal-loads-python-cpp-go-java-v7",
+              w.resolver == "fcb-closed-catalog-imports-v7",
               !w.compiler_resolved, !w.semantic_complete else { throw AtlasSavedError.invalidResponse }
     }
 
@@ -66,6 +66,8 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
         case "python-import": return "Python import statement"
         case "python-from": return "Python from-import statement"
         case "go-import": return "Go package import"
+        case "java-import": return "Java type import"
+        case "java-static-import": return "Java static member import"
         case "cpp-quoted-include": return "Quoted C/C++ include"
         case "cpp-angle-include": return "External C/C++ include"
         case "cpp-computed-include": return "Unresolved computed C/C++ include"
@@ -78,6 +80,12 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
     var resolutionLabel: String {
         if resolutionBasis == "go-module-context-unavailable" { return "Captured go.mod context is unavailable or unsupported" }
         if resolutionBasis == "go-nested-module-boundary" { return "Import crosses a nested Go module; no target selected" }
+        if resolutionBasis == "unresolved-java-wildcard" { return "Java on-demand import; no individual source target selected" }
+        if resolutionBasis == "java-source-file-candidate" || resolutionBasis == "java-enclosing-type-candidate" {
+            let type = resolutionBasis == "java-enclosing-type-candidate" ? "Enclosing Java type candidate" : "Java source-file candidate"
+            return type + (canOpenTarget ? " captured" : " recorded without source bytes")
+                + "; declarations and classpath are not resolved"
+        }
         if resolutionBasis == "go-module-package-file-candidate" {
             let availability = canOpenTarget ? "Captured representative Go package file" : "Representative Go package file has no captured bytes"
             return availability + "; build constraints are not evaluated"
@@ -124,6 +132,7 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
         case "rust": kinds = ["rust-module", "rust-use"]
         case "python": kinds = ["python-import", "python-from"]
         case "go": kinds = ["go-import"]
+        case "java": kinds = ["java-import", "java-static-import"]
         case "cpp": kinds = ["cpp-quoted-include", "cpp-angle-include", "cpp-computed-include"]
         case "javascript", "typescript", "jsx", "tsx":
             kinds = ["javascript-import", "javascript-export", "javascript-require", "javascript-dynamic-import"]
@@ -140,6 +149,7 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
                "rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "ambiguous-rust-crate-root",
                "python-relative-module-candidate", "cpp-source-relative-include-candidate",
                "go-module-package-file-candidate", "go-module-context-unavailable", "go-nested-module-boundary",
+               "java-source-file-candidate", "java-enclosing-type-candidate", "unresolved-java-wildcard",
                "unresolved-cpp-include", "unresolved-rust-use", "external-specifier",
                "unsupported-specifier", "no-catalog-target", "ambiguous-catalog-target"].contains(resolutionBasis) else {
             throw AtlasSavedError.invalidResponse
@@ -176,16 +186,23 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
             || (language == "go" && !(goBases + ["external-specifier", "unsupported-specifier", "no-catalog-target"]).contains(resolutionBasis)) {
             throw AtlasSavedError.invalidResponse
         }
+        let javaBases = ["java-source-file-candidate", "java-enclosing-type-candidate", "unresolved-java-wildcard"]
+        if (javaBases.contains(resolutionBasis) && language != "java")
+            || (language == "java" && !(javaBases + ["unsupported-specifier", "no-catalog-target", "ambiguous-catalog-target"]).contains(resolutionBasis))
+            || (resolutionBasis == "unresolved-java-wildcard" && kind != "java-import") {
+            throw AtlasSavedError.invalidResponse
+        }
         let acceptedBases: [String]
         switch resolution {
         case "captured", "unavailable": acceptedBases = ["exact-relative-path", "unique-relative-module-candidate",
             "rust-module-file-candidate", "rust-use-module-file-candidate", "rust-use-module-prefix-candidate",
-            "python-relative-module-candidate", "cpp-source-relative-include-candidate", "go-module-package-file-candidate"]
+            "python-relative-module-candidate", "cpp-source-relative-include-candidate", "go-module-package-file-candidate",
+            "java-source-file-candidate", "java-enclosing-type-candidate"]
         case "missing": acceptedBases = ["no-catalog-target"]
         case "ambiguous": acceptedBases = ["ambiguous-catalog-target", "ambiguous-rust-crate-root"]
         case "external": acceptedBases = ["external-specifier"]
         default: acceptedBases = ["unsupported-specifier", "unresolved-rust-use", "unresolved-cpp-include",
-            "go-module-context-unavailable", "go-nested-module-boundary"]
+            "go-module-context-unavailable", "go-nested-module-boundary", "unresolved-java-wildcard"]
         }
         guard acceptedBases.contains(resolutionBasis) else { throw AtlasSavedError.invalidResponse }
         if resolution == "captured" || resolution == "unavailable" {

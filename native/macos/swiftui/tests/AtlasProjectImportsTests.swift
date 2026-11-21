@@ -192,6 +192,77 @@ import Foundation
         }
     }
 
+    private static func javaWire(_ index: AtlasPreparedIndex) throws {
+        let original = ProjectLinksFixture.importPage(owner: index.basis.owner,
+            generation: 1, command: "imports-page")
+        for (kind, destination, basis) in [
+            ("java-import", "example.Tool", "java-source-file-candidate"),
+            ("java-import", "example.Tool.Nested", "java-enclosing-type-candidate"),
+            ("java-static-import", "example.Tool.VALUE", "java-source-file-candidate"),
+            ("java-static-import", "example.Tool.*", "java-source-file-candidate")
+        ] {
+            var value = original, rows = original["links"] as! [[String: Any]]
+            for i in rows.indices {
+                rows[i]["language"] = "java"; rows[i]["lexical_import_kind"] = kind
+                rows[i]["destination"] = destination; rows[i]["resolution_basis"] = basis
+                rows[i]["source_path"] = ProjectLinksFixture.path("src/main/java/app/Main.java")
+                rows[i]["target_path"] = ProjectLinksFixture.path("src/main/java/example/Tool.java")
+            }
+            value["links"] = rows
+            let link = try decode(value, index: index).links[0]
+            precondition(link.canOpenTarget && link.importEvidence?.language == "java"
+                && link.evidenceLabel.contains("not compiler resolved")
+                && link.label.contains("classpath are not resolved"))
+            precondition(link.evidenceLabel.contains(kind == "java-import" ? "Java type import" : "Java static member import"))
+            if basis == "java-enclosing-type-candidate" { precondition(link.label.contains("enclosing Java type candidate")) }
+            for (key, wrong) in [("language", "csharp"), ("lexical_import_kind", "go-import"),
+                ("resolution_basis", "go-module-package-file-candidate"), ("resolution_basis", "external-specifier"),
+                ("resolution_basis", "unresolved-java-wildcard"), ("resolution_basis", "ambiguous-catalog-target")] {
+                var bad = value, changed = rows
+                changed[0][key] = wrong; bad["links"] = changed; refuse(bad, index: index)
+            }
+            var wrongLanguage = value, changed = rows
+            changed[0]["language"] = "rust"; changed[0]["lexical_import_kind"] = "rust-use"
+            wrongLanguage["links"] = changed; refuse(wrongLanguage, index: index)
+            for (key, old) in [("extractor", "franken-markdown-d6fbd1d5/import-statements-v6"),
+                ("resolver", "fcb-closed-catalog-imports-v6"),
+                ("extraction_policy", "rust-use-tree-js-literal-loads-python-cpp-go-v6")] {
+                var bad = value; bad[key] = old; refuse(bad, index: index)
+            }
+            for state in ["unavailable", "uncaptured", "outside-capture-scope"] {
+                var unavailable = value, changed = rows
+                for i in changed.indices {
+                    changed[i]["resolution"] = state
+                    for key in ["target_revision", "target_sha256", "target_bytes"] { changed[i][key] = NSNull() }
+                }
+                unavailable["links"] = changed
+                let unavailablePage = try decode(unavailable, index: index)
+                precondition(unavailablePage.links.allSatisfy { !$0.canOpenTarget && $0.targetFile == 4 })
+            }
+        }
+        for (resolution, basis) in [("unresolved", "unresolved-java-wildcard"),
+            ("missing", "no-catalog-target"), ("ambiguous", "ambiguous-catalog-target")] {
+            var value = original, rows = original["links"] as! [[String: Any]]
+            for i in rows.indices {
+                rows[i]["language"] = "java"; rows[i]["lexical_import_kind"] = "java-import"
+                rows[i]["destination"] = resolution == "unresolved" ? "example.*" : "example.Tool"
+                rows[i]["resolution"] = resolution; rows[i]["resolution_basis"] = basis
+                for key in ["target_file_id", "target_path", "target_revision", "target_sha256", "target_bytes"] { rows[i][key] = NSNull() }
+            }
+            value["links"] = rows
+            let edge = try decode(value, index: index).links[0]
+            precondition(!edge.canOpenTarget && edge.targetFile == nil)
+            if resolution == "unresolved" {
+                precondition(edge.label.contains("on-demand import"))
+                var staticWildcard = value, changed = rows
+                changed[0]["lexical_import_kind"] = "java-static-import"
+                staticWildcard["links"] = changed; refuse(staticWildcard, index: index)
+            }
+            rows[0]["target_file_id"] = "4"; rows[0]["target_path"] = ProjectLinksFixture.path("src/main/java/example/Tool.java")
+            value["links"] = rows; refuse(value, index: index)
+        }
+    }
+
     private static func goWire(_ index: AtlasPreparedIndex) throws {
         var value = ProjectLinksFixture.importPage(owner: index.basis.owner,
             generation: 1, command: "imports-page")
@@ -451,6 +522,7 @@ import Foundation
         try pythonWire(index)
         try cppWire(index)
         try goWire(index)
+        try javaWire(index)
         try javascriptLoadWire(index)
         try rustUseWire(index)
         let live = ProjectLinksFixture(includesImports: true)

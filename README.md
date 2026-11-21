@@ -157,6 +157,16 @@ file; build constraints and Go compiler binding are outside this lexical policy.
 See [project import navigation](native/macos/README.md#project-import-navigation)
 for limits and pending independent verification.
 
+**Java imports now lead to retained source candidates.** Ordinary imports,
+nested types and static members participate in outgoing and incoming relationship
+lists across projects and saved repositories. Navigation checks common source
+roots and keeps exact statement evidence, including UTF-16 captures. Ambiguous
+paths and package wildcards retain readable evidence without choosing a target.
+These are conventional filename candidates; Java declarations, classpaths and
+build configuration are not resolved. See
+[project import navigation](native/macos/README.md#project-import-navigation)
+for the supported layouts and pending independent verification.
+
 **City uses the same map.** Its buildings retain the current file footprints and IDs;
 height is a bounded logarithmic transform of **observed file bytes**, capped at 1 GiB,
 with explicit unknown and partial-catalog counts. Camera movement does not discover

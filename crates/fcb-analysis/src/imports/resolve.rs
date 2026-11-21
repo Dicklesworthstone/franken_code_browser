@@ -7,6 +7,7 @@ use super::{ImportFact, ImportKind, ImportLanguage};
 
 mod rust;
 mod go;
+mod java;
 pub use go::{CapturedGoModule, GoModuleLocation, find_go_module, go_package_source,
     resolve_go_import, MAX_GO_MODULE_SOURCE_BYTES};
 
@@ -63,12 +64,19 @@ impl<T> ImportResolution<T> {
 /// Angle includes remain external; computed includes remain unresolved. No
 /// include directories, compilation database, macro expansion or header suffix
 /// preference is inferred, and header-name bytes are not C-unescaped.
+/// Java imports admit a bounded set of conventional source roots and dotted
+/// type/enclosing-type filename candidates. Static imports navigate their type
+/// candidate, never the member. Package wildcards, classpaths and build-system
+/// source roots are not inferred; see `java` for the complete finite policy.
 pub fn resolve_import<T: Copy + Eq>(
     source_path: &[u8], fact: &ImportFact, mut lookup: impl FnMut(&[u8]) -> Option<T>,
 ) -> ImportResolution<T> {
     use ImportResolutionKind::{External, Missing, Unresolved};
     if !valid_source_path(source_path) {
         return ImportResolution::without(Unresolved, "unsupported-specifier");
+    }
+    if matches!(fact.kind(), ImportKind::JavaImport | ImportKind::JavaStaticImport) {
+        return java::resolve_java(source_path, fact, &mut lookup);
     }
     if fact.kind() == ImportKind::GoImport {
         return resolve_go_import(source_path, fact, None, |_| false, |_| None);

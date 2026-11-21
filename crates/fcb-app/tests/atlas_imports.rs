@@ -91,9 +91,9 @@ fn coverage(page: &Json) {
     assert_eq!(page.get("evidence_precision").text(), "exact-import-source-range");
     assert_eq!(page.get("relationship_kind").text(), "lexical-import");
     assert_eq!(page.get("resolution_domain").text(), "declared-catalog-candidates");
-    assert_eq!(page.get("extractor").text(), "franken-markdown-d6fbd1d5/import-statements-v6");
-    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v6");
-    assert_eq!(page.get("extraction_policy").text(), "rust-use-tree-js-literal-loads-python-cpp-go-v6");
+    assert_eq!(page.get("extractor").text(), "franken-markdown-d6fbd1d5/import-statements-v7");
+    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v7");
+    assert_eq!(page.get("extraction_policy").text(), "rust-use-tree-js-literal-loads-python-cpp-go-java-v7");
     assert!(!page.get("compiler_resolved").flag()); assert!(!page.get("semantic_complete").flag());
     assert_eq!(page.get("source_files").number(), page.get("captured_source_files").number()
         + page.get("capture_unavailable_source_files").number() + page.get("outside_capture_scope_source_files").number()
@@ -108,6 +108,81 @@ fn coverage(page: &Json) {
     assert!(page.get("parsed_source_bytes").number() + page.get("parsed_module_bytes").number()
         <= page.get("max_parse_bytes").number());
     assert!(page.get("retained_links").number() <= page.get("links_seen").number());
+}
+
+#[test]
+fn java_import_navigation_keeps_exact_evidence_and_retained_type_candidates() {
+    let source = b"package app;\nimport example.Tool;\nimport example.Tool.Nested;\nimport static example.Tool.VALUE;\nimport static example.Tool.*;\nimport example.*;\nimport missing.Absent;\nimport dup.Value;\nclass Main { String text = \"import hidden.Fake;\"; }\n";
+    let target = b"package example; public class Tool { public static final int VALUE = 7; public class Nested {} }\n";
+    let mut f = Fixture::new(&[("src/main/java/app/Main.java", source),
+        ("src/main/java/example/Tool.java", target),
+        ("dup/Value.java", b"package dup; class Value {}\n"),
+        ("src/main/java/dup/Value.java", b"package dup; class Value {}\n")]);
+    f.build(1);
+    fs::write(f.root.join("src/main/java/app/Main.java"), b"class Replacement {}\n").unwrap();
+    fs::write(f.root.join("src/main/java/example/Tool.java"), b"class Replacement {}\n").unwrap();
+    let page = f.prepare(1, 1);
+    assert!(page.get("relationships_complete").flag());
+    assert_eq!(page.get("links_seen").number(), 7);
+    let simple = link(&page, b"src/main/java/app/Main.java", "example.Tool");
+    assert_eq!(simple.get("language").text(), "java");
+    assert_eq!(simple.get("lexical_import_kind").text(), "java-import");
+    assert_eq!(simple.get("resolution_basis").text(), "java-source-file-candidate");
+    assert_eq!(range(simple.get("evidence_range"), source), b"import example.Tool;");
+    assert_eq!(range(simple.get("specifier_range"), source), b"example.Tool");
+    for destination in ["example.Tool", "example.Tool.Nested", "example.Tool.VALUE", "example.Tool.*"] {
+        let row = link(&page, b"src/main/java/app/Main.java", destination);
+        assert_eq!(row.get("resolution").text(), "captured");
+        assert_eq!(row.get("target_path").get("hex").text(), hex(b"src/main/java/example/Tool.java"));
+        assert_eq!(row.get("resolution_basis").text(), if destination == "example.Tool.Nested" {
+            "java-enclosing-type-candidate"
+        } else { "java-source-file-candidate" });
+        if destination == "example.Tool.VALUE" || destination == "example.Tool.*" {
+            assert_eq!(row.get("lexical_import_kind").text(), "java-static-import");
+        }
+    }
+    for (destination, resolution, basis) in [
+        ("example.*", "unresolved", "unresolved-java-wildcard"),
+        ("missing.Absent", "missing", "no-catalog-target"),
+        ("dup.Value", "ambiguous", "ambiguous-catalog-target"),
+    ] {
+        let row = link(&page, b"src/main/java/app/Main.java", destination);
+        assert_eq!(row.get("resolution").text(), resolution);
+        assert_eq!(row.get("resolution_basis").text(), basis);
+        assert_eq!(row.get("target_file_id"), &Json::Null);
+    }
+    let incoming = f.page(1, Direction::Incoming, Some(b"src/main/java/example/Tool.java"), 0, 64);
+    assert_eq!(incoming.get("matching_links").number(), 4);
+    let id = simple.get("link_id").number();
+    let (evidence, receipt) = f.search.open_import_reader(&f.atlas, owner(72990), 1, id, Side::Evidence, || false).unwrap();
+    assert_eq!(json(&receipt).get("relationship"), simple);
+    assert_eq!(json(&receipt).get("initial_original_offset").number(), simple.get("evidence_range").get("start").number());
+    let (reader, receipt) = f.search.open_import_reader(&f.atlas, owner(72991), 1, id, Side::Target, || false).unwrap();
+    assert_eq!(json(&receipt).get("source_sha256").text(), Sha256::digest(target).to_hex());
+    assert_eq!(json(&receipt).get("additional_source_bytes_read").number(), 0);
+    f.search.clear_index(&f.atlas, 2, || false).unwrap();
+    assert_eq!(evidence.capture().bytes(), source);
+    assert_eq!(reader.capture().bytes(), target);
+}
+
+#[test]
+fn java_import_limits_and_unsupported_escapes_preserve_coverage() {
+    let source = b"import example.Tool;\nimport example.Other;\nclass Main {}\n";
+    let mut f = Fixture::new(&[("src/main/java/app/Main.java", source),
+        ("src/main/java/example/Tool.java", b"package example; class Tool {}\n"),
+        ("src/main/java/example/Other.java", b"package example; class Other {}\n"),
+        ("Bad.java", b"import example.\\u0054ool;\nclass Bad {}\n")]);
+    f.build(1);
+    let page = f.prepare(1, 1);
+    assert!(!page.get("relationships_complete").flag());
+    assert_eq!(page.get("unsupported_source_files").number(), 1);
+    assert_eq!(page.get("links_seen").number(), 2);
+    let bounded = f.begin(2, 1, 1, MAX_ATLAS_IMPORT_PARSE_BYTES);
+    coverage(&bounded);
+    let limited = f.finish(2);
+    assert!(!limited.get("relationships_complete").flag());
+    assert!(limited.get("truncated").flag());
+    assert_eq!(limited.get("retained_links").number(), 1);
 }
 
 #[test]
@@ -723,7 +798,7 @@ fn python_relative_imports_share_incoming_navigation_and_exact_retained_readers(
     let page = f.prepare(1, 1);
     assert!(page.get("relationships_complete").flag(), "{page:?}");
     assert_eq!(page.get("retained_links").number(), 5);
-    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v6");
+    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v7");
 
     let row = link(&page, b"pkg/main.py", ".worker");
     assert_eq!(row.get("language").text(), "python");

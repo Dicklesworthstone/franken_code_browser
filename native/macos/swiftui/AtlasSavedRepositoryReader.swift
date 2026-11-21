@@ -421,6 +421,9 @@ final class AtlasSavedReaderReceiptBox: @unchecked Sendable {
         case .importLink(_, let link, .evidence):
             return "\(link.label) · exact statement bytes \(link.evidence.start)..<\(link.evidence.end) · specifier bytes \(link.specifier.start)..<\(link.specifier.end)"
         case .importLink(_, let link, .target):
+            if link.language == "java" {
+                return "Saved Java source candidate for \(link.destination) · imported declaration location, classpath and compiler binding are not established"
+            }
             if link.resolutionBasis == "rust-use-module-prefix-candidate" {
                 return "Saved containing-module candidate for \(link.destination) · imported item location and compiler resolution are not established"
             }

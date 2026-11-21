@@ -6,7 +6,7 @@
 //! consumes its validated byte spans and recognizes a small source-specific
 //! statement grammar: Rust external mod/use, JS/TS static import/export-from and
 //! literal require/import() expressions, Python import/from statements,
-//! C/C++ literal include directives and Go package imports.
+//! C/C++ literal include directives, Go package imports and Java imports.
 //! It is not a compiler, build graph, package resolver, or replacement lexer.
 //! Every result remains lexical evidence; closed-catalog navigation is explicit.
 //! UTF-8/UTF-16 decoding and evidence conversion use the common source map.
@@ -17,6 +17,7 @@ mod cpp;
 mod resolve;
 mod rust;
 mod go;
+mod java;
 pub use resolve::{resolve_import, ImportResolution, ImportResolutionKind};
 pub use resolve::{CapturedGoModule, GoModuleLocation, find_go_module, go_package_source,
     resolve_go_import, MAX_GO_MODULE_SOURCE_BYTES};
@@ -32,15 +33,16 @@ pub const MAX_IMPORT_ITEMS: usize = 4096;
 pub const MAX_IMPORT_SPECIFIER_BYTES: usize = 1024;
 const MAX_STATEMENT_TERMINALS: usize = 1024;
 const MAX_STATEMENT_BYTES: usize = 16 * 1024;
-pub const IMPORT_EXTRACTOR: &str = "franken-markdown-d6fbd1d5/import-statements-v6";
-pub const IMPORT_POLICY: &str = "rust-use-tree-js-literal-loads-python-cpp-go-v6";
+pub const IMPORT_EXTRACTOR: &str = "franken-markdown-d6fbd1d5/import-statements-v7";
+pub const IMPORT_POLICY: &str = "rust-use-tree-js-literal-loads-python-cpp-go-java-v7";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ImportLanguage { Rust, JavaScript, TypeScript, Jsx, Tsx, Python, Cpp, Go }
+pub enum ImportLanguage { Rust, JavaScript, TypeScript, Jsx, Tsx, Python, Cpp, Go, Java }
 impl ImportLanguage {
     pub const fn name(self) -> &'static str {
         match self { Self::Rust => "rust", Self::JavaScript => "javascript", Self::TypeScript => "typescript",
-            Self::Jsx => "jsx", Self::Tsx => "tsx", Self::Python => "python", Self::Cpp => "cpp", Self::Go => "go" }
+            Self::Jsx => "jsx", Self::Tsx => "tsx", Self::Python => "python", Self::Cpp => "cpp", Self::Go => "go",
+            Self::Java => "java" }
     }
     pub fn from_path(path: &[u8]) -> Option<Self> {
         let file = path.rsplit(|&byte| byte == b'/').next()?;
@@ -51,7 +53,7 @@ impl ImportLanguage {
         match &lower[..suffix.len()] {
             b"rs" => Some(Self::Rust), b"js" | b"mjs" | b"cjs" => Some(Self::JavaScript),
             b"ts" | b"mts" | b"cts" => Some(Self::TypeScript), b"jsx" => Some(Self::Jsx), b"tsx" => Some(Self::Tsx),
-            b"py" | b"pyi" => Some(Self::Python), b"go" => Some(Self::Go),
+            b"py" | b"pyi" => Some(Self::Python), b"go" => Some(Self::Go), b"java" => Some(Self::Java),
             b"c" | b"h" | b"cc" | b"cpp" | b"cxx" | b"c++" | b"hh" | b"hpp" | b"hxx"
                 | b"ipp" | b"tpp" | b"inl" | b"ixx" => Some(Self::Cpp),
             _ => None,
@@ -61,7 +63,7 @@ impl ImportLanguage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImportKind { RustModule, RustUse, JavaScriptImport, JavaScriptExport,
     JavaScriptRequire, JavaScriptDynamicImport, PythonImport, PythonFrom,
-    CppQuotedInclude, CppAngleInclude, CppComputedInclude, GoImport }
+    CppQuotedInclude, CppAngleInclude, CppComputedInclude, GoImport, JavaImport, JavaStaticImport }
 impl ImportKind {
     pub const fn name(self) -> &'static str {
         match self { Self::RustModule => "rust-module", Self::RustUse => "rust-use",
@@ -69,7 +71,8 @@ impl ImportKind {
             Self::JavaScriptRequire => "javascript-require", Self::JavaScriptDynamicImport => "javascript-dynamic-import",
             Self::PythonImport => "python-import", Self::PythonFrom => "python-from",
             Self::CppQuotedInclude => "cpp-quoted-include", Self::CppAngleInclude => "cpp-angle-include",
-            Self::CppComputedInclude => "cpp-computed-include", Self::GoImport => "go-import" }
+            Self::CppComputedInclude => "cpp-computed-include", Self::GoImport => "go-import",
+            Self::JavaImport => "java-import", Self::JavaStaticImport => "java-static-import" }
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,6 +113,10 @@ impl ImportFact {
     /// inter-token whitespace/continuations. A bare-relative from import
     /// combines its explicit leading dots with each imported name; its exact
     /// specifier_range covers that name, and original_range retains the dots.
+    /// Java names omit inter-token whitespace/comments and retain a terminal
+    /// `.*`. The exact specifier span retains their original spelling. Java
+    /// namespace wildcards and non-ASCII names remain evidence without a
+    /// guessed file target.
     pub fn destination(&self) -> &str { &self.destination }
     pub const fn original_range(&self) -> ByteRange { self.original_range }
     pub const fn specifier_range(&self) -> ByteRange { self.specifier_range }
@@ -150,12 +157,14 @@ impl<'source> CapturedImports<'source> {
         let text = map.decoded_text();
         if text.len() > MAX_IMPORT_SOURCE_BYTES * 4 { return Err(ImportError::SourceLimit); }
         if language == ImportLanguage::Cpp { cpp::check_source(text, &mut canceled)?; }
+        if language == ImportLanguage::Java { java::check_source(text, &mut canceled)?; }
         check(&mut canceled)?;
         let capacity = text.len().max(1);
         let mut spans = reserve::<Span>(capacity)?;
         highlight::highlight_into(language.name(), text, &mut spans);
         if spans.capacity() > capacity { return Err(ImportError::InvalidEvidence); }
         if language == ImportLanguage::Go { go::validate_context(text, &spans, &mut canceled)?; }
+        if language == ImportLanguage::Java { java::validate_context(text, &spans, &mut canceled)?; }
         let terminals = terminals(text, &spans, &mut canceled)?;
         if matches!(language, ImportLanguage::JavaScript | ImportLanguage::TypeScript | ImportLanguage::Jsx | ImportLanguage::Tsx) {
             javascript::check_context(text, &terminals, &mut canceled)?;
@@ -167,6 +176,7 @@ impl<'source> CapturedImports<'source> {
             ImportLanguage::Python => parser.python(&mut canceled)?,
             ImportLanguage::Cpp => parser.cpp(&mut canceled)?,
             ImportLanguage::Go => parser.go(&mut canceled)?,
+            ImportLanguage::Java => parser.java(&mut canceled)?,
             _ => parser.javascript(&mut canceled)?,
         }
         check(&mut canceled)?;

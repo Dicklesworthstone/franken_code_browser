@@ -778,7 +778,7 @@ physical-Mac verification remain pending.
 
 Open an FCBS archive in **Saved Repository**, choose **Imports**, and select
 **Build imports**. This uses the same Rust, JavaScript/TypeScript/JSX/TSX,
-Python, C/C++ and Go lexical import engine and finite catalog policies as Project relationships.
+Python, C/C++, Go and Java lexical import engine and finite catalog policies as Project relationships.
 The archive supplies both source evidence and target membership; opening an
 import does not require a working-tree checkout or grant access to live paths.
 
@@ -1285,7 +1285,7 @@ target, even if the live files have since changed.
 The shared import engine supports Rust external module/use declarations,
 JavaScript/TypeScript static imports, re-exports and literal load expressions
 (including JSX/TSX), Python `import` and `from` statements in `.py` and `.pyi`
-files, C/C++ includes, and Go package imports. Python aliases,
+files, C/C++ includes, Go package imports and Java type/static imports. Python aliases,
 comma-separated imports, parenthesized from-import lists and explicit line
 continuations preserve their original statement evidence. Comments and strings
 are classified by the shared FrankenMarkdown lexer.
@@ -1394,13 +1394,40 @@ source and metadata payloads within 128 KiB. Paging accepted imports performs
 no new source or metadata reads. Evidence and target readers keep their exact
 captured bytes after metadata edits, projection replacement or archive detachment.
 
+Java imports in `.java` files now participate in the same live, saved-repository
+and reading-desk navigation. Ordinary type imports, nested types, static member
+imports and static on-demand imports retain the whole original statement and
+its exact specifier bytes, including BOM-marked UTF-16 coordinates. Comments,
+strings and text blocks do not contribute import statements. Java pre-token
+Unicode escapes, unsupported line terminators and malformed import statements
+leave source coverage explicitly incomplete.
+
+For `import example.Tool;`, the finite catalog policy considers
+`example/Tool.java` beneath the repository root, `src`, `src/main/java` and
+`src/test/java`. For a source within a conventional nested module, the same
+four roots beneath the nearest `src`-owning module are also eligible. A static
+import first removes its final member or `*` component. Shorter dotted prefixes
+can identify an **enclosing Java type candidate**, as with
+`import example.Tool.Nested;` and `example/Tool.java`. A target must be unique
+across every eligible source path; competing roots or enclosing types remain
+ambiguous, with no reader target authorized.
+
+These are conventional **Java source candidates**: the policy does not inspect
+package/type declarations, resolve classpaths, interpret Maven or Gradle, or
+establish a compiler binding. It opens the retained candidate at its beginning,
+without claiming the imported declaration's location. An ordinary on-demand
+import such as `import example.*;` keeps readable evidence with no individual
+target chosen. Missing, uncaptured and unavailable candidates likewise retain
+their evidence and explicit status. Saved navigation uses archive catalog
+membership and verified captured bytes without reopening a working tree.
+
 The inventory admits 128 KiB per source, 32 MiB of aggregate parsing and 4,096
 retained import occurrences. Unsupported syntax, malformed decoding, parse limits and
 omitted rows remain visible coverage conditions. These limits apply to the
 captured project import browser. The **Saved Repository → Imports** workflow
 applies the same lexical policies to archived members. Rust/Swift regression fixtures cover Rust
-use trees, JavaScript literal loads, Python imports, C/C++ includes and Go module
-candidates, UTF-16
+use trees, JavaScript literal loads, Python imports, C/C++ includes, Go module
+candidates and Java type/static imports, UTF-16
 coordinates, relative targets, ambiguity, stale captures and native evidence
 validation. Executable and physical-Mac verification remain
 pending.

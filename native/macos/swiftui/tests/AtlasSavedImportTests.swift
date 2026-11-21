@@ -28,8 +28,8 @@ private final class SavedImportFixture: @unchecked Sendable {
         ["projection": "lexical-source-imports", "relationship_kind": "lexical-import",
          "evidence_precision": "exact-import-source-range", "resolution_domain": "declared-catalog-candidates",
          "compiler_resolved": false, "semantic_complete": false,
-         "extractor": "franken-markdown-d6fbd1d5/import-statements-v6",
-         "extraction_policy": "rust-use-tree-js-literal-loads-python-cpp-go-v6", "resolver": "fcb-closed-catalog-imports-v6"]
+         "extractor": "franken-markdown-d6fbd1d5/import-statements-v7",
+         "extraction_policy": "rust-use-tree-js-literal-loads-python-cpp-go-java-v7", "resolver": "fcb-closed-catalog-imports-v7"]
     }
     func link(_ id: UInt64) -> [String: Any] {
         let target = base.members[id == 1 ? 3 : 4]
@@ -236,6 +236,70 @@ private final class SavedImportFixture: @unchecked Sendable {
         targetRows[0]["resolution_basis"] = "ambiguous-rust-crate-root"
         forgedTarget["links"] = targetRows; reject { _ = try decode(forgedTarget) }
     }
+    private static func javaWire(_ f: SavedImportFixture, identity: AtlasSavedIdentity) throws {
+        let decode: ([String: Any]) throws -> AtlasSavedImports = {
+            try AtlasSavedImports.decode(f.base.encode($0), identity: identity, generation: 1,
+                direction: .all, member: nil, start: 0, limit: 64)
+        }
+        let original = f.page(identity.owner, generation: 1)
+        for (kind, destination, basis) in [
+            ("java-import", "example.Tool", "java-source-file-candidate"),
+            ("java-import", "example.Tool.Nested", "java-enclosing-type-candidate"),
+            ("java-static-import", "example.Tool.VALUE", "java-source-file-candidate"),
+            ("java-static-import", "example.Tool.*", "java-source-file-candidate")
+        ] {
+            var value = original, rows = original["links"] as! [[String: Any]]
+            for i in rows.indices {
+                rows[i]["language"] = "java"; rows[i]["lexical_import_kind"] = kind
+                rows[i]["destination"] = destination; rows[i]["resolution_basis"] = basis
+                rows[i]["source_path"] = f.base.path(Array("src/main/java/app/Main.java".utf8), "src/main/java/app/Main.java")
+                rows[i]["target_path"] = f.base.path(Array("src/main/java/example/Tool.java".utf8), "src/main/java/example/Tool.java")
+            }
+            value["links"] = rows
+            let page = try decode(value)
+            precondition(page.links[0].canOpenTarget && !page.links[1].canOpenTarget)
+            precondition(page.links[0].label == (kind == "java-import" ? "Java type import" : "Java static member import"))
+            precondition(page.links[0].resolutionLabel.contains("classpath are not resolved"))
+            precondition(page.links[1].resolutionLabel.contains("recorded without source bytes"))
+            for (key, wrong) in [("language", "csharp"), ("lexical_import_kind", "go-import"),
+                ("resolution_basis", "go-module-package-file-candidate"), ("resolution_basis", "external-specifier"),
+                ("resolution_basis", "unresolved-java-wildcard"), ("resolution_basis", "ambiguous-catalog-target")] {
+                var bad = value, changed = rows
+                changed[0][key] = wrong; bad["links"] = changed; reject { _ = try decode(bad) }
+            }
+            var wrongLanguage = value, changed = rows
+            changed[0]["language"] = "rust"; changed[0]["lexical_import_kind"] = "rust-use"
+            wrongLanguage["links"] = changed; reject { _ = try decode(wrongLanguage) }
+            for (key, old) in [("extractor", "franken-markdown-d6fbd1d5/import-statements-v6"),
+                ("resolver", "fcb-closed-catalog-imports-v6"),
+                ("extraction_policy", "rust-use-tree-js-literal-loads-python-cpp-go-v6")] {
+                var bad = value; bad[key] = old; reject { _ = try decode(bad) }
+            }
+        }
+        for (resolution, basis) in [("unresolved", "unresolved-java-wildcard"),
+            ("missing", "no-catalog-target"), ("ambiguous", "ambiguous-catalog-target")] {
+            var value = original, rows = original["links"] as! [[String: Any]]
+            for i in rows.indices {
+                rows[i]["language"] = "java"; rows[i]["lexical_import_kind"] = "java-import"
+                rows[i]["destination"] = resolution == "unresolved" ? "example.*" : "example.Tool"
+                rows[i]["resolution"] = resolution; rows[i]["resolution_basis"] = basis
+                for key in ["target_member", "target_file_id", "target_revision", "target_digest", "target_path", "target_bytes"] { rows[i][key] = NSNull() }
+            }
+            value["links"] = rows
+            let edge = try decode(value).links[0]
+            precondition(!edge.canOpenTarget && edge.targetMember == nil)
+            if resolution == "unresolved" {
+                precondition(edge.resolutionLabel.contains("on-demand import"))
+                var staticWildcard = value, changed = rows
+                changed[0]["lexical_import_kind"] = "java-static-import"
+                staticWildcard["links"] = changed; reject { _ = try decode(staticWildcard) }
+            }
+            rows[0]["target_member"] = "3"; rows[0]["target_file_id"] = "4"
+            rows[0]["target_path"] = f.base.path(Array("src/main/java/example/Tool.java".utf8), "src/main/java/example/Tool.java")
+            value["links"] = rows; reject { _ = try decode(value) }
+        }
+    }
+
     private static func goWire(_ f: SavedImportFixture, identity: AtlasSavedIdentity) throws {
         let decode: ([String: Any]) throws -> AtlasSavedImports = {
             try AtlasSavedImports.decode(f.base.encode($0), identity: identity, generation: 1,
@@ -395,6 +459,7 @@ private final class SavedImportFixture: @unchecked Sendable {
         let accepted = try decode(f.page(identity.owner, generation: 1))
         try cppWire(f, identity: identity)
         try goWire(f, identity: identity)
+        try javaWire(f, identity: identity)
         try javascriptLoadWire(f, identity: identity)
         precondition(accepted.complete && accepted.links[0].sourcePath.bytes == f.base.rawPath)
         precondition(accepted.links[0].canOpenTarget && !accepted.links[1].canOpenTarget)

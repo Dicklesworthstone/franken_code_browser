@@ -990,7 +990,7 @@ final class AtlasSavedFileAccess {
                 Text("\(model.importDirection == .incoming ? "Imports targeting" : "Imports declared in") \(member.path.display)")
                     .font(.caption).lineLimit(2).textSelection(.enabled)
             }
-            Text("Source imports in Rust, JavaScript/TypeScript/JSX/TSX, Python, C/C++ and Go. Captured go.mod metadata can identify a representative local Go package file. Targets remain saved-manifest candidates; compiler binding and build constraints are not established.")
+            Text("Source imports in Rust, JavaScript/TypeScript/JSX/TSX, Python, C/C++, Go and Java. Captured go.mod metadata can identify a representative local Go package file; Java uses conventional source paths. Targets remain saved-manifest candidates; compiler binding, classpaths and build constraints are not established.")
                 .font(.caption).foregroundStyle(.secondary)
             if let page = model.imports, model.importsAreCurrent {
                 VStack(alignment: .leading, spacing: 4) {
