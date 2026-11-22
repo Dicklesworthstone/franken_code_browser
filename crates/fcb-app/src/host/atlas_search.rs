@@ -465,6 +465,7 @@ impl RetainedAtlasSearch {
         out.literal(",\"catalogued_files\":")?; out.integer(atlas.atlas().file_count() as u64)?;
         out.literal(",\"discovery_policy\":")?; out.quoted(atlas.atlas().catalog().policy_name())?;
         crate::workspace::rule_output::fields(&mut out, atlas.atlas().catalog())?;
+        atlas.encode_discovery_scope(&mut out)?;
         Ok(out)
     }
     fn finish(&mut self, atlas: &AtlasSession, out: Output, partial: bool,

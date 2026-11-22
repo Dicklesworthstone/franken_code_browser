@@ -155,7 +155,7 @@ impl RetainedAtlasSearch {
         if self.pending_relationship_generation() != Some(generation) {
             if self.relationships_pending.is_none() && self.relationship_generation() == Some(generation)
                 && self.last_relationship_attempt == generation {
-                let mut out = self.relationship_output("links-step")?;
+                let mut out = self.relationship_output(atlas, "links-step")?;
                 let snapshot = self.relationship_snapshot(generation)?;
                 let index = self.relationship_index(snapshot)?;
                 wire::page(&mut out, atlas, index, snapshot, None, AtlasRelationshipDirection::All, 0, 64, &mut canceled)?;
@@ -191,7 +191,7 @@ impl RetainedAtlasSearch {
             }
             None => None,
         };
-        let mut out = self.relationship_output("links-page")?;
+        let mut out = self.relationship_output(atlas, "links-page")?;
         let snapshot = self.relationship_snapshot(generation)?;
         let index = self.relationship_index(snapshot)?;
         wire::page(&mut out, atlas, index, snapshot, filter, direction, start, limit, &mut canceled)?;
@@ -208,7 +208,7 @@ impl RetainedAtlasSearch {
         -> Result<(ReaderSession, HostResponse), AtlasSearchError> {
         self.validate(atlas)?; check(&mut canceled)?;
         if reader_owner == self.manifest.owner() { return Err(AtlasSearchError::WrongAtlas); }
-        let mut out = self.relationship_output("links-open-reader")?;
+        let mut out = self.relationship_output(atlas, "links-open-reader")?;
         let snapshot = self.relationship_snapshot(generation)?;
         let index = self.relationship_index(snapshot)?;
         let ordinal = id.checked_sub(1).and_then(|id| usize::try_from(id).ok()).ok_or(AtlasSearchError::MissingRelationship)?;
@@ -251,7 +251,7 @@ impl RetainedAtlasSearch {
         }
         Ok(index)
     }
-    fn relationship_output(&mut self, command: &str) -> Result<Output, AtlasSearchError> {
+    fn relationship_output(&mut self, atlas: &AtlasSession, command: &str) -> Result<Output, AtlasSearchError> {
         let id = self.next_id()?;
         // Native relationship transports admit at most four MiB. The page
         // encoder shortens rows before this bound while retaining continuation.
@@ -260,11 +260,12 @@ impl RetainedAtlasSearch {
         out.literal(",\"owner\":")?; out.integer(self.manifest.owner().get())?;
         out.literal(",\"source_manifest\":")?; out.integer(self.manifest.revision())?;
         out.literal(",\"layout_revision\":")?; out.integer(self.layout.get())?;
+        atlas.encode_discovery_scope(&mut out)?;
         Ok(out)
     }
     fn relationship_response(&mut self, atlas: &AtlasSession, snapshot: &RelationshipSnapshot,
         command: &str, canceled: &mut impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
-        let mut out = self.relationship_output(command)?;
+        let mut out = self.relationship_output(atlas, command)?;
         let index = self.relationship_index(snapshot)?;
         wire::page(&mut out, atlas, index, snapshot, None, AtlasRelationshipDirection::All, 0, 64, canceled)?;
         self.finish(atlas, out, !snapshot.complete, canceled)

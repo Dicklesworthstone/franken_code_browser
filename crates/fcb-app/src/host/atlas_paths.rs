@@ -194,7 +194,7 @@ impl RetainedAtlasPaths {
             files_examined: query.files_examined(), candidates_examined: query.candidates_examined(),
             work_units: query.work_units(), _lease: lease };
         drop(query);
-        let mut out = self.output("find", false)?;
+        let mut out = self.output(atlas, "find", false)?;
         encode_page(&mut out, atlas, &candidate, 0, 64, &mut canceled)?;
         let response = self.finish(atlas, out, !candidate.complete, &mut canceled)?;
         self.accepted = Some(candidate); Ok(response)
@@ -203,7 +203,7 @@ impl RetainedAtlasPaths {
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasPathError> {
         self.validate(atlas)?; check(&mut canceled)?;
         if !(1..=MAX_ATLAS_PATH_PAGE).contains(&limit) { return Err(PathSearchError::InvalidLimits.into()); }
-        let mut out = self.output("page", false)?;
+        let mut out = self.output(atlas, "page", false)?;
         let results = self.results(generation)?;
         if start > results.hits.len() { return Err(PathSearchError::InvalidLimits.into()); }
         encode_page(&mut out, atlas, results, start, limit, &mut canceled)?;
@@ -214,7 +214,7 @@ impl RetainedAtlasPaths {
     pub fn select(&mut self, atlas: &AtlasSession, generation: u64, file: FileId,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasPathError> {
         let hit = self.hit(atlas, generation, file)?; check(&mut canceled)?;
-        let mut out = self.output("select", false)?;
+        let mut out = self.output(atlas, "select", false)?;
         out.literal(",\"query_generation\":")?; out.integer(generation)?;
         out.literal(",\"selection\":")?; encode_hit(&mut out, atlas, hit)?; out.literal("}\n")?;
         let response = self.finish(atlas, out, false, &mut canceled)?;
@@ -224,7 +224,7 @@ impl RetainedAtlasPaths {
     pub fn clear(&mut self, atlas: &AtlasSession, generation: u64,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasPathError> {
         self.validate(atlas)?; self.attempt(generation)?; check(&mut canceled)?;
-        let mut out = self.output("clear", false)?;
+        let mut out = self.output(atlas, "clear", false)?;
         out.literal(",\"query_generation\":")?; out.integer(generation)?;
         out.literal(",\"retained_hits\":\"0\"}\n")?;
         let response = self.finish(atlas, out, false, &mut canceled)?;
@@ -250,7 +250,7 @@ impl RetainedAtlasPaths {
         let hit = self.hit(atlas, generation, file)?; check(&mut canceled)?;
         if reader_owner == self.manifest.owner() { return Err(AtlasPathError::WrongAtlas); }
         if !(1..=MAX_READER_SOURCE_BYTES).contains(&max_bytes) { return Err(AppError::InputLimit.into()); }
-        let mut out = self.output("open-reader", true)?;
+        let mut out = self.output(atlas, "open-reader", true)?;
         let entry = atlas.atlas().catalog().entry(file).ok_or(AtlasPathError::MissingHit)?;
         let root = self.grant.root_path().to_path_buf();
         let path = workspace::checked_source_path(&root, entry.path()).map_err(|_| AppError::SourceChanged)?;
@@ -270,7 +270,7 @@ impl RetainedAtlasPaths {
         self.next_allocation = id.checked_add(1).ok_or(AtlasPathError::IdentityExhausted)?;
         ResourceAllocationId::new(id).map_err(|_| AtlasPathError::IdentityExhausted)
     }
-    fn output(&mut self, command: &str, source_read: bool) -> Result<Output, AtlasPathError> {
+    fn output(&mut self, atlas: &AtlasSession, command: &str, source_read: bool) -> Result<Output, AtlasPathError> {
         let id = self.next_id()?;
         let mut out = Output::new(self.manifest.owner(), MAX_RESPONSE_BYTES, &self.budget, id)?;
         out.literal("{\"schema\":\"fcb.atlas-paths/1\",\"status\":\"ok\",\"command\":")?; out.quoted(command)?;
@@ -278,6 +278,7 @@ impl RetainedAtlasPaths {
         out.literal(",\"source_manifest\":")?; out.integer(self.manifest.revision())?;
         out.literal(",\"layout_revision\":")?; out.integer(self.layout.get())?;
         out.literal(",\"source_payload_read\":")?; out.boolean(source_read)?;
+        atlas.encode_discovery_scope(&mut out)?;
         Ok(out)
     }
     fn finish(&mut self, atlas: &AtlasSession, out: Output, partial: bool,

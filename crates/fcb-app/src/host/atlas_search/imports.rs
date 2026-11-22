@@ -146,7 +146,7 @@ impl RetainedAtlasSearch {
         if self.pending_import_generation() != Some(generation) {
             if self.imports_pending.is_none() && self.import_generation() == Some(generation)
                 && self.last_import_attempt == generation {
-                let mut out = self.import_output("imports-step")?;
+                let mut out = self.import_output(atlas, "imports-step")?;
                 let snapshot = self.import_snapshot(generation)?;
                 let index = self.import_index(snapshot)?;
                 wire::page(&mut out, atlas, index, snapshot, None, AtlasImportDirection::All, 0, 64, &mut canceled)?;
@@ -179,7 +179,7 @@ impl RetainedAtlasSearch {
             }
             None => None,
         };
-        let mut out = self.import_output("imports-page")?;
+        let mut out = self.import_output(atlas, "imports-page")?;
         let snapshot = self.import_snapshot(generation)?; let index = self.import_index(snapshot)?;
         wire::page(&mut out, atlas, index, snapshot, filter, direction, start, limit, &mut canceled)?;
         self.finish(atlas, out, !snapshot.complete, &mut canceled)
@@ -193,7 +193,7 @@ impl RetainedAtlasSearch {
         -> Result<(ReaderSession, HostResponse), AtlasSearchError> {
         self.validate(atlas)?; check(&mut canceled)?;
         if reader_owner == self.manifest.owner() { return Err(AtlasSearchError::WrongAtlas); }
-        let mut out = self.import_output("imports-open-reader")?;
+        let mut out = self.import_output(atlas, "imports-open-reader")?;
         let snapshot = self.import_snapshot(generation)?; let index = self.import_index(snapshot)?;
         let ordinal = id.checked_sub(1).and_then(|n| usize::try_from(n).ok()).ok_or(AtlasSearchError::MissingImport)?;
         let link = snapshot.links.get(ordinal).ok_or(AtlasSearchError::MissingImport)?;
@@ -230,18 +230,19 @@ impl RetainedAtlasSearch {
         }
         Ok(index)
     }
-    fn import_output(&mut self, command: &str) -> Result<Output, AtlasSearchError> {
+    fn import_output(&mut self, atlas: &AtlasSession, command: &str) -> Result<Output, AtlasSearchError> {
         let id = self.next_id()?;
         let mut out = Output::new(self.manifest.owner(), 4 * 1024 * 1024, &self.budget, id)?;
         out.literal("{\"schema\":\"fcb.atlas-imports/1\",\"status\":\"ok\",\"command\":")?; out.quoted(command)?;
         out.literal(",\"owner\":")?; out.integer(self.manifest.owner().get())?;
         out.literal(",\"source_manifest\":")?; out.integer(self.manifest.revision())?;
         out.literal(",\"layout_revision\":")?; out.integer(self.layout.get())?;
+        atlas.encode_discovery_scope(&mut out)?;
         Ok(out)
     }
     fn import_response(&mut self, atlas: &AtlasSession, snapshot: &ImportsSnapshot,
         command: &str, canceled: &mut impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
-        let mut out = self.import_output(command)?;
+        let mut out = self.import_output(atlas, command)?;
         let index = self.import_index(snapshot)?;
         wire::page(&mut out, atlas, index, snapshot, None, AtlasImportDirection::All, 0, 64, canceled)?;
         self.finish(atlas, out, !snapshot.complete, canceled)

@@ -12,8 +12,9 @@ extern "C" {
  * All non-null returned strings are complete fcb.atlas-session/1 JSON; inspect
  * status, discovery_complete and detail_limited rather than treating non-null
  * as success. Free strings exactly once using this library's fcb_free_string.
- * Null means no complete handoff. Foreign pointers must be valid UTF-8 C strings
- * stable until return; invalid pointer memory is not recoverable.
+ * Null means no complete handoff. Unless explicitly declared as raw bytes,
+ * foreign string pointers must be valid UTF-8 C strings stable until return;
+ * invalid pointer memory is not recoverable.
  *
  * At most four live/initializing/retiring atlas cells. Handles are opaque, not
  * pointers, never reused in this loaded library, and distinct from reader IDs.
@@ -26,6 +27,12 @@ extern "C" {
  * from the retained grant. Bind later receipts to this identity and these bytes;
  * do not reinterpret a display label
  * or require a caller's equivalent absolute spelling to be byte-identical.
+ * Every retained atlas/search/index/source envelope identifies its immutable
+ * discovery universe: discovery_scope is "workspace" or "directory",
+ * discovery_directory is null or a reversible raw-path object, and path_basis
+ * is "project-root". All completeness claims refer to that universe; complete
+ * folder discovery never means complete project discovery. Display/query
+ * filters may narrow this catalog but cannot widen it.
  */
 uint64_t fcb_atlas_create(void);
 char *fcb_atlas_open(uint64_t handle, const char *root, uint64_t max_files);
@@ -51,6 +58,27 @@ char *fcb_atlas_open_cancelable(uint64_t handle, const char *root, uint64_t max_
     int32_t (*poll)(void *), void *context);
 char *fcb_atlas_open_with_policy_cancelable(uint64_t handle, const char *root,
     uint64_t max_files, uint64_t discovery_policy, int32_t (*poll)(void *), void *context);
+/* Independently bounded folder discovery, before applying the metadata cap.
+ * root remains the ORIGINAL project root and its grant remains authoritative.
+ * directory is a readable non-NUL-terminated raw Unix byte buffer, length
+ * 1..2048, containing 1..31 nonempty '/'-separated components. Absolute paths,
+ * dot/dot-dot components, embedded NUL and symlink/special-object traversal
+ * are refused. Backslashes, drive-looking names and non-UTF-8 bytes remain
+ * literal native names. The buffer stays valid until return and is not retained.
+ * Ancestor repository rules remain in force under policy 0; siblings do not
+ * spend the folder's file allowance. Policy 1 reads no rule configuration.
+ * All file/source paths stay relative to the original root. A missing or
+ * invalid directory is not successful empty discovery; an excluded ancestor
+ * or unavailable rule policy remains explicitly incomplete.
+ * Invalid policy/length/file limits and null directory return NULL before
+ * dereferencing pointers, polling callbacks or accessing the handle table.
+ * Other admission, cooperative cancellation, late-NULL ownership and freeing
+ * rules are the same as the workspace opener. Changing directory needs a new
+ * handle, so existing capture/query identities are never relabeled.
+ */
+char *fcb_atlas_open_directory_with_policy_cancelable(uint64_t handle, const char *root,
+    const uint8_t *directory, uint64_t directory_len, uint64_t max_files,
+    uint64_t discovery_policy, int32_t (*poll)(void *), void *context);
 char *fcb_atlas_info(uint64_t handle);
 
 /* Plan generations strictly increase across accepted or failed admitted
@@ -107,8 +135,8 @@ char *fcb_atlas_open_reader(uint64_t handle, uint64_t reader, uint64_t frame,
  * alive until replacement is acknowledged. A successful scope change resets
  * focus/history/selection to the new layout's root; a failed or canceled
  * attempt preserves the prior scope, history and candidate. Search and
- * path queries remain workspace-wide; their responses label the scope, and
- * paging/overlay encode only in-scope rows while counts stay workspace-wide.
+ * path queries remain catalog-wide; their responses label the scope, and
+ * paging/overlay encode only in-scope rows while counts stay catalog-wide.
  * Focus of a retained hit whose file is out of scope is refused.
  */
 char *fcb_atlas_scope(uint64_t handle, uint64_t generation,

@@ -25,6 +25,7 @@ use super::{HostResponse, catalog_session::CatalogDiscoveryPolicy,
     reader::{ReaderSession, ReaderSessionError}};
 
 pub const MAX_ATLAS_SESSION_FILES: usize = 20_000;
+pub const MAX_ATLAS_DIRECTORY_BYTES: usize = fcb::search::workspace::MAX_WORKSPACE_PATH_BYTES;
 pub const MAX_ATLAS_SESSION_ITEMS: usize = 4096;
 pub const MAX_ATLAS_SESSION_VISITS: usize = 131_072;
 pub const MAX_ATLAS_HISTORY: usize = 64;
@@ -59,6 +60,24 @@ impl From<WorkspaceAtlasError> for AtlasSessionError { fn from(e: WorkspaceAtlas
 impl From<WorkspaceError> for AtlasSessionError { fn from(e: WorkspaceError) -> Self { Self::Workspace(e.into()) } }
 impl From<ReaderSessionError> for AtlasSessionError { fn from(e: ReaderSessionError) -> Self { Self::Reader(e) } }
 impl From<OutputError> for AtlasSessionError { fn from(e: OutputError) -> Self { Self::App(e.into()) } }
+
+/// Admit raw Unix directory components shared by metadata and retained atlases.
+/// The path stays relative to the original project grant. No normalization of
+/// backslashes, drive-looking names or non-UTF-8 bytes changes its identity.
+pub fn directory_path(directory: &[u8]) -> Result<NormalizedPath, AtlasSessionError> {
+    if directory.is_empty() || directory.len() > MAX_ATLAS_DIRECTORY_BYTES
+        || directory.split(|byte| *byte == b'/').count() >= 32 {
+        return Err(AtlasSessionError::InvalidLimits);
+    }
+    let mut segments = directory.split(|byte| *byte == b'/');
+    let first = segments.next().ok_or(AtlasSessionError::InvalidLimits)?;
+    let mut path = NormalizedPath::from_dirent_name(first)
+        .map_err(|_| AtlasSessionError::InvalidLimits)?;
+    for segment in segments {
+        path = path.join_segment(segment).map_err(|_| AtlasSessionError::InvalidLimits)?;
+    }
+    Ok(path)
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct AtlasSessionOptions {
@@ -261,6 +280,22 @@ impl AtlasSession {
     /// Extension tokens were validated UTF-8 at construction.
     pub fn encode_scope(&self, out: &mut Output) -> Result<(), AtlasSessionError> {
         encode_scope(out, self.scope, self.atlas.file_count())
+    }
+    /// The immutable discovery universe, independent of display/query filters.
+    /// Complete directory coverage never advertises complete project coverage.
+    /// Paths remain reversible identities relative to the original root grant.
+    pub fn encode_discovery_scope(&self, out: &mut Output) -> Result<(), AtlasSessionError> {
+        out.literal(",\"discovery_scope\":")?;
+        if let Some(directory) = self.atlas.catalog().directory() {
+            out.quoted("directory")?;
+            out.literal(",\"discovery_directory\":")?;
+            out.path(&directory.raw().to_path_buf())?;
+        } else {
+            out.quoted("workspace")?;
+            out.literal(",\"discovery_directory\":null")?;
+        }
+        out.literal(",\"path_basis\":\"project-root\"")?;
+        Ok(())
     }
     /// Named scope presets are pure extension sets; product naming lives at
     /// the host boundary, not in the layout engine.
@@ -613,6 +648,7 @@ impl AtlasSession {
         out.literal(",\"catalogued_files\":")?; out.integer(atlas.file_count() as u64)?;
         out.literal(",\"discovery_policy\":")?; out.quoted(self.atlas.catalog().policy_name())?;
         workspace::rule_output::fields(&mut out, self.atlas.catalog())?;
+        self.encode_discovery_scope(&mut out)?;
         encode_scope(&mut out, scope, self.atlas.file_count())?;
         out.literal(",\"retention\":\"frozen-catalog-and-spatial-index\"")?;
         Ok(out)

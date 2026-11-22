@@ -5,7 +5,8 @@
 
 use std::{ffi::c_char, path::Path, sync::OnceLock};
 use fcb_app::host::{HostResponse, atlas_session::{AtlasAction, AtlasExtensionScope, AtlasScope,
-    AtlasSession, AtlasSessionOptions}, catalog_session::CatalogDiscoveryPolicy};
+    AtlasSession, AtlasSessionOptions, MAX_ATLAS_DIRECTORY_BYTES, MAX_ATLAS_SESSION_FILES,
+    directory_path}, catalog_session::CatalogDiscoveryPolicy};
 use fcb_core::Point2D;
 use super::{cstr, reply, string_out};
 use super::atlas_sessions::{AccessError, AtlasSessions, Command};
@@ -198,6 +199,46 @@ pub unsafe extern "C" fn fcb_atlas_open_with_policy_cancelable(handle: u64, root
     })
 }
 
+/// Open a bounded folder catalog under the original project grant. Directory
+/// bytes are raw Unix components, never a replacement root or a lossy label.
+/// Policy, length and file limits are refused before pointer/callback/handle
+/// access. Component admission is shared with the metadata directory route.
+/// # Safety
+/// For admitted limits, root/poll/context follow fcb_atlas_open_cancelable.
+/// directory must point to directory_len readable bytes stable until return.
+/// It is not NUL-terminated; malformed raw paths are refused. A late null can
+/// follow installation: inspect or close the known handle on a worker. Free
+/// every non-null reply once through fcb_free_string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_open_directory_with_policy_cancelable(
+    handle: u64, root: *const c_char, directory: *const u8, directory_len: u64,
+    max_files: u64, discovery_policy: u64,
+    poll: Option<super::search_ffi::SearchCancellationCallback>,
+    context: *mut std::ffi::c_void) -> *mut c_char {
+    reply(|| {
+        let policy = match discovery_policy {
+            0 => CatalogDiscoveryPolicy::RepositoryRules,
+            1 => CatalogDiscoveryPolicy::IncludeExcluded,
+            _ => return None,
+        };
+        let max_files = number(max_files).ok()?;
+        let directory_len = number(directory_len).ok()?;
+        if !(1..=MAX_ATLAS_SESSION_FILES).contains(&max_files)
+            || !(1..=MAX_ATLAS_DIRECTORY_BYTES).contains(&directory_len)
+            || directory.is_null() { return None; }
+        let canceled = || poll.is_some_and(|poll| unsafe { poll(context) != 0 });
+        if canceled() { return None; }
+        let root = unsafe { cstr(root) }?;
+        let directory = unsafe { std::slice::from_raw_parts(directory, directory_len) };
+        let directory = directory_path(directory).ok()?;
+        let response = ATLASES.get()?.open_directory_with_policy(handle, Path::new(root),
+            directory, AtlasSessionOptions { max_files, ..Default::default() },
+            policy, canceled).ok()?;
+        if canceled() { return None; }
+        string_out(response.as_str())
+    })
+}
+
 /// Advance the existing one-file search pipeline with cooperative polling.
 /// Cancellation is checked inside capture, verification, hashing and encoding,
 /// not only between native calls. Null is not a successful empty search page.
@@ -216,3 +257,7 @@ pub unsafe extern "C" fn fcb_atlas_search_step_cancelable(handle: u64, generatio
         string_out(response.as_str())
     })
 }
+
+#[cfg(all(test, unix))]
+#[path = "atlas_directory_ffi_tests.rs"]
+mod directory_tests;
