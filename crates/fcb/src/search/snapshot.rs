@@ -66,7 +66,11 @@ pub fn export_workspace(captures: &WorkspaceCaptures<'_>, limits: SnapshotLimits
         };
         entries.push(SnapshotEntry { path: entry.path().as_bytes(), observed_bytes, data });
     }
-    let bytes = SnapshotBytes::encode(catalog.id().owner(), catalog.discovery_complete(), catalog.policy_name(),
+    // This archive version has no directory-scope identity. Preserve captured
+    // members, but never turn a complete subtree into a complete whole-root
+    // inventory whose missing siblings could be interpreted as deletions.
+    let complete_root = catalog.discovery_complete() && catalog.directory().is_none();
+    let bytes = SnapshotBytes::encode(catalog.id().owner(), complete_root, catalog.policy_name(),
         &entries, limits, budget, allocations[1], &mut canceled)?;
     catalog.validate_active()?;
     if canceled() { return Err(SavedSourceError::Canceled); }

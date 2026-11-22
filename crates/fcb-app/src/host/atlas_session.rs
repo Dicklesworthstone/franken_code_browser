@@ -17,6 +17,7 @@ use fcb::search::{QueryGeneration, RawPath, ResourceAllocationId, ResourceBudget
 use fcb::search::workspace::{RootGrant, WorkspaceCatalog, WorkspaceError, WorkspaceLimits, WorkspaceStage};
 use fcb::source::CancelFlag;
 use fcb::source::ignore::repository::RuleLimits;
+use fcb::source::path::NormalizedPath;
 use fcb_core::{PresentedFrameId, ResourceLease};
 use crate::{AppError, EXIT_OK, EXIT_PARTIAL, MANAGED_BYTES, input, workspace};
 use crate::output::{Output, OutputError, MAX_RESPONSE_BYTES};
@@ -146,7 +147,23 @@ impl AtlasSession {
     /// No ignore configuration is read for that policy. A changed policy needs
     /// a new session; existing source/layout identities are never relabeled.
     pub fn open_with_policy(owner: ArenaOwnerId, root: &Path, options: AtlasSessionOptions,
-        policy: CatalogDiscoveryPolicy, mut canceled: impl FnMut() -> bool)
+        policy: CatalogDiscoveryPolicy, canceled: impl FnMut() -> bool)
+        -> Result<Self, AtlasSessionError> {
+        Self::open_directory_scope(owner, root, None, options, policy, canceled)
+    }
+
+    /// Prepare a bounded directory atlas while preserving the original project
+    /// grant and root-relative source identities. Ancestors provide inherited
+    /// repository rules, but their siblings are not enumerated. The existing
+    /// file/path/depth/worker bounds also apply to this independently sized map.
+    pub fn open_directory_with_policy(owner: ArenaOwnerId, root: &Path, directory: NormalizedPath,
+        options: AtlasSessionOptions, policy: CatalogDiscoveryPolicy, canceled: impl FnMut() -> bool)
+        -> Result<Self, AtlasSessionError> {
+        Self::open_directory_scope(owner, root, Some(directory), options, policy, canceled)
+    }
+
+    fn open_directory_scope(owner: ArenaOwnerId, root: &Path, directory: Option<NormalizedPath>,
+        options: AtlasSessionOptions, policy: CatalogDiscoveryPolicy, mut canceled: impl FnMut() -> bool)
         -> Result<Self, AtlasSessionError> {
         check(&mut canceled)?;
         if root.as_os_str().is_empty() || root.as_os_str().len() > 16_384 || !(1..=MAX_ATLAS_SESSION_FILES).contains(&options.max_files)
@@ -170,12 +187,17 @@ impl AtlasSession {
             ..WorkspaceLimits::default() };
         let manifest = SearchManifestId::new(owner, 1).map_err(AppError::from)?;
         let first_file = FileId::new(owner, 1).map_err(|_| AtlasSessionError::IdentityExhausted)?;
-        let mut catalog = match policy {
-            CatalogDiscoveryPolicy::RepositoryRules => WorkspaceCatalog::open_rule_aware(
+        let mut catalog = match (policy, directory) {
+            (CatalogDiscoveryPolicy::RepositoryRules, None) => WorkspaceCatalog::open_rule_aware(
                 grant, manifest, first_file, limits, RuleLimits::default(), &budget,
                 [allocation(1)?, allocation(5)?])?,
-            CatalogDiscoveryPolicy::IncludeExcluded => WorkspaceCatalog::open(
+            (CatalogDiscoveryPolicy::IncludeExcluded, None) => WorkspaceCatalog::open(
                 grant, manifest, first_file, limits, true, &budget, allocation(1)?)?,
+            (CatalogDiscoveryPolicy::RepositoryRules, Some(directory)) => WorkspaceCatalog::open_rule_aware_in_directory(
+                grant, directory, manifest, first_file, limits, RuleLimits::default(), &budget,
+                [allocation(1)?, allocation(5)?])?,
+            (CatalogDiscoveryPolicy::IncludeExcluded, Some(directory)) => WorkspaceCatalog::open_in_directory(
+                grant, directory, manifest, first_file, limits, true, &budget, allocation(1)?)?,
         };
         while catalog.stage() == WorkspaceStage::Discovering {
             check(&mut canceled)?;
@@ -201,7 +223,8 @@ impl AtlasSession {
             presented: None, frame: None, last_attempt: 0, last_display_generation: 1, next_allocation: 10,
             visible: options.visible, budget, _lease: lease })
     }
-    /// The workspace-wide (All) atlas: the identity/search lane bound. Search
+    /// The base (All) atlas for this session's declared catalog scope. A
+    /// directory session never widens to the project root. Search
     /// and path queries validate against this layout so an explicit scope
     /// change never retires retained workspace-wide results or re-reads source.
     pub fn atlas(&self) -> &RetainedWorkspaceAtlas { &self.atlas }

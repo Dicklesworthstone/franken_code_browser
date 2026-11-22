@@ -8,10 +8,13 @@
 use std::path::Path;
 use fcb::ByteLength;
 use fcb::search::ResourceBudget;
+use fcb::source::path::NormalizedPath;
 use crate::{AppError, allocation, owner};
 use crate::output::{Output, MAX_ENCODED_BYTES, OUTPUT_OVERHEAD_BYTES};
 use super::super::{HostResponse, atlas_session::{AtlasSession, AtlasSessionError, AtlasSessionOptions},
     catalog_session::CatalogDiscoveryPolicy};
+
+pub const MAX_PROJECT_DIRECTORY_BYTES: usize = fcb::search::workspace::MAX_WORKSPACE_PATH_BYTES;
 
 /// Response-local IDs do not authorize later source access. Paths are reversible
 /// native payloads, including names the current UTF-8-only native opener cannot
@@ -30,6 +33,36 @@ pub fn prepare_with_policy(root: &Path, max_files: usize, policy: CatalogDiscove
     mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasSessionError> {
     let atlas = AtlasSession::open_with_policy(owner(), root,
         AtlasSessionOptions { max_files, ..Default::default() }, policy, &mut canceled)?;
+    encode_catalog(&atlas, canceled)
+}
+
+/// Explicit bounded subtree, under the original project root and selected
+/// discovery policy. Raw Unix components are validated without normalizing
+/// backslashes, drive-looking names or invalid UTF-8 into different identities.
+/// Existing root catalogs retain their original schema; this additive route
+/// echoes the directory and declares all file paths relative to the project.
+pub fn prepare_directory(root: &Path, directory: &[u8], max_files: usize,
+    policy: CatalogDiscoveryPolicy, mut canceled: impl FnMut() -> bool)
+    -> Result<HostResponse, AtlasSessionError> {
+    if canceled() { return Err(AtlasSessionError::Canceled); }
+    if directory.is_empty() || directory.len() > MAX_PROJECT_DIRECTORY_BYTES
+        || directory.split(|byte| *byte == b'/').count() >= 32 {
+        return Err(AtlasSessionError::InvalidLimits);
+    }
+    let mut segments = directory.split(|byte| *byte == b'/');
+    let first = segments.next().ok_or(AtlasSessionError::InvalidLimits)?;
+    let mut path = NormalizedPath::from_dirent_name(first)
+        .map_err(|_| AtlasSessionError::InvalidLimits)?;
+    for segment in segments {
+        path = path.join_segment(segment).map_err(|_| AtlasSessionError::InvalidLimits)?;
+    }
+    let atlas = AtlasSession::open_directory_with_policy(owner(), root, path,
+        AtlasSessionOptions { max_files, ..Default::default() }, policy, &mut canceled)?;
+    encode_catalog(&atlas, canceled)
+}
+
+fn encode_catalog(atlas: &AtlasSession, mut canceled: impl FnMut() -> bool)
+    -> Result<HostResponse, AtlasSessionError> {
     let catalog = atlas.atlas().catalog();
     let index = atlas.atlas().index()?;
     // Admit both response/native-copy overlap and the encoder's path scratch.
@@ -39,7 +72,14 @@ pub fn prepare_with_policy(root: &Path, max_files: usize, policy: CatalogDiscove
     let lease = budget.try_reserve_managed(owner(), allocation(94),
         ByteLength::new((3 * MAX_ENCODED_BYTES + 4096) as u64)).map_err(|_| AppError::Admission)?;
     let mut out = Output::new(owner(), MAX_ENCODED_BYTES, &budget, allocation(1))?;
-    out.literal("{\"schema\":\"fcb.project-catalog/1\",\"status\":\"ok\",\"command\":\"catalog\",\"identity_scope\":\"response-local\",\"native_presented\":false,\"source_payload_read\":false,\"payload_bytes_read\":\"0\",\"read_calls\":\"0\",\"discovery_complete\":")?;
+    if let Some(directory) = catalog.directory() {
+        out.literal("{\"schema\":\"fcb.project-directory-catalog/1\",\"status\":\"ok\",\"command\":\"directory-catalog\",\"directory\":")?;
+        out.path(&directory.raw().to_path_buf())?;
+        out.literal(",\"path_basis\":\"project-root\"")?;
+    } else {
+        out.literal("{\"schema\":\"fcb.project-catalog/1\",\"status\":\"ok\",\"command\":\"catalog\"")?;
+    }
+    out.literal(",\"identity_scope\":\"response-local\",\"native_presented\":false,\"source_payload_read\":false,\"payload_bytes_read\":\"0\",\"read_calls\":\"0\",\"discovery_complete\":")?;
     out.boolean(catalog.discovery_complete())?;
     out.literal(",\"catalogued_files\":")?; out.integer(catalog.entries().len() as u64)?;
     out.literal(",\"policy\":")?; out.quoted(catalog.policy_name())?;
@@ -71,6 +111,10 @@ pub fn prepare_with_policy(root: &Path, max_files: usize, policy: CatalogDiscove
     text.push_str(std::str::from_utf8(out.as_bytes()).map_err(|_| AppError::InvalidRange)?);
     Ok(HostResponse { text, exit_code: if catalog.discovery_complete() { crate::EXIT_OK } else { crate::EXIT_PARTIAL }, _lease: lease })
 }
+
+#[cfg(all(test, unix))]
+#[path = "project_directory_catalog_tests.rs"]
+mod directory_tests;
 
 #[cfg(all(test, unix))]
 mod tests {

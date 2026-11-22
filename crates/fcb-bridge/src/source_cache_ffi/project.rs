@@ -114,6 +114,46 @@ pub unsafe extern "C" fn fcb_project_catalog_with_policy_cancelable(root: *const
     })
 }
 
+/// Independently bounded directory catalog under the ORIGINAL project root.
+/// Raw file paths remain project-root-relative; the reply echoes the directory
+/// in fcb.project-directory-catalog/1. This never broadens the grant or follows
+/// symlinks. Policy 0 loads bounded inherited rules; policy 1 reads no rules.
+/// # Safety
+/// root/poll/context obey fcb_project_catalog_cancelable's call-scoped contract.
+/// For admitted lengths, directory points to directory_len initialized readable
+/// bytes in one allocation, stable until return. It is a normalized raw Unix
+/// relative directory, not a UTF-8 C string. Invalid policy/length/file bounds
+/// refuse before either input is dereferenced or poll is invoked. Null is
+/// failure/cancellation; release a non-null result once with fcb_free_string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_project_directory_catalog_cancelable(root: *const c_char,
+    directory: *const u8, directory_len: u64, max_files: u64, discovery_policy: u64,
+    poll: Option<SearchCancellationCallback>, context: *mut c_void) -> *mut c_char {
+    reply(|| {
+        let policy = match discovery_policy {
+            0 => host::catalog_session::CatalogDiscoveryPolicy::RepositoryRules,
+            1 => host::catalog_session::CatalogDiscoveryPolicy::IncludeExcluded,
+            _ => return None,
+        };
+        let max_files = usize::try_from(max_files).ok()?;
+        let directory_len = usize::try_from(directory_len).ok()?;
+        if !(1..=host::atlas_session::MAX_ATLAS_SESSION_FILES).contains(&max_files)
+            || !(1..=host::atlas::MAX_PROJECT_DIRECTORY_BYTES).contains(&directory_len)
+            || directory.is_null() { return None; }
+        let canceled = || poll.is_some_and(|p| unsafe { p(context) != 0 });
+        if canceled() { return None; }
+        let root = unsafe { cstr(root) }?;
+        let directory = unsafe { std::slice::from_raw_parts(directory, directory_len) };
+        let result = host::atlas::prepare_directory_catalog(Path::new(root),
+            directory, max_files, policy, canceled).ok()?;
+        if canceled() { return None; }
+        string_out(result.as_str())
+    })
+}
+
+#[cfg(all(test, unix))]
+mod directory_tests;
+
 #[cfg(test)]
 mod catalog_tests {
     use super::*;

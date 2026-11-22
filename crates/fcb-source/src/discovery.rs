@@ -174,6 +174,9 @@ pub struct BoundedDiscovery {
     own_exclusions: OwnArtifactExclusion,
     read_rule_files: bool,
     repository_rules: Option<RepositoryRules>,
+    // Keep the original grant/path basis. Ancestors contribute policy but are
+    // not enumerated, so unrelated siblings cannot consume the subtree budget.
+    directory: Option<NormalizedPath>,
     pending: VecDeque<PendingDir>,
     open: VecDeque<OpenDir>,
     epoch: ScanEpoch,
@@ -203,6 +206,14 @@ impl BoundedDiscovery {
         discovery.read_rule_files = false;
         Ok(discovery)
     }
+    /// Discover one directory under the original grant, retaining root-relative
+    /// identities. This route never follows symlinks or reads rule files. The
+    /// directory must already exist; subsequent changes produce partial coverage.
+    pub fn open_metadata_only_in_directory(grant: RootGrant, directory: NormalizedPath,
+        limits: DiscoveryLimits, ignore: IgnoreMatcher) -> Result<Self, SourceError> {
+        Self::open_metadata_only(grant, SymlinkPolicy::DisallowAll, limits, ignore)?
+            .with_directory(directory)
+    }
     /// Explicitly authorize nested rule-file reads under separate host capacity.
     /// No symlinks are followed. A bad/missing-evidence rule file withholds its
     /// containing subtree, but other directories can still produce useful pages.
@@ -212,6 +223,29 @@ impl BoundedDiscovery {
         let mut discovery = Self::open_metadata_only(grant, SymlinkPolicy::DisallowAll, limits, IgnoreMatcher::include_all())?;
         discovery.repository_rules = Some(policy);
         Ok(discovery)
+    }
+    /// Load the root and each ancestor's rules before entering the selected
+    /// directory. No sibling directory is enumerated, and a child negation
+    /// cannot bypass an excluded ancestor. Rule I/O remains deferred to batches.
+    pub fn open_rule_aware_in_directory(grant: RootGrant, directory: NormalizedPath,
+        limits: DiscoveryLimits, rules: RuleLimits, budget: &ResourceBudget,
+        allocation: ResourceAllocationId) -> Result<Self, RuleError> {
+        Ok(Self::open_rule_aware(grant, limits, rules, budget, allocation)?
+            .with_directory(directory)?)
+    }
+    fn with_directory(mut self, directory: NormalizedPath) -> Result<Self, SourceError> {
+        if directory.as_bytes().len() > self.limits.max_path_bytes as usize
+            || directory.segments().len() >= self.limits.max_depth as usize {
+            return Err(SourceError::PayloadTooLarge);
+        }
+        let root = self.reader.canonical_root_path()?;
+        let resolved = self.reader.resolve_confined_path(&root, &directory)?;
+        let metadata = fs::symlink_metadata(resolved).map_err(|_| SourceError::CaptureUnavailable)?;
+        validate_not_special(&metadata)?;
+        if !metadata.is_dir() { return Err(SourceError::InvalidRange); }
+        self.grant.validate_active()?;
+        self.directory = Some(directory);
+        Ok(self)
     }
     pub fn reads_rule_files(&self) -> bool { self.read_rule_files || self.repository_rules.is_some() }
     pub fn repository_rules(&self) -> Option<&RepositoryRules> { self.repository_rules.as_ref() }
@@ -229,7 +263,7 @@ impl BoundedDiscovery {
         reader.canonical_root_path()?;
         let mut session = Self { reader, grant, limits, ignore,
             own_exclusions: OwnArtifactExclusion::default_product(), read_rule_files: true,
-            repository_rules: None, pending: VecDeque::new(), open: VecDeque::new(), epoch: ScanEpoch(1),
+            repository_rules: None, directory: None, pending: VecDeque::new(), open: VecDeque::new(), epoch: ScanEpoch(1),
             next_stable_generation: 1, aggregate: DiscoveryAggregate::default(), peaks: DiscoveryPeaks::default(),
             status: ScanStatus::InProgress, queue_saturated: false, root_excluded: false };
         session.pending.push_back(PendingDir { rel: None, kind: DiscoveryKind::Directory,
@@ -249,7 +283,7 @@ impl BoundedDiscovery {
     pub fn ignore(&self) -> &IgnoreMatcher { &self.ignore }
     pub fn ignore_mut(&mut self) -> &mut IgnoreMatcher { &mut self.ignore }
     pub fn is_complete(&self) -> bool { matches!(self.status, ScanStatus::Completed { .. }) }
-    /// The entire granted root was withheld as an owned artifact. This is a
+    /// The granted root or selected directory was withheld by policy. This is a
     /// deliberate policy boundary, not evidence that its previous entries are absent.
     pub fn root_is_excluded(&self) -> bool { self.root_excluded }
 
@@ -414,6 +448,11 @@ impl BoundedDiscovery {
         };
         if self.own_exclusions.is_excluded(&resolved, Some(dir_id)) {
             self.aggregate.excluded = self.aggregate.excluded.saturating_add(1);
+            if self.is_directory_ancestor(pending.rel.as_ref()) {
+                self.root_excluded = true;
+                self.status = ScanStatus::Incomplete { reason: IncompleteReason::TraversalLimited };
+                return OpenResult::SkippedUnavailable;
+            }
             if let Some(path) = pending.rel {
                 // Replace the earlier directory observation with its newly
                 // established exclusion, without counting the directory twice.
@@ -437,6 +476,31 @@ impl BoundedDiscovery {
                 return OpenResult::SkippedUnavailable;
             }
         } else if self.read_rule_files { self.load_rule_files(pending.rel.as_ref(), &resolved, cancel); }
+        if let Some(directory) = self.directory.as_ref()
+            && pending.depth < directory.segments().len() as u32 {
+            // Visit the next ancestor directly after its parent's rules have
+            // been loaded. Each visit uses an ordinary bounded transition and
+            // the same root/depth/path/cycle checks as normal discovery.
+            let name = directory.segments()[pending.depth as usize].as_bytes();
+            let child = match child_relative(pending.rel.as_ref(), name) {
+                Ok(path) => path,
+                Err(_) => {
+                    self.aggregate.path_limited = self.aggregate.path_limited.saturating_add(1);
+                    return OpenResult::SkippedUnavailable;
+                }
+            };
+            if self.classify_exclusion(&child, true) {
+                self.aggregate.excluded = self.aggregate.excluded.saturating_add(1);
+                self.root_excluded = true;
+                self.status = ScanStatus::Incomplete { reason: IncompleteReason::TraversalLimited };
+                return OpenResult::SkippedUnavailable;
+            }
+            let mut ancestry = pending.ancestry; ancestry.push(dir_id);
+            self.pending.push_back(PendingDir { rel: Some(child), kind: DiscoveryKind::Directory,
+                depth: pending.depth + 1, alias_hops: 0, ancestry });
+            self.note_queue_peak();
+            return OpenResult::Opened;
+        }
         let iter = match fs::read_dir(&resolved) {
             Ok(iter) => iter,
             Err(_) => { self.aggregate.unavailable = self.aggregate.unavailable.saturating_add(1); return OpenResult::SkippedUnavailable; }
@@ -445,6 +509,13 @@ impl BoundedDiscovery {
         self.open.push_back(OpenDir { rel: pending.rel, depth: pending.depth, alias_hops: pending.alias_hops,
             ancestry, resolved, iter, children_emitted: 0, split_across_batches: false });
         self.note_descriptor_peak(); self.note_queue_peak(); OpenResult::Opened
+    }
+    fn is_directory_ancestor(&self, path: Option<&NormalizedPath>) -> bool {
+        self.directory.as_ref().is_some_and(|directory| {
+            path.is_none_or(|path| directory == path
+                || directory.as_bytes().starts_with(path.as_bytes())
+                    && directory.as_bytes().get(path.as_bytes().len()) == Some(&b'/'))
+        })
     }
     fn advance_open_dir(&mut self, entries: &mut Vec<DiscoveryEntry>, batch_bytes: &mut u64, any_split: &mut bool) -> Advance {
         let next = self.open.front_mut().and_then(|open| open.iter.next());

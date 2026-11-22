@@ -35,6 +35,33 @@ char *fcb_project_catalog_with_policy_cancelable(const char *root,
     uint64_t max_files, uint64_t discovery_policy,
     int32_t (*poll)(void *), void *context);
 
+/* Independently bounded atlas of one existing directory under the ORIGINAL
+ * project root. directory is 1..2048 raw Unix bytes, with nonempty slash-separated
+ * components, no ".", "..", NUL, leading/trailing slash, or normalization. Names
+ * may be non-UTF-8 and backslashes are literal bytes. Existing depth bounds
+ * apply (up to 31 directory components); max_files remains 1..20000.
+ * discovery_policy has the same 0/1 meaning as the root endpoint above. Invalid
+ * policy/length/file bounds return null before dereferencing inputs or polling.
+ * Policy 0 loads root and ancestor rules before descending; excluded parents
+ * cannot be bypassed by child negations. Policy 1 reads no rule configuration.
+ * Sibling directories are not enumerated. Own-artifact and symlink exclusions
+ * remain active. The original project root remains the access boundary; the
+ * selected directory never becomes a replacement root. No source capture or
+ * network access is made; existing path-based confinement limits still apply.
+ * Non-null fcb.project-directory-catalog/1 JSON has command directory-catalog,
+ * path_basis "project-root", and an exact reversible "directory" echo. All file
+ * paths retain their original project-root-relative bytes. Completeness refers
+ * only to the echoed directory; partial membership is never whole-root absence.
+ * Missing/non-directory/symlink inputs refuse; excluded or unavailable-policy
+ * scopes remain explicitly incomplete. Empty permitted directories are complete.
+ * root, directory, poll and context remain valid through return. Worker-only;
+ * free every non-null response once with fcb_free_string. Other metadata,
+ * configuration-I/O counters and response-local IDs follow the root contract.
+ */
+char *fcb_project_directory_catalog_cancelable(const char *root,
+    const uint8_t *directory, uint64_t directory_len, uint64_t max_files,
+    uint64_t discovery_policy, int32_t (*poll)(void *), void *context);
+
 /* Progressive project file discovery with retained page/row authority.
  * Four live/retiring handles; shared identity allocator with reader/atlas/saved
  * sessions. Create reserves an EMPTY cancelable handle without filesystem I/O.
