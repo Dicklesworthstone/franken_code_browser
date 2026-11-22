@@ -108,3 +108,70 @@ fn two_native_workers_do_not_share_cancellation_state() {
         assert!(canceled.join().unwrap().is_none()); assert!(normal.join().unwrap().is_some());
     });
 }
+
+
+#[test]
+fn catalog_policy_is_explicit_and_the_legacy_entrypoint_stays_rule_aware() {
+    let root = fixture(); let path = native(&root);
+    fs::write(root.join(".gitignore"), b"hidden.rs\n").unwrap();
+    fs::write(root.join("hidden.rs"), b"SOURCE_PAYLOAD_NEVER_READ").unwrap();
+    fs::create_dir(root.join("target")).unwrap();
+    fs::write(root.join("target/generated.rs"), b"SOURCE_PAYLOAD_NEVER_READ").unwrap();
+    let legacy = text(unsafe {
+        fcb_project_catalog_cancelable(path.as_ptr(), 32, None, std::ptr::null_mut())
+    }).unwrap();
+    let rules = text(unsafe {
+        fcb_project_catalog_with_policy_cancelable(path.as_ptr(), 32, 0, None, std::ptr::null_mut())
+    }).unwrap();
+    assert_eq!(legacy, rules);
+    assert!(!rules.contains("\"display\":\"hidden.rs\""));
+    assert!(!rules.contains("\"display\":\"target/generated.rs\""));
+    let included = text(unsafe {
+        fcb_project_catalog_with_policy_cancelable(path.as_ptr(), 32, 1, None, std::ptr::null_mut())
+    }).unwrap();
+    assert!(included.contains("\"policy\":\"all-regular-files/no-rule-files-v1\""), "{included}");
+    assert!(included.contains("\"rule_files_enabled\":false,\"rule_policy\":null"));
+    assert!(included.contains("\"display\":\"hidden.rs\""));
+    assert!(included.contains("\"display\":\"target/generated.rs\""));
+    assert!(included.contains("\"source_payload_read\":false,\"payload_bytes_read\":\"0\",\"read_calls\":\"0\""));
+    assert!(!included.contains("SOURCE_PAYLOAD_NEVER_READ"));
+}
+
+#[test]
+fn catalog_invalid_policy_refuses_before_polling_and_limits_remain_enforced() {
+    let root = fixture(); let path = native(&root);
+    let stop = Stop { polls: AtomicUsize::new(0), at: usize::MAX };
+    for policy in [2, u64::MAX] {
+        assert!(unsafe {
+            fcb_project_catalog_with_policy_cancelable(std::ptr::null(), 32, policy,
+                Some(poll), context(&stop))
+        }.is_null());
+    }
+    assert_eq!(stop.polls.load(Ordering::Relaxed), 0);
+    for policy in [0, 1] {
+        for limit in [0, 20_001, u64::MAX] {
+            assert!(unsafe {
+                fcb_project_catalog_with_policy_cancelable(path.as_ptr(), limit, policy,
+                    None, std::ptr::null_mut())
+            }.is_null());
+        }
+    }
+}
+
+#[test]
+fn catalog_policies_cancel_during_preparation_and_at_final_handoff() {
+    let root = fixture(); let path = native(&root);
+    for policy in [0, 1] {
+        let invoke = |stop: &Stop| unsafe {
+            fcb_project_catalog_with_policy_cancelable(path.as_ptr(), 32, policy,
+                Some(poll), context(stop))
+        };
+        let probe = Stop { polls: AtomicUsize::new(0), at: usize::MAX };
+        assert!(text(invoke(&probe)).is_some());
+        let total = probe.polls.load(Ordering::Relaxed);
+        assert!(total > 2);
+        for at in [1, 2, total] {
+            assert!(text(invoke(&Stop { polls: AtomicUsize::new(0), at })).is_none());
+        }
+    }
+}

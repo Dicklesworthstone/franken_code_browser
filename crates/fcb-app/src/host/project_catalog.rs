@@ -10,17 +10,26 @@ use fcb::ByteLength;
 use fcb::search::ResourceBudget;
 use crate::{AppError, allocation, owner};
 use crate::output::{Output, MAX_ENCODED_BYTES, OUTPUT_OVERHEAD_BYTES};
-use super::super::{HostResponse, atlas_session::{AtlasSession, AtlasSessionError, AtlasSessionOptions}};
+use super::super::{HostResponse, atlas_session::{AtlasSession, AtlasSessionError, AtlasSessionOptions},
+    catalog_session::CatalogDiscoveryPolicy};
 
 /// Response-local IDs do not authorize later source access. Paths are reversible
 /// native payloads, including names the current UTF-8-only native opener cannot
 /// represent. The host must retain and label that distinction, not lose the row.
 /// This one-shot worker call does not claim a progressively streamed directory
 /// walk or a presented frame. It admits at most MAX_ATLAS_SESSION_FILES entries.
-pub fn prepare(root: &Path, max_files: usize, mut canceled: impl FnMut() -> bool)
+pub fn prepare(root: &Path, max_files: usize, canceled: impl FnMut() -> bool)
     -> Result<HostResponse, AtlasSessionError> {
-    let atlas = AtlasSession::open(owner(), root,
-        AtlasSessionOptions { max_files, ..Default::default() }, &mut canceled)?;
+    prepare_with_policy(root, max_files, CatalogDiscoveryPolicy::RepositoryRules, canceled)
+}
+
+/// Use the host's selected discovery scope instead of silently restoring the
+/// default while preparing geometry. The receipt retains the actual policy
+/// and separate rule-file evidence; including excluded files reads no rules.
+pub fn prepare_with_policy(root: &Path, max_files: usize, policy: CatalogDiscoveryPolicy,
+    mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasSessionError> {
+    let atlas = AtlasSession::open_with_policy(owner(), root,
+        AtlasSessionOptions { max_files, ..Default::default() }, policy, &mut canceled)?;
     let catalog = atlas.atlas().catalog();
     let index = atlas.atlas().index()?;
     // Admit both response/native-copy overlap and the encoder's path scratch.
@@ -114,4 +123,78 @@ mod tests {
         assert!(matches!(prepare(&root, 32, || true), Err(AtlasSessionError::Canceled)));
         assert!(prepare(&root.join("missing"), 32, || false).is_err());
     }
+    #[test]
+    fn selected_policy_controls_atlas_membership_and_default_is_compatible() {
+        let root = root();
+        fs::write(root.join(".gitignore"), b"ignored.rs\n").unwrap();
+        fs::write(root.join("ignored.rs"), b"DO_NOT_READ_SOURCE_PAYLOAD").unwrap();
+        fs::write(root.join("kept.rs"), b"DO_NOT_READ_SOURCE_PAYLOAD").unwrap();
+        fs::create_dir(root.join("target")).unwrap();
+        fs::write(root.join("target/generated.rs"), b"DO_NOT_READ_SOURCE_PAYLOAD").unwrap();
+        std::os::unix::fs::symlink(root.join("kept.rs"), root.join("not-followed.rs")).unwrap();
+
+        let legacy = prepare(&root, 32, || false).unwrap();
+        let rules = prepare_with_policy(&root, 32, CatalogDiscoveryPolicy::RepositoryRules, || false).unwrap();
+        assert_eq!(legacy.as_str(), rules.as_str());
+        assert!(rules.as_str().contains("\"policy\":\"repository-rules-v1"), "{}", rules.as_str());
+        assert!(rules.as_str().contains("\"rule_files_enabled\":true"), "{}", rules.as_str());
+        assert!(rules.as_str().contains("\"configuration_bytes_read\":\"11\""), "{}", rules.as_str());
+        assert!(!rules.as_str().contains("\"display\":\"ignored.rs\""));
+        assert!(!rules.as_str().contains("\"display\":\"target/generated.rs\""));
+
+        let included = prepare_with_policy(&root, 32, CatalogDiscoveryPolicy::IncludeExcluded, || false).unwrap();
+        let text = included.as_str();
+        assert!(text.contains("\"policy\":\"all-regular-files/no-rule-files-v1\""), "{text}");
+        assert!(text.contains("\"rule_files_enabled\":false,\"rule_policy\":null"), "{text}");
+        for path in ["ignored.rs", "kept.rs", "target/generated.rs"] {
+            assert!(text.contains(&format!("\"display\":\"{path}\"")), "{text}");
+        }
+        assert!(!text.contains("\"display\":\"not-followed.rs\""));
+        assert!(text.contains("\"source_payload_read\":false,\"payload_bytes_read\":\"0\",\"read_calls\":\"0\""));
+        assert!(!text.contains("DO_NOT_READ_SOURCE_PAYLOAD"));
+    }
+
+    #[test]
+    fn explicit_inclusion_bypasses_bad_rules_without_turning_limits_into_complete_results() {
+        let root = root();
+        fs::write(root.join("safe.rs"), b"source").unwrap();
+        fs::create_dir(root.join("bad")).unwrap();
+        fs::write(root.join("bad/.gitignore"), b"[broken").unwrap();
+        fs::write(root.join("bad/visible.rs"), b"source").unwrap();
+        let rules = prepare(&root, 32, || false).unwrap();
+        assert!(rules.as_str().contains("\"discovery_complete\":false"), "{}", rules.as_str());
+        assert!(rules.as_str().contains("RULE_UNSUPPORTED_PATTERN"), "{}", rules.as_str());
+        assert!(!rules.as_str().contains("\"display\":\"bad/visible.rs\""));
+
+        let included = prepare_with_policy(&root, 32, CatalogDiscoveryPolicy::IncludeExcluded, || false).unwrap();
+        assert!(included.as_str().contains("\"discovery_complete\":true"), "{}", included.as_str());
+        assert!(included.as_str().contains("\"display\":\"bad/visible.rs\""));
+        assert!(included.as_str().contains("\"rule_files_enabled\":false,\"rule_policy\":null"));
+        let limited = prepare_with_policy(&root, 1, CatalogDiscoveryPolicy::IncludeExcluded, || false).unwrap();
+        assert!(limited.as_str().contains("\"discovery_complete\":false"), "{}", limited.as_str());
+        assert!(limited.as_str().contains("\"catalogued_files\":\"1\""));
+        assert_eq!(limited.exit_code(), crate::EXIT_PARTIAL);
+    }
+
+    #[test]
+    fn both_policies_keep_cancellation_root_and_file_admission() {
+        let root = root();
+        fs::write(root.join("kept.rs"), b"source").unwrap();
+        let alias = root.with_extension("symlink");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        for policy in [CatalogDiscoveryPolicy::RepositoryRules, CatalogDiscoveryPolicy::IncludeExcluded] {
+            assert!(matches!(prepare_with_policy(&root, 32, policy, || true),
+                Err(AtlasSessionError::Canceled)));
+            assert!(prepare_with_policy(&root, 0, policy, || false).is_err());
+            assert!(prepare_with_policy(&root, 20_001, policy, || false).is_err());
+            assert!(prepare_with_policy(&alias, 32, policy, || false).is_err());
+            let mut polls = 0;
+            prepare_with_policy(&root, 32, policy, || { polls += 1; false }).unwrap();
+            let mut reached = 0;
+            assert!(matches!(prepare_with_policy(&root, 32, policy, || {
+                reached += 1; reached == polls
+            }), Err(AtlasSessionError::Canceled)));
+        }
+    }
+
 }

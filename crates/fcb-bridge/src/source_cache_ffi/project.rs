@@ -84,12 +84,31 @@ mod tests;
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fcb_project_catalog_cancelable(root: *const c_char,
     max_files: u64, poll: Option<SearchCancellationCallback>, context: *mut c_void) -> *mut c_char {
+    unsafe { fcb_project_catalog_with_policy_cancelable(root, max_files, 0, poll, context) }
+}
+
+/// Explicit discovery policy shared with the progressive file browser: 0
+/// applies repository rules; 1 includes ignored/generated regular files without
+/// reading rule configuration. Every receipt identifies the actual policy.
+/// # Safety
+/// For a valid policy, root/poll/context obey fcb_project_catalog_cancelable's
+/// contract. Other values are refused before dereferencing root or polling.
+/// The returned non-null string must be freed once with fcb_free_string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_project_catalog_with_policy_cancelable(root: *const c_char,
+    max_files: u64, discovery_policy: u64, poll: Option<SearchCancellationCallback>,
+    context: *mut c_void) -> *mut c_char {
     reply(|| {
+        let policy = match discovery_policy {
+            0 => host::catalog_session::CatalogDiscoveryPolicy::RepositoryRules,
+            1 => host::catalog_session::CatalogDiscoveryPolicy::IncludeExcluded,
+            _ => return None,
+        };
         let canceled = || poll.is_some_and(|p| unsafe { p(context) != 0 });
         if canceled() { return None; }
         let root = unsafe { cstr(root) }?;
         let max_files = usize::try_from(max_files).ok()?;
-        let result = host::atlas::prepare_catalog(Path::new(root), max_files, canceled).ok()?;
+        let result = host::atlas::prepare_catalog_with_policy(Path::new(root), max_files, policy, canceled).ok()?;
         if canceled() { return None; }
         string_out(result.as_str())
     })
@@ -102,8 +121,13 @@ mod catalog_tests {
     fn catalog_abi_and_null_admission() {
         let _: unsafe extern "C" fn(*const c_char, u64, Option<SearchCancellationCallback>, *mut c_void)
             -> *mut c_char = fcb_project_catalog_cancelable;
+        let _: unsafe extern "C" fn(*const c_char, u64, u64, Option<SearchCancellationCallback>, *mut c_void)
+            -> *mut c_char = fcb_project_catalog_with_policy_cancelable;
         let header = include_str!("../../include/fcb_project_catalog.h");
         assert_eq!(header.matches("fcb_project_catalog_cancelable(").count(), 1);
+        assert_eq!(header.matches("fcb_project_catalog_with_policy_cancelable(").count(), 1);
         assert!(unsafe { fcb_project_catalog_cancelable(std::ptr::null(), 20_000, None, std::ptr::null_mut()) }.is_null());
+        assert!(unsafe { fcb_project_catalog_with_policy_cancelable(std::ptr::null(), 20_000, 1,
+            None, std::ptr::null_mut()) }.is_null());
     }
 }

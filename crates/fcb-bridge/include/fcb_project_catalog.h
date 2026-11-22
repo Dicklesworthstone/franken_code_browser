@@ -21,6 +21,20 @@ extern "C" {
 char *fcb_project_catalog_cancelable(const char *root, uint64_t max_files,
     int32_t (*poll)(void *), void *context);
 
+/* Same worker/cancellation/result ownership contract, with an explicit
+ * discovery policy shared with fcb_catalog_open_with_policy: 0 applies
+ * repository-rules-v1; 1 includes ignored/generated regular files under
+ * all-regular-files/no-rule-files-v1 without reading ignore configuration.
+ * Other values return null before dereferencing root or invoking poll.
+ * Root grants, symlink/special-object refusal and all discovery/layout limits
+ * still apply. Responses name the admitted policy and rule-file evidence;
+ * repository-rules-v1 may carry a :SHA256 observation fingerprint.
+ * The old entrypoint above retains policy 0 for source/ABI compatibility.
+ */
+char *fcb_project_catalog_with_policy_cancelable(const char *root,
+    uint64_t max_files, uint64_t discovery_policy,
+    int32_t (*poll)(void *), void *context);
+
 /* Progressive project file discovery with retained page/row authority.
  * Four live/retiring handles; shared identity allocator with reader/atlas/saved
  * sessions. Create reserves an EMPTY cancelable handle without filesystem I/O.

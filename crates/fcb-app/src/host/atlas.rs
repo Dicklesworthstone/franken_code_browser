@@ -253,4 +253,4 @@ mod tests {
 
 #[path = "project_catalog.rs"]
 mod project_catalog;
-pub use project_catalog::prepare as prepare_catalog;
+pub use project_catalog::{prepare as prepare_catalog, prepare_with_policy as prepare_catalog_with_policy};

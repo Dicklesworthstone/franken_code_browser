@@ -20,7 +20,8 @@ use fcb::source::ignore::repository::RuleLimits;
 use fcb_core::{PresentedFrameId, ResourceLease};
 use crate::{AppError, EXIT_OK, EXIT_PARTIAL, MANAGED_BYTES, input, workspace};
 use crate::output::{Output, OutputError, MAX_RESPONSE_BYTES};
-use super::{HostResponse, reader::{ReaderSession, ReaderSessionError}};
+use super::{HostResponse, catalog_session::CatalogDiscoveryPolicy,
+    reader::{ReaderSession, ReaderSessionError}};
 
 pub const MAX_ATLAS_SESSION_FILES: usize = 20_000;
 pub const MAX_ATLAS_SESSION_ITEMS: usize = 4096;
@@ -133,8 +134,20 @@ pub struct AtlasSession {
     _lease: ResourceLease,
 }
 impl AtlasSession {
+    /// Preserve the default repository-rule scope for existing hosts.
     pub fn open(owner: ArenaOwnerId, root: &Path, options: AtlasSessionOptions,
-        mut canceled: impl FnMut() -> bool) -> Result<Self, AtlasSessionError> {
+        canceled: impl FnMut() -> bool) -> Result<Self, AtlasSessionError> {
+        Self::open_with_policy(owner, root, options, CatalogDiscoveryPolicy::RepositoryRules, canceled)
+    }
+
+    /// Prepare the atlas under the same explicit discovery policy as the
+    /// progressive file browser. IncludeExcluded changes membership only:
+    /// root grants, symlink/special-object refusal and all bounds still apply.
+    /// No ignore configuration is read for that policy. A changed policy needs
+    /// a new session; existing source/layout identities are never relabeled.
+    pub fn open_with_policy(owner: ArenaOwnerId, root: &Path, options: AtlasSessionOptions,
+        policy: CatalogDiscoveryPolicy, mut canceled: impl FnMut() -> bool)
+        -> Result<Self, AtlasSessionError> {
         check(&mut canceled)?;
         if root.as_os_str().is_empty() || root.as_os_str().len() > 16_384 || !(1..=MAX_ATLAS_SESSION_FILES).contains(&options.max_files)
             || !(1..=MAX_ATLAS_SESSION_ITEMS).contains(&options.visible.max_items)
@@ -155,9 +168,15 @@ impl AtlasSession {
         let grant = RootGrant::new(RootId::new(owner, 1).map_err(|_| AtlasSessionError::IdentityExhausted)?, RawPath::from_path(&root));
         let limits = WorkspaceLimits { max_files: options.max_files, max_file_bytes: 0, max_source_bytes: 0,
             ..WorkspaceLimits::default() };
-        let mut catalog = WorkspaceCatalog::open_rule_aware(grant, SearchManifestId::new(owner, 1).map_err(AppError::from)?,
-            FileId::new(owner, 1).map_err(|_| AtlasSessionError::IdentityExhausted)?, limits,
-            RuleLimits::default(), &budget, [allocation(1)?, allocation(5)?])?;
+        let manifest = SearchManifestId::new(owner, 1).map_err(AppError::from)?;
+        let first_file = FileId::new(owner, 1).map_err(|_| AtlasSessionError::IdentityExhausted)?;
+        let mut catalog = match policy {
+            CatalogDiscoveryPolicy::RepositoryRules => WorkspaceCatalog::open_rule_aware(
+                grant, manifest, first_file, limits, RuleLimits::default(), &budget,
+                [allocation(1)?, allocation(5)?])?,
+            CatalogDiscoveryPolicy::IncludeExcluded => WorkspaceCatalog::open(
+                grant, manifest, first_file, limits, true, &budget, allocation(1)?)?,
+        };
         while catalog.stage() == WorkspaceStage::Discovering {
             check(&mut canceled)?;
             catalog.step(&CancelFlag::new())?;
