@@ -40,6 +40,45 @@ impl DeskRepository {
         canceled: impl FnMut() -> bool) -> Result<HostResponse, DeskRepositoryError> {
         Ok(self.search.begin(&self.atlas, generation, needle, options, canceled)?)
     }
+
+    /// Admit literal decoded-text search within an immutable path/type/visible
+    /// scope. The scope also carries the explicit text case policy. Admission
+    /// reads no source; the existing step/page/hit operations retain exact bytes.
+    pub fn begin_query_scoped(&mut self, generation: u64, needle: &str,
+        scope: AtlasSearchScope, options: AtlasSearchOptions,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, DeskRepositoryError> {
+        Ok(self.search.begin_scoped(&self.atlas, generation, needle, scope, options, canceled)?)
+    }
+
+    /// Count all admitted literal occurrences after retained rows fill.
+    /// max_matches may be zero for count-only work. Complete counting and row
+    /// truncation are separate receipt fields; source/file limits still apply.
+    pub fn begin_counted_query_scoped(&mut self, generation: u64, needle: &str,
+        scope: AtlasSearchScope, options: AtlasSearchOptions,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, DeskRepositoryError> {
+        Ok(self.search.begin_counted_scoped(&self.atlas, generation, needle, scope, options, canceled)?)
+    }
+
+    /// Explicit bounded expression syntax: phrases, required/excluded terms,
+    /// and path/language filters. All content predicates use the same complete
+    /// capture before a primary occurrence becomes a hit. Source-read bytes and
+    /// predicate-scan bytes have independent allowances; literals stay literal.
+    pub fn begin_expression_scoped(&mut self, generation: u64, expression: &str,
+        scope: AtlasSearchScope, options: AtlasSearchOptions, max_scan_bytes: u64,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, DeskRepositoryError> {
+        Ok(self.search.begin_expression_scoped(&self.atlas, generation, expression,
+            scope, options, max_scan_bytes, canceled)?)
+    }
+
+    /// Count primary occurrences after the expression's same-capture predicates
+    /// succeed, including with zero retained rows. Predicates never multiply
+    /// occurrence counts or turn budget-limited verification into absence.
+    pub fn begin_expression_counted_scoped(&mut self, generation: u64, expression: &str,
+        scope: AtlasSearchScope, options: AtlasSearchOptions, max_scan_bytes: u64,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, DeskRepositoryError> {
+        Ok(self.search.begin_expression_counted_scoped(&self.atlas, generation, expression,
+            scope, options, max_scan_bytes, canceled)?)
+    }
     /// Admit declaration-name, Markdown-heading or whole-token occurrence
     /// navigation through the same frozen catalog and retained-hit lifecycle.
     /// The scope is captured before any source/file quota; it never adds a root
@@ -120,6 +159,50 @@ impl DeskRepository {
         -> Result<HostResponse, DeskRepositoryError> {
         Ok(self.search.begin_indexed(&self.atlas, generation, index_generation, needle,
             max_matches, max_scan_bytes, canceled)?)
+    }
+
+    /// Search the selected members of an explicitly prepared capture set.
+    /// Scope and case policy are frozen before verification; incompatible
+    /// gram semantics use the shared engine's exact captured-source fallback.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_indexed_query_scoped(&mut self, generation: u64, index_generation: u64,
+        needle: &str, scope: AtlasSearchScope, max_matches: usize, max_scan_bytes: u64,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, DeskRepositoryError> {
+        Ok(self.search.begin_indexed_scoped(&self.atlas, generation, index_generation,
+            needle, scope, max_matches, max_scan_bytes, canceled)?)
+    }
+
+    /// Count beyond the retained-row allowance over the frozen captures, with
+    /// no live-source I/O. Zero rows is valid; unavailable/pending membership
+    /// and exhausted verification bytes keep count completeness explicit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_indexed_query_counted_scoped(&mut self, generation: u64, index_generation: u64,
+        needle: &str, scope: AtlasSearchScope, max_matches: usize, max_scan_bytes: u64,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, DeskRepositoryError> {
+        Ok(self.search.begin_indexed_counted_scoped(&self.atlas, generation, index_generation,
+            needle, scope, max_matches, max_scan_bytes, canceled)?)
+    }
+
+    /// Evaluate the shared expression parser/verifier against the named index's
+    /// captures. A hit's source revision comes from its capture, not this query
+    /// generation; subsequent desk activation never reopens the live path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_indexed_expression_scoped(&mut self, generation: u64, index_generation: u64,
+        expression: &str, scope: AtlasSearchScope, max_matches: usize, max_scan_bytes: u64,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, DeskRepositoryError> {
+        Ok(self.search.begin_indexed_expression_scoped(&self.atlas, generation, index_generation,
+            expression, scope, max_matches, max_scan_bytes, canceled)?)
+    }
+
+    /// Count verified primary occurrences across captured expression matches,
+    /// retaining only max_matches rows (possibly none). Uses the same common
+    /// generation lane and cancellation/publication rules as all desk queries.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_indexed_expression_counted_scoped(&mut self, generation: u64, index_generation: u64,
+        expression: &str, scope: AtlasSearchScope, max_matches: usize, max_scan_bytes: u64,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, DeskRepositoryError> {
+        Ok(self.search.begin_indexed_expression_counted_scoped(&self.atlas, generation, index_generation,
+            expression, scope, max_matches, max_scan_bytes, canceled)?)
     }
     pub fn search_indexed(&mut self, generation: u64, index_generation: u64, needle: &str,
         max_matches: usize, max_scan_bytes: u64, canceled: impl FnMut() -> bool)
