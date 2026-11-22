@@ -408,7 +408,7 @@ struct AtlasDeskRecoveryStore: Sendable {
         }
         let header = try readRange(file, offset: 0, count: 24)
         let expected: [UInt8] = [0x46, 0x43, 0x42, 0x4b, 0x44, 0x45, 0x53, 0x4b, 1, 0]
-        guard Array(header.prefix(10)) == expected, header[10] <= 1, header[11] == 0,
+        guard Array(header.prefix(10)) == expected, header[10] <= 2, header[11] == 0,
               header[12..<16].allSatisfy({ $0 == 0 }) else { throw AtlasDeskRecoveryError.invalidCheckpoint }
         var payload: UInt64 = 0
         for (index, byte) in header[16..<24].enumerated() { payload |= UInt64(byte) << (index * 8) }

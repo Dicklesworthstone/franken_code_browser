@@ -911,8 +911,12 @@ bounded manifest and keeps a 64 KiB page cache. Posting pages are verified when
 read, and candidate matches still verify the exact saved source. The UI shows
 indexed, uncovered and unavailable member counts. Short literals, uncovered
 members and text encodings without compatible postings retain direct scanning.
-Unicode lowercase literal, expression and structural searches use direct source scans;
-the accepted query reports which policy actually ran.
+Case-insensitive literal searches use bounded case variants for ASCII-qualified
+rows, with exact verification of every candidate. Unicode, UTF-16, malformed,
+uncovered and legacy rows keep direct scanning. Fresh builds qualify ASCII rows;
+older indexes remain readable but need a fresh build to gain this pruning.
+Expression and structural searches retain direct source scans. The accepted
+query reports which policy actually ran.
 
 Each accepted literal result reports its own index generation, eliminated
 members, direct-scan fallbacks and postings visited. **Reload index status**
@@ -1903,6 +1907,45 @@ remain readable without an invented excerpt. Added core, host, C ABI and native 
 encoding, original-byte retention, query replacement, cancellation, bounded
 results, counted progress and Stop. They are code-first additions: executable
 Rust/Swift verification and physical-Mac qualification remain pending.
+
+## Keeping large-file passages in the Reading Desk
+
+Select text in the **Observed Range Reader** and choose **Keep selected passage**.
+The action retains the exact accepted observation and its original byte range;
+it performs no additional source reads. Open **Reading desk…** and use the
+**Observed passages** section to read the saved text, add a rationale, or copy
+the text, text with location, or exact original bytes as hex. **Keep note in
+desk** accepts the personal edit. The passage remains readable after the source
+reader closes, the live file changes, or the Desk is recovered on a later launch.
+
+This handoff is available from a selected file, project-file reading, Quick Open,
+and streamed search context. They all use the same Reading Desk. Ordinary
+retained readers opened through **Open…** also expose their existing Keep action.
+Observed passages have their own collection; they do not become complete-file
+panes. Their detail view shows absolute original offsets, retained context,
+encoding, observed lengths, consistency evidence and an extent SHA-256. A
+passage above 4 GiB keeps its actual position in the original file. Malformed
+input retains its exact original bytes while replacement text is disclosed.
+
+The Desk shares 32 retained-source slots, 32 personal-record slots and 32 MiB of
+original bytes across complete captures, bookmarks and observed passages. Several
+passages from the same current observation share its backing bytes. Selected
+passages are bounded to 256 KiB. Forgetting the last passage releases its
+observation; forgetting one passage preserves any others that share it.
+
+Explicit checkpoints and **Recovery… → Enable automatic recovery** include
+observed context and accepted notes in FCBK 1.2. Existing 1.0 and 1.1 checkpoints
+still open, and a Desk without observed passages still writes 1.1. Recovery never
+reopens stored source paths. Unsaved note drafts retain the existing close
+protection, and an unconfirmed Keep or note response is reconciled before another
+copy can be submitted. **Export source pack…** currently includes complete-source
+bookmarks and explicitly reports excluded observed passages; use a checkpoint
+to preserve the entire Desk.
+
+Core, host, actual C transport and native regression sources cover bounded
+retention, full-width offsets, UTF-16, malformed bytes, source closure, stale note
+versions, canceled/lost responses and checkpoint recovery. The implementation
+remains code-first; Rust/Swift execution and physical-Mac qualification are pending.
 
 ## Finding text in one large file
 

@@ -81,7 +81,10 @@ extension AtlasNativeOpen where Reader == AtlasNativeFileReader {
 @MainActor struct AtlasNativeOpenView: View {
     let model: AtlasNativeOpen<AtlasNativeFileReader>
     let presentationID: UUID
+    let desk: AtlasReadingDeskModel
     let chooseProject: @MainActor () -> Void
+    @State private var showsReadingDesk = false
+    @State private var keptCaptureRequested = false
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -96,6 +99,7 @@ extension AtlasNativeOpen where Reader == AtlasNativeFileReader {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
+                Button("Reading desk…") { showsReadingDesk = true }.disabled(desk.closed)
                 Button("Open Project Folder…", action: chooseProject)
                 Button("Close") { model.closeReader(); dismiss() }
                     .keyboardShortcut(.cancelAction)
@@ -106,16 +110,21 @@ extension AtlasNativeOpen where Reader == AtlasNativeFileReader {
                 // No project, local-link callback or image-root authority.
                 Group {
                     switch reader.content {
-                    case .retained(let retained): AtlasPagedSourceView(model: retained)
+                    case .retained(let retained):
+                        AtlasPagedSourceView(model: retained,
+                            canKeep: desk.canOperate && desk.readerDomain == retained.retainedRegistryDomain,
+                            keep: { reader in desk.keep(reader: reader); keptCaptureRequested = true })
                     case .observed(let presentation):
-                        AtlasObservedReaderView(presentation: presentation, showsCloseButton: false)
+                        AtlasObservedReaderView(presentation: presentation, showsCloseButton: false, desk: desk)
                     }
                 }.id(ObjectIdentifier(reader))
             }
             AtlasNativeOpenStatus(model: model)
+            if keptCaptureRequested { Text(desk.notice).font(.caption).foregroundStyle(.secondary).padding(8) }
         }
         .frame(minWidth: 1050, minHeight: 640)
         .onDisappear { model.dismissReader(presentationID) }
+        .sheet(isPresented: $showsReadingDesk) { AtlasReadingDeskView(model: desk) }
     }
 }
 

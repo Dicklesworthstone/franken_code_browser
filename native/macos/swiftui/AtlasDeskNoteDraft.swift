@@ -44,8 +44,8 @@ import Observation
         if label.utf8.count > 256 { return "The label exceeds 256 UTF-8 bytes." }
         if body.utf8.count > 16_384 { return "The note exceeds 16,384 UTF-8 bytes." }
         if !target.isCurrent(in: model.state) { return AtlasReadingDeskError.staleNote.message }
-        if target.isNew && (model.state?.bookmarks.count ?? 32) >= 32 {
-            return "This desk already keeps 32 bookmarks and notes. Keep your draft while you choose an existing item to edit or forget."
+        if target.isNew && (model.state?.annotationCount ?? 32) >= 32 {
+            return "This desk already keeps 32 bookmarks and observed passages. Keep your draft while you choose an existing item to edit or forget."
         }
         if case .edit(_, let sequence) = target.kind, sequence == UInt64.max {
             return "This note has exhausted its update sequence. Its existing text and this draft are preserved."

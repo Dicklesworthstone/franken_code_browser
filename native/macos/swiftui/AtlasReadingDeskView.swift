@@ -22,6 +22,7 @@ private final class AtlasDeskFileAccess {
     @State private var showRecovery = false
     @State private var panelNotice = ""
     @State private var noteDraft: AtlasDeskNoteDraft?
+    @State private var observedDraft: AtlasDeskObservedNoteDraft?
     @State private var reattachment: AtlasDeskReattachment?
     @State private var comparisonReview: AtlasDeskComparisonReview?
     @State private var readerCapture: AtlasDeskReaderCapture?
@@ -75,6 +76,7 @@ private final class AtlasDeskFileAccess {
             AtlasDeskReaderView(desk: model, capture: capture, pins: pins, project: project)
         }
         .sheet(item: $noteDraft) { draft in AtlasDeskNoteEditor(model: model, draft: draft) }
+        .sheet(item: $observedDraft) { draft in AtlasDeskObservedPassageView(model: model, draft: draft) }
         .sheet(item: $comparisonReview) { review in AtlasDeskReattachmentReviewView(model: model, review: review) }
         .sheet(isPresented: $showRecovery) { AtlasDeskRecoveryView(model: model) }
         .onDisappear { reattachment = nil; comparisonReview = nil; readerTask?.cancel(); readerCapture?.reader.close(); pins.closeAll() }
@@ -90,7 +92,7 @@ private final class AtlasDeskFileAccess {
             Button("Choose checkpoint…", action: chooseCheckpoint)
             Button("Cancel", role: .cancel) { }
         } message: {
-            Text("Opening a checkpoint replaces the current \(model.state?.panes.count ?? 0) panes and \(model.state?.bookmarks.count ?? 0) bookmarks and notes after validation. Save a new checkpoint first if you want to preserve their text and arrangement.")
+            Text("Opening a checkpoint replaces the current \(model.state?.panes.count ?? 0) panes, \(model.state?.bookmarks.count ?? 0) bookmarks and \(model.state?.observedPassages.count ?? 0) observed passages with their notes after validation. Save a new checkpoint first if you want to preserve their text and arrangement.")
         }
     }
 
@@ -104,7 +106,7 @@ private final class AtlasDeskFileAccess {
             }
             Text("Retained sources").font(.headline)
             if let state = model.state {
-                Text("\(state.retainedSources) sources · \(state.retainedBytes) original bytes")
+                Text("\(state.retainedSources) sources and observations · \(state.retainedBytes) original bytes")
                     .font(.caption).foregroundStyle(.secondary)
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 6) {
@@ -131,18 +133,18 @@ private final class AtlasDeskFileAccess {
             HStack {
                 Text("Bookmarks and notes").font(.headline)
                 Spacer()
-                Text("\(model.state?.bookmarks.count ?? 0) / 32").font(.caption).foregroundStyle(.secondary)
+                Text("\(model.state?.bookmarks.count ?? 0)").font(.caption).foregroundStyle(.secondary)
             }
             TextField("Why keep this location?", text: $model.bookmarkLabel)
                 .onSubmit { model.bookmark() }.disabled(!model.canOperate || model.state?.active == nil)
             Button("Bookmark current range", action: model.bookmark)
                 .disabled(!model.canOperate || model.state?.active == nil || model.bookmarkLabel.isEmpty
                     || model.bookmarkLabel.utf8.count > 256 || model.bookmarkLabel.utf8.contains(0)
-                    || (model.state?.bookmarks.count ?? 32) >= 32)
+                    || (model.state?.annotationCount ?? 32) >= 32)
             Button("Add note to current range…") {
                 guard let state = model.state, let pane = state.active else { return }
                 panelNotice = ""; noteDraft = AtlasDeskNoteDraft(state: state, pane: pane, label: model.bookmarkLabel)
-            }.disabled(!model.canOperate || model.state?.active == nil || (model.state?.bookmarks.count ?? 32) >= 32)
+            }.disabled(!model.canOperate || model.state?.active == nil || (model.state?.annotationCount ?? 32) >= 32)
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 8) {
                     ForEach(model.state?.bookmarks ?? []) { bookmark in
@@ -185,6 +187,41 @@ private final class AtlasDeskFileAccess {
                     }
                 }
             }.frame(minHeight: 100)
+            Divider()
+            HStack {
+                Text("Observed passages").font(.headline)
+                Spacer()
+                Text("\(model.state?.observedPassages.count ?? 0)").font(.caption).foregroundStyle(.secondary)
+            }
+            Text("\(model.state?.annotationCount ?? 0) / 32 bookmarks and passages in this desk")
+                .font(.caption2).foregroundStyle(.secondary)
+            if model.state?.observedPassages.isEmpty != false {
+                Text("Select text in an Observed Range Reader, then Keep selected passage. Checkpoints retain its original bytes and personal note.")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 8) {
+                        ForEach(model.state?.observedPassages ?? []) { passage in
+                            Button {
+                                guard let state = model.state,
+                                      let target = AtlasDeskObservedTarget(state: state, passage: passage) else { return }
+                                panelNotice = ""; observedDraft = AtlasDeskObservedNoteDraft(target: target)
+                            } label: {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Label(passage.label, systemImage: passage.id == model.lastKeptObservedPassage
+                                        ? "text.badge.checkmark" : "text.quote").lineLimit(2)
+                                    Text("Original bytes \(passage.selection.start)..<\(passage.selection.end)")
+                                        .font(.caption2).foregroundStyle(.secondary)
+                                    if !passage.body.isEmpty {
+                                        Text(String(passage.body.prefix(160))).font(.caption).lineLimit(3)
+                                    }
+                                }.frame(maxWidth: .infinity, alignment: .leading)
+                            }.disabled(!model.canOperate || !model.supportsObservedPassages)
+                            .help("Read exact retained source, copy its original bytes, or edit the personal note")
+                        }
+                    }
+                }.frame(minHeight: 90, idealHeight: 150)
+            }
         }.padding(.trailing, 12)
     }
 
@@ -229,8 +266,11 @@ private final class AtlasDeskFileAccess {
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             } else {
-                ContentUnavailableView("Keep a source to begin", systemImage: "books.vertical",
-                    description: Text("Use Keep in reading desk from a retained reader, capture a file explicitly, or open a saved checkpoint."))
+                ContentUnavailableView(model.state?.observedPassages.isEmpty == false ? "Your observed passages are retained" : "Keep a source to begin",
+                    systemImage: "books.vertical",
+                    description: Text(model.state?.observedPassages.isEmpty == false
+                        ? "Choose an Observed passage on the left to read its exact source and add a personal note. Save a checkpoint to preserve this desk."
+                        : "Use Keep in reading desk from a retained reader, Keep selected passage from an Observed Range Reader, capture a file explicitly, or open a checkpoint."))
             }
         }.padding(.leading, 12)
     }
@@ -296,7 +336,7 @@ private final class AtlasDeskFileAccess {
         panel.title = "Export bookmarked source and notes"
         panel.prompt = "Export"
         panel.nameFieldStringValue = "Reading-desk-source.json"
-        panel.message = "Includes all \(state.bookmarks.count) bookmark labels and full personal notes, plus up to \(sourceBytes) original bytes from \(target.selectionCount) saved selections, unredacted and unencrypted. Whole selections that exceed the budget are listed as omitted. JSON is limited to 16 MiB. Source labels may contain private paths. Review your notes before sharing. Choose a new filename; existing files are preserved."
+        panel.message = "Includes all \(state.bookmarks.count) bookmark labels and their full personal notes, plus up to \(sourceBytes) original bytes from \(target.selectionCount) bookmarked selections, unredacted and unencrypted. Excludes \(state.observedPassages.count) observed passages and their notes; save a checkpoint for the complete desk. Whole selections that exceed the budget are listed as omitted. JSON is limited to 16 MiB. Source labels may contain private paths. Review your notes before sharing. Choose a new filename; existing files are preserved."
         panel.canCreateDirectories = true
         guard model.withAutomaticRecoveryDeferred({ panel.runModal() }) == .OK, let url = panel.url else { return }
         guard let access = AtlasDeskFileAccess(selectedURL: url) else { panelNotice = "The selected destination did not grant current write access."; return }

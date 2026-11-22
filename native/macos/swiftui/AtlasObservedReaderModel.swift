@@ -315,6 +315,37 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
               selection.observation.identity.path == authority.input.absolutePath else { return nil }
         return selection
     }
+    var retentionDomain: UUID? { transport.domain }
+    var selectionForRetention: AtlasObservedReaderSelection? { searchableSelection }
+
+    /// Transfer one already resolved observation through its original worker.
+    /// The descriptor and file grant survive close/cancel until the foreign
+    /// call drains. A receiver with effects must reconcile a lost delivery.
+    func withRetainedObservation<Value: Sendable>(selectionID: UUID,
+        observation: AtlasObservedReaderObservation,
+        _ work: @escaping @Sendable (UInt64) throws -> Value) async throws -> Value {
+        try Task.checkCancellation()
+        guard let selected = searchableSelection, selected.id == selectionID,
+              selected.observation == observation, let original = session else {
+            throw AtlasObservedReaderError.unavailable
+        }
+        let (ticket, cancellation) = begin("Keeping the selected observed passage…")
+        do {
+            let value = try await withTaskCancellationHandler(operation: {
+                try await io.perform(cancellation: cancellation, keepingAlive: [original]) {
+                    try work(original.handle)
+                }
+            }, onCancel: { cancellation.cancel(); original.cancel() })
+            guard accepts(ticket, cancellation), session === original,
+                  page?.observation == observation else { throw AtlasObservedReaderError.canceled }
+            finish(ticket)
+            notice = "The reading desk is checking the retained passage. The rest of this file remains unobserved."
+            return value
+        } catch {
+            fail(error, ticket: ticket)
+            throw error
+        }
+    }
     private func selectedFindRequest(_ mode: AtlasObservedReaderSearchMode,
         selectionID: UUID? = nil) -> AtlasObservedReaderSearchRequest? {
         guard mode == .text || mode == .occurrences, transport.search != nil,

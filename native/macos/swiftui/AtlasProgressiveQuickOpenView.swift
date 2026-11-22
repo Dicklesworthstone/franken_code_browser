@@ -4,6 +4,7 @@ import SwiftUI
     let root: String
     let project: UUID
     let accessLease: AnyObject?
+    let desk: AtlasReadingDeskModel
     let canObserveCurrentProject: @MainActor () -> Bool
     let open: @MainActor (AtlasProgressiveFileCapture) -> Void
     @State private var model = AtlasProgressiveQuickOpenModel(transport: .native)
@@ -118,7 +119,7 @@ import SwiftUI
             if !allowed { closeObservedReader() }
         }
         .sheet(item: $observedReader) { presentation in
-            AtlasObservedReaderView(presentation: presentation).id(presentation.id)
+            AtlasObservedReaderView(presentation: presentation, desk: desk).id(presentation.id)
         }
     }
     private func activate() {

@@ -509,6 +509,9 @@ struct AtlasObservedReaderSelection: Sendable, Identifiable {
 }
 
 struct AtlasObservedReaderTransport: Sendable {
+    // Shared only by the real native registry. Injected transports opt in with
+    // their own domain; a numeric handle is never sufficient for a transfer.
+    static let nativeDomain = UUID()
     let create: @Sendable () -> UInt64
     let open: @Sendable (UInt64, AtlasObservedReaderInput, AtlasSearchCancellation) throws -> String?
     let info: @Sendable (UInt64) throws -> String?
@@ -521,6 +524,7 @@ struct AtlasObservedReaderTransport: Sendable {
     var search: AtlasObservedReaderSearchTransport? = nil
     var lines: (@Sendable (UInt64, AtlasObservedReaderLineRequest, AtlasSearchCancellation) throws -> String?)? = nil
     var resolveSelection: (@Sendable (UInt64, UInt64, UInt64, UInt64) throws -> String?)? = nil
+    var domain: UUID? = nil
 }
 
 // Shared by the bounded range and search receipts. Neither admits a complete

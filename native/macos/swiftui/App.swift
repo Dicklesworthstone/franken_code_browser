@@ -708,7 +708,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         .sheet(isPresented: $nativeOpen.showsReader) {
             if let presentation = nativeOpen.presentationID {
                 AtlasNativeOpenView(model: nativeOpen, presentationID: presentation,
-                    chooseProject: chooseProject).id(presentation)
+                    desk: readingDesk, chooseProject: chooseProject).id(presentation)
             }
         }
         .sheet(isPresented: $showsFileFinder, onDismiss: finishReadingDeskReview) { fileFinderSheet }
@@ -725,14 +725,14 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 .onDisappear { presentation.close() }
         }
         .sheet(item: $observedReader, onDismiss: finishReadingDeskReview) { presentation in
-            AtlasObservedReaderView(presentation: presentation,
+            AtlasObservedReaderView(presentation: presentation, desk: readingDesk,
                 searchProject: observedSourceProjectSearch(for: presentation)).id(presentation.id)
         }
         .sheet(item: $workspaceStreamSearch, onDismiss: {
             closeWorkspaceStreamSearch()
             finishReadingDeskReview()
         }) { presentation in
-            AtlasWorkspaceStreamView(presentation: presentation).id(presentation.id)
+            AtlasWorkspaceStreamView(presentation: presentation, desk: readingDesk).id(presentation.id)
                 .onDisappear { presentation.close() }
         }
         .onAppear {
@@ -997,6 +997,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         let requestedRoot = root
         let generation = loadGeneration
         return AtlasProgressiveQuickOpenView(root: requestedRoot, project: generation, accessLease: accessLease,
+            desk: readingDesk,
             canObserveCurrentProject: {
                 guard showsFileFinder, !loadingProject, loadGeneration == generation,
                       root.utf8.elementsEqual(requestedRoot.utf8) else { return false }

@@ -122,6 +122,22 @@ Open a repository → explore its atlas → select a file → read exact source
 The browsing product does not execute project code to open a directory. Editing, builds,
 debuggers and terminals are outside its initial release scope.
 
+**Large-file passages can be kept with notes and recovered offline.**
+In the Observed Range Reader, select text and choose **Keep selected passage**.
+The Reading Desk's **Observed passages** section keeps the original byte offsets,
+exact observed bytes, decoding context and personal notes through checkpoint
+save and recovery. Closing the reader or replacing the live file does not change
+that saved evidence. See [keeping observed passages](native/macos/README.md#keeping-large-file-passages-in-the-reading-desk)
+for limits and the source-pack distinction. This source implementation awaits
+independent executable and physical-Mac verification.
+
+**Saved indexes accelerate case-insensitive literal search.** Fresh index builds
+qualify ASCII source rows for bounded upper/lowercase trigram pruning. Unicode,
+UTF-16, legacy and uncovered records keep exact verified fallback scans, with
+the same original-byte matches, counts and result-window order. Older indexes
+remain readable; rebuilding enables the new pruning. See
+[the host and CLI contract](crates/fcb-app/README.md#indexed-case-insensitive-search-in-saved-repositories).
+
 **Matching brackets connects exact selections across retained source pages.**
 Select one parenthesis, square bracket or brace and choose **Go to matching
 bracket**. The reader skips comments and strings, checks the destination in the

@@ -23,20 +23,25 @@ extension AtlasObservedReaderModel {
     /// Supplied only by a host that owns the same current project authority.
     /// Standalone file and other range-only hosts keep this capability absent.
     let searchProject: ((AtlasObservedReaderSelectionQuery) -> Void)?
+    let desk: AtlasReadingDeskModel?
     private var origin: AtlasObservedReaderSource { presentation.source }
     @State private var model: AtlasObservedReaderModel
     @State private var wrapsLines = false
     @State private var showsLineNumbers = true
     @State private var showsWhitespace = false
     @State private var copyNotice = ""
+    @State private var showsReadingDesk = false
+    @State private var keptPassageRequested = false
     @FocusState private var searchFocused: Bool
     @Environment(\.dismiss) private var dismiss
 
     init(presentation: AtlasObservedReaderPresentation, showsCloseButton: Bool = true,
+         desk: AtlasReadingDeskModel? = nil,
          searchProject: ((AtlasObservedReaderSelectionQuery) -> Void)? = nil) {
         self.presentation = presentation
         self.showsCloseButton = showsCloseButton
         self.searchProject = searchProject
+        self.desk = desk
         _model = State(initialValue: presentation.model)
     }
 
@@ -45,6 +50,9 @@ extension AtlasObservedReaderModel {
             HStack {
                 Label("Observed Range Reader", systemImage: "doc.text.viewfinder").font(.headline)
                 Spacer()
+                if let desk {
+                    Button("Reading desk…") { showsReadingDesk = true }.disabled(desk.closed)
+                }
                 Button("Reopen current file", action: model.reopenCurrentFile).disabled(!model.canReopen)
                     .help("Open the current pathname as a new descriptor and observe its first range. Keep the accepted observation if opening fails.")
                 if showsCloseButton {
@@ -148,6 +156,12 @@ extension AtlasObservedReaderModel {
                         }
                         .disabled(!model.canCopySelection)
                         .help("Copy this exact retained observation; other file ranges remain unknown")
+                        if let desk {
+                            Button("Keep selected passage") {
+                                if desk.keepObserved(reader: model) { keptPassageRequested = true }
+                            }.disabled(!desk.canKeepObserved(reader: model))
+                            .help("Keep this exact observed selection and its original offsets for notes and checkpoints. Unseen ranges are not captured.")
+                        }
                         if model.hasTextSelectionIntent && model.textSelection == nil && !model.resolvingTextSelection {
                             Button("Retry selection", action: model.retryTextSelection).disabled(model.busy)
                         }
@@ -174,6 +188,11 @@ extension AtlasObservedReaderModel {
             VStack(alignment: .leading, spacing: 4) {
                 Text(model.notice).textSelection(.enabled)
                 if !copyNotice.isEmpty { Text(copyNotice) }
+                if keptPassageRequested, let desk {
+                    Text(desk.notice)
+                    Button("Read passage or add note in desk…") { showsReadingDesk = true }
+                        .disabled(desk.closed || desk.busy)
+                }
                 Text(model.coverage)
                 Text("Copy selection preserves the displayed decoding, original selected bytes, or extent provenance. Original hex copies the whole visible observation. At most eight observations are retained; an evicted range is unavailable until you explicitly observe it again.")
             }
@@ -182,6 +201,9 @@ extension AtlasObservedReaderModel {
         .padding(14).frame(minWidth: 880, idealWidth: 1120, minHeight: 740, idealHeight: 900)
         .onAppear { presentation.start() }
         .onDisappear { presentation.close() }
+        .sheet(isPresented: $showsReadingDesk) {
+            if let desk { AtlasReadingDeskView(model: desk) }
+        }
         .onChange(of: model.navigation) { _, _ in copyNotice = "" }
         .onChange(of: model.searchText) { _, _ in copyNotice = "" }
         .onChange(of: model.searchMode) { _, _ in copyNotice = "" }

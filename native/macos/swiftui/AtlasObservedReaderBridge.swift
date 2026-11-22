@@ -154,7 +154,8 @@ extension AtlasObservedReaderTransport {
                 observedReaderLines(handle, request.firstLine, request.lines, request.maximumSelectedBytes,
                     request.maximumScanBytes, request.encoding.abi, poll, context)
             }
-        }, resolveSelection: { try observedReaderTake(observedReaderResolveSelection($0, $1, $2, $3)) })
+        }, resolveSelection: { try observedReaderTake(observedReaderResolveSelection($0, $1, $2, $3)) },
+        domain: nativeDomain)
 }
 
 private func observedReaderPolling(_ cancellation: AtlasSearchCancellation,

@@ -12,6 +12,12 @@ import Glibc
 private let checkpoint = Data(base64Encoded:
     "RkNCS0RFU0sBAAEAAAAAADAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD//////////wAAAAAAAAAAkEyUK9QL+T/OOJf8rSWpA9GT7vvKn7Q0dd/o1l4zy68=")!
 private let digest = "904c942bd40bf93fce3897fcad25a903d193eefbca9fb43475dfe8d65e33cbaf"
+// FCBK 1.2: one retained UTF-8 observation of abcd (path raw bytes path\\xff),
+// selected at original0..4, label Keep and body My note. Independent Python
+// struct/SHA-256 construction matches the core observation checkpoint fixture.
+private let observedCheckpoint = Data(base64Encoded:
+    "RkNCS0RFU0sBAAIAAAAAAAgBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD//////////wAAAAAAAAAAAQAAAAAAAAABAAAAAAAAABEAAAAAAAAAEgAAAAAAAAATAAAAAAAAAAUAAAAAAAAAcGF0aP8AAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAEAAAAAAAAAAEEAAAAAAAAAAABIAAAAAAAAACI1CZv1OYzjRO4RfzyiVedIJyJeCO5IX2j4WGTbwMViQQAAAAAAAAAYWJjZAQAAAAAAAAAS2VlcAcAAAAAAAAATXkgbm90ZQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAA8fJX+P2FrAce5dwU5oyZ8EgoTkShxL9OEkP8OZ4AVok=")!
+private let observedDigest = "f1f257f8fd85ac071ee5dc14e68c99f048284e44a1c4bf4e1243fc399e005689"
 private enum FixtureError: Error { case interrupted }
 
 // Independent oracle for this exact known checkpoint: compare EVERY byte,
@@ -19,10 +25,16 @@ private enum FixtureError: Error { case interrupted }
 // Production supplies the Rust verifier; Rust descriptor/checksum tests exercise
 // that route separately. The storage suite retains its portable injected seam.
 private func verifyFixtureIntegrity(_ descriptor: Int32, _ length: UInt64, _ expected: [UInt8]) throws {
-    guard length == UInt64(checkpoint.count), expected == Array(checkpoint.suffix(32)) else {
+    try verifyFixtureBytes(descriptor, length, expected, bytes: checkpoint)
+}
+private func verifyObservedFixtureIntegrity(_ descriptor: Int32, _ length: UInt64, _ expected: [UInt8]) throws {
+    try verifyFixtureBytes(descriptor, length, expected, bytes: observedCheckpoint)
+}
+private func verifyFixtureBytes(_ descriptor: Int32, _ length: UInt64, _ expected: [UInt8], bytes fixture: Data) throws {
+    guard length == UInt64(fixture.count), expected == Array(fixture.suffix(32)) else {
         throw AtlasDeskRecoveryError.invalidCheckpoint
     }
-    var bytes = [UInt8](repeating: 0, count: checkpoint.count)
+    var bytes = [UInt8](repeating: 0, count: fixture.count)
     var offset = 0
     while offset < bytes.count {
         let count = bytes.withUnsafeMutableBufferPointer {
@@ -32,7 +44,7 @@ private func verifyFixtureIntegrity(_ descriptor: Int32, _ length: UInt64, _ exp
         guard count > 0 else { throw AtlasDeskRecoveryError.invalidCheckpoint }
         offset += count
     }
-    guard Data(bytes) == checkpoint else { throw AtlasDeskRecoveryError.invalidCheckpoint }
+    guard Data(bytes) == fixture else { throw AtlasDeskRecoveryError.invalidCheckpoint }
 }
 
 private func check(_ condition: Bool, _ message: String = "fixture assertion failed") {
@@ -99,6 +111,7 @@ private func fileNames(_ directory: URL) throws -> Set<String> {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false,
             attributes: [.posixPermissions: 0o700])
         try lifecycle(root)
+        try observedCheckpointVersion(root)
         try failedWrites(root)
         try bodyCorruptionAndUnavailableVerification(root)
         try quotaAndSessionBound(root)
@@ -150,6 +163,33 @@ private func fileNames(_ directory: URL) throws -> Set<String> {
             savedAt: third.savedAt, sourceBytes: third.sourceBytes, checkpointBytes: third.checkpointBytes)
         expectError(.changed) { try store.remove(forged) }
         check(try Data(contentsOf: unknown) == Data("preserve this unrelated file".utf8))
+    }
+
+    private static func observedCheckpointVersion(_ root: URL) throws {
+        let store = AtlasDeskRecoveryStore(directory: root.appendingPathComponent("observed-v12", isDirectory: true),
+            limits: .init(maximumCheckpointBytes: UInt64(observedCheckpoint.count)),
+            verifyIntegrity: verifyObservedFixtureIntegrity)
+        let session = UUID()
+        func observedReceipt() -> AtlasDeskSaveReceipt {
+            .init(effect: "complete-file-and-parent-sync-requested", written: UInt64(observedCheckpoint.count),
+                checkpointBytes: UInt64(observedCheckpoint.count), sourceBytes: 4, digest: observedDigest,
+                errorCode: nil, succeeded: true)
+        }
+        let saved = try store.save(session: session, owner: 7, revision: 1, sourceBytes: 4) { url in
+            writeFixture(observedCheckpoint, to: url)
+            return observedReceipt()
+        }
+        check(saved.confirmed && saved.canRestore && saved.sourceBytes == 4)
+        check(try store.list() == [saved], "Observed passage checkpoints must remain visible to recovery")
+        check(try store.withCheckpoint(saved) { try Data(contentsOf: $0) } == observedCheckpoint)
+        var future = observedCheckpoint; future[10] = 3
+        expectError(.invalidCheckpoint) {
+            _ = try store.save(session: session, owner: 7, revision: 2, sourceBytes: 4) { url in
+                writeFixture(future, to: url)
+                return observedReceipt()
+            }
+        }
+        check(try store.list() == [saved], "A newer unsupported version must preserve the valid1.2 recovery copy")
     }
 
     private static func failedWrites(_ root: URL) throws {

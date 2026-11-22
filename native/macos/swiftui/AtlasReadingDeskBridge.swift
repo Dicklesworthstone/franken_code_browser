@@ -42,6 +42,15 @@ extension AtlasDeskRecoveryService {
 @_silgen_name("fcb_desk_window") private func fcb_desk_window(_ h: UInt64, _ revision: UInt64, _ pane: UInt64, _ offset: UInt64, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_desk_import_reader") private func fcb_desk_import_reader(_ h: UInt64, _ revision: UInt64, _ attempt: UInt64,
     _ reader: UInt64, _ start: UInt64, _ end: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_desk_import_observation") private func fcb_desk_import_observation(_ h: UInt64, _ revision: UInt64,
+    _ attempt: UInt64, _ reader: UInt64, _ observation: UInt64, _ start: UInt64, _ end: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_desk_observed_passage") private func fcb_desk_observed_passage(_ h: UInt64, _ revision: UInt64,
+    _ passage: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_desk_edit_observed_passage") private func fcb_desk_edit_observed_passage(_ h: UInt64, _ revision: UInt64,
+    _ attempt: UInt64, _ passage: UInt64, _ sequence: UInt64, _ label: UnsafePointer<CChar>?,
+    _ body: UnsafePointer<UInt8>?, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_desk_forget_observed_passage") private func fcb_desk_forget_observed_passage(_ h: UInt64,
+    _ revision: UInt64, _ attempt: UInt64, _ passage: UInt64, _ sequence: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_desk_open_reader") private func fcb_desk_open_reader(_ h: UInt64, _ revision: UInt64,
     _ pane: UInt64, _ destination: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_desk_restore") private func fcb_desk_restore(_ h: UInt64, _ revision: UInt64, _ attempt: UInt64, _ path: UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>?
@@ -111,7 +120,24 @@ extension AtlasReadingDeskTransport {
         }
     }, cancel: { fcb_desk_cancel($0) == 1 }, close: { fcb_desk_close($0) == 1 }, retirementFailed: {
         try? FileHandle.standardError.write(contentsOf: Data("FCB_DESK_RETIREMENT_UNAVAILABLE\n".utf8))
-    }, readerDomain: AtlasReaderTransport.native.comparison?.domain)
+    }, readerDomain: AtlasReaderTransport.native.comparison?.domain,
+       observed: AtlasDeskObservedTransport(domain: AtlasObservedReaderTransport.nativeDomain,
+        keep: { handle, revision, attempt, reader, observation, start, end in
+            guard start < end, end - start <= AtlasDeskObservation.maximumSelectionBytes else { return nil }
+            return take(fcb_desk_import_observation(handle, revision, attempt, reader, observation, start, end))
+        }, read: { handle, revision, passage in
+            take(fcb_desk_observed_passage(handle, revision, passage))
+        }, edit: { handle, revision, attempt, passage, sequence, label, body in
+            guard AtlasDeskNoteTarget.validText(label: label, body: body) else { return nil }
+            return label.withCString { labelPointer in
+                Array(body.utf8).withUnsafeBufferPointer { bytes in
+                    take(fcb_desk_edit_observed_passage(handle, revision, attempt, passage,
+                        sequence, labelPointer, bytes.baseAddress, UInt64(bytes.count)))
+                }
+            }
+        }, forget: { handle, revision, attempt, passage, sequence in
+            take(fcb_desk_forget_observed_passage(handle, revision, attempt, passage, sequence))
+        }))
 
     private static func take(_ pointer: UnsafeMutablePointer<CChar>?) -> String? {
         guard let pointer else { return nil }

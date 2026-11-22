@@ -3,13 +3,14 @@ import AppKit
 
 @MainActor struct AtlasWorkspaceStreamView: View {
     let presentation: AtlasWorkspaceStreamPresentation
+    let desk: AtlasReadingDeskModel
     @State private var model: AtlasWorkspaceStreamModel
     @State private var copyNotice = ""
     @Environment(\.dismiss) private var dismiss
     @FocusState private var queryFocused: Bool
 
-    init(presentation: AtlasWorkspaceStreamPresentation) {
-        self.presentation = presentation; _model = State(initialValue: presentation.model)
+    init(presentation: AtlasWorkspaceStreamPresentation, desk: AtlasReadingDeskModel) {
+        self.presentation = presentation; self.desk = desk; _model = State(initialValue: presentation.model)
     }
 
     var body: some View {
@@ -156,7 +157,7 @@ import AppKit
         .onChange(of: model.mode) { _, _ in copyNotice = "" }
         .onChange(of: model.witness?.target) { _, _ in copyNotice = "" }
         .sheet(item: Binding(get: { model.currentContext }, set: { if $0 == nil { model.closeContext() } })) { context in
-            AtlasObservedReaderView(presentation: context)
+            AtlasObservedReaderView(presentation: context, desk: desk)
         }
     }
 
