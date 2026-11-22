@@ -60,6 +60,26 @@ enum DocumentWireFixture {
         out["next_heading"] = headingEnd < headingCount ? String(headingEnd) as Any : NSNull()
         return out
     }
+    static func find(owner: UInt64, generation: UInt64, width: UInt64, needle: String,
+                     first: UInt64) -> [String: Any] {
+        var out = page("document-find", owner: owner, generation: generation, width: width)
+        for key in ["first_flow_line", "flow_lines", "next_flow_line", "whole_document_visible", "headings", "next_heading"] {
+            out.removeValue(forKey: key)
+        }
+        let total: UInt64 = needle.utf8.elementsEqual("absent".utf8) ? 0 : 130
+        let end = min(first + 128, total)
+        out["needle"] = needle; out["search_domain"] = "rendered-text-utf8"
+        out["case_sensitive"] = true; out["normalization"] = "exact"; out["overlapping"] = true
+        out["max_scan_bytes"] = "16777216"; out["scanned_rendered_bytes"] = "1400"
+        out["first_match"] = String(first); out["matches_seen"] = String(total)
+        out["match_count_complete"] = true; out["next_match"] = end < total ? String(end) as Any : NSNull()
+        out["matches"] = (first..<end).map { index in
+            ["match_id": String(index + 1),
+             "rendered_utf8_range": range(index * 4, index * 4 + UInt64(needle.utf8.count)),
+             "first_flow_line": String(index / 5)] as [String: Any]
+        }
+        return out
+    }
     static func linkRow(_ id: UInt64) -> [String: Any] {
         ["link_id": String(id), "block_index": "0", "evidence_range": range(0, UInt64(raw.count)),
          "destination": id == 2 ? "other.md#next" : "#caf%C3%A9",
@@ -117,7 +137,7 @@ final class DocumentBoundary: @unchecked Sendable {
     func corruptNext() { lock.withLock { corrupt = true } }
     private func call(_ command: String, generation: UInt64, first: UInt64 = 0,
         headingFirst: UInt64 = 0, newWidth: UInt64? = nil, slug: String = "café",
-        start: UInt64 = 0, end: UInt64 = 0, mode: UInt8 = 0) -> String {
+        start: UInt64 = 0, end: UInt64 = 0, mode: UInt8 = 0, needle: String = "") -> String {
         let (blocked, width, corrupt) = lock.withLock {
             counts.calls += 1; counts.active += 1; counts.peak = max(counts.peak, counts.active)
             if let newWidth { self.width = newWidth }
@@ -136,6 +156,8 @@ final class DocumentBoundary: @unchecked Sendable {
             selected["window_utf8_range"] = DocumentWireFixture.range(DocumentWireFixture.start - 3, DocumentWireFixture.end - 3)
             selected["original_hex"] = DocumentWireFixture.hex(DocumentWireFixture.raw[Int(DocumentWireFixture.start)..<Int(DocumentWireFixture.end)])
             out["selection"] = selected
+        } else if command == "document-find" {
+            out = DocumentWireFixture.find(owner: owner, generation: generation, width: width, needle: needle, first: first)
         } else if command == "document-links-prepare" || command == "document-links" {
             out = DocumentWireFixture.links(command, owner: owner, generation: generation, width: width, first: first)
         } else if command == "document-link" {
@@ -209,6 +231,9 @@ final class DocumentBoundary: @unchecked Sendable {
         }, link: { [self] handle, generation, id, count in
             precondition(handle == owner && count == 64)
             return call("document-link", generation: generation, start: id)
+        }, find: { [self] handle, generation, needle, first, count in
+            precondition(handle == owner && count == 128 && (1...1024).contains(needle.utf8.count))
+            return call("document-find", generation: generation, first: first, needle: needle)
         })
     }
 }

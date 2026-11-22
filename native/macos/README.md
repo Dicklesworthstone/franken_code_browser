@@ -2164,6 +2164,37 @@ branching, failed/canceled opens, bounded eviction, refresh, grant replacement,
 dismissal and late replies. Executable verification and physical-Mac scrolling,
 selection, focus and accessibility qualification remain pending.
 
+## Finding text in a Markdown preview
+
+Prepare **Markdown** or **Split preview**, enter text in the preview's **Find**
+field and submit the query. Search uses FrankenMarkdown's retained logical
+rendered text, so a phrase such as `bold phrase` can match `**bold** phrase` or
+`[bold](guide.md) phrase`. Matching is literal and case-sensitive, preserves the
+exact Unicode spelling, and includes overlapping occurrences. The response
+counts every match in the accepted document; **Previous match** and **Next
+match** navigate across bounded pages of results.
+
+Opening a match selects **Text** and shows the logical flow context where it
+starts. Separators between displayed rows lead to the next available row;
+trailing separators lead to the last row. A document that renders only
+separators can have matches with an empty display context. These locations are
+rendered UTF-8 ranges. The existing **Show source** and copy actions continue
+to use their qualified enclosing-source mapping.
+
+The optional host capability accepts a query of 1–1,024 UTF-8 bytes and returns
+at most 128 match records per page. Each page scans at most 16 MiB of retained
+rendered text using the shared incremental matcher, with bounded cancellation
+checks and no source reads, reparsing or full-document hit table. Native query,
+job, document-generation and page identities fence asynchronous results.
+Editing the query, reflowing, replacing the capture or closing the preview
+withdraws stale Find actions. A failed or canceled search preserves the
+accepted preview and source reader.
+
+The public host method is `ReaderSession::find_document`; the C entrypoint is
+`fcb_reader_document_find`. Rust host/registry/ABI and native decoder/model
+regressions are included in source. Their execution and physical-Mac interaction
+verification remain pending the independent strict-RCH campaign.
+
 ## Source reader display
 
 The source reader's **Display** menu provides independent **Line numbers**,

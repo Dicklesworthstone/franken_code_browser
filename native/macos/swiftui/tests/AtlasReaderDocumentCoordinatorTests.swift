@@ -95,6 +95,7 @@ import Foundation
         check(!plain.supportsDocument, "source-only host acquired document capability")
         await rejected { _ = try await plain.document(.prepare(width: 100)) }
         plain.close()
+        try await documentFind(input)
         try await documentLinks(input)
         try await documentImages(input)
         print("\(checks) retained-document coordinator checks passed")
@@ -158,6 +159,64 @@ import Foundation
         coordinator.close()
         try await until { held == nil && wire.source.snapshot.closes == 1 }
 #endif
+    }
+
+    @MainActor static func documentFind(_ input: AtlasReaderInput) async throws {
+        let wire = DocumentBoundary(owner: 13)
+        let coordinator = AtlasReaderCoordinator(transport: wire.reader, document: wire.document)
+        _ = try await coordinator.open(input: input)
+        guard case .prepared(let initial, _) = try await coordinator.document(.prepare(width: 100)) else { fatalError() }
+        guard case .matches(let matches) = try await coordinator.document(.find(needle: "Café", first: 0)) else { fatalError() }
+        check(matches.needle.utf8.elementsEqual("Café".utf8) && matches.rows.count == 128 && matches.total == 130,
+              "Five-argument Find transport lost its exact query, bounded count, or inventory")
+        _ = try await coordinator.document(.copy(initial.target(at: 0)!, .renderedText))
+        let first = matches.target(id: 1)!
+        guard case .page(let opened) = try await coordinator.document(.findMatch(first)) else { fatalError() }
+        check(opened.first == first.match.firstLine && opened.inventory.matches(initial.inventory),
+              "Find context used a different retained document")
+        guard case .matches(let last) = try await coordinator.document(.find(needle: "Café", first: 128)) else { fatalError() }
+        check(last.rows.count == 2 && last.next == nil, "Find continuation lost its complete short final page")
+        let before = wire.snapshot.calls
+        await rejected { _ = try await coordinator.document(.findMatch(first)) }
+        await rejected { _ = try await coordinator.document(.find(needle: "", first: 0)) }
+        await rejected { _ = try await coordinator.document(.find(needle: "Café", first: 131)) }
+        check(wire.snapshot.calls == before, "Stale Find token or invalid query reached foreign work")
+        let gate = wire.blockNext("document-find")
+        let canceled = Task { try await coordinator.document(.find(needle: "old", first: 0)) }
+        try await until { gate.hasEntered }
+        coordinator.cancel()
+        let replacement = Task { try await coordinator.document(.find(needle: "new", first: 0)) }
+        await Task.yield()
+        gate.release()
+        await rejected { _ = try await canceled.value }
+        guard case .matches(let replacementMatches) = try await replacement.value else { fatalError() }
+        check(replacementMatches.needle == "new" && wire.snapshot.opens == 1 && wire.snapshot.peak == 1,
+              "Canceled Find published or reopened/overlapped retained source")
+        let target = replacementMatches.target(id: 1)!
+        _ = try await coordinator.document(.prepare(width: 80))
+        let afterReflow = wire.snapshot.calls
+        await rejected { _ = try await coordinator.document(.findMatch(target)) }
+        check(wire.snapshot.calls == afterReflow, "Reflow allowed a stale rendered-match activation")
+        let closeGate = wire.blockNext("document-find")
+        let closing = Task { try await coordinator.document(.find(needle: "closing", first: 0)) }
+        try await until { closeGate.hasEntered }
+        coordinator.close()
+        check(wire.snapshot.closes == 0, "Find released the reader lease during its foreign scan")
+        closeGate.release()
+        await rejected { _ = try await closing.value }
+        try await until { wire.snapshot.closes == 1 }
+
+        let legacyWire = DocumentBoundary(owner: 14)
+        var transport = legacyWire.document
+        transport.find = nil
+        let legacy = AtlasReaderCoordinator(transport: legacyWire.reader, document: transport)
+        _ = try await legacy.open(input: input)
+        guard case .prepared(let retained, _) = try await legacy.document(.prepare(width: 100)) else { fatalError() }
+        let calls = legacyWire.snapshot.calls
+        await rejected { _ = try await legacy.document(.find(needle: "line", first: 0)) }
+        check(legacyWire.snapshot.calls == calls, "An absent optional Find transport performed foreign work")
+        _ = try await legacy.document(.copy(retained.target(at: 0)!, .renderedText))
+        legacy.close()
     }
 
     @MainActor static func documentLinks(_ input: AtlasReaderInput) async throws {

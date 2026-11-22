@@ -123,6 +123,7 @@ import Observation
         documentPreview = AtlasDocumentPreviewModel(supported: document != nil,
             richSupported: document?.prepareDisplay != nil && document?.displayPage != nil
                 && document?.displayFont != nil && document?.displayFromSource != nil,
+            findSupported: document?.find != nil,
             execute: { try await coordinator.document($0) },
             cancel: { coordinator.cancel() }, revoke: { coordinator.revokeDocument() })
         documentPreview.didBecomeIdle = { [weak self] in self?.resumeDeferredReaderWork() }

@@ -5,6 +5,9 @@ private func fcb_reader_document(_ handle: UInt64, _ generation: UInt64, _ width
     _ source: UInt64, _ lines: UInt64, _ items: UInt64, _ blocks: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_reader_document_window")
 private func fcb_reader_document_window(_ handle: UInt64, _ generation: UInt64, _ first: UInt64, _ count: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_reader_document_find")
+private func fcb_reader_document_find(_ handle: UInt64, _ generation: UInt64,
+    _ needle: UnsafePointer<CChar>?, _ first: UInt64, _ count: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_reader_document_headings")
 private func fcb_reader_document_headings(_ handle: UInt64, _ generation: UInt64, _ first: UInt64, _ count: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_reader_document_heading")
@@ -71,7 +74,10 @@ extension AtlasReaderDocumentTransport {
         }
     },
     imagePrepare: { take(fcb_reader_document_image_prepare($0, $1, $2, $3)) },
-    imageChunk: { take(fcb_reader_document_image_chunk($0, $1, $2, $3, $4, $5)) })
+    imageChunk: { take(fcb_reader_document_image_chunk($0, $1, $2, $3, $4, $5)) },
+    find: { handle, generation, needle, first, count in
+        needle.withCString { take(fcb_reader_document_find(handle, generation, $0, first, count)) }
+    })
 
     private static func take(_ pointer: UnsafeMutablePointer<CChar>?) -> String? {
         guard let pointer else { return nil }

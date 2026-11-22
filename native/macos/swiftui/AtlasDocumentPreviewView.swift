@@ -29,6 +29,7 @@ import AppKit
                 }
                 VStack(spacing: 0) {
                     flowControls
+                    if model.findSupported { findControls }
                     Divider()
                     flow
                     if let source = model.source, let shownSource {
@@ -129,6 +130,26 @@ import AppKit
             }
         }
         .controlSize(.small).padding(8)
+    }
+
+    private var findControls: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                TextField("Find rendered text", text: $model.findInput)
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityLabel("Find exact case-sensitive text in the rendered Markdown document")
+                    .onSubmit(model.find)
+                Button("Find", action: model.find).disabled(!model.canFind)
+                Button("Previous match", action: model.previousFind).disabled(!model.canPreviousFind)
+                Button("Next match", action: model.nextFind).disabled(!model.canNextFind)
+                if !model.findInput.isEmpty {
+                    Button { model.findInput = "" } label: { Image(systemName: "xmark.circle") }
+                        .buttonStyle(.borderless).accessibilityLabel("Clear rendered Find")
+                }
+            }
+            Text(model.findStatus).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+        }
+        .controlSize(.small).padding(.horizontal, 8).padding(.bottom, 8)
     }
 
     @ViewBuilder private var flow: some View {

@@ -99,6 +99,17 @@ struct AtlasMarkdownPreviewPreference {
     private(set) var page: AtlasReaderDocumentPage?
     private(set) var headings: AtlasReaderDocumentHeadings?
     private(set) var links: AtlasReaderDocumentLinks?
+    private(set) var findResults: AtlasReaderDocumentMatches?
+    private(set) var selectedFindID: UInt64?
+    var findInput = "" {
+        didSet {
+            guard !oldValue.utf8.elementsEqual(findInput.utf8) else { return }
+            // Revoke synchronously with the edit, before a delayed button or
+            // worker completion can apply the previous query's match token.
+            findResults = nil; selectedFindID = nil
+            if finding { cancel(silent: true); notice = "" }
+        }
+    }
     private(set) var source: AtlasReaderDocumentSource?
     private(set) var displayPage: AtlasDocumentDisplayPage?
     private(set) var displayFonts: [AtlasDocumentDisplayFont] = []
@@ -122,6 +133,8 @@ struct AtlasMarkdownPreviewPreference {
     private var linkHistory: [UInt64] = []
     @ObservationIgnored private let supported: Bool
     let richSupported: Bool
+    let findSupported: Bool
+    private var finding = false
     @ObservationIgnored private let execute: Execute
     @ObservationIgnored private let cancelWork: @MainActor () -> Void
     @ObservationIgnored private let revoke: @MainActor () -> Void
@@ -132,10 +145,11 @@ struct AtlasMarkdownPreviewPreference {
     /// wake that owner, but cannot decide that source/selection work is idle.
     @ObservationIgnored var didBecomeIdle: (@MainActor () -> Void)?
 
-    init(supported: Bool, richSupported: Bool = false, execute: @escaping Execute,
+    init(supported: Bool, richSupported: Bool = false, findSupported: Bool = false, execute: @escaping Execute,
          cancel: @escaping @MainActor () -> Void, revoke: @escaping @MainActor () -> Void) {
         self.supported = supported
         self.richSupported = richSupported
+        self.findSupported = findSupported
         self.execute = execute
         cancelWork = cancel
         self.revoke = revoke
@@ -171,6 +185,39 @@ struct AtlasMarkdownPreviewPreference {
     var canLinksNext: Bool { canNavigate && links?.next != nil }
     var canDisplayBack: Bool { canNavigate && !displayHistory.isEmpty }
     var canDisplayNext: Bool { canNavigate && displayPage?.next != nil }
+    var canFind: Bool {
+        findSupported && canLocateSource && AtlasReaderDocumentLimits.validFindNeedle(findInput)
+            && (page?.inventory.renderedBytes ?? UInt64.max) <= AtlasReaderDocumentLimits.findScanBytes
+    }
+    var canPreviousFind: Bool {
+        canNavigate && currentFindResults != nil && (selectedFindID ?? 0) > 1
+    }
+    var canNextFind: Bool {
+        guard canNavigate, let results = currentFindResults, let selectedFindID else { return false }
+        return selectedFindID < results.total
+    }
+    private var currentFindResults: AtlasReaderDocumentMatches? {
+        guard let results = findResults, let page, results.inventory.matches(page.inventory),
+              results.needle.utf8.elementsEqual(findInput.utf8) else { return nil }
+        return results
+    }
+    var findStatus: String {
+        if let results = currentFindResults {
+            if results.total == 0 { return "No matches in the rendered document." }
+            if let selectedFindID, let target = results.target(id: selectedFindID) {
+                let context = results.inventory.totalLines == 0
+                    ? "rendered text has no displayed flow row"
+                    : "flow row \(target.match.firstLine + 1)"
+                return "Match \(selectedFindID) of \(results.total) · \(context)"
+            }
+            return "\(results.total) matches in the rendered document."
+        }
+        if let page, page.inventory.renderedBytes > AtlasReaderDocumentLimits.findScanBytes {
+            return "Rendered Find admits up to 16 MiB. This preview and its source remain readable."
+        }
+        return "Exact, case-sensitive Find in rendered text, including text joined by Markdown formatting."
+    }
+
     var linkCoverage: String {
         guard let links else { return "Load the links parsed from this retained Markdown capture." }
         return "\(links.rows.count) of \(links.total) retained links shown; \(links.seen) parsed occurrences. "
@@ -306,6 +353,7 @@ struct AtlasMarkdownPreviewPreference {
         authorized = false
         canRestoreNavigation = false
         source = nil
+        findResults = nil; selectedFindID = nil
         links = nil; linkHistory = []
         displayPage = nil; displayFonts = []; displayHistory = []; showsStyled = false
         revoke()
@@ -519,6 +567,101 @@ struct AtlasMarkdownPreviewPreference {
     func nextHeadings() { if let next = headings?.next { loadHeadings(first: next) } }
     func previousHeadings() { if let first = headingHistory.last { loadHeadings(first: first, goingBack: true) } }
 
+    func find() {
+        guard canFind else {
+            if !AtlasReaderDocumentLimits.validFindNeedle(findInput) {
+                notice = "Enter 1–1024 UTF-8 bytes of text without NUL."
+            }
+            return
+        }
+        loadFind(first: 0, selected: 1)
+    }
+    func previousFind() {
+        guard canPreviousFind, let selectedFindID else { return }
+        openFind(id: selectedFindID - 1)
+    }
+    func nextFind() {
+        guard canNextFind, let selectedFindID else { return }
+        openFind(id: selectedFindID + 1)
+    }
+    private func openFind(id: UInt64) {
+        guard canNavigate, let results = currentFindResults, id > 0, id <= results.total else { return }
+        if let target = results.target(id: id) { openFindMatch(target) }
+        else {
+            let first = ((id - 1) / AtlasReaderDocumentLimits.findMatches) * AtlasReaderDocumentLimits.findMatches
+            loadFind(first: first, selected: id)
+        }
+    }
+    func allowsFind(_ target: AtlasReaderDocumentMatchTarget) -> Bool {
+        canNavigate && currentFindResults?.target(id: target.match.id) == target
+    }
+    func openFindMatch(_ target: AtlasReaderDocumentMatchTarget) {
+        guard allowsFind(target), let previous = page else { return }
+        let move = history.visit(previous.first)
+        // Logical navigation can be accepted by the worker before a canceled
+        // delivery. Keep the old page visible, with its old row actions retired.
+        authorized = false; canRestoreNavigation = true; source = nil
+        perform(.findMatch(target), notice: "Opening rendered match…") { model, result in
+            guard case .page(let page) = result, page.inventory.matches(previous.inventory),
+                  page.first == target.match.firstLine,
+                  model.currentFindResults?.target(id: target.match.id) == target,
+                  model.page?.id == previous.id,
+                  model.history.commit(move, resolved: page.first) else { throw AtlasReaderError.invalidResponse }
+            model.installNavigationPage(page, display: nil)
+            model.prefersStyled = false
+            model.selectedFindID = target.match.id
+            model.authorized = true; model.canRestoreNavigation = false
+        }
+    }
+    private func loadFind(first: UInt64, selected: UInt64) {
+        guard canFind, let previous = page else { return }
+        let needle = findInput, previousResults = currentFindResults
+        let move = history.visit(previous.first)
+        var restored: AtlasReaderDocumentPage?
+        var selectedTarget: AtlasReaderDocumentMatchTarget?
+        findResults = nil; selectedFindID = nil
+        perform(.find(needle: needle, first: first), notice: "Finding rendered text…",
+            resolve: { [weak self] result, execute in
+                guard case .matches(let matches) = result,
+                      matches.inventory.matches(previous.inventory),
+                      matches.needle.utf8.elementsEqual(needle.utf8), matches.first == first,
+                      self?.findInput.utf8.elementsEqual(needle.utf8) == true,
+                      self?.page?.id == previous.id else { throw AtlasReaderError.invalidResponse }
+                if let previousResults, first > 0, !previousResults.matchesSearch(matches) {
+                    throw AtlasReaderError.invalidResponse
+                }
+                guard matches.total > 0 else { return result }
+                guard let target = matches.target(id: selected) else { throw AtlasReaderError.invalidResponse }
+                selectedTarget = target
+                // A match range may cross rows or name renderer separators.
+                // Open the engine's context row; never synthesize a highlight
+                // or an original-source selection from these rendered offsets.
+                self?.authorized = false; self?.canRestoreNavigation = true; self?.source = nil
+                let opened = try await execute(.findMatch(target))
+                guard case .page(let page) = opened, page.inventory.matches(matches.inventory),
+                      page.first == target.match.firstLine else { throw AtlasReaderError.invalidResponse }
+                restored = page
+                return result
+            }) { model, result in
+                guard case .matches(let matches) = result,
+                      matches.inventory.matches(previous.inventory), matches.first == first,
+                      matches.needle.utf8.elementsEqual(model.findInput.utf8),
+                      model.page?.id == previous.id else { throw AtlasReaderError.invalidResponse }
+                if let restored, let selectedTarget {
+                    guard matches.target(id: selectedTarget.match.id) == selectedTarget,
+                          model.history.commit(move, resolved: restored.first) else { throw AtlasReaderError.invalidResponse }
+                    model.installNavigationPage(restored, display: nil)
+                    model.prefersStyled = false
+                    model.selectedFindID = selectedTarget.match.id
+                    model.authorized = true; model.canRestoreNavigation = false
+                } else {
+                    guard matches.total == 0 else { throw AtlasReaderError.invalidResponse }
+                    model.selectedFindID = nil
+                }
+                model.findResults = matches
+            }
+    }
+
     func prepareLinks() {
         guard canNavigate, let inventory = page?.inventory else { return }
         links = nil; linkHistory = []
@@ -690,12 +833,14 @@ struct AtlasMarkdownPreviewPreference {
         task = nil
         busy = false
         followingSource = false
+        finding = false
         if !silent { notice = "Preview operation canceled. Accepted source and search state are unchanged." }
     }
     func close() {
         cancel(silent: true)
         revoke()
         identity = nil; page = nil; headings = nil; links = nil; source = nil
+        findResults = nil; selectedFindID = nil; findInput = ""
         preferredPresentation = nil
         followsSource = false; pendingSourceFollow = nil; sourceNavigationEcho = nil
         canRestoreNavigation = false
@@ -798,6 +943,10 @@ struct AtlasMarkdownPreviewPreference {
         operation = ticket
         busy = true
         followingSource = automaticSourceFollow
+        switch request {
+        case .find, .findMatch: finding = true
+        default: finding = false
+        }
         self.notice = notice
         let execute = self.execute
         task = Task { [weak self] in
@@ -817,6 +966,7 @@ struct AtlasMarkdownPreviewPreference {
                 if self.operation == ticket {
                     self.busy = false; self.task = nil
                     self.followingSource = false
+                    self.finding = false
                     then?(self)
                     // A reentrant source callback may have started another
                     // operation or closed this reader. Only its owner can
@@ -837,6 +987,7 @@ struct AtlasMarkdownPreviewPreference {
                 }
                 self.busy = false; self.task = nil
                 self.followingSource = false
+                self.finding = false
                 self.didBecomeIdle?()
             }
         }

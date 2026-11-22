@@ -9,6 +9,11 @@ import Foundation
     var revocations = 0
     var held = false
     var holdDisplay = false
+    var holdFindWindow = false
+    var findTotal: UInt64 = 130
+    var findStartLine: UInt64 = 17
+    var renderedBytes: UInt64 = 16384
+    var totalHeadings: UInt64 = 130
     var exactSourceRows = false
     var externalDestination = "https://example.invalid/docs?q=a%20b#section"
     var failure: AtlasReaderError?
@@ -32,8 +37,8 @@ import Foundation
         .init(owner: owner, file: 1, revision: revision, capturedBytes: bytes,
               pathBytes: Array(path.utf8), encoding: encoding, displayPath: path)
     }
-    func model(supported: Bool = true, richSupported: Bool = false) -> AtlasDocumentPreviewModel {
-        AtlasDocumentPreviewModel(supported: supported, richSupported: richSupported, execute: { try await self.execute($0) },
+    func model(supported: Bool = true, richSupported: Bool = false, findSupported: Bool = true) -> AtlasDocumentPreviewModel {
+        AtlasDocumentPreviewModel(supported: supported, richSupported: richSupported, findSupported: findSupported, execute: { try await self.execute($0) },
             cancel: { self.cancels += 1 }, revoke: { self.revocations += 1 })
     }
     func execute(_ request: AtlasReaderDocumentRequest) async throws -> AtlasReaderDocumentResult {
@@ -45,7 +50,9 @@ import Foundation
         case .prepareDisplay, .displayPage, .displayFromSource: displayRequest = true
         default: displayRequest = false
         }
-        if held || (holdDisplay && displayRequest) {
+        let findWindow: Bool
+        if case .findMatch = request { findWindow = true } else { findWindow = false }
+        if held || (holdDisplay && displayRequest) || (holdFindWindow && findWindow) {
             return try await withCheckedThrowingContinuation { pending.append(($0, value)) }
         }
         return value
@@ -63,11 +70,13 @@ import Foundation
             generation += 1
             displayInventory = nil
             inventory = .init(identity: identity, generation: generation, width: width,
-                totalLines: totalLines, totalHeadings: 130, renderedBytes: 16384, sourceBase: 3)
+                totalLines: totalLines, totalHeadings: totalHeadings, renderedBytes: renderedBytes, sourceBase: 3)
             return .prepared(page(first: 0), headings(first: 0))
         }
         switch request {
         case .window(let first): return .page(page(first: first))
+        case .find(let needle, let first): return .matches(matches(needle: needle, first: first))
+        case .findMatch(let target): return .page(page(first: target.match.firstLine))
         case .headings(let first): return .headings(headings(first: first))
         case .heading(let target): return .page(page(first: target.heading.renderedOffset / 16))
         case .fromSource(let offset):
@@ -115,6 +124,17 @@ import Foundation
         }
         return .init(id: UUID(), inventory: inventory, first: first, items: items,
             next: end < totalDisplayItems ? end : nil)
+    }
+    func matches(needle: String, first: UInt64) -> AtlasReaderDocumentMatches {
+        let inventory = inventory!, end = min(first + AtlasReaderDocumentLimits.findMatches, findTotal)
+        let rows = (first..<end).map { index in
+            let offset = totalLines == 0 ? index : index * 2
+            return AtlasReaderDocumentMatch(id: index + 1,
+                rendered: .init(start: offset, end: offset + UInt64(needle.utf8.count)),
+                firstLine: totalLines == 0 ? 0 : min(totalLines - 1, findStartLine + index))
+        }
+        return .init(id: UUID(), inventory: inventory, needle: needle, first: first,
+            rows: rows, total: findTotal, next: end < findTotal ? end : nil)
     }
     func links(first: UInt64) -> AtlasReaderDocumentLinks {
         let inventory = inventory!, total: UInt64 = 130, end = min(total, first + 64)
@@ -425,6 +445,7 @@ import Foundation
         await styledDeliveries()
         await sourceFollowing()
         await styledNavigationTransactions()
+        await documentFind()
         print("AtlasDocumentPreviewTests: \(checks) checks passed")
     }
 
@@ -1278,6 +1299,151 @@ import Foundation
             m.openExternalLink(target) { _ in opens += 1; return true }
             check(opens == 0 && f.requests.count == requests && m.notice.contains("Only absolute HTTP"),
                   "A disallowed address reached the worker or OS adapter")
+        }
+    }
+
+    @MainActor private static func documentFind() async {
+        do {
+            let f = Fixture(), m = f.model(richSupported: true)
+            await ready(f, m)
+            check(m.showsStyled, "Find fixture begins with the accepted styled preview")
+            let prior = m.page!, oldRow = prior.target(at: 0)!
+            m.findInput = "bold line"; m.find(); await wait { !m.busy }
+            check(m.findResults?.rows.count == 128 && m.findResults?.total == 130 && m.selectedFindID == 1,
+                  "Find keeps one bounded page and the complete count")
+            check(m.page?.first == 17 && !m.showsStyled && m.canBack && !m.allows(oldRow),
+                  "Successful Find opens Text context and retires the previous row token")
+            let oldMatch = m.findResults!.target(id: 128)!
+            m.openFindMatch(oldMatch); await wait { !m.busy }
+            check(m.selectedFindID == 128 && m.page?.first == 144, "An accepted Find target navigates by its flow context")
+            m.nextFind(); await wait { !m.busy }
+            check(m.findResults?.first == 128 && m.findResults?.rows.count == 2 && m.selectedFindID == 129,
+                  "Next match fetches the next bounded match page")
+            check(!m.allowsFind(oldMatch), "Pagination revived an old Find page UUID")
+            m.previousFind(); await wait { !m.busy }
+            check(m.findResults?.first == 0 && m.selectedFindID == 128 && m.page?.first == 144,
+                  "Previous match loads its preceding match page")
+            let current = m.findResults!.target(id: 128)!, calls = f.requests.count
+            m.findInput = "other"
+            check(m.findResults == nil && m.selectedFindID == nil && !m.allowsFind(current),
+                  "Query editing synchronously revokes accepted match targets")
+            m.openFindMatch(current)
+            check(f.requests.count == calls, "An edited query reused an old match token")
+        }
+        do {
+            let f = Fixture(), m = f.model(richSupported: true)
+            await ready(f, m)
+            let previous = m.page!
+            f.findTotal = 0; m.findInput = "absent"; m.find(); await wait { !m.busy }
+            check(m.findResults?.total == 0 && m.selectedFindID == nil && m.page?.id == previous.id && m.showsStyled,
+                  "Zero matches preserve the accepted document and its presentation")
+            check(m.findStatus.contains("No matches") && !m.canNextFind && !m.canPreviousFind && m.authorized,
+                  "Empty Find reports a complete zero without navigation authority")
+        }
+        do {
+            let f = Fixture()
+            f.totalLines = 0; f.totalHeadings = 0; f.findTotal = 2; f.renderedBytes = 2
+            let m = f.model()
+            await ready(f, m)
+            m.findInput = "\n"; m.find(); await wait { !m.busy }
+            check(m.findResults?.total == 2 && m.page?.lines.isEmpty == true && m.page?.first == 0,
+                  "Rendered separators in a zero-flow document keep their count and empty context")
+            check(m.findStatus.contains("no displayed flow row"), "Empty context was mislabeled as no match")
+        }
+        do {
+            let f = Fixture(), m = f.model()
+            await ready(f, m)
+            let previous = m.page!
+            f.held = true; m.findInput = "Café"; m.find()
+            await wait { f.pending.count == 1 }
+            m.findInput = "Cafe\u{301}"
+            check(!m.busy && m.findResults == nil && m.page?.id == previous.id && m.authorized,
+                  "Byte-distinct canonical-equivalent edit cancels Find without replacing the source page")
+            f.release(); await settle()
+            check(m.findResults == nil && f.requests.count == 2, "Canceled Find launched match navigation")
+            m.find(); await wait { f.pending.count == 1 }
+            let accepted = f.matches(needle: "Cafe\u{301}", first: 0)
+            let wrongEcho = AtlasReaderDocumentMatches(id: accepted.id, inventory: accepted.inventory,
+                needle: "Café", first: accepted.first, rows: accepted.rows, total: accepted.total, next: accepted.next)
+            f.release(replacement: .matches(wrongEcho)); await wait { !m.busy }
+            check(m.page?.id == previous.id && m.findResults == nil && m.notice == AtlasReaderError.invalidResponse.message,
+                  "Canonical-equivalent typed query echo gained authority")
+        }
+        do {
+            let f = Fixture(), m = f.model()
+            await ready(f, m)
+            let previous = m.page!
+            f.holdFindWindow = true; m.findInput = "line"; m.find()
+            await wait { f.pending.count == 1 }
+            check(!m.authorized && m.page?.id == previous.id, "Pending context navigation must retain read-only old pixels")
+            m.findInput = "replacement"
+            check(!m.busy && m.canFind && !m.authorized && m.findResults == nil,
+                  "Canceled match navigation cannot prevent a fresh retained-text Find")
+            f.release(); await settle()
+            check(m.page?.id == previous.id && m.findResults == nil, "Canceled context window replaced the page")
+            f.holdFindWindow = false; f.findTotal = 0
+            m.find(); await wait { !m.busy }
+            check(m.findResults?.total == 0 && m.page?.id == previous.id && !m.authorized && m.canFind,
+                  "A zero-hit retry must preserve read-only row authority and allow another Find")
+            f.findTotal = 2; m.findInput = "recovery"; m.find(); await wait { !m.busy }
+            check(m.authorized && m.selectedFindID == 1 && m.page?.first == 17,
+                  "A successful fresh Find recovers from canceled context navigation without reflow")
+        }
+        do {
+            let f = Fixture(), m = f.model()
+            await ready(f, m)
+            m.findInput = "line"; m.find(); await wait { !m.busy }
+            let prior = m.page!, target = m.findResults!.target(id: 2)!
+            f.failure = .engine("DOCUMENT_WINDOW_REFUSED")
+            m.openFindMatch(target); await wait { !m.busy }
+            check(m.page?.id == prior.id && !m.authorized && m.canFind,
+                  "Failed match navigation preserves pixels and a fresh Find route")
+            m.findInput = "retry"; m.find(); await wait { !m.busy }
+            check(m.authorized && m.selectedFindID == 1, "Fresh Find did not recover a failed match navigation")
+            let beforeReflow = m.findResults!.target(id: 1)!
+            m.widthInput = "80"; m.prepare(); await wait { !m.busy }
+            check(m.findResults == nil && !m.allowsFind(beforeReflow), "Reflow retained stale Find targets")
+            m.find(); await wait { !m.busy }
+            let old = m.findResults!.target(id: 1)!
+            m.close()
+            check(m.findInput.isEmpty && m.findResults == nil && !m.allowsFind(old), "Close retained rendered Find state")
+        }
+        do {
+            let f = Fixture(), m = f.model()
+            await ready(f, m)
+            let previous = m.page!
+            f.held = true; m.findInput = "first"; m.find(); await wait { f.pending.count == 1 }
+            m.findInput = "second"; m.find(); await wait { f.pending.count == 2 }
+            f.release(0); await settle()
+            check(m.busy && m.findResults == nil && m.page?.id == previous.id, "Old query completion replaced a newer operation")
+            f.held = false; f.release(); await wait { !m.busy }
+            check(m.findResults?.needle == "second" && m.selectedFindID == 1, "New query did not own the accepted page")
+        }
+        do {
+            let f = Fixture(), m = f.model(findSupported: false)
+            await ready(f, m)
+            let calls = f.requests.count
+            m.findInput = "line"; m.find()
+            check(!m.canFind && f.requests.count == calls, "Optional Find capability caused unsupported foreign work")
+        }
+        do {
+            let f = Fixture()
+            f.renderedBytes = AtlasReaderDocumentLimits.findScanBytes + 1
+            let m = f.model()
+            await ready(f, m)
+            let previous = m.page!, calls = f.requests.count
+            m.findInput = "line"; m.find()
+            check(!m.canFind && f.requests.count == calls && m.page?.id == previous.id && m.findStatus.contains("16 MiB"),
+                  "Over-budget Find should retain the readable preview")
+        }
+        do {
+            let f = Fixture(), m = f.model()
+            await ready(f, m)
+            let calls = f.requests.count
+            for needle in ["", "\0", String(repeating: "é", count: 513)] {
+                m.findInput = needle; m.find()
+            }
+            check(f.requests.count == calls && m.authorized, "Invalid Find input disturbed the accepted document")
         }
     }
 

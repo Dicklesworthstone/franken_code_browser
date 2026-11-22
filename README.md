@@ -181,6 +181,13 @@ readers and exact selection handoff to the Reading Desk. A missing or canceled
 destination preserves the current source and forward history. See
 [project documentation navigation](native/macos/README.md#project-documentation-links-and-backlinks).
 
+**Find in a Markdown preview searches the rendered document.** Literal phrases can
+cross emphasis or link markup, with a complete match count and Previous/Next navigation
+through bounded result pages. Each match opens its logical text context using the retained
+layout; source actions keep their existing provenance checks. See
+[finding rendered text](native/macos/README.md#finding-text-in-a-markdown-preview)
+for exact matching rules, limits and pending independent verification.
+
 **CLI Markdown previews open the selected search region.**
 `fcb atlas . --text needle --markdown-hit 0 --json` starts at the first rendered
 row of the hit's qualified enclosing Markdown region. An explicit

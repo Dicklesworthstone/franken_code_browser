@@ -51,6 +51,27 @@ private enum Fixture {
         out["next_heading"] = headingEnd < headings ? String(headingEnd) as Any : NSNull()
         return out
     }
+    static func find(needle: String = "aa", first: UInt64 = 0, total: UInt64 = 3,
+                     flowTotal: UInt64 = 3, rendered: UInt64? = nil) -> [String: Any] {
+        var out = page(command: "document-find", total: flowTotal, headings: flowTotal == 0 ? 0 : 2)
+        for key in ["first_flow_line", "flow_lines", "next_flow_line", "whole_document_visible", "headings", "next_heading"] {
+            out.removeValue(forKey: key)
+        }
+        let bytes = rendered ?? flowTotal * 20, end = min(first + 128, total)
+        out["rendered_utf8_bytes"] = String(bytes)
+        out["needle"] = needle; out["search_domain"] = "rendered-text-utf8"
+        out["case_sensitive"] = true; out["normalization"] = "exact"; out["overlapping"] = true
+        out["max_scan_bytes"] = "16777216"; out["scanned_rendered_bytes"] = String(bytes)
+        out["first_match"] = String(first); out["matches_seen"] = String(total)
+        out["match_count_complete"] = true
+        out["next_match"] = end < total ? String(end) as Any : NSNull()
+        out["matches"] = (first..<end).map { index in
+            ["match_id": String(index + 1),
+             "rendered_utf8_range": range(index, index + UInt64(needle.utf8.count)),
+             "first_flow_line": String(flowTotal == 0 ? 0 : min(index / 20, flowTotal - 1))] as [String: Any]
+        }
+        return out
+    }
     static func linkRow(_ id: UInt64) -> [String: Any] {
         let kind: String, destination: String, fragment: Any
         switch id {
@@ -285,7 +306,128 @@ private enum Fixture {
                 "error": ["code": "DOCUMENT_READ_SOURCE_LIMIT"]]))
         }
         try documentLinks()
+        try documentFind()
         print("PASS: \(checks) document decoding, paging, copy domains, source mapping and stale-authority checks")
+    }
+
+
+    @MainActor static func documentFind() throws {
+        let info = try AtlasReaderInfo.decode(Fixture.json(Fixture.header("info")), handle: 7, path: Fixture.path)
+        let state = AtlasReaderDocumentState()
+        let prepare = try state.admit(.prepare(width: 100), info: info)
+        try state.accept(try prepare.decode(Fixture.json(Fixture.page(total: 8))), job: prepare)
+        let source = state.page!, row = source.target(at: 0)!
+        for needle in ["", "\0", String(repeating: "é", count: 513)] {
+            rejects("unbounded or NUL Find input") { _ = try state.admit(.find(needle: needle, first: 0), info: info) }
+        }
+        rejects("pagination without an accepted search") { _ = try state.admit(.find(needle: "aa", first: 1), info: info) }
+        let job = try state.admit(.find(needle: "aa", first: 0), info: info)
+        let wire = Fixture.find(total: 130, flowTotal: 8)
+        let result = try job.decode(Fixture.json(wire))
+        try state.accept(result, job: job)
+        let matches = state.matches!, target = matches.target(id: 1)!
+        check(matches.rows.count == 128 && matches.total == 130 && matches.next == 128,
+              "Find exposes bounded rows and a complete count")
+        check(matches.rows[0].rendered.end > matches.rows[1].rendered.start, "Overlapping matches were rejected")
+        check(state.page?.id == source.id && state.page?.target(at: 0) == row, "Find replaced source row authority")
+        let exact = try state.admit(.find(needle: "Café", first: 0), info: info)
+        var equivalent = Fixture.find(needle: "Café", total: 1, flowTotal: 8)
+        equivalent["needle"] = "Cafe\u{301}"
+        rejects("Unicode-normalized query echo") { _ = try exact.decode(Fixture.json(equivalent)) }
+        rejects("new query retained an old match token") { _ = try state.admit(.findMatch(target), info: info) }
+        let reload = try state.admit(.find(needle: "aa", first: 0), info: info)
+        try state.accept(try reload.decode(Fixture.json(wire)), job: reload)
+        let current = state.matches!.target(id: 1)!
+        check(current != target, "A new Find page reused its authority UUID")
+        let activation = try state.admit(.findMatch(current), info: info)
+        // A newline separator may lie before the selected context row; no
+        // fabricated range intersection or glyph/source highlight is required.
+        var separator = wire, matchRows = separator["matches"] as! [[String: Any]]
+        matchRows[0]["rendered_utf8_range"] = Fixture.range(19, 21)
+        matchRows = [matchRows[0]]
+        matchRows[0]["first_flow_line"] = "1"
+        separator["matches"] = matchRows; separator["matches_seen"] = "1"; separator["next_match"] = NSNull()
+        // This distinct query spelling starts a fresh count invariant.
+        let fresh = try state.admit(.find(needle: "\n\n", first: 0), info: info)
+        separator["needle"] = "\n\n"
+        try state.accept(try fresh.decode(Fixture.json(separator)), job: fresh)
+        let separatorTarget = state.matches!.target(id: 1)!
+        let separatorOpen = try state.admit(.findMatch(separatorTarget), info: info)
+        let context = Fixture.page(command: "document-window", first: 1, total: 8)
+        try state.accept(try separatorOpen.decode(Fixture.json(context)), job: separatorOpen)
+        check(state.page?.first == 1 && separatorTarget.match.rendered.start < state.page!.lines[0].rendered.start,
+              "Separator match did not open its next context row")
+        rejects("superseded activation was published") {
+            try state.accept(try activation.decode(Fixture.json(Fixture.page(command: "document-window", total: 8))), job: activation)
+        }
+        for (key, value) in [
+            ("needle", "aA"), ("first_match", "1"), ("matches_seen", "00130"),
+            ("max_scan_bytes", "16777215"), ("scanned_rendered_bytes", "159"),
+            ("search_domain", "original-source"), ("normalization", "nfc"),
+            ("source_revision", "2"), ("document_generation", "2")
+        ] {
+            var bad = wire; bad[key] = value
+            rejects("Find accepted invalid \(key)") { _ = try job.decode(Fixture.json(bad)) }
+        }
+        for key in ["case_sensitive", "overlapping", "match_count_complete"] {
+            var bad = wire; bad[key] = false
+            rejects("Find weakened \(key)") { _ = try job.decode(Fixture.json(bad)) }
+        }
+        var bad = wire; bad.removeValue(forKey: "next_match")
+        rejects("Find omitted continuation boundary") { _ = try job.decode(Fixture.json(bad)) }
+        bad = wire; bad["next_match"] = NSNull()
+        rejects("Find claimed a premature terminal page") { _ = try job.decode(Fixture.json(bad)) }
+        bad = wire; bad["matches_seen"] = "161"
+        rejects("Find count exceeded possible byte positions") { _ = try job.decode(Fixture.json(bad)) }
+        let rows = wire["matches"] as! [[String: Any]]
+        for changedRows in [Array(rows.dropLast()), rows + [rows[0]]] {
+            bad = wire; bad["matches"] = changedRows
+            rejects("Find admitted a truncated or unbounded page") { _ = try job.decode(Fixture.json(bad)) }
+        }
+        for (key, value) in [("match_id", "2"), ("first_flow_line", "8")] {
+            bad = wire; var invalid = rows; invalid[0][key] = value; bad["matches"] = invalid
+            rejects("Find admitted invalid match \(key)") { _ = try job.decode(Fixture.json(bad)) }
+        }
+        for range in [Fixture.range(0, 1), Fixture.range(159, 161)] {
+            bad = wire; var invalid = rows; invalid[0]["rendered_utf8_range"] = range; bad["matches"] = invalid
+            rejects("Find admitted a wrong-length or out-of-bounds match") { _ = try job.decode(Fixture.json(bad)) }
+        }
+        bad = wire; var repeated = rows; repeated[1]["rendered_utf8_range"] = Fixture.range(0, 2); bad["matches"] = repeated
+        rejects("Find admitted repeated match offsets") { _ = try job.decode(Fixture.json(bad)) }
+        let first = try state.admit(.find(needle: "aa", first: 0), info: info)
+        try state.accept(try first.decode(Fixture.json(wire)), job: first)
+        let next = try state.admit(.find(needle: "aa", first: 128), info: info)
+        let final = Fixture.find(first: 128, total: 130, flowTotal: 8)
+        try state.accept(try next.decode(Fixture.json(final)), job: next)
+        check(state.matches?.rows.count == 2 && state.matches?.next == nil, "Find final page lost its true boundary")
+        let changedCount = Fixture.find(first: 128, total: 129, flowTotal: 8)
+        rejects("Find pagination changed the frozen total") { _ = try next.decode(Fixture.json(changedCount)) }
+        let terminal = try state.admit(.find(needle: "aa", first: 130), info: info)
+        try state.accept(try terminal.decode(Fixture.json(Fixture.find(first: 130, total: 130, flowTotal: 8))), job: terminal)
+        check(state.matches?.rows.isEmpty == true && state.matches?.first == 130, "Terminal empty Find page was refused")
+        rejects("Find admitted an ordinal past the complete count") {
+            _ = try state.admit(.find(needle: "aa", first: 131), info: info)
+        }
+        let delayed = try state.admit(.find(needle: "aa", first: 0), info: info)
+        let delayedResult = try delayed.decode(Fixture.json(wire))
+        _ = try state.admit(.prepare(width: 80), info: info)
+        check(state.matches == nil, "Reflow retained Find targets")
+        rejects("Find completed after reflow") { try state.accept(delayedResult, job: delayed) }
+
+        let empty = AtlasReaderDocumentState()
+        let emptyPrepare = try empty.admit(.prepare(width: 100), info: info)
+        var emptyWire = Fixture.page(total: 0, headings: 0); emptyWire["rendered_utf8_bytes"] = "2"
+        try empty.accept(try emptyPrepare.decode(Fixture.json(emptyWire)), job: emptyPrepare)
+        let emptyFind = try empty.admit(.find(needle: "\n", first: 0), info: info)
+        try empty.accept(try emptyFind.decode(Fixture.json(Fixture.find(needle: "\n", total: 2, flowTotal: 0, rendered: 2))), job: emptyFind)
+        let emptyTarget = empty.matches!.target(id: 1)!
+        check(emptyTarget.match.firstLine == 0 && empty.matches?.total == 2, "Zero-flow separators lost their matches")
+        let emptyOpen = try empty.admit(.findMatch(emptyTarget), info: info)
+        emptyWire["command"] = "document-window"
+        try empty.accept(try emptyOpen.decode(Fixture.json(emptyWire)), job: emptyOpen)
+        check(empty.page?.lines.isEmpty == true && empty.page?.first == 0, "Zero-flow match invented a displayed row")
+        empty.revoke()
+        rejects("Closed document retained a Find target") { _ = try empty.admit(.findMatch(emptyTarget), info: info) }
     }
 
     @MainActor static func documentLinks() throws {

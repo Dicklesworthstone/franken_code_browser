@@ -26,6 +26,8 @@ struct AtlasReaderDocumentTransport: Sendable {
     // Frozen for this reader at the verified saved-member handoff. A separate
     // revocation gate prevents acquisition after archive close/replacement.
     var savedImages: AtlasSavedDocumentImageProvider? = nil
+    /// Optional exact literal Find over the retained rendered UTF-8 document.
+    var find: (@Sendable (UInt64, UInt64, String, UInt64, UInt64) -> String?)? = nil
 }
 
 /// Archive identity is independent of native paths and current-root grants.
@@ -84,6 +86,12 @@ enum AtlasReaderDocumentLimits {
     static let pageTextBytes: UInt64 = 256 * 1024
     static let links: UInt64 = 4096
     static let destinationBytes = 4096
+    static let findNeedleBytes = 1024
+    static let findMatches: UInt64 = 128
+    static let findScanBytes: UInt64 = 16 * 1024 * 1024
+    static func validFindNeedle(_ needle: String) -> Bool {
+        !needle.isEmpty && needle.utf8.count <= findNeedleBytes && !needle.utf8.contains(0)
+    }
 }
 
 struct AtlasDocumentByteRange: Equatable, Sendable, Decodable {
@@ -240,6 +248,40 @@ struct AtlasReaderDocumentHeadings: Sendable {
     }
 }
 
+/// Rendered UTF-8 coordinates never authorize original source or glyph actions.
+struct AtlasReaderDocumentMatch: Sendable, Equatable, Identifiable {
+    let id: UInt64
+    let rendered: AtlasDocumentByteRange
+    let firstLine: UInt64
+}
+struct AtlasReaderDocumentMatchTarget: Sendable, Equatable {
+    let inventory: AtlasReaderDocumentInventory
+    let pageID: UUID
+    let needle: String
+    let match: AtlasReaderDocumentMatch
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.inventory.matches(rhs.inventory) && lhs.pageID == rhs.pageID
+            && lhs.needle.utf8.elementsEqual(rhs.needle.utf8) && lhs.match == rhs.match
+    }
+}
+struct AtlasReaderDocumentMatches: Sendable {
+    let id: UUID
+    let inventory: AtlasReaderDocumentInventory
+    let needle: String
+    let first: UInt64
+    let rows: [AtlasReaderDocumentMatch]
+    let total: UInt64
+    let next: UInt64?
+    func target(id: UInt64) -> AtlasReaderDocumentMatchTarget? {
+        rows.first(where: { $0.id == id }).map {
+            .init(inventory: inventory, pageID: self.id, needle: needle, match: $0)
+        }
+    }
+    func matchesSearch(_ other: Self) -> Bool {
+        inventory.matches(other.inventory) && needle.utf8.elementsEqual(other.needle.utf8) && total == other.total
+    }
+}
+
 /// These are engine classifications, not permission to open a filesystem path
 /// or external URL. Occurrence IDs are local to this exact document generation.
 enum AtlasReaderDocumentLinkKind: String, Sendable, Decodable {
@@ -317,6 +359,8 @@ enum AtlasReaderDocumentRequest: Sendable {
     case window(first: UInt64)
     case headings(first: UInt64)
     case heading(AtlasReaderDocumentHeadingTarget)
+    case find(needle: String, first: UInt64)
+    case findMatch(AtlasReaderDocumentMatchTarget)
     case fromSource(offset: UInt64)
     case source(AtlasReaderDocumentTarget)
     case copy(AtlasReaderDocumentTarget, AtlasReaderDocumentCopyMode)
@@ -332,6 +376,8 @@ enum AtlasReaderDocumentRequest: Sendable {
         case .window: "document-window"
         case .headings: "document-headings"
         case .heading: "document-heading"
+        case .find: "document-find"
+        case .findMatch: "document-window"
         case .fromSource: "document-from-source"
         case .source: "document-source"
         case .copy: "document-copy"
@@ -349,6 +395,7 @@ enum AtlasReaderDocumentResult: Sendable {
     case prepared(AtlasReaderDocumentPage, AtlasReaderDocumentHeadings)
     case page(AtlasReaderDocumentPage)
     case headings(AtlasReaderDocumentHeadings)
+    case matches(AtlasReaderDocumentMatches)
     case source(AtlasReaderDocumentSource)
     case copy(AtlasReaderDocumentCopy)
     case links(AtlasReaderDocumentLinks)
@@ -366,6 +413,7 @@ struct AtlasReaderDocumentJob: Sendable {
     let request: AtlasReaderDocumentRequest
     var displayInventory: AtlasDocumentDisplayInventory? = nil
     var imageSource: AtlasDocumentImageSource? = nil
+    var previousMatches: AtlasReaderDocumentMatches? = nil
 
     func execute(_ transport: AtlasReaderDocumentTransport,
                  canceled: () -> Bool = { false }) throws -> AtlasReaderDocumentResult {
@@ -377,6 +425,11 @@ struct AtlasReaderDocumentJob: Sendable {
         case .window(let first): json = transport.window(handle, generation, first, count)
         case .headings(let first): json = transport.headings(handle, generation, first, count)
         case .heading(let target): json = transport.heading(handle, generation, target.heading.slug, count)
+        case .find(let needle, let first):
+            guard let find = transport.find else { throw AtlasReaderError.unavailable }
+            json = find(handle, generation, needle, first, AtlasReaderDocumentLimits.findMatches)
+        case .findMatch(let target):
+            json = transport.window(handle, generation, target.match.firstLine, count)
         case .fromSource(let offset): json = transport.fromSource(handle, generation, offset, count)
         case .source(let target):
             json = transport.source(handle, generation, target.rendered.start, target.rendered.end, AtlasReaderDocumentLimits.context)
@@ -575,6 +628,14 @@ struct AtlasReaderDocumentJob: Sendable {
                 return .prepared(try wire.page(basis, expectedFirst: 0), try wire.headings(basis, first: 0))
             case .window(let first): return .page(try wire.page(basis, expectedFirst: first))
             case .headings(let first): return .headings(try wire.headings(basis, first: first))
+            case .find(let needle, let first):
+                let matches = try wire.matches(basis, needle: needle, first: first)
+                if let previousMatches, previousMatches.needle.utf8.elementsEqual(needle.utf8),
+                   !previousMatches.matchesSearch(matches) { throw AtlasReaderError.invalidResponse }
+                return .matches(matches)
+            case .findMatch(let target):
+                guard target.inventory.matches(basis) else { throw AtlasReaderError.invalidResponse }
+                return .page(try wire.page(basis, expectedFirst: target.match.firstLine))
             case .heading(let target):
                 guard try wire.text("heading_slug").utf8.elementsEqual(target.heading.slug.utf8),
                       try wire.range("heading_original_range") == target.heading.original else {
@@ -610,6 +671,7 @@ struct AtlasReaderDocumentJob: Sendable {
     private(set) var page: AtlasReaderDocumentPage?
     private(set) var headings: AtlasReaderDocumentHeadings?
     private(set) var links: AtlasReaderDocumentLinks?
+    private(set) var matches: AtlasReaderDocumentMatches?
     private(set) var displayInventory: AtlasDocumentDisplayInventory?
 
     func admit(_ request: AtlasReaderDocumentRequest, info: AtlasReaderInfo) throws -> AtlasReaderDocumentJob {
@@ -630,6 +692,17 @@ struct AtlasReaderDocumentJob: Sendable {
                 guard first <= inventory.totalHeadings else { throw AtlasReaderError.invalidInput }
             case .heading(let target):
                 guard headings?.target(slug: target.heading.slug) == target else { throw AtlasReaderError.invalidInput }
+            case .find(let needle, let first):
+                guard AtlasReaderDocumentLimits.validFindNeedle(needle),
+                      inventory.renderedBytes <= AtlasReaderDocumentLimits.findScanBytes else {
+                    throw AtlasReaderError.invalidInput
+                }
+                if first != 0 {
+                    guard let matches, matches.needle.utf8.elementsEqual(needle.utf8),
+                          first <= matches.total else { throw AtlasReaderError.invalidInput }
+                }
+            case .findMatch(let target):
+                guard matches?.target(id: target.match.id) == target else { throw AtlasReaderError.invalidInput }
             case .fromSource(let offset):
                 guard offset >= inventory.sourceBase, offset <= info.identity.capturedBytes else { throw AtlasReaderError.invalidInput }
             case .source(let target), .copy(let target, _):
@@ -667,6 +740,10 @@ struct AtlasReaderDocumentJob: Sendable {
         }
         var job = AtlasReaderDocumentJob(id: UUID(), info: info, generation: next, inventory: inventory, request: request)
         job.displayInventory = displayInventory
+        job.previousMatches = matches
+        // Query submission retires the old page token immediately. A canceled
+        // or malformed Find reply cannot leave old matches active as the new query.
+        if case .find = request { matches = nil }
         active = job.id
         return job
     }
@@ -676,8 +753,22 @@ struct AtlasReaderDocumentJob: Sendable {
         if let expected = job.inventory, inventory?.matches(expected) != true { throw AtlasReaderError.canceled }
         switch result {
         case .prepared(let page, let headings): inventory = page.inventory; self.page = page; self.headings = headings
-        case .page(let page): self.page = page
+        case .page(let page):
+            if case .findMatch(let target) = job.request {
+                guard matches?.target(id: target.match.id) == target,
+                      page.inventory.matches(target.inventory), page.first == target.match.firstLine else {
+                    throw AtlasReaderError.canceled
+                }
+            }
+            self.page = page
         case .headings(let headings): self.headings = headings
+        case .matches(let matches):
+            guard case .find(let needle, let first) = job.request,
+                  matches.needle.utf8.elementsEqual(needle.utf8), matches.first == first,
+                  inventory?.matches(matches.inventory) == true else { throw AtlasReaderError.invalidResponse }
+            if let previous = job.previousMatches, previous.needle.utf8.elementsEqual(needle.utf8),
+               !previous.matchesSearch(matches) { throw AtlasReaderError.invalidResponse }
+            self.matches = matches
         case .links(let links):
             if let previous = self.links, !previous.matchesInventory(links) { throw AtlasReaderError.invalidResponse }
             self.links = links
@@ -696,7 +787,7 @@ struct AtlasReaderDocumentJob: Sendable {
         active = nil
     }
     func abandon(_ job: AtlasReaderDocumentJob) { if active == job.id { active = nil } }
-    func revoke() { active = nil; inventory = nil; page = nil; headings = nil; links = nil; displayInventory = nil }
+    func revoke() { active = nil; inventory = nil; page = nil; headings = nil; links = nil; matches = nil; displayInventory = nil }
     func close() { revoke(); generation = 0 }
 }
 
@@ -734,12 +825,12 @@ private struct AtlasReaderDocumentWire: Decodable {
         }
         return true
     }
-    func array<T: Decodable>(_ key: String) throws -> [T] {
+    func array<T: Decodable>(_ key: String, limit: UInt64 = AtlasReaderDocumentLimits.pageLines) throws -> [T] {
         var container = try fields.nestedUnkeyedContainer(forKey: Key(key))
-        if let count = container.count, count > Int(AtlasReaderDocumentLimits.pageLines) { throw AtlasReaderError.invalidResponse }
+        if let count = container.count, count > Int(limit) { throw AtlasReaderError.invalidResponse }
         var values: [T] = []
         while !container.isAtEnd {
-            guard values.count < Int(AtlasReaderDocumentLimits.pageLines) else { throw AtlasReaderError.invalidResponse }
+            guard values.count < Int(limit) else { throw AtlasReaderError.invalidResponse }
             values.append(try container.decode(T.self))
         }
         return values
@@ -816,6 +907,44 @@ private struct AtlasReaderDocumentWire: Decodable {
             return .init(slug: row.slug, title: row.title, renderedOffset: offset, original: row.original_range)
         }
         return .init(id: UUID(), inventory: inventory, first: first, rows: headings, next: next)
+    }
+    func matches(_ inventory: AtlasReaderDocumentInventory, needle: String, first: UInt64) throws -> AtlasReaderDocumentMatches {
+        struct Row: Decodable {
+            let match_id, first_flow_line: String
+            let rendered_utf8_range: AtlasDocumentByteRange
+        }
+        guard AtlasReaderDocumentLimits.validFindNeedle(needle),
+              inventory.renderedBytes <= AtlasReaderDocumentLimits.findScanBytes,
+              try text("needle").utf8.elementsEqual(needle.utf8),
+              try text("search_domain") == "rendered-text-utf8",
+              try flag("case_sensitive"), try text("normalization") == "exact", try flag("overlapping"),
+              try flag("match_count_complete"), try number("first_match") == first,
+              try number("max_scan_bytes") == AtlasReaderDocumentLimits.findScanBytes,
+              try number("scanned_rendered_bytes") == inventory.renderedBytes,
+              fields.contains(Key("next_match")) else { throw AtlasReaderError.invalidResponse }
+        let total = try number("matches_seen"), bytes = UInt64(needle.utf8.count)
+        let possible = inventory.renderedBytes >= bytes ? inventory.renderedBytes - bytes + 1 : 0
+        guard first <= total, total <= possible else { throw AtlasReaderError.invalidResponse }
+        let rows: [Row] = try array("matches", limit: AtlasReaderDocumentLimits.findMatches)
+        guard UInt64(rows.count) == min(AtlasReaderDocumentLimits.findMatches, total - first) else {
+            throw AtlasReaderError.invalidResponse
+        }
+        let next = try optionalNumber("next_match"), end = first + UInt64(rows.count)
+        guard next == (end < total ? end : nil) else { throw AtlasReaderError.invalidResponse }
+        var previousStart: UInt64?, previousLine: UInt64 = 0
+        let matches = try rows.enumerated().map { position, row -> AtlasReaderDocumentMatch in
+            let range = row.rendered_utf8_range
+            guard AtlasReaderWire.integer(row.match_id) == first + UInt64(position) + 1,
+                  let line = AtlasReaderWire.integer(row.first_flow_line),
+                  (inventory.totalLines == 0 && line == 0) || line < inventory.totalLines,
+                  range.valid(upTo: inventory.renderedBytes, nonempty: true), range.length == bytes,
+                  previousStart.map({ range.start > $0 }) ?? true, line >= previousLine else {
+                throw AtlasReaderError.invalidResponse
+            }
+            previousStart = range.start; previousLine = line
+            return .init(id: first + UInt64(position) + 1, rendered: range, firstLine: line)
+        }
+        return .init(id: UUID(), inventory: inventory, needle: needle, first: first, rows: matches, total: total, next: next)
     }
     private struct LinkRow: Decodable {
         let link_id, block_index, destination, destination_display: String
