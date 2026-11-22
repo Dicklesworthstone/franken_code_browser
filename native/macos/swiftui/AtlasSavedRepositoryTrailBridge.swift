@@ -16,6 +16,12 @@ import Foundation
     _ destination: UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_trail_write_receipt") private func savedTrailWriteReceipt(_ handle: UInt64,
     _ operation: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_trail_export") private func savedTrailExport(_ handle: UInt64,
+    _ operation: UInt64, _ generation: UInt64, _ digest: UnsafePointer<CChar>?, _ destination: UnsafePointer<CChar>?,
+    _ entries: UInt64, _ verificationBytes: UInt64, _ selectedBytes: UInt64,
+    _ outputBytes: UInt64, _ outputScalars: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_trail_export_receipt") private func savedTrailExportReceipt(_ handle: UInt64,
+    _ operation: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_free_string") private func savedTrailFree(_ pointer: UnsafeMutablePointer<CChar>?)
 
 extension AtlasSavedTrailTransport {
@@ -52,6 +58,18 @@ extension AtlasSavedTrailTransport {
     }, writeReceipt: { handle, operation in
         guard handle > 0, operation > 0 else { return nil }
         return take(savedTrailWriteReceipt(handle, operation))
+    }, export: { handle, request in
+        guard handle > 0, handle == request.identity.owner, request.limits.isValid else { return nil }
+        let limits = request.limits
+        return request.trail.digest.withCString { digest in
+            request.destination.withCString { destination in
+                take(savedTrailExport(handle, request.operation, request.trail.generation, digest, destination,
+                    limits.entries, limits.verificationBytes, limits.selectedBytes, limits.outputBytes, limits.outputScalars))
+            }
+        }
+    }, exportReceipt: { handle, operation in
+        guard handle > 0, operation > 0 else { return nil }
+        return take(savedTrailExportReceipt(handle, operation))
     })
     private static func take(_ pointer: UnsafeMutablePointer<CChar>?) -> String? {
         guard let pointer else { return nil }

@@ -140,6 +140,11 @@ private final class AtlasSavedSession: @unchecked Sendable {
     private(set) var trailWriteInProgress = false
     private(set) var trailWriteCancellationRequested = false
     private(set) var trailWriteNotice = "Save a new reading trail from an exact saved source range."
+    private(set) var trailExportRequest: AtlasSavedTrailExportRequest?
+    private(set) var trailExportReceipt: AtlasSavedTrailExportReceipt?
+    private(set) var trailExportOutcomeKnown = true
+    private(set) var trailExportInProgress = false
+    private(set) var trailExportNotice = "Export the attached trail’s notes and exact saved-source selections."
     private(set) var searchPage: AtlasSavedSearchPage?
     private(set) var queryGeneration: UInt64?
     private(set) var expressionPage: AtlasSavedExpressionPage?
@@ -179,6 +184,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
     @ObservationIgnored private var lastPathAttempt: UInt64 = 0
     @ObservationIgnored private var lastTrailAttempt: UInt64 = 0
     @ObservationIgnored private var lastTrailWriteAttempt: UInt64 = 0
+    @ObservationIgnored private var lastTrailExportAttempt: UInt64 = 0
     @ObservationIgnored private var lastQueryAttempt: UInt64 = 0
     @ObservationIgnored private var lastExpressionAttempt: UInt64 = 0
     @ObservationIgnored private var lastStructureAttempt: UInt64 = 0
@@ -206,6 +212,10 @@ private final class AtlasSavedSession: @unchecked Sendable {
     var canWriteTrail: Bool {
         canOperate && trails?.write != nil && trails?.writeReceipt != nil && info?.trailWriteStateKnown == true &&
             max(lastTrailWriteAttempt, info?.lastTrailWriteAttempt ?? 0) < UInt64.max
+    }
+    var canExportTrail: Bool {
+        canOperate && trailIsCurrent && trails?.export != nil && trails?.exportReceipt != nil &&
+            info?.trailExportStateKnown == true && max(lastTrailExportAttempt, info?.lastTrailExportAttempt ?? 0) < UInt64.max
     }
     func canAuthorTrail(from source: AtlasSavedReaderCapture) -> Bool {
         canWriteTrail && ownsDocumentSource(source) && source.reader.canKeep
@@ -296,6 +306,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
                 model.trailPage = nil; model.trailGeneration = nil; model.lastTrailAttempt = 0
                 model.trailStateKnown = true; model.selectedTrailItem = nil
                 model.clearTrailWrite()
+                model.clearTrailExport()
                 model.lastRelationshipAttempt = 0; model.memberOffsetInput = "0"
                 model.searchPage = nil; model.queryGeneration = nil; model.lastQueryAttempt = 0; model.searchInput = ""
                 model.expressionPage = nil; model.expressionGeneration = nil; model.lastExpressionAttempt = 0
@@ -558,6 +569,96 @@ private final class AtlasSavedSession: @unchecked Sendable {
         }
     }
 
+    @discardableResult func exportTrail(_ parent: AtlasSavedTrailParent, destination: String,
+        limits: AtlasSavedTrailExportLimits, accessLease: AnyObject?) -> AtlasSavedTrailExportRequest? {
+        guard canExportTrail, let info, let page = trailPage, parent.matches(page) else { return nil }
+        guard AtlasSavedIndexBuildRequest.validDestination(destination), Array(destination.utf8) != info.path.bytes,
+              page.path.bytes != Array(destination.utf8) else {
+            trailExportNotice = "Choose a new source-pack filename distinct from the archive and trail. No export was started."
+            notice = trailExportNotice; return nil
+        }
+        if !trailExportOutcomeKnown, let prior = trailExportRequest,
+           prior.destination.utf8.elementsEqual(destination.utf8) {
+            trailExportNotice = "The previous export outcome for this destination is unknown. Reload its receipt or choose a different new filename."
+            notice = trailExportNotice; return nil
+        }
+        let request: AtlasSavedTrailExportRequest
+        do {
+            let previous = max(lastTrailExportAttempt, info.lastTrailExportAttempt)
+            guard previous < UInt64.max else { throw AtlasSavedError.unavailable }
+            request = try AtlasSavedTrailExportRequest(trail: parent, operation: previous + 1,
+                destination: destination, limits: limits)
+            lastTrailExportAttempt = request.operation
+        } catch { trailExportNotice = Self.message(error); notice = trailExportNotice; return nil }
+        trailExportRequest = request; trailExportReceipt = nil; trailExportOutcomeKnown = false
+        trailExportInProgress = true
+        trailExportNotice = "Verifying saved selections and creating a bounded source pack. Entries for other archives keep their notes and unavailable status…"
+        notice = trailExportNotice
+        perform { model, flag in
+            defer { model.trailExportInProgress = false }
+            guard let lease = model.session, model.info?.identity == request.identity,
+                  let export = model.trails?.export else { throw AtlasSavedError.unavailable }
+            do {
+                let lifetime: [AnyObject] = [lease] + [accessLease].compactMap { $0 }
+                let json = try await model.io.perform(cancellation: flag, keepingAlive: lifetime) {
+                    export(lease.handle, request)
+                }
+                let receipt = try AtlasSavedTrailExportReceipt.decode(json, request: request)
+                guard !model.closed, model.session === lease else { return }
+                try model.acceptTrailExport(receipt, request: request)
+            } catch {
+                guard !model.closed, model.session === lease else { return }
+                if await model.reconcileTrailExport(lease, request: request) {
+                    model.trailExportNotice = "Recovered the retained export receipt. \(model.trailExportReceipt!.message)"
+                } else {
+                    model.trailExportNotice = "The source-pack write outcome is unknown. The destination may contain a complete or incomplete file. Reload its retained receipt before using it; a new export needs a different filename."
+                }
+                model.notice = model.trailExportNotice
+            }
+        }
+        return request
+    }
+    func reloadTrailExportReceipt() {
+        guard let request = trailExportRequest else { return }
+        perform { model, _ in
+            guard let lease = model.session, model.info?.identity == request.identity else { throw AtlasSavedError.unavailable }
+            if await model.reconcileTrailExport(lease, request: request) {
+                model.trailExportNotice = "Recovered the retained export receipt. \(model.trailExportReceipt!.message)"
+            } else {
+                model.trailExportNotice = model.trailExportOutcomeKnown
+                    ? "The receipt read failed. The previously verified export outcome remains available."
+                    : "The export outcome is still unknown. No export was retried. Inspect the destination before choosing another new filename."
+            }
+            model.notice = model.trailExportNotice
+        }
+    }
+    private func acceptTrailExport(_ receipt: AtlasSavedTrailExportReceipt, request: AtlasSavedTrailExportRequest) throws {
+        guard info?.identity == request.identity, receipt.identity == request.identity,
+              receipt.operation == request.operation, trailExportRequest?.operation == request.operation else {
+            throw AtlasSavedError.invalidResponse
+        }
+        trailExportReceipt = receipt; trailExportOutcomeKnown = true
+        lastTrailExportAttempt = max(lastTrailExportAttempt, request.operation)
+        info?.lastTrailExportAttempt = max(info?.lastTrailExportAttempt ?? 0, request.operation)
+        info?.lastTrailExportOperation = request.operation
+        trailExportNotice = receipt.message; notice = receipt.message
+    }
+    private func reconcileTrailExport(_ lease: AtlasSavedSession, request: AtlasSavedTrailExportRequest) async -> Bool {
+        guard !closed, session === lease, info?.identity == request.identity,
+              trailExportRequest?.operation == request.operation, let receipt = trails?.exportReceipt else { return false }
+        do {
+            let json = try await io.perform(cancellation: AtlasSearchCancellation(), keepingAlive: [lease]) {
+                receipt(lease.handle, request.operation)
+            }
+            let accepted = try AtlasSavedTrailExportReceipt.decode(json, request: request)
+            guard !closed, session === lease else { return false }
+            try acceptTrailExport(accepted, request: request); return true
+        } catch {
+            trailExportOutcomeKnown = trailExportReceipt?.operation == request.operation
+            return false
+        }
+    }
+
     func attachTrail(path: String, accessLease: AnyObject?) {
         guard canOpenTrail, let info, path.hasPrefix("/"), path.utf8.count <= 16_384,
               !path.utf8.contains(0) else { return }
@@ -720,6 +821,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
     private func acceptInfo(_ current: AtlasSavedInfo, lease: AtlasSavedSession) throws {
         guard current.lastIndexAttempt >= (info?.lastIndexAttempt ?? 0),
               !current.trailWriteStateKnown || current.lastTrailWriteAttempt >= (info?.lastTrailWriteAttempt ?? 0),
+              !current.trailExportStateKnown || current.lastTrailExportAttempt >= (info?.lastTrailExportAttempt ?? 0),
               !current.indexBuildStateKnown || current.lastIndexBuildAttempt >= (info?.lastIndexBuildAttempt ?? 0) else {
             throw AtlasSavedError.invalidResponse
         }
@@ -727,6 +829,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
         info = current; lastIndexAttempt = max(lastIndexAttempt, current.lastIndexAttempt); indexStateKnown = true
         lastIndexBuildAttempt = max(lastIndexBuildAttempt, current.lastIndexBuildAttempt)
         lastTrailWriteAttempt = max(lastTrailWriteAttempt, current.lastTrailWriteAttempt)
+        lastTrailExportAttempt = max(lastTrailExportAttempt, current.lastTrailExportAttempt)
     }
     private func reconcileIndex(_ lease: AtlasSavedSession) async -> Bool {
         guard !closed, session === lease, let previous = info else { return false }
@@ -1779,6 +1882,9 @@ private final class AtlasSavedSession: @unchecked Sendable {
             trailWriteCancellationRequested = true
             trailWriteNotice = "Cancellation requested. Waiting for the writer to drain and report whether the new trail was created."
             notice = trailWriteNotice
+        } else if trailExportInProgress {
+            trailExportNotice = "Cancellation requested. Waiting for the source-pack writer to drain and report its actual destination effect."
+            notice = trailExportNotice
         } else { notice = "Cancel requested. Waiting for entered saved-archive work to drain." }
     }
     func closeArchive() {
@@ -1799,6 +1905,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
         pathPage = nil; pathGeneration = nil; pathInput = ""; lastPathAttempt = 0
         trailPage = nil; trailGeneration = nil; selectedTrailItem = nil; lastTrailAttempt = 0; trailStateKnown = true
         clearTrailWrite()
+        clearTrailExport()
         searchPage = nil; queryGeneration = nil; lastQueryAttempt = 0; searchInput = ""
         expressionPage = nil; expressionGeneration = nil; lastExpressionAttempt = 0
         structurePage = nil; structureGeneration = nil; lastStructureAttempt = 0
@@ -1815,6 +1922,11 @@ private final class AtlasSavedSession: @unchecked Sendable {
         trailWriteRequest = nil; trailWriteReceipt = nil; trailWriteOutcomeKnown = true
         trailWriteInProgress = false; trailWriteCancellationRequested = false; lastTrailWriteAttempt = 0
         trailWriteNotice = "Save a new reading trail from an exact saved source range."
+    }
+    private func clearTrailExport() {
+        trailExportRequest = nil; trailExportReceipt = nil; trailExportOutcomeKnown = true
+        trailExportInProgress = false; lastTrailExportAttempt = 0
+        trailExportNotice = "Export the attached trail’s notes and exact saved-source selections."
     }
     private func run(_ lease: AtlasSavedSession, _ request: AtlasSavedRequest,
         flag: AtlasSearchCancellation) async throws -> String? {

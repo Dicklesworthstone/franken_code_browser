@@ -951,6 +951,51 @@ archive supplies the source. The native attachment, authoring, reader navigation
 and Desk handoff have host, C-boundary and Swift regression fixtures. Independent
 execution and physical-Mac qualification remain pending.
 
+### Exporting a saved trail with its source
+
+In **Saved Repository → Reading trail**, choose **Export source pack…** to save
+the attached trail's notes, exact source references and verified selections in
+a new self-contained JSON file. Presets admit up to **64 KiB**, **1 MiB** or
+**4 MiB** of selected original bytes. The save panel explains that source,
+paths and notes may contain secrets; the export does not redact or encrypt
+them. Existing destinations are never overwritten.
+
+The pack uses the same `fcb.trail-source-pack/1` representation as CLI trail
+export: exact original bytes are lowercase hex, preserving malformed text,
+byte-order marks and selections inside a text scalar without inventing a decoded
+representation. Saved order, repeated visits, zero-length bookmarks and rationale
+remain intact. It is a source-evidence artifact, not an FCBT trail attachment or
+an archive, and its notes are never executed.
+
+Native export reads only the currently retained FCBS archive descriptor.
+Replacing its pathname or the attached trail pathname cannot substitute new
+source. Entries for another archive, missing members or changed captures keep
+their notes and explicit unavailable reasons. Source limits omit whole
+selections, with the omission recorded beside the reference. This can produce
+a complete JSON file with partial source coverage; the receipt reports those
+outcomes independently.
+
+Each operation admits at most **1,024 visits**, **64 MiB** of whole-member
+verification and **16 MiB** each of complete encoded bytes and Unicode scalars
+in the JSON representation. All admitted notes and provenance are reserved
+before source reads. An oversized metadata envelope refuses before creating
+a destination. Only one selected member is retained during verification;
+repeated visits count against the source-work allowance separately.
+
+The accepted trail, queries and opened readers remain available after export.
+Cancellation waits for the entered worker to drain, then reports the actual
+destination effect. **Reload export receipt** recovers the retained terminal
+result without reading or rewriting the destination. A missing reply never
+automatically retries a write; inspect an uncertain destination and choose a
+different new filename for another export. The destination grant remains held
+through writer completion even if the view closes.
+
+The host, registry, public-header marshaling and native model regression sources
+cover exact bytes, unavailable visits, whole-selection limits, metadata refusal,
+retained descriptors, exclusive creation, cancellation, lost replies and grant
+retirement. Independent strict-RCH execution and physical-Mac save-panel
+qualification remain pending.
+
 ## Comparing retained source ranges
 
 Use **Pin source** in two retained readers, then choose **Compare** in **Pinned

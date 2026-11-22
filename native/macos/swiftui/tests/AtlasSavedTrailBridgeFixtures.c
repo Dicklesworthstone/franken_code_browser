@@ -5,10 +5,10 @@
 
 /* Header-checked marshaling and owned-response fixture. Real FCBT/archive
  * resolution and payload verification remain in the Rust service fixtures. */
-static uint64_t calls[7];
+static uint64_t calls[9];
 static int result_mode;
 void fixture_saved_trail_mode(int mode) { result_mode = mode; }
-uint64_t fixture_saved_trail_count(uint64_t index) { assert(index < 7); return calls[index]; }
+uint64_t fixture_saved_trail_count(uint64_t index) { assert(index < 9); return calls[index]; }
 static char *reply(void) {
     if (result_mode == 1) return NULL;
     if (result_mode == 2) {
@@ -65,4 +65,19 @@ char *fcb_saved_trail_write(uint64_t handle, uint64_t operation,
 char *fcb_saved_trail_write_receipt(uint64_t handle, uint64_t operation) {
     assert(handle == UINT64_MAX - 10 && operation == UINT64_MAX);
     calls[6]++; return reply();
+}
+char *fcb_saved_trail_export(uint64_t handle, uint64_t operation, uint64_t generation,
+    const char *digest, const char *destination, uint64_t entries, uint64_t verification_bytes,
+    uint64_t selected_bytes, uint64_t output_bytes, uint64_t output_scalars) {
+    assert(handle == UINT64_MAX - 10 && operation == UINT64_MAX && generation == UINT64_MAX - 9);
+    assert(digest && strlen(digest) == 64);
+    for (size_t i = 0; i < 64; i++) assert(digest[i] == 'a');
+    assert(destination && strcmp(destination, "/pack-e\xcc\x81.json") == 0);
+    assert(entries == 1024 && verification_bytes == 64 * 1024 * 1024);
+    assert(selected_bytes == 4 * 1024 * 1024 && output_bytes == 16 * 1024 * 1024 && output_scalars == output_bytes);
+    calls[7]++; return reply();
+}
+char *fcb_saved_trail_export_receipt(uint64_t handle, uint64_t operation) {
+    assert(handle == UINT64_MAX - 10 && operation == UINT64_MAX);
+    calls[8]++; return reply();
 }

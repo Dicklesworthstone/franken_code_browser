@@ -204,4 +204,148 @@ struct AtlasSavedTrailTransport: Sendable {
     let run: @Sendable (UInt64, AtlasSavedTrailRequest) -> String?
     var write: (@Sendable (UInt64, AtlasSavedTrailWriteRequest) -> String?)? = nil
     var writeReceipt: (@Sendable (UInt64, UInt64) -> String?)? = nil
+    var export: (@Sendable (UInt64, AtlasSavedTrailExportRequest) -> String?)? = nil
+    var exportReceipt: (@Sendable (UInt64, UInt64) -> String?)? = nil
+}
+
+struct AtlasSavedTrailExportLimits: Sendable, Equatable {
+    var entries: UInt64 = 1024
+    var verificationBytes: UInt64 = 64 * 1024 * 1024
+    var selectedBytes: UInt64 = 1024 * 1024
+    var outputBytes: UInt64 = 16 * 1024 * 1024
+    var outputScalars: UInt64 = 16 * 1024 * 1024
+    var isValid: Bool {
+        entries <= 1024 && verificationBytes <= 64 * 1024 * 1024 && selectedBytes <= 64 * 1024 * 1024 &&
+            (1...16 * 1024 * 1024).contains(outputBytes) && (1...16 * 1024 * 1024).contains(outputScalars)
+    }
+}
+
+/// Frozen accepted trail identity; the save panel supplies destination access
+/// separately. Display labels never reopen an archive or a source pathname.
+struct AtlasSavedTrailExportRequest: Sendable {
+    let trail: AtlasSavedTrailParent
+    let operation: UInt64
+    let destination: String
+    let limits: AtlasSavedTrailExportLimits
+    var identity: AtlasSavedIdentity { trail.identity }
+    init(trail: AtlasSavedTrailParent, operation: UInt64, destination: String,
+         limits: AtlasSavedTrailExportLimits) throws {
+        guard operation > 0, trail.generation > 0, AtlasSavedWire.digest(trail.digest),
+              trail.items <= 1024, AtlasSavedIndexBuildRequest.validDestination(destination), limits.isValid else {
+            throw AtlasSavedError.invalidInput
+        }
+        self.trail = trail; self.operation = operation; self.destination = destination; self.limits = limits
+    }
+}
+
+struct AtlasSavedTrailExportReceipt: Sendable {
+    let identity: AtlasSavedIdentity
+    let operation: UInt64
+    let effect: AtlasSavedIndexBuildEffect
+    let succeeded, completeArtifact, coverageComplete: Bool
+    let exportBytes, exportScalars, bytesWritten, verified, unavailable, omitted, selectedBytes: UInt64
+    let digest, errorCode: String?
+    var message: String {
+        if succeeded {
+            return "Created a source pack: \(verified) verified selections, \(unavailable) unavailable and \(omitted) omitted. \(exportBytes) UTF-8 JSON bytes; \(exportScalars) Unicode scalars. " +
+                (coverageComplete ? "Every saved selection is included." : "Coverage is partial; all admitted notes and omission reasons remain in the pack.")
+        }
+        let state: String
+        switch effect {
+        case .none: state = "No source-pack destination was created."
+        case .incomplete: state = "The destination contains an incomplete source pack."
+        case .fileSyncUnconfirmed: state = "Complete source-pack bytes were written; file synchronization is unconfirmed."
+        case .fileSyncRequested: state = "Complete source-pack bytes were written and file synchronization was requested."
+        case .fileAndParentSyncRequested: state = "The complete source pack and parent directory were synchronized."
+        }
+        return "\(state) \(errorCode ?? "Unconfirmed export"). Inspect the destination before choosing a new filename."
+    }
+    static func decode(_ json: String?, request: AtlasSavedTrailExportRequest) throws -> Self {
+        guard let json, !json.isEmpty, json.utf8.count <= 256 * 1024 else { throw AtlasSavedError.unavailable }
+        do {
+            let data = Data(json.utf8), w = try JSONDecoder().decode(Wire.self, from: data)
+            let identity = try JSONDecoder().decode(AtlasSavedIdentity.self, from: data)
+            let b = w.budgets, c = w.coverage, l = request.limits
+            guard identity == request.identity, w.schema == "fcb.saved-repository/1", w.command == "trail-export",
+                  w.status == "ok" || w.status == "error", w.operation.value == request.operation,
+                  w.last_trail_export_attempt.value == request.operation,
+                  w.trail_generation.value == request.trail.generation, w.trail_digest == request.trail.digest,
+                  w.destination.bytes == Array(request.destination.utf8), w.pack_schema == "fcb.trail-source-pack/1",
+                  w.character_representation == "unicode-scalars-in-serialized-utf8-json", w.archive_scope == "retained-single-archive",
+                  b.entries.value == l.entries, b.verification_source_bytes.value == l.verificationBytes,
+                  b.selected_original_bytes.value == l.selectedBytes, b.export_bytes.value == l.outputBytes,
+                  b.export_characters.value == l.outputScalars,
+                  !w.archive_path_reopened, !w.live_source_reopened, w.accepted_trail_unchanged, w.accepted_query_unchanged,
+                  w.source_derived_sensitive, !w.redacted, !w.encrypted, !w.overwritten, !w.power_loss_qualified,
+                  c.total_entries.value == request.trail.items, c.entries_visited.value <= min(l.entries, request.trail.items),
+                  c.verification_bytes_admitted.value <= l.verificationBytes, c.source_bytes_read.value <= c.verification_bytes_admitted.value,
+                  c.selected_original_bytes.value <= l.selectedBytes,
+                  c.selected_original_bytes.value <= c.source_bytes_read.value,
+                  c.selected_original_bytes.value <= request.trail.referenceBytes,
+                  w.member_bytes_read.value == c.source_bytes_read.value,
+                  w.member_read_calls.value <= 1_048_576 * 1024,
+                  w.export_bytes.value <= l.outputBytes, w.export_characters.value <= l.outputScalars,
+                  w.export_characters.value <= w.export_bytes.value, w.bytes_written.value <= w.export_bytes.value else {
+                throw AtlasSavedError.invalidResponse
+            }
+            let verified = c.verified_entries.value, unavailable = c.unavailable_entries.value
+            let sourceOmitted = c.omitted_source_limit.value, outputOmitted = c.omitted_output_limit.value
+            let tailOmitted = c.omitted_entry_limit.value
+            guard [verified, unavailable, sourceOmitted, outputOmitted, tailOmitted].allSatisfy({ $0 <= request.trail.items }),
+                  verified + unavailable + sourceOmitted + outputOmitted <= c.entries_visited.value,
+                  tailOmitted <= request.trail.items - c.entries_visited.value else { throw AtlasSavedError.invalidResponse }
+            let built = w.export_bytes.value > 0, succeeded = w.status == "ok", error = w.error.value
+            if built {
+                guard let digest = w.export_digest.value, AtlasSavedWire.digest(digest),
+                      w.export_characters.value > 0,
+                      verified + unavailable + sourceOmitted + outputOmitted == c.entries_visited.value,
+                      c.entries_visited.value + tailOmitted == request.trail.items else { throw AtlasSavedError.invalidResponse }
+            } else {
+                guard w.export_digest.value == nil, w.export_characters.value == 0 else { throw AtlasSavedError.invalidResponse }
+            }
+            guard succeeded == (error == nil), !succeeded || (built &&
+                    (w.effect == .fileSyncRequested || w.effect == .fileAndParentSyncRequested)),
+                  w.effect != .none || w.bytes_written.value == 0,
+                  w.effect == .none || built,
+                  !w.effect.completeFile || w.bytes_written.value == w.export_bytes.value,
+                  w.complete_artifact == (built && w.effect.completeFile),
+                  w.coverage_complete == (built && verified == request.trail.items && unavailable == 0 &&
+                    sourceOmitted == 0 && outputOmitted == 0 && tailOmitted == 0) else { throw AtlasSavedError.invalidResponse }
+            if let error {
+                guard !error.code.isEmpty, error.code.utf8.count <= 512,
+                      error.code.unicodeScalars.allSatisfy({ $0.value >= 32 && $0.value != 127 }) else {
+                    throw AtlasSavedError.invalidResponse
+                }
+            }
+            return Self(identity: identity, operation: request.operation, effect: w.effect,
+                succeeded: succeeded, completeArtifact: w.complete_artifact, coverageComplete: w.coverage_complete,
+                exportBytes: w.export_bytes.value, exportScalars: w.export_characters.value, bytesWritten: w.bytes_written.value,
+                verified: verified, unavailable: unavailable, omitted: sourceOmitted + outputOmitted + tailOmitted,
+                selectedBytes: c.selected_original_bytes.value, digest: w.export_digest.value, errorCode: error?.code)
+        } catch let error as AtlasSavedError { throw error }
+        catch { throw AtlasSavedError.invalidResponse }
+    }
+    private struct Failure: Decodable { let code: String }
+    private struct Budgets: Decodable {
+        let entries, verification_source_bytes, selected_original_bytes, export_bytes, export_characters: AtlasSavedNumber
+    }
+    private struct Coverage: Decodable {
+        let total_entries, entries_visited, verified_entries, unavailable_entries: AtlasSavedNumber
+        let omitted_entry_limit, omitted_source_limit, omitted_output_limit: AtlasSavedNumber
+        let verification_bytes_admitted, source_bytes_read, selected_original_bytes: AtlasSavedNumber
+    }
+    private struct Wire: Decodable {
+        let schema, command, status, trail_digest, pack_schema, character_representation, archive_scope: String
+        let operation, last_trail_export_attempt, trail_generation: AtlasSavedNumber
+        let destination: AtlasSavedPath
+        let budgets: Budgets
+        let coverage: Coverage
+        let coverage_complete, complete_artifact: Bool
+        let export_bytes, export_characters, bytes_written, member_bytes_read, member_read_calls: AtlasSavedNumber
+        let export_digest: AtlasSavedSearchOptional<String>
+        let error: AtlasSavedSearchOptional<Failure>
+        let effect: AtlasSavedIndexBuildEffect
+        let archive_path_reopened, live_source_reopened, accepted_trail_unchanged, accepted_query_unchanged: Bool
+        let source_derived_sensitive, redacted, encrypted, overwritten, power_loss_qualified: Bool
+    }
 }

@@ -341,6 +341,11 @@ final class AtlasSavedFileAccess {
             HStack {
                 Text("Reading trail").font(.headline)
                 Spacer()
+                Menu("Export source pack…") {
+                    Button("Up to 64 KiB of selected source…") { exportTrail(selectedBytes: 64 * 1024) }
+                    Button("Up to 1 MiB of selected source…") { exportTrail(selectedBytes: 1024 * 1024) }
+                    Button("Up to 4 MiB of selected source…") { exportTrail(selectedBytes: 4 * 1024 * 1024) }
+                }.disabled(!model.canExportTrail || readerTask != nil)
                 Button("Open reading trail…", action: chooseTrail).disabled(!model.canOpenTrail || readerTask != nil)
                 Button("Reload state", action: model.reloadTrail).disabled(!model.canOperate || readerTask != nil)
                 Button("Close trail", action: model.detachTrail)
@@ -359,6 +364,19 @@ final class AtlasSavedFileAccess {
             if !model.trailStateKnown {
                 Text("The accepted attachment is unknown. These previously verified notes are read only until Reload state succeeds.")
                     .font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+            }
+            if let request = model.trailExportRequest {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Source-pack destination: \(String(reflecting: request.destination))")
+                        .font(.caption).lineLimit(2).textSelection(.enabled)
+                    Text(verbatim: model.trailExportNotice).font(.caption)
+                        .foregroundStyle(model.trailExportOutcomeKnown ? Color.secondary : Color.orange).textSelection(.enabled)
+                    if let digest = model.trailExportReceipt?.digest {
+                        Text("Pack digest: \(digest)").font(.caption2.monospaced()).textSelection(.enabled)
+                    }
+                    Button("Reload export receipt", action: model.reloadTrailExportReceipt)
+                        .controlSize(.small).disabled(!model.canOperate)
+                }
             }
             if let page = model.trailPage {
                 VStack(alignment: .leading, spacing: 3) {
@@ -1209,6 +1227,26 @@ final class AtlasSavedFileAccess {
             panelNotice = "The selected archive filename cannot be represented exactly by the native open interface."; return
         }
         panelNotice = ""; model.open(path: path, accessLease: access)
+    }
+    private func exportTrail(selectedBytes: UInt64) {
+        guard model.canExportTrail, readerTask == nil, let page = model.trailPage else { return }
+        let parent = AtlasSavedTrailParent(page)
+        let limits = AtlasSavedTrailExportLimits(selectedBytes: selectedBytes)
+        let panel = NSSavePanel()
+        panel.title = "Export a new trail source pack"
+        panel.message = "Exports ordered notes, paths and up to \(selectedBytes) original source bytes from this opened archive as JSON. Other-archive or unavailable selections retain their notes and reasons. Source and notes may contain secrets; nothing is redacted or encrypted. Choose a new filename; existing files are never overwritten."
+        panel.nameFieldStringValue = "ReadingTrail.source-pack.json"
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let access = AtlasSavedFileAccess(selectedURL: url)
+        guard model.canExportTrail, readerTask == nil, let current = model.trailPage, parent.matches(current) else {
+            panelNotice = "The archive or trail changed while choosing a destination. Review the current trail and choose Export again."; return
+        }
+        guard let path = access.nativePath else {
+            panelNotice = "The destination cannot be represented exactly by the native export interface."; return
+        }
+        panelNotice = ""
+        _ = model.exportTrail(parent, destination: path, limits: limits, accessLease: access)
     }
     private func chooseTrail() {
         guard model.canOpenTrail, readerTask == nil, let identity = model.info?.identity else { return }

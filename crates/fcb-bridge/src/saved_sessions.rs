@@ -10,7 +10,7 @@ use fcb_app::host::{HostResponse, saved_repository::{SavedRepositorySession, Sav
     SnapshotLimits, Sha256Digest}};
 use fcb_app::host::saved_repository::relationships::{SavedRelationshipError, RelationshipDirection, RelationshipSide};
 use fcb_app::host::saved_repository::imports::{SavedImportError, SavedImportDirection, SavedImportSide};
-use fcb_app::host::saved_repository::trail::{SavedTrailError, SavedTrailWriteRequest};
+use fcb_app::host::saved_repository::trail::{SavedTrailError, SavedTrailWriteRequest, SavedTrailExportRequest};
 use fcb_app::host::saved_repository::paths::SavedPathOptions;
 use fcb_app::host::saved_repository::index_build::SavedIndexBuildLimits;
 use fcb_app::host::saved_repository::desk::SavedDeskError;
@@ -116,6 +116,7 @@ pub(super) enum Command<'a> {
     TrailPage { generation: u64, start: usize, limit: usize },
     DetachTrail { generation: u64 },
     TrailWriteReceipt { operation: u64 },
+    TrailExportReceipt { operation: u64 },
 }
 pub(super) enum DocumentImageCommand {
     Authorize,
@@ -257,6 +258,8 @@ impl SavedSessions {
                 session.detach_trail(generation, &mut stop).map_err(AccessError::from),
             Command::TrailWriteReceipt { operation } =>
                 session.trail_write_receipt(operation, &mut stop).map_err(AccessError::from),
+            Command::TrailExportReceipt { operation } =>
+                session.trail_export_receipt(operation, &mut stop).map_err(AccessError::from),
             Command::Info => session.info(&mut stop).map_err(AccessError::from),
             Command::IndexBuildReceipt { operation } =>
                 session.index_build_receipt(operation, &mut stop).map_err(AccessError::from),
@@ -305,6 +308,18 @@ impl SavedSessions {
         let session = state.as_mut().ok_or(AccessError::NotOpen)?;
         let mut stop = || cell.validate(epoch).is_err() || canceled();
         session.write_trail(request, &mut stop).map_err(AccessError::from)
+    }
+    /// Effect-bearing export replies survive cancellation/close after create.
+    /// The locked cell retains the original descriptor through writer drain.
+    pub(super) fn export_trail(&self, handle: u64, request: SavedTrailExportRequest<'_>,
+        mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
+        let cell = self.get(handle)?;
+        let epoch = cell.epoch.load(Ordering::Acquire);
+        let mut state = lock(&cell.state)?;
+        cell.validate(epoch)?;
+        let session = state.as_mut().ok_or(AccessError::NotOpen)?;
+        let mut stop = || cell.validate(epoch).is_err() || canceled();
+        session.export_trail(request, &mut stop).map_err(AccessError::from)
     }
     /// Lock saved source before destination, both nonblocking. The existing
     /// reader registry admits an empty handle BEFORE any member read occurs.

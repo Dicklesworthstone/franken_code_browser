@@ -94,6 +94,7 @@ struct AcceptedQuery {
 /// workspace discovery, native presentation, executor or external process.
 pub struct SavedRepositorySession {
     archive: PagedSnapshot<File>,
+    archive_limits: SnapshotLimits,
     index: Option<AcceptedIndex>,
     index_build: Option<index_build::RetainedIndexBuild>,
     query: Option<AcceptedQuery>,
@@ -104,6 +105,7 @@ pub struct SavedRepositorySession {
     paths: Option<paths::AcceptedPaths>,
     trail: Option<trail::AcceptedTrail>,
     trail_write: Option<trail::write::RetainedTrailWrite>,
+    trail_export: Option<trail::export::RetainedTrailExport>,
     path: PathBuf,
     last_query_attempt: u64,
     last_expression_attempt: u64,
@@ -115,6 +117,7 @@ pub struct SavedRepositorySession {
     last_path_attempt: u64,
     last_trail_attempt: u64,
     last_trail_write_attempt: u64,
+    last_trail_export_attempt: u64,
     next_allocation: u64,
     budget: ResourceBudget,
     _lease: ResourceLease,
@@ -138,9 +141,9 @@ impl SavedRepositorySession {
         if metadata.len() > limits.max_document_bytes as u64 { return Err(SavedRepositoryError::InvalidLimits); }
         let archive = PagedSnapshot::open(file, owner, limits, &budget, allocation(2)?, &mut canceled)?;
         check(&mut canceled)?;
-        Ok(Self { archive, index: None, index_build: None, query: None, expression: None, structure: None, relationships: None, imports: None, paths: None, trail: None, trail_write: None, path, last_query_attempt: 0,
+        Ok(Self { archive, archive_limits: limits, index: None, index_build: None, query: None, expression: None, structure: None, relationships: None, imports: None, paths: None, trail: None, trail_write: None, trail_export: None, path, last_query_attempt: 0,
             last_expression_attempt: 0, last_structure_attempt: 0,
-            last_index_attempt: 0, last_index_build_attempt: 0, last_relationship_attempt: 0, last_import_attempt: 0, last_path_attempt: 0, last_trail_attempt: 0, last_trail_write_attempt: 0, next_allocation: 3, budget, _lease: lease })
+            last_index_attempt: 0, last_index_build_attempt: 0, last_relationship_attempt: 0, last_import_attempt: 0, last_path_attempt: 0, last_trail_attempt: 0, last_trail_write_attempt: 0, last_trail_export_attempt: 0, next_allocation: 3, budget, _lease: lease })
     }
     pub fn owner(&self) -> ArenaOwnerId { self.archive.directory().owner() }
     pub fn archive_digest(&self) -> Sha256Digest { self.archive.directory().digest() }
@@ -169,6 +172,8 @@ impl SavedRepositorySession {
         out.literal(",\"last_trail_attempt\":")?; out.integer(self.last_trail_attempt())?;
         out.literal(",\"last_trail_write_attempt\":")?; out.integer(self.last_trail_write_attempt())?;
         out.literal(",\"last_trail_write_operation\":")?; optional(&mut out, self.last_trail_write_operation())?;
+        out.literal(",\"last_trail_export_attempt\":")?; out.integer(self.last_trail_export_attempt())?;
+        out.literal(",\"last_trail_export_operation\":")?; optional(&mut out, self.last_trail_export_operation())?;
         let directory = self.archive.directory();
         out.literal(",\"initial_archive_bytes_read\":")?; out.integer(directory.validation_stats().bytes_read)?;
         out.literal(",\"directory_reserved_bytes\":")?; out.integer(directory.retained_charge() as u64)?;

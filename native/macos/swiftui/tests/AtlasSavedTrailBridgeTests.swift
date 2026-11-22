@@ -69,6 +69,20 @@ import Foundation
             precondition(transport.write!(owner, new) == nil && transport.writeReceipt!(owner, .max) == nil)
         }
         precondition(count(4) == 26, "every nonnull write response must be freed exactly once")
+        let export = try AtlasSavedTrailExportRequest(trail: parent, operation: .max,
+            destination: "/pack-e\u{301}.json", limits: AtlasSavedTrailExportLimits(selectedBytes: 4 * 1024 * 1024))
+        mode(0)
+        precondition(transport.export!(owner, export) == "{}" && transport.exportReceipt!(owner, .max) == "{}")
+        precondition(count(7) == 1 && count(8) == 1 && count(4) == 28)
+        precondition(transport.export!(0, export) == nil && transport.export!(owner - 1, export) == nil)
+        precondition(transport.exportReceipt!(0, .max) == nil && transport.exportReceipt!(owner, 0) == nil)
+        mode(1)
+        precondition(transport.export!(owner, export) == nil && transport.exportReceipt!(owner, .max) == nil && count(4) == 28)
+        for invalidMode in [Int32(2), 3, 4] {
+            mode(invalidMode)
+            precondition(transport.export!(owner, export) == nil && transport.exportReceipt!(owner, .max) == nil)
+        }
+        precondition(count(4) == 34, "every nonnull export response must be freed exactly once")
         print("Saved trail public-header ABI, full-width IDs, exact paths and response ownership fixtures passed")
     }
 }

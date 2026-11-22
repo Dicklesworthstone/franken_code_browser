@@ -135,6 +135,9 @@ struct AtlasSavedInfo: Sendable {
     var lastTrailWriteAttempt: UInt64
     var lastTrailWriteOperation: UInt64?
     let trailWriteStateKnown: Bool
+    var lastTrailExportAttempt: UInt64
+    var lastTrailExportOperation: UInt64?
+    let trailExportStateKnown: Bool
     var index: AtlasSavedIndex?
     var lastIndexAttempt: UInt64
     var lastIndexBuildAttempt: UInt64
@@ -159,6 +162,7 @@ struct AtlasSavedInfo: Sendable {
                     w.importGeneration == nil && w.importAttempt == 0 && w.pathGeneration == nil && w.pathAttempt == 0 &&
                     w.trailGeneration == nil && w.trailAttempt == 0 &&
                     w.trailWriteAttempt == 0 && w.trailWriteOperation == nil &&
+                    w.trailExportAttempt == 0 && w.trailExportOperation == nil &&
                     w.memberBytes.value == 0 && w.memberCalls.value == 0) else { throw AtlasSavedError.invalidResponse }
             return Self(identity: actualIdentity,
                 path: w.path, relationshipGeneration: w.relationship, queryGeneration: w.query,
@@ -170,6 +174,8 @@ struct AtlasSavedInfo: Sendable {
                 trailGeneration: w.trailGeneration, lastTrailAttempt: w.trailAttempt, trailStateKnown: w.trailKnown,
                 lastTrailWriteAttempt: w.trailWriteAttempt, lastTrailWriteOperation: w.trailWriteOperation,
                 trailWriteStateKnown: w.trailWriteKnown,
+                lastTrailExportAttempt: w.trailExportAttempt, lastTrailExportOperation: w.trailExportOperation,
+                trailExportStateKnown: w.trailExportKnown,
                 index: index, lastIndexAttempt: w.indexAttempt,
                 lastIndexBuildAttempt: w.indexBuildAttempt, lastIndexBuildOperation: w.indexBuildOperation,
                 indexBuildStateKnown: w.indexBuildKnown, initialArchiveBytes: w.initial.value,
@@ -202,6 +208,9 @@ struct AtlasSavedInfo: Sendable {
         let trailWriteAttempt: UInt64
         let trailWriteOperation: UInt64?
         let trailWriteKnown: Bool
+        let trailExportAttempt: UInt64
+        let trailExportOperation: UInt64?
+        let trailExportKnown: Bool
         let initial, memberBytes, memberCalls: AtlasSavedNumber
         enum CodingKeys: CodingKey {
             case archive_path, accepted_relationship_generation, accepted_query_generation, accepted_index_generation,
@@ -212,6 +221,7 @@ struct AtlasSavedInfo: Sendable {
                  accepted_path_generation, last_path_attempt,
                  accepted_trail_generation, last_trail_attempt,
                  last_trail_write_attempt, last_trail_write_operation,
+                 last_trail_export_attempt, last_trail_export_operation,
                  initial_archive_bytes_read, member_bytes_read, member_read_calls
         }
         init(from decoder: Decoder) throws {
@@ -292,6 +302,15 @@ struct AtlasSavedInfo: Sendable {
                 trailWriteOperation = try generation(.last_trail_write_operation)
             } else { trailWriteAttempt = 0; trailWriteOperation = nil }
             guard trailWriteOperation == nil || trailWriteOperation! <= trailWriteAttempt else { throw AtlasSavedError.invalidResponse }
+            trailExportKnown = c.contains(.last_trail_export_attempt) && c.contains(.last_trail_export_operation)
+            guard c.contains(.last_trail_export_attempt) == c.contains(.last_trail_export_operation) else {
+                throw AtlasSavedError.invalidResponse
+            }
+            if trailExportKnown {
+                trailExportAttempt = try c.decode(AtlasSavedNumber.self, forKey: .last_trail_export_attempt).value
+                trailExportOperation = try generation(.last_trail_export_operation)
+            } else { trailExportAttempt = 0; trailExportOperation = nil }
+            guard trailExportOperation == nil || trailExportOperation! <= trailExportAttempt else { throw AtlasSavedError.invalidResponse }
             initial = try c.decode(AtlasSavedNumber.self, forKey: .initial_archive_bytes_read)
             memberBytes = try c.decode(AtlasSavedNumber.self, forKey: .member_bytes_read)
             memberCalls = try c.decode(AtlasSavedNumber.self, forKey: .member_read_calls)

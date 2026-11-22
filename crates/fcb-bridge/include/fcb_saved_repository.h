@@ -118,6 +118,37 @@ char *fcb_saved_trail_write_cancelable(uint64_t handle, uint64_t operation,
     int32_t (*poll)(void *), void *context);
 char *fcb_saved_trail_write_receipt(uint64_t handle, uint64_t operation);
 
+/* Export the exact accepted FCBT generation/digest against this retained FCBS
+ * descriptor only. No archive/trail/live source pathname is reopened. Other
+ * archives, missing members and changed captures remain explicit unavailable
+ * entries, retaining ordered notes and provenance. The output is self-contained
+ * fcb.trail-source-pack/1 JSON with exact original source bytes encoded as hex.
+ *
+ * Limits: entries 0..1024; whole-member verification and selected original bytes
+ * independently 0..64 MiB; complete output bytes and Unicode scalars independently
+ * 1..16 MiB. All admitted reference metadata is reserved before source loads.
+ * No truncation inside a selection. Missing/limited evidence is represented in
+ * a valid partial pack; complete_artifact and coverage_complete are independent.
+ *
+ * Destination must name a NEW file: create-only, no overwrite. Paths/notes/source
+ * may be sensitive; no redaction/encryption is claimed. Destination/digest are
+ * readable NUL-terminated UTF-8 until return. Keep destination permission alive
+ * through worker drain. Cancellation may follow a filesystem effect; inspect
+ * the retained effect/bytes_written and never automatically replay a lost reply.
+ * Operations increase independently of attachment/write/search generations.
+ * Info reports last_trail_export_attempt and last_trail_export_operation.
+ */
+char *fcb_saved_trail_export(uint64_t handle, uint64_t operation,
+    uint64_t generation, const char *digest, const char *destination,
+    uint64_t entries, uint64_t verification_bytes, uint64_t selected_bytes,
+    uint64_t output_bytes, uint64_t output_scalars);
+char *fcb_saved_trail_export_cancelable(uint64_t handle, uint64_t operation,
+    uint64_t generation, const char *digest, const char *destination,
+    uint64_t entries, uint64_t verification_bytes, uint64_t selected_bytes,
+    uint64_t output_bytes, uint64_t output_scalars,
+    int32_t (*poll)(void *), void *context);
+char *fcb_saved_trail_export_receipt(uint64_t handle, uint64_t operation);
+
 /* Quick Open searches the already validated archive directory with the shared
  * exact/prefix/fuzzy path ranker, including members without captured contents.
  * query is a borrowed 1..256-byte native path query, with no NUL. Raw non-UTF-8

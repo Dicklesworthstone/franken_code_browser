@@ -256,6 +256,7 @@ final class SavedTrailFixture: @unchecked Sendable {
         precondition(!fixture.base.calls.contains("LIVE-OPEN"), "trail navigation reopened live source")
         capture.reader.close(); later.reader.close(); point.reader.close(); model.close()
         try await AtlasSavedTrailAuthoringTests.run()
+        try await AtlasSavedTrailExportTests.run()
         print("Saved trail wire, ordered navigation, exact ranges, uncertain replies and retained-reader fixtures passed")
     }
 }

@@ -28,6 +28,9 @@ mod trail;
 #[path = "saved_trail_write_ffi.rs"]
 mod trail_write;
 
+#[path = "saved_trail_export_ffi.rs"]
+mod trail_export;
+
 fn answer(handle: u64, work: impl FnOnce(&SavedSessions) -> Result<HostResponse, AccessError>) -> Option<*mut c_char> {
     let result = match SAVED.get() { Some(sessions) => work(sessions), None => Err(AccessError::Unknown) };
     match result { Ok(response) => string_out(response.as_str()), Err(error) => string_out(&error.json(handle)) }

@@ -20,12 +20,15 @@ const MAX_READ_CALLS: usize = 131_072;
 /// Explicit immutable trail authoring and retained create-only write receipts.
 pub mod write;
 pub use write::{SavedTrailWriteParent, SavedTrailWriteRequest};
+/// Self-contained evidence export from the explicitly retained archive.
+pub mod export;
+pub use export::{SavedTrailExportLimits, SavedTrailExportRequest};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SavedTrailError {
     Saved(SavedRepositoryError), Trail(TrailReadError), InvalidLimits, MissingTrail,
     StaleGeneration, ReadFailed, FileChanged, ReadCallLimit,
-    MissingWrite, StaleWrite, ParentMismatch,
+    MissingWrite, StaleWrite, ParentMismatch, MissingExport, StaleExport,
 }
 impl std::fmt::Display for SavedTrailError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -40,6 +43,8 @@ impl std::fmt::Display for SavedTrailError {
             Self::MissingWrite => f.write_str("SAVED_TRAIL_NO_WRITE"),
             Self::StaleWrite => f.write_str("SAVED_TRAIL_STALE_WRITE"),
             Self::ParentMismatch => f.write_str("SAVED_TRAIL_PARENT_MISMATCH"),
+            Self::MissingExport => f.write_str("SAVED_TRAIL_NO_EXPORT"),
+            Self::StaleExport => f.write_str("SAVED_TRAIL_STALE_EXPORT"),
         }
     }
 }

@@ -173,3 +173,40 @@ fn closing_during_trail_write_keeps_its_effect_response_and_capacity_through_dra
     let fresh = saved.create().unwrap(); assert_ne!(fresh, handle);
     saved.close(fresh).unwrap(); for handle in rest { saved.close(handle).unwrap(); }
 }
+
+#[test]
+fn trail_export_cancel_and_close_keep_effect_receipts_through_writer_drain() {
+    use fcb_app::host::saved_repository::trail::{SavedTrailExportRequest, SavedTrailWriteParent};
+    for closing in [false, true] {
+        let fixture = fixture(); let saved = SavedSessions::new(); let handle = open(&saved, &fixture);
+        attach(&saved, handle, &fixture.trail, 1).unwrap();
+        let trail_bytes = fs::read(&fixture.trail).unwrap();
+        let view = fcb::search::trail::TrailView::open(&trail_bytes, || false).unwrap();
+        let destination = fixture.archive.with_extension(if closing { "closed-pack.json" } else { "canceled-pack.json" });
+        let mut signaled = false;
+        let response = saved.export_trail(handle, SavedTrailExportRequest { operation: 1,
+            trail: SavedTrailWriteParent { generation: 1, digest: view.digest() },
+            destination: &destination, limits: Default::default() }, || {
+            if !signaled && destination.exists() {
+                signaled = true;
+                if closing { saved.close(handle).unwrap(); } else { saved.cancel(handle).unwrap(); }
+                return true;
+            }
+            false
+        }).unwrap();
+        assert!(signaled);
+        assert!(response.as_str().contains("\"effect\":\"destination-created-incomplete\""));
+        assert!(response.as_str().contains("SAVED_TRAIL_EXPORT_CANCELED"));
+        assert_eq!(number(response.as_str(), "bytes_written"), 0);
+        assert_eq!(fs::metadata(&destination).unwrap().len(), 0);
+        if closing {
+            assert_eq!(saved.execute(handle, Command::TrailExportReceipt { operation: 1 }, || false).err(), Some(AccessError::Unknown));
+        } else {
+            fs::write(&destination, b"external update").unwrap();
+            assert_eq!(saved.execute(handle, Command::TrailExportReceipt { operation: 1 }, || false).unwrap().as_str(), response.as_str());
+            assert_eq!(fs::read(&destination).unwrap(), b"external update");
+            assert!(page(&saved, handle, 1).is_ok());
+            saved.close(handle).unwrap();
+        }
+    }
+}
