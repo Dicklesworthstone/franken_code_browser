@@ -28,11 +28,16 @@ extern "C" {
  * do not reinterpret a display label
  * or require a caller's equivalent absolute spelling to be byte-identical.
  * Every retained atlas/search/index/source envelope identifies its immutable
- * discovery universe: discovery_scope is "workspace" or "directory",
- * discovery_directory is null or a reversible raw-path object, and path_basis
- * is "project-root". All completeness claims refer to that universe; complete
- * folder discovery never means complete project discovery. Display/query
- * filters may narrow this catalog but cannot widen it.
+ * discovery universe: discovery_scope is "workspace", "directory" or "file".
+ * discovery_directory and discovery_file are null except for the selected
+ * kind's reversible raw-path object; path_basis is "project-root".
+ * All completeness claims refer to that universe; complete folder or file
+ * discovery never means complete project discovery. Display/query filters
+ * may narrow this catalog but cannot widen it. Discovery exclusions,
+ * unavailable entries, symlinks and special objects have separate canonical
+ * integer-string counters named discovery_excluded_entries,
+ * discovery_unavailable_entries, discovery_symlinks_not_followed and
+ * discovery_special_objects. These are not query-filter exclusion counts.
  */
 uint64_t fcb_atlas_create(void);
 char *fcb_atlas_open(uint64_t handle, const char *root, uint64_t max_files);
@@ -78,6 +83,27 @@ char *fcb_atlas_open_with_policy_cancelable(uint64_t handle, const char *root,
  */
 char *fcb_atlas_open_directory_with_policy_cancelable(uint64_t handle, const char *root,
     const uint8_t *directory, uint64_t directory_len, uint64_t max_files,
+    uint64_t discovery_policy, int32_t (*poll)(void *), void *context);
+/* Direct discovery of one regular file before any metadata cap is spent.
+ * root stays the ORIGINAL project root. file is 1..2048 raw Unix bytes with
+ * 1..32 nonempty '/'-separated components. Native names, including non-UTF-8
+ * bytes and literal backslashes, retain exact identity. Absolute/traversal/NUL
+ * paths, symlinks, directories, missing files and special objects are refused.
+ * An unavailable or non-file replacement after admission leaves explicit
+ * partial coverage; successful source reads remain new per-file observations.
+ * Root/ancestor rules are read under policy 0 without enumerating siblings.
+ * A fully evaluated file exclusion has an explicit excluded count; an
+ * excluded ancestor or unavailable policy leaves discovery incomplete.
+ * Policy 1 permits excluded regular files without reading rule configuration.
+ * max_files still uses 1..20000 admission, but at most one file is discovered.
+ * File identity and later source ranges remain relative to the original grant.
+ * Invalid policy/length/file limits and a null file return NULL before pointer,
+ * callback or handle access. Remaining cancellation, retry, late-NULL and
+ * string/handle ownership match the directory opener. A new file needs a new
+ * handle; existing captures and result windows never acquire a new scope.
+ */
+char *fcb_atlas_open_file_with_policy_cancelable(uint64_t handle, const char *root,
+    const uint8_t *file, uint64_t file_len, uint64_t max_files,
     uint64_t discovery_policy, int32_t (*poll)(void *), void *context);
 char *fcb_atlas_info(uint64_t handle);
 

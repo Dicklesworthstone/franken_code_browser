@@ -26,6 +26,7 @@ use super::{HostResponse, catalog_session::CatalogDiscoveryPolicy,
 
 pub const MAX_ATLAS_SESSION_FILES: usize = 20_000;
 pub const MAX_ATLAS_DIRECTORY_BYTES: usize = fcb::search::workspace::MAX_WORKSPACE_PATH_BYTES;
+pub const MAX_ATLAS_FILE_BYTES: usize = fcb::search::workspace::MAX_WORKSPACE_PATH_BYTES;
 pub const MAX_ATLAS_SESSION_ITEMS: usize = 4096;
 pub const MAX_ATLAS_SESSION_VISITS: usize = 131_072;
 pub const MAX_ATLAS_HISTORY: usize = 64;
@@ -65,11 +66,22 @@ impl From<OutputError> for AtlasSessionError { fn from(e: OutputError) -> Self {
 /// The path stays relative to the original project grant. No normalization of
 /// backslashes, drive-looking names or non-UTF-8 bytes changes its identity.
 pub fn directory_path(directory: &[u8]) -> Result<NormalizedPath, AtlasSessionError> {
-    if directory.is_empty() || directory.len() > MAX_ATLAS_DIRECTORY_BYTES
-        || directory.split(|byte| *byte == b'/').count() >= 32 {
+    catalog_path(directory, MAX_ATLAS_DIRECTORY_BYTES, 31)
+}
+
+/// Admit one raw project-relative file, including its final name at depth 32.
+/// No parent listing or display-string conversion participates in its identity.
+pub fn file_path(file: &[u8]) -> Result<NormalizedPath, AtlasSessionError> {
+    catalog_path(file, MAX_ATLAS_FILE_BYTES, 32)
+}
+
+fn catalog_path(raw: &[u8], max_bytes: usize, max_components: usize)
+    -> Result<NormalizedPath, AtlasSessionError> {
+    if raw.is_empty() || raw.len() > max_bytes
+        || raw.split(|byte| *byte == b'/').count() > max_components {
         return Err(AtlasSessionError::InvalidLimits);
     }
-    let mut segments = directory.split(|byte| *byte == b'/');
+    let mut segments = raw.split(|byte| *byte == b'/');
     let first = segments.next().ok_or(AtlasSessionError::InvalidLimits)?;
     let mut path = NormalizedPath::from_dirent_name(first)
         .map_err(|_| AtlasSessionError::InvalidLimits)?;
@@ -77,6 +89,12 @@ pub fn directory_path(directory: &[u8]) -> Result<NormalizedPath, AtlasSessionEr
         path = path.join_segment(segment).map_err(|_| AtlasSessionError::InvalidLimits)?;
     }
     Ok(path)
+}
+
+enum CatalogTarget {
+    Workspace,
+    Directory(NormalizedPath),
+    File(NormalizedPath),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -168,7 +186,7 @@ impl AtlasSession {
     pub fn open_with_policy(owner: ArenaOwnerId, root: &Path, options: AtlasSessionOptions,
         policy: CatalogDiscoveryPolicy, canceled: impl FnMut() -> bool)
         -> Result<Self, AtlasSessionError> {
-        Self::open_directory_scope(owner, root, None, options, policy, canceled)
+        Self::open_catalog_scope(owner, root, CatalogTarget::Workspace, options, policy, canceled)
     }
 
     /// Prepare a bounded directory atlas while preserving the original project
@@ -178,10 +196,19 @@ impl AtlasSession {
     pub fn open_directory_with_policy(owner: ArenaOwnerId, root: &Path, directory: NormalizedPath,
         options: AtlasSessionOptions, policy: CatalogDiscoveryPolicy, canceled: impl FnMut() -> bool)
         -> Result<Self, AtlasSessionError> {
-        Self::open_directory_scope(owner, root, Some(directory), options, policy, canceled)
+        Self::open_catalog_scope(owner, root, CatalogTarget::Directory(directory), options, policy, canceled)
     }
 
-    fn open_directory_scope(owner: ArenaOwnerId, root: &Path, directory: Option<NormalizedPath>,
+    /// Prepare a catalog containing only an explicitly selected regular file.
+    /// The original root grant and inherited repository rules still apply.
+    /// Sibling enumeration never spends the selected file's metadata allowance.
+    pub fn open_file_with_policy(owner: ArenaOwnerId, root: &Path, file: NormalizedPath,
+        options: AtlasSessionOptions, policy: CatalogDiscoveryPolicy, canceled: impl FnMut() -> bool)
+        -> Result<Self, AtlasSessionError> {
+        Self::open_catalog_scope(owner, root, CatalogTarget::File(file), options, policy, canceled)
+    }
+
+    fn open_catalog_scope(owner: ArenaOwnerId, root: &Path, target: CatalogTarget,
         options: AtlasSessionOptions, policy: CatalogDiscoveryPolicy, mut canceled: impl FnMut() -> bool)
         -> Result<Self, AtlasSessionError> {
         check(&mut canceled)?;
@@ -206,17 +233,22 @@ impl AtlasSession {
             ..WorkspaceLimits::default() };
         let manifest = SearchManifestId::new(owner, 1).map_err(AppError::from)?;
         let first_file = FileId::new(owner, 1).map_err(|_| AtlasSessionError::IdentityExhausted)?;
-        let mut catalog = match (policy, directory) {
-            (CatalogDiscoveryPolicy::RepositoryRules, None) => WorkspaceCatalog::open_rule_aware(
+        let mut catalog = match (policy, target) {
+            (CatalogDiscoveryPolicy::RepositoryRules, CatalogTarget::Workspace) => WorkspaceCatalog::open_rule_aware(
                 grant, manifest, first_file, limits, RuleLimits::default(), &budget,
                 [allocation(1)?, allocation(5)?])?,
-            (CatalogDiscoveryPolicy::IncludeExcluded, None) => WorkspaceCatalog::open(
+            (CatalogDiscoveryPolicy::IncludeExcluded, CatalogTarget::Workspace) => WorkspaceCatalog::open(
                 grant, manifest, first_file, limits, true, &budget, allocation(1)?)?,
-            (CatalogDiscoveryPolicy::RepositoryRules, Some(directory)) => WorkspaceCatalog::open_rule_aware_in_directory(
+            (CatalogDiscoveryPolicy::RepositoryRules, CatalogTarget::Directory(directory)) => WorkspaceCatalog::open_rule_aware_in_directory(
                 grant, directory, manifest, first_file, limits, RuleLimits::default(), &budget,
                 [allocation(1)?, allocation(5)?])?,
-            (CatalogDiscoveryPolicy::IncludeExcluded, Some(directory)) => WorkspaceCatalog::open_in_directory(
+            (CatalogDiscoveryPolicy::IncludeExcluded, CatalogTarget::Directory(directory)) => WorkspaceCatalog::open_in_directory(
                 grant, directory, manifest, first_file, limits, true, &budget, allocation(1)?)?,
+            (CatalogDiscoveryPolicy::RepositoryRules, CatalogTarget::File(file)) => WorkspaceCatalog::open_rule_aware_for_file(
+                grant, file, manifest, first_file, limits, RuleLimits::default(), &budget,
+                [allocation(1)?, allocation(5)?])?,
+            (CatalogDiscoveryPolicy::IncludeExcluded, CatalogTarget::File(file)) => WorkspaceCatalog::open_for_file(
+                grant, file, manifest, first_file, limits, true, &budget, allocation(1)?)?,
         };
         while catalog.stage() == WorkspaceStage::Discovering {
             check(&mut canceled)?;
@@ -243,7 +275,7 @@ impl AtlasSession {
             visible: options.visible, budget, _lease: lease })
     }
     /// The base (All) atlas for this session's declared catalog scope. A
-    /// directory session never widens to the project root. Search
+    /// directory or file session never widens to the project root. Search
     /// and path queries validate against this layout so an explicit scope
     /// change never retires retained workspace-wide results or re-reads source.
     pub fn atlas(&self) -> &RetainedWorkspaceAtlas { &self.atlas }
@@ -282,19 +314,34 @@ impl AtlasSession {
         encode_scope(out, self.scope, self.atlas.file_count())
     }
     /// The immutable discovery universe, independent of display/query filters.
-    /// Complete directory coverage never advertises complete project coverage.
+    /// Complete directory or file coverage never advertises complete project coverage.
     /// Paths remain reversible identities relative to the original root grant.
     pub fn encode_discovery_scope(&self, out: &mut Output) -> Result<(), AtlasSessionError> {
         out.literal(",\"discovery_scope\":")?;
-        if let Some(directory) = self.atlas.catalog().directory() {
+        let catalog = self.atlas.catalog();
+        if let Some(file) = catalog.file() {
+            out.quoted("file")?;
+            out.literal(",\"discovery_directory\":null,\"discovery_file\":")?;
+            out.path(&file.raw().to_path_buf())?;
+        } else if let Some(directory) = catalog.directory() {
             out.quoted("directory")?;
             out.literal(",\"discovery_directory\":")?;
             out.path(&directory.raw().to_path_buf())?;
+            out.literal(",\"discovery_file\":null")?;
         } else {
             out.quoted("workspace")?;
-            out.literal(",\"discovery_directory\":null")?;
+            out.literal(",\"discovery_directory\":null,\"discovery_file\":null")?;
         }
         out.literal(",\"path_basis\":\"project-root\"")?;
+        let aggregate = catalog.aggregate();
+        for (key, count) in [
+            ("discovery_excluded_entries", aggregate.excluded),
+            ("discovery_unavailable_entries", aggregate.unavailable),
+            ("discovery_symlinks_not_followed", aggregate.symlinks),
+            ("discovery_special_objects", aggregate.special),
+        ] {
+            out.literal(",")?; out.quoted(key)?; out.literal(":")?; out.integer(count)?;
+        }
         Ok(())
     }
     /// Named scope presets are pure extension sets; product naming lives at

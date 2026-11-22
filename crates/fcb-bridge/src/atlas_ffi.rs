@@ -5,8 +5,8 @@
 
 use std::{ffi::c_char, path::Path, sync::OnceLock};
 use fcb_app::host::{HostResponse, atlas_session::{AtlasAction, AtlasExtensionScope, AtlasScope,
-    AtlasSession, AtlasSessionOptions, MAX_ATLAS_DIRECTORY_BYTES, MAX_ATLAS_SESSION_FILES,
-    directory_path}, catalog_session::CatalogDiscoveryPolicy};
+    AtlasSession, AtlasSessionOptions, MAX_ATLAS_DIRECTORY_BYTES, MAX_ATLAS_FILE_BYTES,
+    MAX_ATLAS_SESSION_FILES, directory_path, file_path}, catalog_session::CatalogDiscoveryPolicy};
 use fcb_core::Point2D;
 use super::{cstr, reply, string_out};
 use super::atlas_sessions::{AccessError, AtlasSessions, Command};
@@ -239,6 +239,46 @@ pub unsafe extern "C" fn fcb_atlas_open_directory_with_policy_cancelable(
     })
 }
 
+/// Discover exactly one regular file under the original project grant without
+/// enumerating its parent or siblings. Raw path components retain their native
+/// identity; inherited repository rules and root confinement remain in force.
+/// # Safety
+/// root/poll/context follow fcb_atlas_open_cancelable. file is a readable raw
+/// byte buffer of file_len bytes stable until return, not a C string. Invalid
+/// policy/length/file limits and a null file pointer return null before pointer
+/// dereference, callback polling or handle-table access. Other failures leave
+/// the ordinary late-null ownership contract: inspect or close the known handle
+/// on a worker and free every non-null reply once with fcb_free_string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_open_file_with_policy_cancelable(
+    handle: u64, root: *const c_char, file: *const u8, file_len: u64,
+    max_files: u64, discovery_policy: u64,
+    poll: Option<super::search_ffi::SearchCancellationCallback>,
+    context: *mut std::ffi::c_void) -> *mut c_char {
+    reply(|| {
+        let policy = match discovery_policy {
+            0 => CatalogDiscoveryPolicy::RepositoryRules,
+            1 => CatalogDiscoveryPolicy::IncludeExcluded,
+            _ => return None,
+        };
+        let max_files = number(max_files).ok()?;
+        let file_len = number(file_len).ok()?;
+        if !(1..=MAX_ATLAS_SESSION_FILES).contains(&max_files)
+            || !(1..=MAX_ATLAS_FILE_BYTES).contains(&file_len)
+            || file.is_null() { return None; }
+        let canceled = || poll.is_some_and(|poll| unsafe { poll(context) != 0 });
+        if canceled() { return None; }
+        let root = unsafe { cstr(root) }?;
+        let file = unsafe { std::slice::from_raw_parts(file, file_len) };
+        let file = file_path(file).ok()?;
+        let response = ATLASES.get()?.open_file_with_policy(handle, Path::new(root),
+            file, AtlasSessionOptions { max_files, ..Default::default() },
+            policy, canceled).ok()?;
+        if canceled() { return None; }
+        string_out(response.as_str())
+    })
+}
+
 /// Advance the existing one-file search pipeline with cooperative polling.
 /// Cancellation is checked inside capture, verification, hashing and encoding,
 /// not only between native calls. Null is not a successful empty search page.
@@ -261,3 +301,7 @@ pub unsafe extern "C" fn fcb_atlas_search_step_cancelable(handle: u64, generatio
 #[cfg(all(test, unix))]
 #[path = "atlas_directory_ffi_tests.rs"]
 mod directory_tests;
+
+#[cfg(all(test, unix))]
+#[path = "atlas_file_ffi_tests.rs"]
+mod file_tests;

@@ -150,6 +150,12 @@ impl Cell {
     }
 }
 
+enum CatalogTarget {
+    Workspace,
+    Directory(NormalizedPath),
+    File(NormalizedPath),
+}
+
 pub(super) struct AtlasSessions {
     cells: Mutex<[Option<Arc<Cell>>; MAX_ATLAS_SESSIONS]>,
     live: Arc<AtomicUsize>,
@@ -187,16 +193,22 @@ impl AtlasSessions {
     }
     pub(super) fn open_with_policy(&self, handle: u64, root: &Path, options: AtlasSessionOptions,
         policy: CatalogDiscoveryPolicy, canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
-        self.open_scoped(handle, root, None, options, policy, canceled)
+        self.open_scoped(handle, root, CatalogTarget::Workspace, options, policy, canceled)
     }
     /// Discovery starts in this directory before spending the metadata cap.
     /// The original root grant and project-relative source identities survive.
     pub(super) fn open_directory_with_policy(&self, handle: u64, root: &Path,
         directory: NormalizedPath, options: AtlasSessionOptions, policy: CatalogDiscoveryPolicy,
         canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
-        self.open_scoped(handle, root, Some(directory), options, policy, canceled)
+        self.open_scoped(handle, root, CatalogTarget::Directory(directory), options, policy, canceled)
     }
-    fn open_scoped(&self, handle: u64, root: &Path, directory: Option<NormalizedPath>,
+    /// Direct member discovery keeps sibling counts out of file admission.
+    pub(super) fn open_file_with_policy(&self, handle: u64, root: &Path,
+        file: NormalizedPath, options: AtlasSessionOptions, policy: CatalogDiscoveryPolicy,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
+        self.open_scoped(handle, root, CatalogTarget::File(file), options, policy, canceled)
+    }
+    fn open_scoped(&self, handle: u64, root: &Path, target: CatalogTarget,
         options: AtlasSessionOptions, policy: CatalogDiscoveryPolicy,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
         let cell = self.get(handle)?;
@@ -207,10 +219,12 @@ impl AtlasSessions {
         let mut stop = || cell.validate(epoch).is_err() || canceled();
         let result = (|| {
             let owner = ArenaOwnerId::new(handle).map_err(|_| AccessError::InvalidArgument)?;
-            let mut candidate = match directory {
-                Some(directory) => AtlasSession::open_directory_with_policy(owner, root, directory,
+            let mut candidate = match target {
+                CatalogTarget::Directory(directory) => AtlasSession::open_directory_with_policy(owner, root, directory,
                     options, policy, &mut stop)?,
-                None => AtlasSession::open_with_policy(owner, root, options, policy, &mut stop)?,
+                CatalogTarget::File(file) => AtlasSession::open_file_with_policy(owner, root, file,
+                    options, policy, &mut stop)?,
+                CatalogTarget::Workspace => AtlasSession::open_with_policy(owner, root, options, policy, &mut stop)?,
             };
             let search = RetainedAtlasSearch::new(&candidate)?;
             let paths = RetainedAtlasPaths::new(&candidate)?;
@@ -356,3 +370,7 @@ mod expression_tests;
 #[cfg(all(test, unix))]
 #[path = "atlas_directory_sessions_tests.rs"]
 mod directory_tests;
+
+#[cfg(all(test, unix))]
+#[path = "atlas_file_sessions_tests.rs"]
+mod file_tests;
