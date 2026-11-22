@@ -297,7 +297,7 @@ fn execute(session: &mut DeskSession, attempt: u64, frame: &str,
     repository: &mut RepositoryCommands, documents: &mut DocumentCommands,
     comparisons: &mut ComparisonCommands, saved: &mut SavedCommands,
     code: &mut CodeCommands, readers: &mut ReadingCommands) -> Result<(HostResponse, bool), Failure> {
-    // Revision + command + at most ten scoped structural-search arguments.
+    // Revision + command + at most ten scoped search arguments.
     // Keep framing fixed-size even for a hostile separator-heavy frame.
     let mut fields = [""; 12]; let mut used = 0;
     for field in frame.split('\t') {
@@ -312,7 +312,11 @@ fn execute(session: &mut DeskSession, attempt: u64, frame: &str,
     // Only the new scoped commands need the two additional fields. Preserve
     // the established framing bound for every existing protocol command.
     if used > 10 && !matches!(command, "repo-begin-structure" | "repo-begin-structure-text-hex"
-        | "repo-begin-indexed-structure" | "repo-begin-indexed-structure-text-hex") {
+        | "repo-begin-indexed-structure" | "repo-begin-indexed-structure-text-hex"
+        | "repo-begin-matching" | "repo-begin-matching-text-hex"
+        | "repo-begin-expression" | "repo-begin-expression-text-hex"
+        | "repo-begin-indexed-matching" | "repo-begin-indexed-matching-text-hex"
+        | "repo-begin-indexed-expression" | "repo-begin-indexed-expression-text-hex") {
         return Err(Failure::Protocol("DESK_FIELD_LIMIT"));
     }
     if command.starts_with("repo-") {

@@ -897,6 +897,89 @@ cargo test --locked -p fcb-app --test whole_file_cli
 No compiled binary, execution receipt, signed artifact, native qualification or
 product gate closure is asserted by the presence of this implementation.
 
+## Search and count text in a live Reading Desk
+
+A repository attached with `repo-open` supports scoped literal and expression
+queries through the same incremental Desk workflow as structural search.
+Queries can capture current sources or reuse an explicitly prepared in-memory
+index. Hit activation imports the exact searched capture into the Desk.
+
+| Command | Source and query |
+| --- | --- |
+| `repo-begin-matching TOKEN QUERY_GEN CASE COUNT LIMIT SOURCE_BYTES SCOPE SCOPE_VALUE TEXT` | Live literal search with explicit case, scope and counting options. |
+| `repo-begin-expression TOKEN QUERY_GEN CASE COUNT LIMIT SOURCE_BYTES VERIFY_BYTES SCOPE SCOPE_VALUE EXPRESSION` | Live bounded expression with separate capture and verification budgets. |
+| `repo-begin-indexed-matching TOKEN INDEX_GEN QUERY_GEN CASE COUNT LIMIT VERIFY_BYTES SCOPE SCOPE_VALUE TEXT` | Literal verification over the named index's retained captures. |
+| `repo-begin-indexed-expression TOKEN INDEX_GEN QUERY_GEN CASE COUNT LIMIT VERIFY_BYTES SCOPE SCOPE_VALUE EXPRESSION` | Expression verification over those same immutable captures. |
+
+Every command accepts a `-text-hex` suffix for UTF-8 hex query framing.
+`CASE` is `sensitive` or `unicode-lowercase`. Lowercase matching applies
+to primary, required and excluded content terms, preserves original source
+byte ranges, and is not full Unicode case folding. It does not alter path
+identity or make directory names case-insensitive.
+
+`COUNT` is `bounded` or `count-all`. Both retain at most `LIMIT`
+navigable hits; `count-all` continues scanning after that limit to determine
+the total. `LIMIT=0` is valid only with `count-all` and requests counts
+without retaining navigable rows. Overlapping occurrences are counted.
+Expression totals count the primary term's occurrences after every required
+and excluded term has been checked against the same complete capture; repeated
+predicate matches do not multiply the total.
+
+Expressions use the shared bounded parser: quoted phrases, required terms,
+excluded terms prefixed with `-`, and `path:`/`lang:` filters. For example,
+`"pub fn" Result -unsafe lang:rust path:src/` finds occurrences of
+`pub fn` in selected Rust captures containing `Result` and no `unsafe`.
+Only expression commands interpret these operators. Literal commands preserve
+the whole input as literal text. Regex remains unqualified and is rejected.
+
+Scopes use the same encoding as structural queries:
+
+| `SCOPE` | `SCOPE_VALUE` |
+| --- | --- |
+| `workspace` | `-` for the attached authorized catalog. |
+| `directory` | Hex UTF-8 relative directory path, with exact component boundaries. |
+| `file` | Hex UTF-8 relative file path. |
+| `visible` | Sorted unique lowercase raw-path hex CSV; `-` explicitly selects no files. |
+
+Scope and expression metadata predicates narrow the attached catalog before
+source/file quotas. They do not discover additional files beyond that catalog
+or enlarge its root grant. Visible membership is declared by the caller;
+missing members keep coverage incomplete. Invalid scopes never become a
+workspace fallback.
+
+`LIMIT` is at most 4,096. Live `SOURCE_BYTES` is 1–33,554,432.
+`VERIFY_BYTES` is 0–33,554,432 for indexed literal queries and
+0–268,435,456 for expressions. Captures remain limited to 1 MiB per file and
+32 MiB per live query or prepared index; a larger expression verification
+allowance does not increase source capture limits. Query text is at most
+1,024 UTF-8 bytes. Unavailable sources, unsupported decoding and exhausted
+work budgets cannot produce a complete count.
+
+Use `repo-step` with the returned `step_count` to advance at most one
+selected file, `repo-page`/`repo-progress` to inspect without advancing,
+and `repo-cancel` to cancel the exact pending generation. These queries
+share the existing increasing generation sequence with structural search,
+index builds and clear operations. Failed or canceled replacements preserve
+the previous accepted results.
+
+`matches_seen` and `match_count_complete` describe counting;
+`retained_hits` and `truncated` describe navigable rows. A counted query
+may finish with `search_complete=true`, `match_count_complete=true`,
+and `truncated=true`. That terminal response still has exit code 3 because
+rows were omitted. A running response's exit code 3 is progress; quitting
+with unfinished work also makes the session partial.
+
+`repo-hit` selects the original byte range, including UTF-16 and Unicode
+lowercase expansions. Indexed queries perform no live-source reads, and an
+activated source survives index clearing and repository detachment. Search
+itself does not change the Desk revision; successful hit activation does.
+
+Rust hosts have the corresponding `DeskRepository::begin_query_scoped`,
+`begin_expression_scoped`, indexed variants and counted variants. The
+`desk_repository_text_queries` and `desk_repository_text_queries_cli` suites
+cover the public and stdio paths. These are code-first regression sources;
+independent strict-RCH execution remains pending.
+
 ## Search live repository structure in a Reading Desk
 
 A live repository attached with `repo-open` can search declaration names,

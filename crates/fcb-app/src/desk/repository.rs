@@ -26,6 +26,21 @@ pub(super) const WORK_HELP: &str = "\nIncremental repository work (no background
   repo-find-indexed TOKEN INDEX_GEN QUERY_GEN LIMIT VERIFY_BYTES TEXT\n\
   repo-begin-indexed TOKEN INDEX_GEN QUERY_GEN LIMIT VERIFY_BYTES TEXT\n\
 Both indexed query commands also accept a -text-hex suffix.\n\
+\nScoped literal and expression queries:\n\
+  repo-begin-matching TOKEN QUERY_GEN CASE COUNT LIMIT SOURCE_BYTES SCOPE SCOPE_VALUE TEXT\n\
+  repo-begin-expression TOKEN QUERY_GEN CASE COUNT LIMIT SOURCE_BYTES VERIFY_BYTES SCOPE SCOPE_VALUE EXPRESSION\n\
+  repo-begin-indexed-matching TOKEN INDEX_GEN QUERY_GEN CASE COUNT LIMIT VERIFY_BYTES SCOPE SCOPE_VALUE TEXT\n\
+  repo-begin-indexed-expression TOKEN INDEX_GEN QUERY_GEN CASE COUNT LIMIT VERIFY_BYTES SCOPE SCOPE_VALUE EXPRESSION\n\
+Each also accepts a -text-hex suffix. CASE is sensitive or unicode-lowercase;\n\
+lowercase matching preserves original byte ranges and is not full case folding.\n\
+COUNT is bounded or count-all. LIMIT is 1..4096, or 0 for count-all with no rows.\n\
+Count-all continues past retained-row limits, subject to coverage/work budgets.\n\
+Inspect match_count_complete separately from retained_hits and truncated.\n\
+SOURCE_BYTES is 1..33554432. VERIFY_BYTES is 0..33554432 for indexed literals,\n\
+or 0..268435456 for expressions. Source capture remains capped at 32 MiB.\n\
+Expressions support phrases, conjunctions, exclusions, path: and lang: filters;\n\
+only expression commands parse operators. Regex is not qualified or enabled.\n\
+\nStructural queries:\n\
   repo-begin-structure TOKEN QUERY_GEN MODE NAME_MODE LIMIT SOURCE_BYTES SCOPE SCOPE_VALUE TEXT\n\
   repo-begin-indexed-structure TOKEN INDEX_GEN QUERY_GEN MODE NAME_MODE LIMIT VERIFY_BYTES SCOPE SCOPE_VALUE TEXT\n\
 Both structural commands also accept a -text-hex suffix for a UTF-8 hex needle.\n\
@@ -154,6 +169,74 @@ impl RepositoryCommands {
                 let repo = self.get(number(token)?)?;
                 let response = if command.starts_with("repo-begin") { repo.begin_query(generation, needle, options, &mut *canceled)? }
                     else { repo.search(generation, needle, options, &mut *canceled)? };
+                self.progress_reply = repo.work_state().pending_query == Some(generation);
+                Ok(response)
+            }
+            ("repo-begin-matching" | "repo-begin-matching-text-hex",
+                [token, generation, case, counting, limit, bytes, scope, scope_value, text]) => {
+                let scope = text_scope(scope, scope_value, case)?;
+                let count_all = count_all(counting)?;
+                let decoded;
+                let needle = if command.ends_with("text-hex") {
+                    decoded = String::from_utf8(hex(text, 1024)?).map_err(|_| Failure::Protocol("DESK_INVALID_TEXT"))?;
+                    decoded.as_str()
+                } else { text };
+                let options = AtlasSearchOptions { max_matches: count(limit)?, max_source_bytes: count(bytes)?,
+                    ..AtlasSearchOptions::default() };
+                let generation = number(generation)?;
+                let repo = self.get(number(token)?)?;
+                let response = if count_all {
+                    repo.begin_counted_query_scoped(generation, needle, scope, options, &mut *canceled)?
+                } else { repo.begin_query_scoped(generation, needle, scope, options, &mut *canceled)? };
+                self.progress_reply = repo.work_state().pending_query == Some(generation);
+                Ok(response)
+            }
+            ("repo-begin-expression" | "repo-begin-expression-text-hex",
+                [token, generation, case, counting, limit, bytes, verify, scope, scope_value, text]) => {
+                let scope = text_scope(scope, scope_value, case)?;
+                let count_all = count_all(counting)?;
+                let decoded;
+                let expression = if command.ends_with("text-hex") {
+                    decoded = String::from_utf8(hex(text, 1024)?).map_err(|_| Failure::Protocol("DESK_INVALID_TEXT"))?;
+                    decoded.as_str()
+                } else { text };
+                let options = AtlasSearchOptions { max_matches: count(limit)?, max_source_bytes: count(bytes)?,
+                    ..AtlasSearchOptions::default() };
+                let generation = number(generation)?;
+                let repo = self.get(number(token)?)?;
+                let response = if count_all {
+                    repo.begin_expression_counted_scoped(generation, expression, scope, options,
+                        number(verify)?, &mut *canceled)?
+                } else { repo.begin_expression_scoped(generation, expression, scope, options,
+                    number(verify)?, &mut *canceled)? };
+                self.progress_reply = repo.work_state().pending_query == Some(generation);
+                Ok(response)
+            }
+            ("repo-begin-indexed-matching" | "repo-begin-indexed-matching-text-hex"
+                | "repo-begin-indexed-expression" | "repo-begin-indexed-expression-text-hex",
+                [token, index, generation, case, counting, limit, bytes, scope, scope_value, text]) => {
+                let scope = text_scope(scope, scope_value, case)?;
+                let count_all = count_all(counting)?;
+                let decoded;
+                let needle = if command.ends_with("text-hex") {
+                    decoded = String::from_utf8(hex(text, 1024)?).map_err(|_| Failure::Protocol("DESK_INVALID_TEXT"))?;
+                    decoded.as_str()
+                } else { text };
+                let generation = number(generation)?;
+                let index = number(index)?;
+                let limit = count(limit)?;
+                let bytes = number(bytes)?;
+                let repo = self.get(number(token)?)?;
+                let response = match (command.starts_with("repo-begin-indexed-expression"), count_all) {
+                    (false, false) => repo.begin_indexed_query_scoped(generation, index, needle,
+                        scope, limit, bytes, &mut *canceled)?,
+                    (false, true) => repo.begin_indexed_query_counted_scoped(generation, index, needle,
+                        scope, limit, bytes, &mut *canceled)?,
+                    (true, false) => repo.begin_indexed_expression_scoped(generation, index, needle,
+                        scope, limit, bytes, &mut *canceled)?,
+                    (true, true) => repo.begin_indexed_expression_counted_scoped(generation, index, needle,
+                        scope, limit, bytes, &mut *canceled)?,
+                };
                 self.progress_reply = repo.work_state().pending_query == Some(generation);
                 Ok(response)
             }
@@ -291,6 +374,24 @@ fn structure_name_mode(mode: &str) -> Result<SymbolNameMode, Failure> {
 /// not evidence that a native frame was displayed. "-" explicitly means empty
 /// workspace/visible payload; it never broadens an invalid file/directory scope.
 fn structure_scope(kind: &str, value: &str) -> Result<AtlasSearchScope, Failure> {
+    query_scope(kind, value, "DESK_STRUCTURE_SCOPE")
+}
+fn text_scope(kind: &str, value: &str, case: &str) -> Result<AtlasSearchScope, Failure> {
+    let case_sensitive = match case {
+        "sensitive" => true,
+        "unicode-lowercase" => false,
+        _ => return Err(Failure::Protocol("DESK_SEARCH_CASE")),
+    };
+    Ok(query_scope(kind, value, "DESK_SEARCH_SCOPE")?.with_case_sensitive(case_sensitive))
+}
+fn count_all(mode: &str) -> Result<bool, Failure> {
+    match mode {
+        "bounded" => Ok(false),
+        "count-all" => Ok(true),
+        _ => Err(Failure::Protocol("DESK_SEARCH_COUNT_MODE")),
+    }
+}
+fn query_scope(kind: &str, value: &str, invalid: &'static str) -> Result<AtlasSearchScope, Failure> {
     let scope = AtlasSearchScope::all();
     match kind {
         "workspace" if value == "-" => Ok(scope),
@@ -302,6 +403,6 @@ fn structure_scope(kind: &str, value: &str) -> Result<AtlasSearchScope, Failure>
             let kind = if kind == "directory" { AtlasSearchPathKind::Directory } else { AtlasSearchPathKind::File };
             scope.with_path(kind, &path).map_err(DeskRepositoryError::from).map_err(Failure::from)
         }
-        _ => Err(Failure::Protocol("DESK_STRUCTURE_SCOPE")),
+        _ => Err(Failure::Protocol(invalid)),
     }
 }
