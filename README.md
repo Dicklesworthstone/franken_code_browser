@@ -132,6 +132,15 @@ preserving the previous trail and all its visits. The CLI offers the same immuta
 workflow. This source implementation still requires
 independent native verification.
 
+**Native trail exports can include several saved repository versions.**
+Choose **Export source pack… → Include other saved archives…** and select the
+additional captures. The export combines exact selections and notes in one JSON
+file, routes each visit by verified archive digest and preserves repeated visits.
+The current retained archive plus up to seven explicitly selected archives share
+bounded validation and source-work allowances. Existing destinations are never
+overwritten. See [source-pack export](native/macos/README.md#exporting-a-saved-trail-with-its-source)
+for coverage limits and pending independent native verification.
+
 **Offline Desk navigation connects saved search to retained reading work.**
 The persistent `fcb desk --stdio` session now offers `saved-paths` Quick Open
 and `saved-structure` searches for declaration candidates, Markdown headings

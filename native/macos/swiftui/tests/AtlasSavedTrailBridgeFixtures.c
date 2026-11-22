@@ -5,10 +5,10 @@
 
 /* Header-checked marshaling and owned-response fixture. Real FCBT/archive
  * resolution and payload verification remain in the Rust service fixtures. */
-static uint64_t calls[9];
+static uint64_t calls[10];
 static int result_mode;
 void fixture_saved_trail_mode(int mode) { result_mode = mode; }
-uint64_t fixture_saved_trail_count(uint64_t index) { assert(index < 9); return calls[index]; }
+uint64_t fixture_saved_trail_count(uint64_t index) { assert(index < 10); return calls[index]; }
 static char *reply(void) {
     if (result_mode == 1) return NULL;
     if (result_mode == 2) {
@@ -80,4 +80,30 @@ char *fcb_saved_trail_export(uint64_t handle, uint64_t operation, uint64_t gener
 char *fcb_saved_trail_export_receipt(uint64_t handle, uint64_t operation) {
     assert(handle == UINT64_MAX - 10 && operation == UINT64_MAX);
     calls[8]++; return reply();
+}
+
+char *fcb_saved_trail_export_with_archives_cancelable(uint64_t handle, uint64_t operation, uint64_t generation,
+    const char *digest, const char *destination, uint64_t entries, uint64_t verification_bytes,
+    uint64_t selected_bytes, uint64_t output_bytes, uint64_t output_scalars,
+    const char *const *paths, uint64_t archive_count, uint64_t validation_bytes,
+    int32_t (*poll)(void *), void *context) {
+    assert(handle == UINT64_MAX - 10 && operation == UINT64_MAX && generation == UINT64_MAX - 9);
+    assert(digest && strlen(digest) == 64);
+    for (size_t i = 0; i < 64; i++) assert(digest[i] == 'a');
+    assert(destination && strcmp(destination, "/pack-e\xcc\x81.json") == 0);
+    assert(entries == 1024 && verification_bytes == 64 * 1024 * 1024);
+    assert(selected_bytes == 4 * 1024 * 1024 && output_bytes == 16 * 1024 * 1024 && output_scalars == output_bytes);
+    assert(validation_bytes == 256 * 1024 * 1024 && poll && context && poll(context) == 0);
+    assert(archive_count == 0 || archive_count == 2 || archive_count == 7);
+    if (archive_count == 2) {
+        assert(paths && paths[0] && paths[1]);
+        assert(strcmp(paths[0], "/extra-e\xcc\x81.fcbs") == 0);
+        assert(strcmp(paths[1], "/extra-\xc3\xa9.fcbs") == 0);
+    } else if (archive_count == 7) {
+        static const char *expected[] = {"/extra-0.fcbs", "/extra-1.fcbs", "/extra-2.fcbs",
+            "/extra-3.fcbs", "/extra-4.fcbs", "/extra-5.fcbs", "/extra-6.fcbs"};
+        assert(paths);
+        for (size_t i = 0; i < 7; i++) assert(paths[i] && strcmp(paths[i], expected[i]) == 0);
+    }
+    calls[9]++; return reply();
 }

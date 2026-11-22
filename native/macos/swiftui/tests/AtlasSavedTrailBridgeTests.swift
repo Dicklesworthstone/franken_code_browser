@@ -83,6 +83,32 @@ import Foundation
             precondition(transport.export!(owner, export) == nil && transport.exportReceipt!(owner, .max) == nil)
         }
         precondition(count(4) == 34, "every nonnull export response must be freed exactly once")
-        print("Saved trail public-header ABI, full-width IDs, exact paths and response ownership fixtures passed")
+        let mixed = try AtlasSavedTrailExportRequest(trail: parent, operation: .max,
+            destination: export.destination, limits: export.limits, additionalArchives: ["/extra-e\u{301}.fcbs", "/extra-é.fcbs"])
+        let maximum = try AtlasSavedTrailExportRequest(trail: parent, operation: .max,
+            destination: export.destination, limits: export.limits, additionalArchives: (0..<7).map { "/extra-\($0).fcbs" })
+        let beforeMixed = count(9), beforeFreed = count(4), beforeLegacy = count(7)
+        mode(0)
+        for request in [mixed, maximum, export] {
+            precondition(transport.exportWithArchives!(owner, request, AtlasSearchCancellation()) == "{}")
+        }
+        precondition(count(9) == beforeMixed + 3 && count(4) == beforeFreed + 3)
+        precondition(transport.export!(owner, mixed) == nil && count(7) == beforeLegacy,
+            "legacy export silently discarded selected archive authority")
+        precondition(transport.exportWithArchives!(0, mixed, AtlasSearchCancellation()) == nil)
+        precondition(transport.exportWithArchives!(owner - 1, mixed, AtlasSearchCancellation()) == nil)
+        let canceled = AtlasSearchCancellation(); canceled.cancel()
+        precondition(transport.exportWithArchives!(owner, mixed, canceled) == nil && count(9) == beforeMixed + 3,
+            "cancellation before entry reached the foreign writer")
+        mode(1)
+        precondition(transport.exportWithArchives!(owner, mixed, AtlasSearchCancellation()) == nil)
+        precondition(count(4) == beforeFreed + 3)
+        for invalidMode in [Int32(2), 3, 4] {
+            mode(invalidMode)
+            precondition(transport.exportWithArchives!(owner, mixed, AtlasSearchCancellation()) == nil)
+        }
+        precondition(count(9) == beforeMixed + 7 && count(4) == beforeFreed + 6,
+            "every nonnull mixed export response must be freed exactly once")
+        print("Saved trail public-header ABI, full-width IDs, exact archive arrays, cancellation and response ownership fixtures passed")
     }
 }

@@ -6,105 +6,25 @@
 //! representation, including escaped metadata, not characters in decoded code.
 
 use super::*;
-use fcb::search::trail::{Sha256Digest, TrailExportCursor, TrailExportLimits, TrailExportOutcome, TrailExportStats};
+use fcb::search::trail::{TrailExportCursor, TrailExportLimits, TrailExportOutcome, TrailExportStats};
 
 pub(crate) const PACK_SCHEMA: &str = "fcb.trail-source-pack/1";
 const ENTRY_METADATA_BYTES: usize = 512 * 1024;
 const ENTRY_OVERHEAD_RESERVE: usize = 256;
 const TAIL_RESERVE: usize = 2048;
-const MAX_DIRECTORY_BYTES: u64 = 64 * 1024 * 1024;
-
-/// Archive envelopes are validated once and only their bounded directories stay
-/// resident. A parent reservation backs the entire child accounting domain, so
-/// several valid directories cannot bypass the command's managed-byte ceiling.
-/// Field order releases archive leases before their accounting/reservation.
-struct Archives {
-    handles: [Option<PagedSnapshot<File>>; MAX_EXPORT_ARCHIVES],
-    count: usize,
-    supplied: usize,
-    validation_bytes_admitted: u64,
-    validation_bytes_read: u64,
-    validation_read_calls: u64,
-    directory_budget: ResourceBudget,
-    _reservation: ResourceLease,
-}
-impl Archives {
-    fn open(s: &Settings, budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool)
-        -> Result<Self, Failure> {
-        if s.archives.is_empty() { return Err(Failure::new("TRAIL_ARCHIVE_REQUIRED")); }
-        if s.archives.len() > MAX_EXPORT_ARCHIVES { return Err(Failure::new("TRAIL_EXPORT_ARCHIVE_LIMIT")); }
-        let reservation = budget.try_reserve_managed(owner(), allocation(214), ByteLength::new(MAX_DIRECTORY_BYTES))
-            .map_err(|_| Failure::new("TRAIL_EXPORT_DIRECTORY_ADMISSION"))?;
-        let directory_budget = ResourceBudget::new(owner(), ByteLength::new(MAX_DIRECTORY_BYTES))
-            .map_err(|_| Failure::new("TRAIL_EXPORT_DIRECTORY_ADMISSION"))?;
-        let mut archives = Self { handles: std::array::from_fn(|_| None), count: 0,
-            supplied: s.archives.len(), validation_bytes_admitted: 0, validation_bytes_read: 0,
-            validation_read_calls: 0, directory_budget, _reservation: reservation };
-        for (ordinal, path) in s.archives.iter().enumerate() {
-            if canceled() { return Err(Failure::canceled()); }
-            let path = input::absolute(path)?;
-            let (file, observed) = input::open_regular(&path)?;
-            let mut limits = SnapshotLimits::default();
-            if observed.len() > limits.max_document_bytes as u64 { return Err(Failure::new("SNAPSHOT_LIMIT")); }
-            // PagedSnapshot checks the declared envelope against this limit
-            // before body reads, then reads at most one byte to establish EOF.
-            // Charge that probe even when it returns zero. Descriptor growth or
-            // a forged header therefore cannot exceed admission on a failure.
-            let admission = observed.len().checked_add(1)
-                .ok_or_else(|| Failure::new("TRAIL_EXPORT_VALIDATION_BYTE_LIMIT"))?;
-            if admission > s.export_validation_bytes.saturating_sub(archives.validation_bytes_admitted) {
-                return Err(Failure::new("TRAIL_EXPORT_VALIDATION_BYTE_LIMIT"));
-            }
-            archives.validation_bytes_admitted += admission;
-            limits.max_document_bytes = observed.len() as usize;
-            let candidate = PagedSnapshot::open(file, owner(), limits, &archives.directory_budget,
-                allocation(220 + ordinal as u64), &mut *canceled).map_err(fail)?;
-            let stats = candidate.directory().validation_stats();
-            archives.validation_bytes_read += stats.bytes_read;
-            archives.validation_read_calls += stats.read_calls;
-            if archives.validation_bytes_read > archives.validation_bytes_admitted {
-                return Err(Failure::new("TRAIL_EXPORT_VALIDATION_BYTE_LIMIT"));
-            }
-            // Aliases/copies are equivalent only after each supplied file has
-            // passed full validation. Retain the first verified handle; count
-            // all validation work and never deduplicate explicit trail visits.
-            if !archives.handles.iter().flatten().any(|prior| prior.directory().digest() == candidate.directory().digest()) {
-                archives.handles[archives.count] = Some(candidate);
-                archives.count += 1;
-            }
-        }
-        Ok(archives)
-    }
-
-    fn for_digest(&mut self, digest: Sha256Digest) -> Result<&mut PagedSnapshot<File>, Failure> {
-        let position = self.handles.iter().position(|archive| archive.as_ref()
-            .is_some_and(|archive| archive.directory().digest() == digest)).unwrap_or(0);
-        // If the user omitted this digest, the existing cursor produces its
-        // explicit OtherArchive row before any member read or source admission.
-        self.handles[position].as_mut().ok_or_else(|| Failure::new("TRAIL_ARCHIVE_REQUIRED"))
-    }
-
-    fn encode_validation(&self, out: &mut Output, maximum: u64) -> Result<(), OutputError> {
-        let directory = self.directory_budget.accounting();
-        out.literal("{\"routing\":\"verified-archive-digest\",\"duplicate_policy\":\"first-verified-handle\"")?;
-        for (key, value) in [("supplied_archives", self.supplied as u64), ("distinct_archives", self.count as u64),
-            ("duplicate_archives", (self.supplied - self.count) as u64),
-            ("validation_bytes_admitted", self.validation_bytes_admitted),
-            ("validation_bytes_read", self.validation_bytes_read), ("validation_read_calls", self.validation_read_calls),
-            ("retained_directory_bytes", directory.reserved().get()), ("peak_directory_bytes", directory.peak_reserved().get()),
-            ("max_archives", MAX_EXPORT_ARCHIVES as u64), ("max_validation_bytes", maximum),
-            ("max_directory_bytes", MAX_DIRECTORY_BYTES)] {
-            out.literal(",")?; out.quoted(key)?; out.literal(":")?; out.integer(value)?;
-        }
-        out.literal(",\"validation_admission\":\"observed-file-length-plus-one-eof-probe\"}")
-    }
-}
+pub(crate) mod archives;
+use archives::Archives;
 
 pub(super) fn run(s: &Settings, view: TrailView<'_>, receipt: &mut Output,
     budget: &ResourceBudget, effect: &mut Effect, canceled: &mut impl FnMut() -> bool)
     -> Result<u8, Failure> {
     let destination = input::absolute(s.output.as_deref().ok_or_else(|| Failure::new("TRAIL_OUTPUT_REQUIRED"))?)?;
-    let mut archives = Archives::open(s, budget, canceled)?;
+    if s.archives.is_empty() { return Err(Failure::new("TRAIL_ARCHIVE_REQUIRED")); }
+    let mut archives = Archives::new(None, s.archives.len(), s.export_validation_bytes);
+    let mut paths = [Path::new(""); MAX_EXPORT_ARCHIVES];
+    if s.archives.len() > paths.len() { return Err(Failure::new("TRAIL_EXPORT_ARCHIVE_LIMIT")); }
+    for (target, path) in paths.iter_mut().zip(&s.archives) { *target = path.as_path(); }
+    archives.open_paths(&paths[..s.archives.len()], owner(), budget, allocation(214), canceled).map_err(fail)?;
     let mut pack = Output::new(owner(), s.export_bytes, budget, allocation(210))?;
     header(&mut pack, s, view, &archives)?;
     let mut metadata = Output::new(owner(), ENTRY_METADATA_BYTES, budget, allocation(211))?;
@@ -137,7 +57,9 @@ pub(super) fn run(s: &Settings, view: TrailView<'_>, receipt: &mut Output,
     while cursor.stats().entries_visited < view.len().min(s.limit) {
         if canceled() { return Err(Failure::canceled()); }
         let entry = view.entry(cursor.stats().entries_visited)?;
-        let archive = archives.for_digest(entry.archive)?;
+        let archive = if archives.handles.iter().flatten().any(|archive| archive.directory().digest() == entry.archive) {
+            archives.for_digest(entry.archive)
+        } else { archives.first() }.ok_or_else(|| Failure::new("TRAIL_ARCHIVE_REQUIRED"))?;
         let item = cursor.next(archive, budget, [allocation(212), allocation(213)], &mut *canceled).map_err(fail)?
             .ok_or_else(|| Failure::new("TRAIL_EXPORT_STALE_CURSOR"))?;
         if item.target.ordinal() > 0 { pack.literal(",")?; }
@@ -173,7 +95,7 @@ pub(super) fn run(s: &Settings, view: TrailView<'_>, receipt: &mut Output,
         receipt.literal(",\"contains_user_text\":true,\"redacted\":false")?;
         receipt.literal(",\"export_bytes\":")?; receipt.integer(bytes as u64)?;
         receipt.literal(",\"export_characters\":")?; receipt.integer(characters as u64)?;
-        receipt.literal(",\"archive_validation\":")?; archives.encode_validation(receipt, s.export_validation_bytes)?;
+        receipt.literal(",\"archive_validation\":")?; archives.encode_validation(receipt)?;
         receipt.literal(",\"character_representation\":\"unicode-scalars-in-serialized-utf8-json\",\"coverage\":")?;
         coverage(receipt, stats)?;
         receipt.literal(",\"effect\":\"complete-file-sync-requested\",\"power_loss_qualified\":false,\"complete\":")?;
@@ -201,7 +123,7 @@ fn header(out: &mut Output, s: &Settings, view: TrailView<'_>, archives: &Archiv
         if ordinal > 0 { out.literal(",")?; }
         archive_output(out, archive)?;
     }
-    out.literal("],\"archive_validation\":")?; archives.encode_validation(out, s.export_validation_bytes)?;
+    out.literal("],\"archive_validation\":")?; archives.encode_validation(out)?;
     out.literal(",\"budgets\":{\"entries\":")?; out.integer(s.limit as u64)?;
     out.literal(",\"verification_source_bytes\":")?; out.integer(s.export_source_bytes)?;
     out.literal(",\"export_bytes\":")?; out.integer(s.export_bytes as u64)?;
@@ -227,7 +149,7 @@ pub(crate) fn header_prefix(out: &mut Output, view: TrailView<'_>) -> Result<(),
     out.literal(",\"live_roots_accessed\":false,\"redacted\":false,\"payload_truncated\":false,\"archive\":")
 }
 
-fn archive_output(out: &mut Output, archive: &PagedSnapshot<File>) -> Result<(), OutputError> {
+pub(crate) fn archive_output<R: std::io::Read + std::io::Seek>(out: &mut Output, archive: &PagedSnapshot<R>) -> Result<(), OutputError> {
     out.literal("{\"digest\":")?; out.quoted(&archive.directory().digest().to_hex())?;
     out.literal(",\"discovery_complete\":")?; out.boolean(archive.directory().discovery_complete())?;
     out.literal(",\"validation_bytes_read\":")?; out.integer(archive.directory().validation_stats().bytes_read)?;

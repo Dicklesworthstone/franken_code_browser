@@ -20,6 +20,12 @@ import Foundation
     _ operation: UInt64, _ generation: UInt64, _ digest: UnsafePointer<CChar>?, _ destination: UnsafePointer<CChar>?,
     _ entries: UInt64, _ verificationBytes: UInt64, _ selectedBytes: UInt64,
     _ outputBytes: UInt64, _ outputScalars: UInt64) -> UnsafeMutablePointer<CChar>?
+private typealias SavedTrailExportPoll = @convention(c) (UnsafeMutableRawPointer?) -> Int32
+@_silgen_name("fcb_saved_trail_export_with_archives_cancelable") private func savedTrailExportWithArchives(_ handle: UInt64,
+    _ operation: UInt64, _ generation: UInt64, _ digest: UnsafePointer<CChar>?, _ destination: UnsafePointer<CChar>?,
+    _ entries: UInt64, _ verificationBytes: UInt64, _ selectedBytes: UInt64, _ outputBytes: UInt64, _ outputScalars: UInt64,
+    _ paths: UnsafePointer<UnsafePointer<CChar>?>?, _ count: UInt64, _ validationBytes: UInt64,
+    _ poll: SavedTrailExportPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_trail_export_receipt") private func savedTrailExportReceipt(_ handle: UInt64,
     _ operation: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_free_string") private func savedTrailFree(_ pointer: UnsafeMutablePointer<CChar>?)
@@ -59,7 +65,8 @@ extension AtlasSavedTrailTransport {
         guard handle > 0, operation > 0 else { return nil }
         return take(savedTrailWriteReceipt(handle, operation))
     }, export: { handle, request in
-        guard handle > 0, handle == request.identity.owner, request.limits.isValid else { return nil }
+        guard handle > 0, handle == request.identity.owner, request.limits.isValid,
+              request.additionalArchives.isEmpty else { return nil }
         let limits = request.limits
         return request.trail.digest.withCString { digest in
             request.destination.withCString { destination in
@@ -70,7 +77,44 @@ extension AtlasSavedTrailTransport {
     }, exportReceipt: { handle, operation in
         guard handle > 0, operation > 0 else { return nil }
         return take(savedTrailExportReceipt(handle, operation))
+    }, exportWithArchives: { handle, request, cancellation in
+        guard handle > 0, handle == request.identity.owner, request.limits.isValid, !cancellation.isCanceled else { return nil }
+        let poll: SavedTrailExportPoll = { context in
+            guard let context else { return 1 }
+            return Unmanaged<AtlasSearchCancellation>.fromOpaque(context).takeUnretainedValue().isCanceled ? 1 : 0
+        }
+        let limits = request.limits
+        return withExtendedLifetime(cancellation) {
+            withArchivePaths(request.additionalArchives) { paths in
+                request.trail.digest.withCString { digest in
+                    request.destination.withCString { destination in
+                        take(savedTrailExportWithArchives(handle, request.operation, request.trail.generation, digest, destination,
+                            limits.entries, limits.verificationBytes, limits.selectedBytes, limits.outputBytes, limits.outputScalars,
+                            paths, UInt64(request.additionalArchives.count), limits.archiveValidationBytes, poll,
+                            Unmanaged.passUnretained(cancellation).toOpaque()))
+                    }
+                }
+            }
+        }
     })
+    /// Nest the bounded string lifetimes around the synchronous foreign call;
+    /// neither a temporary C string nor its pointer array may escape it.
+    private static func withArchivePaths<T>(_ paths: [String],
+        _ call: (UnsafePointer<UnsafePointer<CChar>?>?) -> T) -> T {
+        var pointers: [UnsafePointer<CChar>?] = []
+        pointers.reserveCapacity(paths.count)
+        func visit(_ index: Int) -> T {
+            guard index < paths.count else {
+                return pointers.withUnsafeBufferPointer { call($0.baseAddress) }
+            }
+            return paths[index].withCString { pointer in
+                pointers.append(pointer)
+                defer { pointers.removeLast() }
+                return visit(index + 1)
+            }
+        }
+        return visit(0)
+    }
     private static func take(_ pointer: UnsafeMutablePointer<CChar>?) -> String? {
         guard let pointer else { return nil }
         defer { savedTrailFree(pointer) }

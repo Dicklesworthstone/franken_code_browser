@@ -101,6 +101,17 @@ the requested new destination. Cancellation and response-delivery failure retain
 the reported file effect; they cannot undo a completed write. Executable
 regression verification of the multi-archive route remains pending.
 
+The native Saved Repository workflow also supports mixed-archive source packs:
+**Export source pack… → Include other saved archives…** combines the retained
+archive with up to seven explicitly selected supplemental archives. CLI and
+native export share the bounded archive-admission implementation and digest
+routing policy. The native receipt binds the selected path inventory and
+validation counters to the export operation; recovering that receipt performs
+no source reads or publication retry. Supplemental files are selected for export
+only and do not change the archive attached to trail browsing. See
+[native source-pack export](../../native/macos/README.md#exporting-a-saved-trail-with-its-source)
+for presets, coverage and pending verification.
+
 On macOS, human `fcb open` and bare `fcb` can hand off to an installed native app.
 This CLI lane does not claim completion of all FCB-057 acceptance criteria.
 

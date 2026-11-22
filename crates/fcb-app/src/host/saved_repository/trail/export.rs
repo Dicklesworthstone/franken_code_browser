@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
 //! Explicit self-contained source packs from an accepted trail and the already
-//! open archive. The canonical cursor verifies whole captured members and
+//! open archive plus explicitly selected supplemental archives. The cursor
+//! verifies whole captured members and
 //! chooses whole selections; shared trail encoders preserve notes/provenance.
 //! Labels and other-archive references never open paths. The create-only writer
 //! retains a terminal effect receipt before any fallible delivery can intervene.
@@ -18,10 +19,12 @@ use crate::{AppError, EXIT_CANCELED, EXIT_ERROR, EXIT_OK, EXIT_PARTIAL, input};
 use crate::host::HostResponse;
 use crate::host::desk::persistence::{publish_new_bytes, CheckpointIoError, CheckpointSaveEffect};
 use crate::output::{Output, OutputError, MAX_ENCODED_BYTES};
-use crate::trail::{entry_output, export::{coverage, header_prefix, PACK_SCHEMA}};
+use crate::trail::{entry_output, export::{archive_output, coverage, header_prefix, PACK_SCHEMA,
+    archives::{Archives, ArchiveSetError, MAX_ARCHIVES, MAX_VALIDATION_BYTES}}};
 use super::{SavedRepositorySession, SavedTrailError, SavedTrailWriteParent, check};
 
 const RECEIPT_BYTES: usize = 256 * 1024;
+const MIXED_RECEIPT_BYTES: usize = 2 * 1024 * 1024;
 const METADATA_BYTES: usize = 512 * 1024;
 const ENTRY_RESERVE: usize = 512;
 const TAIL_RESERVE: usize = 4096;
@@ -78,7 +81,7 @@ impl ExportFailure {
     }
 }
 pub(in crate::host::saved_repository) struct RetainedTrailExport {
-    operation: u64, receipt: Output, tail: usize, encoded_tail: bool,
+    operation: u64, receipt: Output, receipt_bytes: usize, tail: usize, encoded_tail: bool,
     effect: CheckpointSaveEffect, written: u64, artifact_bytes: u64,
     coverage: TrailExportStats, failure: Option<ExportFailure>,
 }
@@ -116,6 +119,18 @@ impl SavedRepositorySession {
     /// partial evidence pack remains a complete JSON artifact with explicit
     /// omitted/unavailable rows. No prior result, trail or reader is replaced.
     pub fn export_trail(&mut self, request: SavedTrailExportRequest<'_>,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, SavedTrailError> {
+        self.export_trail_with_archives(request, &[], 0, canceled)
+    }
+
+    /// Supplement the retained primary with up to seven explicitly granted
+    /// archive paths. Full envelope validation shares one independent byte and
+    /// directory budget; no member is read and no output is created until all
+    /// supplied inputs validate. A missing digest remains an unavailable visit.
+    /// Explicit paths are borrowed only through worker drain and never retained
+    /// as future filesystem authority by the effect-recovery receipt.
+    pub fn export_trail_with_archives(&mut self, request: SavedTrailExportRequest<'_>,
+        additional_archives: &[&Path], validation_bytes: u64,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, SavedTrailError> {
         if request.operation == 0 || request.operation <= self.last_trail_export_attempt {
             return Err(SavedTrailError::StaleExport);
@@ -123,11 +138,14 @@ impl SavedRepositorySession {
         self.last_trail_export_attempt = request.operation;
         check(&mut canceled)?;
         if !request.limits.valid() || request.destination.as_os_str().is_empty()
-            || request.destination.as_os_str().len() > 16_384 { return Err(SavedTrailError::InvalidLimits); }
+            || request.destination.as_os_str().len() > 16_384
+            || additional_archives.len() >= MAX_ARCHIVES || validation_bytes > MAX_VALIDATION_BYTES
+            || additional_archives.iter().any(|path| !path.is_absolute() || path.as_os_str().is_empty()
+                || path.as_os_str().len() > 16_384) { return Err(SavedTrailError::InvalidLimits); }
         if !input::NATIVE_FILE_SUPPORTED { return Err(AppError::UnsupportedPlatform.into()); }
         let owner = self.owner();
         let archive_digest = self.archive_digest();
-        let [out_id, reply_id, path_id, pack_id, metadata_id, source_id, capture_id] = self.allocations()?;
+        let [out_id, reply_id, path_id, pack_id, metadata_id, source_id, capture_id, archives_id] = self.allocations()?;
         let _path = self.budget.try_reserve_managed(owner, path_id, ByteLength::new(64 * 1024))
             .map_err(|_| AppError::Admission)?;
         let destination = input::absolute(request.destination)?;
@@ -136,14 +154,19 @@ impl SavedRepositorySession {
         accepted.validate(owner, archive_digest, request.trail.generation)?;
         if accepted.digest != request.trail.digest { return Err(SavedTrailError::ParentMismatch); }
         let view = TrailView::open(&accepted.bytes, &mut canceled)?;
-        let mut receipt = Output::new(owner, RECEIPT_BYTES, &self.budget, out_id)?;
-        let (reply, reply_lease) = reply_storage(owner, &self.budget, reply_id)?;
-        encode_prefix(self, &mut receipt, request, &destination, view)?;
+        let mixed = !additional_archives.is_empty();
+        let receipt_bytes = if mixed { MIXED_RECEIPT_BYTES } else { RECEIPT_BYTES };
+        let mut receipt = Output::new(owner, receipt_bytes, &self.budget, out_id)?;
+        let (reply, reply_lease) = reply_storage(owner, &self.budget, reply_id, receipt_bytes)?;
+        encode_prefix(self, &mut receipt, request, &destination, view, mixed)?;
+        let mut archives = Archives::new(Some(archive_digest), additional_archives.len(), validation_bytes);
         let mut stats = TrailExportStats { total_entries: view.len(), ..TrailExportStats::default() };
         let before = self.archive.load_stats();
         let built = (|| -> Result<(Output, usize, Sha256Digest), SavedTrailError> {
+            if mixed { archives.open_paths(additional_archives, owner, &self.budget, archives_id, &mut canceled)?; }
             let mut pack = Output::new(owner, request.limits.output_bytes, &self.budget, pack_id)?;
-            encode_header(&mut pack, view, &self.archive, self.archive_limits.max_document_bytes, request.limits)?;
+            encode_header(&mut pack, view, &self.archive, self.archive_limits.max_document_bytes,
+                request.limits, if mixed { Some(&archives) } else { None })?;
             let mut metadata = Output::new(owner, METADATA_BYTES, &self.budget, metadata_id)?;
             let mut reserved_bytes = pack.as_bytes().len() + TAIL_RESERVE;
             let mut reserved_scalars = scalars(pack.as_bytes())? + TAIL_RESERVE;
@@ -170,8 +193,16 @@ impl SavedRepositorySession {
             let mut cursor = TrailExportCursor::new(view, generation, file, revision, TrailExportLimits {
                 max_entries: request.limits.entries, max_source_bytes: request.limits.verification_bytes,
                 max_selected_bytes: selected_limit })?;
-            loop {
-                let next = cursor.next(&mut self.archive, &self.budget, [source_id, capture_id], &mut canceled);
+            stats = cursor.stats();
+            while cursor.stats().entries_visited < view.len().min(request.limits.entries) {
+                let entry = view.entry(cursor.stats().entries_visited)?;
+                let next = if let Some(archive) = archives.for_digest(entry.archive) {
+                    cursor.next(archive, &self.budget, [source_id, capture_id], &mut canceled)
+                } else {
+                    // The retained primary handles its own digest. For omitted
+                    // digests, the cursor emits OtherArchive before any reads.
+                    cursor.next(&mut self.archive, &self.budget, [source_id, capture_id], &mut canceled)
+                };
                 stats = cursor.stats();
                 let Some(item) = next? else { break };
                 if item.target.ordinal() > 0 { pack.literal(",")?; }
@@ -203,10 +234,25 @@ impl SavedRepositorySession {
             Ok((pack, count, digest.finalize()))
         })();
         let after = self.archive.load_stats();
+        if mixed {
+            receipt.literal(",\"additional_archives\":[")?;
+            for (ordinal, path) in additional_archives.iter().enumerate() {
+                if ordinal > 0 { receipt.literal(",")?; }
+                receipt.literal("{\"ordinal\":")?; receipt.integer(ordinal as u64)?;
+                receipt.literal(",\"path\":")?; receipt.path(path)?;
+                receipt.literal(",\"opened\":")?; receipt.boolean(archives.inputs[ordinal].opened)?;
+                receipt.literal(",\"digest\":")?;
+                match archives.inputs[ordinal].digest {
+                    Some(digest) => receipt.quoted(&digest.to_hex())?, None => receipt.literal("null")?,
+                }
+                receipt.literal("}")?;
+            }
+            receipt.literal("],\"archive_validation\":")?; archives.encode_validation(&mut receipt)?;
+        }
         receipt.literal(",\"coverage\":")?; coverage(&mut receipt, stats)?;
         receipt.literal(",\"coverage_complete\":")?; receipt.boolean(built.is_ok() && stats.complete())?;
-        receipt.literal(",\"member_bytes_read\":")?; receipt.integer(after.bytes_read.saturating_sub(before.bytes_read))?;
-        receipt.literal(",\"member_read_calls\":")?; receipt.integer(after.read_calls.saturating_sub(before.read_calls))?;
+        receipt.literal(",\"member_bytes_read\":")?; receipt.integer(stats.source_bytes_read)?;
+        receipt.literal(",\"member_read_calls\":")?; receipt.integer(after.read_calls.saturating_sub(before.read_calls) + archives.member_read_calls())?;
         let artifact_bytes = built.as_ref().map_or(0, |(p, _, _)| p.as_bytes().len() as u64);
         receipt.literal(",\"export_bytes\":")?; receipt.integer(artifact_bytes)?;
         receipt.literal(",\"export_characters\":")?; receipt.integer(built.as_ref().map_or(0, |(_, n, _)| *n as u64))?;
@@ -214,7 +260,7 @@ impl SavedRepositorySession {
         if let Ok((_, _, digest)) = &built { receipt.quoted(&digest.to_hex())?; } else { receipt.literal("null")?; }
         if receipt.remaining_bytes() < 4096 { return Err(AppError::Admission.into()); }
         let tail = receipt.checkpoint();
-        let mut retained = RetainedTrailExport { operation: request.operation, receipt, tail, encoded_tail: false,
+        let mut retained = RetainedTrailExport { operation: request.operation, receipt, receipt_bytes, tail, encoded_tail: false,
             effect: CheckpointSaveEffect::None, written: 0, artifact_bytes, coverage: stats, failure: None };
         match built {
             Ok((pack, _, _)) => retained.failure = publish_new_bytes(&destination, pack.as_bytes(),
@@ -232,8 +278,9 @@ impl SavedRepositorySession {
         check(&mut canceled)?;
         let retained = self.trail_export.as_ref().ok_or(SavedTrailError::MissingExport)?;
         if operation != retained.operation { return Err(SavedTrailError::StaleExport); }
+        let receipt_bytes = retained.receipt_bytes;
         let [id] = self.allocations()?;
-        let (reply, lease) = reply_storage(self.owner(), &self.budget, id)?;
+        let (reply, lease) = reply_storage(self.owner(), &self.budget, id, receipt_bytes)?;
         check(&mut canceled)?;
         self.trail_export_response(reply, lease)
     }
@@ -247,12 +294,12 @@ impl SavedRepositorySession {
     }
 }
 
-fn reply_storage(owner: ArenaOwnerId, budget: &ResourceBudget, id: ResourceAllocationId)
+fn reply_storage(owner: ArenaOwnerId, budget: &ResourceBudget, id: ResourceAllocationId, capacity: usize)
     -> Result<(String, ResourceLease), SavedTrailError> {
-    let lease = budget.try_reserve_managed(owner, id, ByteLength::new((RECEIPT_BYTES * 3 + 4096) as u64))
+    let lease = budget.try_reserve_managed(owner, id, ByteLength::new((capacity * 3 + 4096) as u64))
         .map_err(|_| AppError::Admission)?;
-    let mut text = String::new(); text.try_reserve_exact(RECEIPT_BYTES).map_err(|_| AppError::Admission)?;
-    if text.capacity() > RECEIPT_BYTES { return Err(AppError::Admission.into()); }
+    let mut text = String::new(); text.try_reserve_exact(capacity).map_err(|_| AppError::Admission)?;
+    if text.capacity() > capacity { return Err(AppError::Admission.into()); }
     Ok((text, lease))
 }
 fn limits(out: &mut Output, limits: SavedTrailExportLimits) -> Result<(), OutputError> {
@@ -267,7 +314,7 @@ fn limits(out: &mut Output, limits: SavedTrailExportLimits) -> Result<(), Output
     out.literal("}")
 }
 fn encode_prefix(session: &SavedRepositorySession, out: &mut Output, request: SavedTrailExportRequest<'_>,
-    destination: &Path, view: TrailView<'_>) -> Result<(), OutputError> {
+    destination: &Path, view: TrailView<'_>, mixed: bool) -> Result<(), OutputError> {
     out.literal("{\"schema\":\"fcb.saved-repository/1\",\"command\":\"trail-export\",\"owner\":")?;
     out.integer(session.owner().get())?;
     out.literal(",\"archive_digest\":")?; out.quoted(&session.archive_digest().to_hex())?;
@@ -281,19 +328,48 @@ fn encode_prefix(session: &SavedRepositorySession, out: &mut Output, request: Sa
     out.literal(",\"destination\":")?; out.path(destination)?;
     out.literal(",\"pack_schema\":")?; out.quoted(PACK_SCHEMA)?;
     out.literal(",\"budgets\":")?; limits(out, request.limits)?;
-    out.literal(",\"character_representation\":\"unicode-scalars-in-serialized-utf8-json\",\"archive_scope\":\"retained-single-archive\",\"archive_path_reopened\":false,\"live_source_reopened\":false,\"accepted_trail_unchanged\":true,\"accepted_query_unchanged\":true,\"source_derived_sensitive\":true,\"redacted\":false,\"encrypted\":false,\"overwritten\":false,\"power_loss_qualified\":false,\"live_root_authority\":false,\"native_presented\":false")
+    out.literal(",\"character_representation\":\"unicode-scalars-in-serialized-utf8-json\",\"archive_scope\":")?;
+    out.quoted(archive_scope(mixed))?;
+    out.literal(",\"archive_path_reopened\":false,\"live_source_reopened\":false,\"accepted_trail_unchanged\":true,\"accepted_query_unchanged\":true,\"source_derived_sensitive\":true,\"redacted\":false,\"encrypted\":false,\"overwritten\":false,\"power_loss_qualified\":false,\"live_root_authority\":false,\"native_presented\":false")
+}
+fn archive_scope(mixed: bool) -> &'static str {
+    if mixed { "retained-primary-and-explicit-supplemental-archives" } else { "retained-single-archive" }
 }
 fn encode_header(out: &mut Output, view: TrailView<'_>, archive: &PagedSnapshot<File>,
-    max_archive_bytes: usize, options: SavedTrailExportLimits) -> Result<(), OutputError> {
+    max_archive_bytes: usize, options: SavedTrailExportLimits, supplemental: Option<&Archives>) -> Result<(), OutputError> {
     header_prefix(out, view)?;
+    if supplemental.is_some_and(|archives| archives.count > 0) { out.literal("null")?; }
+    else { primary_archive_output(out, archive, max_archive_bytes)?; }
+    if let Some(archives) = supplemental {
+        out.literal(",\"archives\":[")?; primary_archive_output(out, archive, max_archive_bytes)?;
+        for additional in archives.handles.iter().flatten() {
+            out.literal(",")?; archive_output(out, additional)?;
+        }
+        out.literal("],\"archive_validation\":")?; archives.encode_validation(out)?;
+    }
+    out.literal(",\"archive_scope\":")?; out.quoted(archive_scope(supplemental.is_some()))?;
+    out.literal(",\"budgets\":")?; limits(out, options)?;
+    out.literal(",\"entries\":[")
+}
+fn primary_archive_output(out: &mut Output, archive: &PagedSnapshot<File>, max_archive_bytes: usize)
+    -> Result<(), OutputError> {
     out.literal("{\"digest\":")?; out.quoted(&archive.directory().digest().to_hex())?;
     out.literal(",\"discovery_complete\":")?; out.boolean(archive.directory().discovery_complete())?;
     out.literal(",\"validation_bytes_read\":")?; out.integer(archive.directory().validation_stats().bytes_read)?;
     out.literal(",\"validation_read_calls\":")?; out.integer(archive.directory().validation_stats().read_calls)?;
     out.literal(",\"max_archive_bytes\":")?; out.integer(max_archive_bytes as u64)?;
-    out.literal("},\"archive_scope\":\"retained-single-archive\",\"budgets\":")?;
-    limits(out, options)?;
-    out.literal(",\"entries\":[")
+    out.literal("}")
+}
+impl From<ArchiveSetError> for SavedTrailError {
+    fn from(error: ArchiveSetError) -> Self {
+        match error {
+            ArchiveSetError::Input(error) => error.into(),
+            ArchiveSetError::Archive(error) => fcb::search::trail::TrailReadError::Archive(error).into(),
+            ArchiveSetError::ArchiveLimit => Self::InvalidLimits,
+            ArchiveSetError::ValidationByteLimit => Self::ExportValidationByteLimit,
+            ArchiveSetError::DirectoryAdmission => Self::ExportDirectoryAdmission,
+        }
+    }
 }
 fn scalars(bytes: &[u8]) -> Result<usize, SavedTrailError> {
     Ok(std::str::from_utf8(bytes).map_err(|_| SavedTrailError::InvalidLimits)?.chars().count())

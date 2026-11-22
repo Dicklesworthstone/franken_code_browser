@@ -29,6 +29,7 @@ pub enum SavedTrailError {
     Saved(SavedRepositoryError), Trail(TrailReadError), InvalidLimits, MissingTrail,
     StaleGeneration, ReadFailed, FileChanged, ReadCallLimit,
     MissingWrite, StaleWrite, ParentMismatch, MissingExport, StaleExport,
+    ExportValidationByteLimit, ExportDirectoryAdmission,
 }
 impl std::fmt::Display for SavedTrailError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -45,6 +46,8 @@ impl std::fmt::Display for SavedTrailError {
             Self::ParentMismatch => f.write_str("SAVED_TRAIL_PARENT_MISMATCH"),
             Self::MissingExport => f.write_str("SAVED_TRAIL_NO_EXPORT"),
             Self::StaleExport => f.write_str("SAVED_TRAIL_STALE_EXPORT"),
+            Self::ExportValidationByteLimit => f.write_str("TRAIL_EXPORT_VALIDATION_BYTE_LIMIT"),
+            Self::ExportDirectoryAdmission => f.write_str("TRAIL_EXPORT_DIRECTORY_ADMISSION"),
         }
     }
 }

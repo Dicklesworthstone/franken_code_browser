@@ -217,6 +217,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
         canOperate && trailIsCurrent && trails?.export != nil && trails?.exportReceipt != nil &&
             info?.trailExportStateKnown == true && max(lastTrailExportAttempt, info?.lastTrailExportAttempt ?? 0) < UInt64.max
     }
+    var canExportTrailWithArchives: Bool { canExportTrail && trails?.exportWithArchives != nil }
     func canAuthorTrail(from source: AtlasSavedReaderCapture) -> Bool {
         canWriteTrail && ownsDocumentSource(source) && source.reader.canKeep
     }
@@ -570,8 +571,10 @@ private final class AtlasSavedSession: @unchecked Sendable {
     }
 
     @discardableResult func exportTrail(_ parent: AtlasSavedTrailParent, destination: String,
-        limits: AtlasSavedTrailExportLimits, accessLease: AnyObject?) -> AtlasSavedTrailExportRequest? {
-        guard canExportTrail, let info, let page = trailPage, parent.matches(page) else { return nil }
+        limits: AtlasSavedTrailExportLimits, accessLease: AnyObject?, additionalArchives: [String] = [],
+        archiveAccessLease: AnyObject? = nil) -> AtlasSavedTrailExportRequest? {
+        guard canExportTrail, additionalArchives.isEmpty || canExportTrailWithArchives,
+              let info, let page = trailPage, parent.matches(page) else { return nil }
         guard AtlasSavedIndexBuildRequest.validDestination(destination), Array(destination.utf8) != info.path.bytes,
               page.path.bytes != Array(destination.utf8) else {
             trailExportNotice = "Choose a new source-pack filename distinct from the archive and trail. No export was started."
@@ -587,21 +590,27 @@ private final class AtlasSavedSession: @unchecked Sendable {
             let previous = max(lastTrailExportAttempt, info.lastTrailExportAttempt)
             guard previous < UInt64.max else { throw AtlasSavedError.unavailable }
             request = try AtlasSavedTrailExportRequest(trail: parent, operation: previous + 1,
-                destination: destination, limits: limits)
+                destination: destination, limits: limits, additionalArchives: additionalArchives)
             lastTrailExportAttempt = request.operation
         } catch { trailExportNotice = Self.message(error); notice = trailExportNotice; return nil }
         trailExportRequest = request; trailExportReceipt = nil; trailExportOutcomeKnown = false
         trailExportInProgress = true
-        trailExportNotice = "Verifying saved selections and creating a bounded source pack. Entries for other archives keep their notes and unavailable status…"
+        trailExportNotice = additionalArchives.isEmpty
+            ? "Verifying saved selections and creating a bounded source pack. Entries for other archives keep their notes and unavailable status…"
+            : "Validating \(additionalArchives.count) selected archives and verifying trail sources. Missing archives keep their notes and unavailable status…"
         notice = trailExportNotice
         perform { model, flag in
             defer { model.trailExportInProgress = false }
             guard let lease = model.session, model.info?.identity == request.identity,
-                  let export = model.trails?.export else { throw AtlasSavedError.unavailable }
+                  let transport = model.trails else { throw AtlasSavedError.unavailable }
             do {
-                let lifetime: [AnyObject] = [lease] + [accessLease].compactMap { $0 }
+                // Supplemental grants share one holder, keeping the bounded
+                // worker lease list small even for seven selected archives.
+                // Cancellation never releases any grant before the call drains.
+                let lifetime: [AnyObject] = [lease] + [accessLease, archiveAccessLease].compactMap { $0 }
                 let json = try await model.io.perform(cancellation: flag, keepingAlive: lifetime) {
-                    export(lease.handle, request)
+                    if request.additionalArchives.isEmpty { return transport.export?(lease.handle, request) }
+                    return transport.exportWithArchives?(lease.handle, request, flag)
                 }
                 let receipt = try AtlasSavedTrailExportReceipt.decode(json, request: request)
                 guard !model.closed, model.session === lease else { return }

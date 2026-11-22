@@ -15,10 +15,12 @@ private final class SavedTrailExportFixture: @unchecked Sendable {
     private var lostReceipts = false
     private var blocked = false
     private var entered = false
+    private var canceledMixedExport = false
     private func locked<T>(_ work: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return work() }
     var exports: [AtlasSavedTrailExportRequest] { locked { requests } }
     var receiptReads: Int { locked { lookups } }
     var didEnter: Bool { locked { entered } }
+    var observedMixedCancellation: Bool { locked { canceledMixedExport } }
     func fault(_ name: String) { locked { nextFault = name } }
     func restore() { locked { lostReceipts = false } }
     func blockNext() { locked { blocked = true; entered = false } }
@@ -40,7 +42,7 @@ private final class SavedTrailExportFixture: @unchecked Sendable {
     }
     var transport: AtlasSavedTrailTransport {
         let inner = trail.trails
-        return AtlasSavedTrailTransport(run: inner.run, export: { [self] owner, request in
+        let export: @Sendable (UInt64, AtlasSavedTrailExportRequest) -> String? = { [self] owner, request in
             precondition(!Thread.isMainThread)
             let state = locked { () -> (Bool, String?) in
                 precondition(request.operation > (attempts[owner] ?? 0))
@@ -55,6 +57,10 @@ private final class SavedTrailExportFixture: @unchecked Sendable {
                 if state.1 == "unknown" { lostReceipts = true }
                 return state.1 == "lost" || state.1 == "unknown" ? nil : response
             }
+        }
+        return AtlasSavedTrailTransport(run: inner.run, export: { owner, request in
+            precondition(request.additionalArchives.isEmpty, "supplemental authority reached the legacy ABI")
+            return export(owner, request)
         }, exportReceipt: { [self] owner, operation in
             precondition(!Thread.isMainThread)
             return locked {
@@ -62,6 +68,11 @@ private final class SavedTrailExportFixture: @unchecked Sendable {
                 guard !lostReceipts, let record = receipts[owner], record.0 == operation else { return nil }
                 return record.1
             }
+        }, exportWithArchives: { [self] owner, request, cancellation in
+            precondition(!request.additionalArchives.isEmpty)
+            let response = export(owner, request)
+            locked { canceledMixedExport = cancellation.isCanceled }
+            return response
         })
     }
     func reply(_ request: AtlasSavedTrailExportRequest, failure: Bool = false) -> [String: Any] {
@@ -89,6 +100,24 @@ private final class SavedTrailExportFixture: @unchecked Sendable {
             "source_derived_sensitive": true, "redacted": false, "encrypted": false,
             "overwritten": false, "power_loss_qualified": false
         ]) { _, new in new }
+        if !request.additionalArchives.isEmpty {
+            let count = UInt64(request.additionalArchives.count)
+            out["archive_scope"] = "retained-primary-and-explicit-supplemental-archives"
+            out["additional_archives"] = request.additionalArchives.enumerated().map { index, path in
+                ["ordinal": String(index), "path": trail.base.path(Array(path.utf8), path), "opened": true,
+                 "digest": index == 0 ? String(repeating: "b", count: 64) : request.identity.digest] as [String: Any]
+            }
+            out["archive_validation"] = [
+                "routing": "verified-archive-digest", "duplicate_policy": "first-verified-handle",
+                "supplied_archives": String(count + 1), "validated_archives": String(count + 1),
+                "distinct_archives": "2", "duplicate_archives": String(count - 1), "opened_archive_paths": String(count),
+                "validation_complete": true, "validation_bytes_admitted": "4096", "validation_bytes_read": "4094",
+                "validation_read_calls": "12", "retained_directory_bytes": "512", "peak_directory_bytes": "768",
+                "max_archives": "8", "max_validation_bytes": String(l.archiveValidationBytes), "max_directory_bytes": "67108864",
+                "validation_admission": "observed-file-length-plus-one-eof-probe",
+                "validation_scope": "explicit-supplemental-archive-envelopes"
+            ] as [String: Any]
+        }
         return out
     }
 }
@@ -174,6 +203,172 @@ enum AtlasSavedTrailExportTests {
         model.close(); precondition(weakClosingGrant != nil && model.busy)
         fixture.resume.signal(); await wait { !model.busy }; await wait { weakClosingGrant == nil }
         precondition(model.closed && model.trailExportReceipt == nil && fixture.exports.count == 6)
-        print("Saved trail export identity, partial coverage, receipt recovery, cancel/close and grant-drain fixtures passed")
+        try await mixedArchiveExports()
+        print("Saved trail export identity, mixed archive admission, receipt recovery, cancel/close and grant-drain fixtures passed")
     }
+    @MainActor private static func mixedArchiveExports() async throws {
+        let fixture = SavedTrailExportFixture()
+        let model = AtlasSavedRepositoryModel(transport: fixture.saved, trails: fixture.transport)
+        model.open(path: "/saved/repository.fcbs", accessLease: nil); await wait { !model.busy }
+        model.attachTrail(path: "/saved/guide.fcbt", accessLease: nil); await wait { !model.busy }
+        let parent = AtlasSavedTrailParent(model.trailPage!)
+        // Canonically equivalent Unicode names remain separate exact paths.
+        let paths = ["/saved/e\u{301}.fcbs", "/saved/é.fcbs"]
+        precondition(model.canExportTrailWithArchives)
+        let request = model.exportTrail(parent, destination: "/export/mixed.json", limits: .init(),
+            accessLease: nil, additionalArchives: paths)!
+        await wait { !model.busy }
+        let receipt = model.trailExportReceipt!
+        precondition(receipt.succeeded && receipt.completeArtifact && !receipt.coverageComplete)
+        precondition(receipt.archiveValidation?.supplied == 3 && receipt.archiveValidation?.validated == 3)
+        precondition(receipt.archiveValidation?.distinct == 2 && receipt.archiveValidation?.duplicates == 1)
+        precondition(receipt.archiveValidation?.openedPaths == 2 && receipt.archiveValidation?.bytesRead == 4094)
+        precondition(parent.matches(model.trailPage!) && fixture.exports.count == 1)
+        precondition(fixture.exports[0].additionalArchives[0].utf8.elementsEqual(paths[0].utf8))
+
+        for invalidPaths in [
+            Array(repeating: "/saved/extra.fcbs", count: 8), ["relative.fcbs"], ["/saved/nul\0.fcbs"],
+            ["/saved/../extra.fcbs"], ["/" + String(repeating: "a", count: 16_384)], [request.destination]
+        ] {
+            do {
+                _ = try AtlasSavedTrailExportRequest(trail: parent, operation: 2, destination: request.destination,
+                    limits: .init(), additionalArchives: invalidPaths)
+                preconditionFailure("Invalid supplemental archive authority admitted")
+            } catch {}
+        }
+        var excessive = AtlasSavedTrailExportLimits()
+        excessive.archiveValidationBytes += 1
+        do {
+            _ = try AtlasSavedTrailExportRequest(trail: parent, operation: 2, destination: "/export/limit.json",
+                limits: excessive, additionalArchives: paths)
+            preconditionFailure("Unbounded archive validation admitted")
+        } catch {}
+        precondition(model.exportTrail(parent, destination: paths[0], limits: .init(), accessLease: nil,
+            additionalArchives: paths) == nil)
+        precondition(fixture.exports.count == 1)
+
+        func rejected(_ object: [String: Any]) {
+            do {
+                _ = try AtlasSavedTrailExportReceipt.decode(fixture.trail.base.encode(object), request: request)
+                preconditionFailure("Malformed mixed-archive receipt admitted")
+            } catch {}
+        }
+        for key in ["supplied_archives", "validated_archives", "distinct_archives", "duplicate_archives",
+                    "opened_archive_paths", "validation_bytes_read", "validation_bytes_admitted",
+                    "retained_directory_bytes", "peak_directory_bytes", "max_archives", "max_validation_bytes",
+                    "max_directory_bytes", "validation_read_calls", "routing", "duplicate_policy",
+                    "validation_admission", "validation_scope", "validation_complete"] {
+            var bad = fixture.reply(request), validation = bad["archive_validation"] as! [String: Any]
+            switch key {
+            case "supplied_archives", "validated_archives", "distinct_archives", "opened_archive_paths": validation[key] = "4"
+            case "duplicate_archives": validation[key] = "0"
+            case "validation_bytes_read": validation[key] = "4097"
+            case "validation_bytes_admitted": validation[key] = "268435457"
+            case "retained_directory_bytes": validation[key] = "769"
+            case "peak_directory_bytes": validation[key] = "67108865"
+            case "validation_read_calls": validation[key] = "01"
+            case "validation_complete": validation[key] = false
+            default: validation[key] = "wrong"
+            }
+            bad["archive_validation"] = validation; rejected(bad)
+        }
+        for kind in ["missing-validation", "missing-inventory", "inventory-count", "path", "ordinal", "digest", "unopened", "scope"] {
+            var bad = fixture.reply(request)
+            var archives = bad["additional_archives"] as! [[String: Any]]
+            switch kind {
+            case "missing-validation": bad.removeValue(forKey: "archive_validation")
+            case "missing-inventory": bad.removeValue(forKey: "additional_archives")
+            case "inventory-count": archives.removeLast(); bad["additional_archives"] = archives
+            case "path":
+                archives[0]["path"] = fixture.trail.base.path(Array(paths[1].utf8), paths[1])
+                bad["additional_archives"] = archives
+            case "ordinal": archives[0]["ordinal"] = "1"; bad["additional_archives"] = archives
+            case "digest": archives[0]["digest"] = "not-a-digest"; bad["additional_archives"] = archives
+            case "unopened": archives[0]["opened"] = false; bad["additional_archives"] = archives
+            default: bad["archive_scope"] = "retained-single-archive"
+            }
+            rejected(bad)
+        }
+        // A failed envelope may have opened and read one candidate, but cannot
+        // claim any source selection or destination effect.
+        var failed = fixture.reply(request)
+        var archives = failed["additional_archives"] as! [[String: Any]]
+        archives[0]["digest"] = NSNull()
+        archives[1]["digest"] = NSNull(); archives[1]["opened"] = false
+        failed["additional_archives"] = archives
+        var validation = failed["archive_validation"] as! [String: Any]
+        for key in ["validated_archives", "distinct_archives", "opened_archive_paths"] { validation[key] = "1" }
+        validation["duplicate_archives"] = "0"; validation["validation_complete"] = false
+        failed["archive_validation"] = validation
+        failed["status"] = "error"; failed["effect"] = "none"
+        failed["error"] = ["code": "SAVED_TRAIL_EXPORT_ARCHIVE_INVALID"]
+        failed["complete_artifact"] = false; failed["export_digest"] = NSNull()
+        for key in ["export_bytes", "export_characters", "bytes_written", "member_bytes_read", "member_read_calls"] { failed[key] = "0" }
+        var coverage = failed["coverage"] as! [String: String]
+        for key in Array(coverage.keys) where key != "total_entries" { coverage[key] = "0" }
+        failed["coverage"] = coverage
+        let failedReceipt = try AtlasSavedTrailExportReceipt.decode(fixture.trail.base.encode(failed), request: request)
+        precondition(!failedReceipt.succeeded && failedReceipt.effect == .none && failedReceipt.archiveValidation?.complete == false)
+        var falseSuccess = failed
+        falseSuccess["status"] = "ok"; falseSuccess["error"] = NSNull(); rejected(falseSuccess)
+
+        // Seven maximum-length paths require a larger bounded receipt cap;
+        // escaped display bytes must not turn a valid receipt into unknown work.
+        let longPaths = (0..<7).map { "/\(String(repeating: "\n", count: 16_370))\($0).fcbs" }
+        let largeRequest = try AtlasSavedTrailExportRequest(trail: parent, operation: 2, destination: "/export/large.json",
+            limits: .init(), additionalArchives: longPaths)
+        let largeReply = fixture.trail.base.encode(fixture.reply(largeRequest))
+        precondition(largeReply.utf8.count > 256 * 1024 && largeReply.utf8.count < 2 * 1024 * 1024)
+        _ = try AtlasSavedTrailExportReceipt.decode(largeReply, request: largeRequest)
+
+        fixture.fault("lost")
+        _ = model.exportTrail(parent, destination: "/export/mixed-lost.json", limits: .init(), accessLease: nil,
+            additionalArchives: paths)
+        await wait { !model.busy }
+        precondition(model.trailExportOutcomeKnown && fixture.exports.count == 2 && fixture.receiptReads == 1)
+
+        final class Grant {}
+        final class GrantGroup {
+            let files: [Grant]
+            init(_ files: [Grant]) { self.files = files }
+        }
+        var first: Grant? = Grant(), second: Grant? = Grant(), destination: Grant? = Grant()
+        weak var weakFirst = first, weakSecond = second, weakDestination = destination
+        var group: GrantGroup? = GrantGroup([first!, second!])
+        fixture.blockNext()
+        _ = model.exportTrail(parent, destination: "/export/mixed-canceled.json", limits: .init(), accessLease: destination,
+            additionalArchives: paths, archiveAccessLease: group)
+        first = nil; second = nil; destination = nil; group = nil
+        await wait { fixture.didEnter }
+        model.cancel()
+        precondition(model.busy && !model.canExportTrailWithArchives)
+        precondition(weakFirst != nil && weakSecond != nil && weakDestination != nil)
+        fixture.resume.signal(); await wait { !model.busy }
+        await wait { weakFirst == nil && weakSecond == nil && weakDestination == nil }
+        precondition(fixture.observedMixedCancellation && fixture.exports.count == 3)
+        precondition(model.trailExportOutcomeKnown && model.trailExportReceipt?.completeArtifact == true)
+        precondition(parent.matches(model.trailPage!))
+
+        var closing: Grant? = Grant(); weak var weakClosing = closing
+        fixture.blockNext()
+        _ = model.exportTrail(parent, destination: "/export/mixed-closed.json", limits: .init(), accessLease: nil,
+            additionalArchives: paths, archiveAccessLease: closing)
+        closing = nil; await wait { fixture.didEnter }
+        model.close(); precondition(weakClosing != nil && model.busy)
+        fixture.resume.signal(); await wait { !model.busy }; await wait { weakClosing == nil }
+        precondition(model.closed && model.trailExportReceipt == nil && fixture.exports.count == 4)
+
+        var legacy = fixture.transport
+        legacy.exportWithArchives = nil
+        let legacyModel = AtlasSavedRepositoryModel(transport: fixture.saved, trails: legacy)
+        legacyModel.open(path: "/saved/repository.fcbs", accessLease: nil); await wait { !legacyModel.busy }
+        legacyModel.attachTrail(path: "/saved/guide.fcbt", accessLease: nil); await wait { !legacyModel.busy }
+        precondition(legacyModel.canExportTrail && !legacyModel.canExportTrailWithArchives)
+        let legacyParent = AtlasSavedTrailParent(legacyModel.trailPage!)
+        precondition(legacyModel.exportTrail(legacyParent, destination: "/export/unsupported.json", limits: .init(),
+            accessLease: nil, additionalArchives: paths) == nil)
+        precondition(fixture.exports.count == 4)
+        legacyModel.close()
+    }
+
 }

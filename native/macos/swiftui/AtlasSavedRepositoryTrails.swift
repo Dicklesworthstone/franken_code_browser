@@ -206,6 +206,7 @@ struct AtlasSavedTrailTransport: Sendable {
     var writeReceipt: (@Sendable (UInt64, UInt64) -> String?)? = nil
     var export: (@Sendable (UInt64, AtlasSavedTrailExportRequest) -> String?)? = nil
     var exportReceipt: (@Sendable (UInt64, UInt64) -> String?)? = nil
+    var exportWithArchives: (@Sendable (UInt64, AtlasSavedTrailExportRequest, AtlasSearchCancellation) -> String?)? = nil
 }
 
 struct AtlasSavedTrailExportLimits: Sendable, Equatable {
@@ -214,28 +215,45 @@ struct AtlasSavedTrailExportLimits: Sendable, Equatable {
     var selectedBytes: UInt64 = 1024 * 1024
     var outputBytes: UInt64 = 16 * 1024 * 1024
     var outputScalars: UInt64 = 16 * 1024 * 1024
+    /// Supplemental envelopes are validated before any selected source reads.
+    /// The primary archive retains its already validated descriptor.
+    var archiveValidationBytes: UInt64 = 256 * 1024 * 1024
     var isValid: Bool {
         entries <= 1024 && verificationBytes <= 64 * 1024 * 1024 && selectedBytes <= 64 * 1024 * 1024 &&
-            (1...16 * 1024 * 1024).contains(outputBytes) && (1...16 * 1024 * 1024).contains(outputScalars)
+            (1...16 * 1024 * 1024).contains(outputBytes) && (1...16 * 1024 * 1024).contains(outputScalars) &&
+            archiveValidationBytes <= 256 * 1024 * 1024
     }
 }
 
 /// Frozen accepted trail identity; the save panel supplies destination access
 /// separately. Display labels never reopen an archive or a source pathname.
 struct AtlasSavedTrailExportRequest: Sendable {
+    static let maximumAdditionalArchives = 7
     let trail: AtlasSavedTrailParent
     let operation: UInt64
     let destination: String
     let limits: AtlasSavedTrailExportLimits
+    /// Only explicit native file selections authorize these paths. Trail
+    /// metadata never supplies them, and byte spelling is preserved.
+    let additionalArchives: [String]
     var identity: AtlasSavedIdentity { trail.identity }
     init(trail: AtlasSavedTrailParent, operation: UInt64, destination: String,
-         limits: AtlasSavedTrailExportLimits) throws {
+         limits: AtlasSavedTrailExportLimits, additionalArchives: [String] = []) throws {
         guard operation > 0, trail.generation > 0, AtlasSavedWire.digest(trail.digest),
-              trail.items <= 1024, AtlasSavedIndexBuildRequest.validDestination(destination), limits.isValid else {
+              trail.items <= 1024, AtlasSavedIndexBuildRequest.validDestination(destination), limits.isValid,
+              additionalArchives.count <= Self.maximumAdditionalArchives,
+              additionalArchives.allSatisfy({ AtlasSavedIndexBuildRequest.validDestination($0) &&
+                  !$0.utf8.elementsEqual(destination.utf8) }) else {
             throw AtlasSavedError.invalidInput
         }
         self.trail = trail; self.operation = operation; self.destination = destination; self.limits = limits
+        self.additionalArchives = additionalArchives
     }
+}
+
+struct AtlasSavedTrailArchiveValidation: Sendable {
+    let supplied, validated, distinct, duplicates, openedPaths, bytesRead: UInt64
+    let complete: Bool
 }
 
 struct AtlasSavedTrailExportReceipt: Sendable {
@@ -245,9 +263,13 @@ struct AtlasSavedTrailExportReceipt: Sendable {
     let succeeded, completeArtifact, coverageComplete: Bool
     let exportBytes, exportScalars, bytesWritten, verified, unavailable, omitted, selectedBytes: UInt64
     let digest, errorCode: String?
+    let archiveValidation: AtlasSavedTrailArchiveValidation?
     var message: String {
         if succeeded {
-            return "Created a source pack: \(verified) verified selections, \(unavailable) unavailable and \(omitted) omitted. \(exportBytes) UTF-8 JSON bytes; \(exportScalars) Unicode scalars. " +
+            let archives = archiveValidation.map {
+                "Validated \($0.validated) archives (\($0.distinct) distinct) before selecting sources. "
+            } ?? ""
+            return archives + "Created a source pack: \(verified) verified selections, \(unavailable) unavailable and \(omitted) omitted. \(exportBytes) UTF-8 JSON bytes; \(exportScalars) Unicode scalars. " +
                 (coverageComplete ? "Every saved selection is included." : "Coverage is partial; all admitted notes and omission reasons remain in the pack.")
         }
         let state: String
@@ -261,7 +283,8 @@ struct AtlasSavedTrailExportReceipt: Sendable {
         return "\(state) \(errorCode ?? "Unconfirmed export"). Inspect the destination before choosing a new filename."
     }
     static func decode(_ json: String?, request: AtlasSavedTrailExportRequest) throws -> Self {
-        guard let json, !json.isEmpty, json.utf8.count <= 256 * 1024 else { throw AtlasSavedError.unavailable }
+        let maximumReceiptBytes = request.additionalArchives.isEmpty ? 256 * 1024 : 2 * 1024 * 1024
+        guard let json, !json.isEmpty, json.utf8.count <= maximumReceiptBytes else { throw AtlasSavedError.unavailable }
         do {
             let data = Data(json.utf8), w = try JSONDecoder().decode(Wire.self, from: data)
             let identity = try JSONDecoder().decode(AtlasSavedIdentity.self, from: data)
@@ -271,7 +294,9 @@ struct AtlasSavedTrailExportReceipt: Sendable {
                   w.last_trail_export_attempt.value == request.operation,
                   w.trail_generation.value == request.trail.generation, w.trail_digest == request.trail.digest,
                   w.destination.bytes == Array(request.destination.utf8), w.pack_schema == "fcb.trail-source-pack/1",
-                  w.character_representation == "unicode-scalars-in-serialized-utf8-json", w.archive_scope == "retained-single-archive",
+                  w.character_representation == "unicode-scalars-in-serialized-utf8-json",
+                  w.archive_scope == (request.additionalArchives.isEmpty ? "retained-single-archive" :
+                    "retained-primary-and-explicit-supplemental-archives"),
                   b.entries.value == l.entries, b.verification_source_bytes.value == l.verificationBytes,
                   b.selected_original_bytes.value == l.selectedBytes, b.export_bytes.value == l.outputBytes,
                   b.export_characters.value == l.outputScalars,
@@ -288,6 +313,7 @@ struct AtlasSavedTrailExportReceipt: Sendable {
                   w.export_characters.value <= w.export_bytes.value, w.bytes_written.value <= w.export_bytes.value else {
                 throw AtlasSavedError.invalidResponse
             }
+            let validation = try validateArchives(w, request: request)
             let verified = c.verified_entries.value, unavailable = c.unavailable_entries.value
             let sourceOmitted = c.omitted_source_limit.value, outputOmitted = c.omitted_output_limit.value
             let tailOmitted = c.omitted_entry_limit.value
@@ -295,6 +321,11 @@ struct AtlasSavedTrailExportReceipt: Sendable {
                   verified + unavailable + sourceOmitted + outputOmitted <= c.entries_visited.value,
                   tailOmitted <= request.trail.items - c.entries_visited.value else { throw AtlasSavedError.invalidResponse }
             let built = w.export_bytes.value > 0, succeeded = w.status == "ok", error = w.error.value
+            if validation?.complete == false {
+                guard !built, !succeeded, w.effect == .none, c.entries_visited.value == 0,
+                      c.verification_bytes_admitted.value == 0, c.source_bytes_read.value == 0,
+                      w.member_read_calls.value == 0 else { throw AtlasSavedError.invalidResponse }
+            }
             if built {
                 guard let digest = w.export_digest.value, AtlasSavedWire.digest(digest),
                       w.export_characters.value > 0,
@@ -321,9 +352,61 @@ struct AtlasSavedTrailExportReceipt: Sendable {
                 succeeded: succeeded, completeArtifact: w.complete_artifact, coverageComplete: w.coverage_complete,
                 exportBytes: w.export_bytes.value, exportScalars: w.export_characters.value, bytesWritten: w.bytes_written.value,
                 verified: verified, unavailable: unavailable, omitted: sourceOmitted + outputOmitted + tailOmitted,
-                selectedBytes: c.selected_original_bytes.value, digest: w.export_digest.value, errorCode: error?.code)
+                selectedBytes: c.selected_original_bytes.value, digest: w.export_digest.value, errorCode: error?.code,
+                archiveValidation: validation)
         } catch let error as AtlasSavedError { throw error }
         catch { throw AtlasSavedError.invalidResponse }
+    }
+    private static func validateArchives(_ w: Wire, request: AtlasSavedTrailExportRequest) throws -> AtlasSavedTrailArchiveValidation? {
+        guard !request.additionalArchives.isEmpty else {
+            guard w.archive_validation == nil, w.additional_archives == nil else { throw AtlasSavedError.invalidResponse }
+            return nil
+        }
+        guard let v = w.archive_validation, let archives = w.additional_archives,
+              archives.count == request.additionalArchives.count,
+              v.routing == "verified-archive-digest", v.duplicate_policy == "first-verified-handle",
+              v.validation_admission == "observed-file-length-plus-one-eof-probe",
+              v.validation_scope == "explicit-supplemental-archive-envelopes",
+              v.max_archives.value == UInt64(AtlasSavedTrailExportRequest.maximumAdditionalArchives + 1),
+              v.max_validation_bytes.value == request.limits.archiveValidationBytes,
+              v.max_directory_bytes.value == 64 * 1024 * 1024,
+              v.validation_bytes_read.value <= v.validation_bytes_admitted.value,
+              v.validation_bytes_admitted.value <= v.max_validation_bytes.value,
+              v.retained_directory_bytes.value <= v.peak_directory_bytes.value,
+              v.peak_directory_bytes.value <= v.max_directory_bytes.value else { throw AtlasSavedError.invalidResponse }
+        var digests: Set<String> = [request.identity.digest]
+        var validated: UInt64 = 1, opened: UInt64 = 0
+        for (index, archive) in archives.enumerated() {
+            guard archive.ordinal.value == UInt64(index),
+                  archive.path.bytes == Array(request.additionalArchives[index].utf8),
+                  archive.opened || archive.digest.value == nil else { throw AtlasSavedError.invalidResponse }
+            if archive.opened { opened += 1 }
+            if let digest = archive.digest.value {
+                guard AtlasSavedWire.digest(digest) else { throw AtlasSavedError.invalidResponse }
+                validated += 1; digests.insert(digest)
+            }
+        }
+        let supplied = UInt64(archives.count + 1), distinct = UInt64(digests.count)
+        guard v.supplied_archives.value == supplied, v.validated_archives.value == validated,
+              v.distinct_archives.value == distinct, v.duplicate_archives.value == validated - distinct,
+              v.opened_archive_paths.value == opened, validated - 1 <= opened,
+              v.validation_complete == (validated == supplied) else { throw AtlasSavedError.invalidResponse }
+        return AtlasSavedTrailArchiveValidation(supplied: supplied, validated: validated, distinct: distinct,
+            duplicates: validated - distinct, openedPaths: opened, bytesRead: v.validation_bytes_read.value,
+            complete: v.validation_complete)
+    }
+    private struct AdditionalArchive: Decodable {
+        let ordinal: AtlasSavedNumber
+        let path: AtlasSavedPath
+        let opened: Bool
+        let digest: AtlasSavedSearchOptional<String>
+    }
+    private struct ArchiveValidation: Decodable {
+        let routing, duplicate_policy, validation_admission, validation_scope: String
+        let supplied_archives, validated_archives, distinct_archives, duplicate_archives: AtlasSavedNumber
+        let opened_archive_paths, validation_bytes_admitted, validation_bytes_read, validation_read_calls: AtlasSavedNumber
+        let retained_directory_bytes, peak_directory_bytes, max_archives, max_validation_bytes, max_directory_bytes: AtlasSavedNumber
+        let validation_complete: Bool
     }
     private struct Failure: Decodable { let code: String }
     private struct Budgets: Decodable {
@@ -340,6 +423,8 @@ struct AtlasSavedTrailExportReceipt: Sendable {
         let destination: AtlasSavedPath
         let budgets: Budgets
         let coverage: Coverage
+        let additional_archives: [AdditionalArchive]?
+        let archive_validation: ArchiveValidation?
         let coverage_complete, complete_artifact: Bool
         let export_bytes, export_characters, bytes_written, member_bytes_read, member_read_calls: AtlasSavedNumber
         let export_digest: AtlasSavedSearchOptional<String>

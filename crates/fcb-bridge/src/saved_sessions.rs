@@ -321,6 +321,20 @@ impl SavedSessions {
         let mut stop = || cell.validate(epoch).is_err() || canceled();
         session.export_trail(request, &mut stop).map_err(AccessError::from)
     }
+    /// Supplemental read grants belong to this one entered export. Closing or
+    /// canceling the cell still preserves a create-only terminal effect reply.
+    pub(super) fn export_trail_with_archives(&self, handle: u64, request: SavedTrailExportRequest<'_>,
+        additional_archives: &[&Path], validation_bytes: u64,
+        mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
+        let cell = self.get(handle)?;
+        let epoch = cell.epoch.load(Ordering::Acquire);
+        let mut state = lock(&cell.state)?;
+        cell.validate(epoch)?;
+        let session = state.as_mut().ok_or(AccessError::NotOpen)?;
+        let mut stop = || cell.validate(epoch).is_err() || canceled();
+        session.export_trail_with_archives(request, additional_archives, validation_bytes, &mut stop)
+            .map_err(AccessError::from)
+    }
     /// Lock saved source before destination, both nonblocking. The existing
     /// reader registry admits an empty handle BEFORE any member read occurs.
     /// Reader cancellation does not change the shared saved session's epoch.

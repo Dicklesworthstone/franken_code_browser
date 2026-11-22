@@ -177,26 +177,40 @@ fn closing_during_trail_write_keeps_its_effect_response_and_capacity_through_dra
 #[test]
 fn trail_export_cancel_and_close_keep_effect_receipts_through_writer_drain() {
     use fcb_app::host::saved_repository::trail::{SavedTrailExportRequest, SavedTrailWriteParent};
-    for closing in [false, true] {
+    for (closing, mixed) in [(false, false), (true, false), (false, true), (true, true)] {
         let fixture = fixture(); let saved = SavedSessions::new(); let handle = open(&saved, &fixture);
         attach(&saved, handle, &fixture.trail, 1).unwrap();
         let trail_bytes = fs::read(&fixture.trail).unwrap();
         let view = fcb::search::trail::TrailView::open(&trail_bytes, || false).unwrap();
         let destination = fixture.archive.with_extension(if closing { "closed-pack.json" } else { "canceled-pack.json" });
         let mut signaled = false;
-        let response = saved.export_trail(handle, SavedTrailExportRequest { operation: 1,
+        // A duplicate explicit input still receives full envelope validation.
+        // Its grant/descriptor must survive the same cancel/close writer drain.
+        let supplemental = fixture.archive.with_extension("supplemental.fcbs");
+        fs::copy(&fixture.archive, &supplemental).unwrap();
+        let request = SavedTrailExportRequest { operation: 1,
             trail: SavedTrailWriteParent { generation: 1, digest: view.digest() },
-            destination: &destination, limits: Default::default() }, || {
+            destination: &destination, limits: Default::default() };
+        let mut stop = || {
             if !signaled && destination.exists() {
                 signaled = true;
                 if closing { saved.close(handle).unwrap(); } else { saved.cancel(handle).unwrap(); }
                 return true;
             }
             false
-        }).unwrap();
+        };
+        let response = if mixed {
+            saved.export_trail_with_archives(handle, request, &[supplemental.as_path()], 256 * 1024 * 1024, &mut stop)
+        } else { saved.export_trail(handle, request, &mut stop) }.unwrap();
         assert!(signaled);
         assert!(response.as_str().contains("\"effect\":\"destination-created-incomplete\""));
         assert!(response.as_str().contains("SAVED_TRAIL_EXPORT_CANCELED"));
+        if mixed {
+            assert!(response.as_str().contains("\"validation_complete\":true"));
+            assert_eq!(number(response.as_str(), "validated_archives"), 2);
+            assert_eq!(number(response.as_str(), "distinct_archives"), 1);
+            assert_eq!(number(response.as_str(), "duplicate_archives"), 1);
+        }
         assert_eq!(number(response.as_str(), "bytes_written"), 0);
         assert_eq!(fs::metadata(&destination).unwrap().len(), 0);
         if closing {

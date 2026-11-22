@@ -967,13 +967,35 @@ representation. Saved order, repeated visits, zero-length bookmarks and rational
 remain intact. It is a source-evidence artifact, not an FCBT trail attachment or
 an archive, and its notes are never executed.
 
-Native export reads only the currently retained FCBS archive descriptor.
-Replacing its pathname or the attached trail pathname cannot substitute new
-source. Entries for another archive, missing members or changed captures keep
-their notes and explicit unavailable reasons. Source limits omit whole
-selections, with the omission recorded beside the reference. This can produce
-a complete JSON file with partial source coverage; the receipt reports those
-outcomes independently.
+The ordinary presets use the currently retained FCBS archive descriptor.
+To include visits from other repository captures, choose **Export source pack…
+→ Include other saved archives…**, pick a size preset and explicitly select
+**one to seven additional archives** in the file panel. Then choose a new export
+destination. The retained archive is always included, for at most eight inputs.
+Supplemental selections belong to that export only; they do not attach archives
+to the browsing session or change which trail entries can be opened there.
+
+Every supplemental archive is fully validated before source selection. Routing
+uses its verified archive digest, so identical paths in different captures
+cannot substitute for one another. Duplicate digests share the first verified
+handle after all supplied copies have been validated; explicit trail visits and
+their notes are still preserved separately. Replacing the current archive's
+pathname or the attached trail pathname cannot substitute new source.
+
+Supplemental envelope validation has a separate **256 MiB** aggregate limit.
+Admission counts each selected file's observed length plus one EOF probe; each
+archive retains the **80 MiB** envelope ceiling, and supplemental directories
+share **64 MiB** of managed admission. Invalid, unreadable or over-budget
+supplemental files refuse the export before creating its destination. Receipts
+include the ordered selected-path inventory, validation work and duplicate
+counts. The existing member-verification and selected-source budgets apply
+across all archives, including repeated visits.
+
+Visits referencing an archive that was not supplied, missing members or changed
+captures keep their notes and explicit unavailable reasons. Source limits omit
+whole selections, with the omission recorded beside the reference. This can
+produce a complete JSON file with partial source coverage; the receipt reports
+those outcomes independently.
 
 Each operation admits at most **1,024 visits**, **64 MiB** of whole-member
 verification and **16 MiB** each of complete encoded bytes and Unicode scalars
@@ -987,13 +1009,15 @@ Cancellation waits for the entered worker to drain, then reports the actual
 destination effect. **Reload export receipt** recovers the retained terminal
 result without reading or rewriting the destination. A missing reply never
 automatically retries a write; inspect an uncertain destination and choose a
-different new filename for another export. The destination grant remains held
-through writer completion even if the view closes.
+different new filename for another export. The destination and selected-archive
+grants remain held until the entered worker finishes, including cancellation
+or closing the view.
 
 The host, registry, public-header marshaling and native model regression sources
 cover exact bytes, unavailable visits, whole-selection limits, metadata refusal,
-retained descriptors, exclusive creation, cancellation, lost replies and grant
-retirement. Independent strict-RCH execution and physical-Mac save-panel
+retained descriptors, mixed-archive digest routing, duplicate inputs, validation
+limits, exclusive creation, cancellation, lost replies and grant retirement.
+Independent strict-RCH execution and physical-Mac save-panel
 qualification remain pending.
 
 ## Comparing retained source ranges

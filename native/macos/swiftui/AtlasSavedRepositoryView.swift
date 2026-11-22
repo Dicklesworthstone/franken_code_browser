@@ -30,6 +30,13 @@ final class AtlasSavedFileAccess {
     deinit { if accessing { url.stopAccessingSecurityScopedResource() } }
 }
 
+/// One worker lease retains every explicitly selected supplemental archive
+/// grant until the foreign export call drains, including cancellation/close.
+private final class AtlasSavedTrailArchiveAccess {
+    let files: [AtlasSavedFileAccess]
+    init(_ files: [AtlasSavedFileAccess]) { self.files = files }
+}
+
 /// A selected FCBS archive is a complete independent browsing entry point. The
 /// list owns only bounded metadata pages; source reads happen through verified
 /// empty-reader handoffs on the worker, never through displayed member names.
@@ -345,6 +352,12 @@ final class AtlasSavedFileAccess {
                     Button("Up to 64 KiB of selected source…") { exportTrail(selectedBytes: 64 * 1024) }
                     Button("Up to 1 MiB of selected source…") { exportTrail(selectedBytes: 1024 * 1024) }
                     Button("Up to 4 MiB of selected source…") { exportTrail(selectedBytes: 4 * 1024 * 1024) }
+                    Divider()
+                    Menu("Include other saved archives…") {
+                        Button("Up to 64 KiB of selected source…") { exportTrail(selectedBytes: 64 * 1024, includeArchives: true) }
+                        Button("Up to 1 MiB of selected source…") { exportTrail(selectedBytes: 1024 * 1024, includeArchives: true) }
+                        Button("Up to 4 MiB of selected source…") { exportTrail(selectedBytes: 4 * 1024 * 1024, includeArchives: true) }
+                    }.disabled(!model.canExportTrailWithArchives)
                 }.disabled(!model.canExportTrail || readerTask != nil)
                 Button("Open reading trail…", action: chooseTrail).disabled(!model.canOpenTrail || readerTask != nil)
                 Button("Reload state", action: model.reloadTrail).disabled(!model.canOperate || readerTask != nil)
@@ -369,6 +382,10 @@ final class AtlasSavedFileAccess {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Source-pack destination: \(String(reflecting: request.destination))")
                         .font(.caption).lineLimit(2).textSelection(.enabled)
+                    if !request.additionalArchives.isEmpty {
+                        Text("Sources: opened archive and \(request.additionalArchives.count) explicitly selected saved archives.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     Text(verbatim: model.trailExportNotice).font(.caption)
                         .foregroundStyle(model.trailExportOutcomeKnown ? Color.secondary : Color.orange).textSelection(.enabled)
                     if let digest = model.trailExportReceipt?.digest {
@@ -1228,25 +1245,57 @@ final class AtlasSavedFileAccess {
         }
         panelNotice = ""; model.open(path: path, accessLease: access)
     }
-    private func exportTrail(selectedBytes: UInt64) {
-        guard model.canExportTrail, readerTask == nil, let page = model.trailPage else { return }
+    private func exportTrail(selectedBytes: UInt64, includeArchives: Bool = false) {
+        guard model.canExportTrail, !includeArchives || model.canExportTrailWithArchives,
+              readerTask == nil, let page = model.trailPage else { return }
         let parent = AtlasSavedTrailParent(page)
         let limits = AtlasSavedTrailExportLimits(selectedBytes: selectedBytes)
+        var additionalArchives: [String] = []
+        var archiveAccess: AtlasSavedTrailArchiveAccess?
+        if includeArchives {
+            let sources = NSOpenPanel()
+            sources.title = "Include saved archives in this source pack"
+            sources.prompt = "Include archives"
+            sources.message = "The currently opened archive is already included. Select up to seven other saved FCB archives for this export. Sources are matched by their saved content identity. Missing selections retain their notes and reasons."
+            sources.canChooseFiles = true; sources.canChooseDirectories = false; sources.allowsMultipleSelection = true
+            guard sources.runModal() == .OK else { return }
+            guard (1...AtlasSavedTrailExportRequest.maximumAdditionalArchives).contains(sources.urls.count) else {
+                panelNotice = "Choose between one and seven additional saved archives. No export was started."; return
+            }
+            let files = sources.urls.map { AtlasSavedFileAccess(selectedURL: $0) }
+            additionalArchives = files.compactMap(\.nativePath)
+            guard additionalArchives.count == files.count,
+                  additionalArchives.allSatisfy(AtlasSavedIndexBuildRequest.validDestination) else {
+                panelNotice = "A selected archive filename cannot be represented exactly by the native export interface."; return
+            }
+            archiveAccess = AtlasSavedTrailArchiveAccess(files)
+            guard model.canExportTrailWithArchives, readerTask == nil,
+                  let current = model.trailPage, parent.matches(current) else {
+                panelNotice = "The archive or trail changed while choosing source archives. Review the current trail and choose Export again."; return
+            }
+        }
         let panel = NSSavePanel()
         panel.title = "Export a new trail source pack"
-        panel.message = "Exports ordered notes, paths and up to \(selectedBytes) original source bytes from this opened archive as JSON. Other-archive or unavailable selections retain their notes and reasons. Source and notes may contain secrets; nothing is redacted or encrypted. Choose a new filename; existing files are never overwritten."
+        let sources = additionalArchives.isEmpty
+            ? "this opened archive"
+            : "this opened archive and \(additionalArchives.count) selected saved archives"
+        let validation = additionalArchives.isEmpty ? "" :
+            " The selected archives are fully validated before export, within a 256 MiB total archive-read limit."
+        panel.message = "Exports ordered notes, paths and up to \(selectedBytes) original source bytes from \(sources) as JSON. Unavailable selections retain their notes and reasons.\(validation) Source and notes may contain secrets; nothing is redacted or encrypted. Choose a new filename; existing files are never overwritten."
         panel.nameFieldStringValue = "ReadingTrail.source-pack.json"
         panel.canCreateDirectories = true
         guard panel.runModal() == .OK, let url = panel.url else { return }
         let access = AtlasSavedFileAccess(selectedURL: url)
-        guard model.canExportTrail, readerTask == nil, let current = model.trailPage, parent.matches(current) else {
+        guard model.canExportTrail, !includeArchives || model.canExportTrailWithArchives,
+              readerTask == nil, let current = model.trailPage, parent.matches(current) else {
             panelNotice = "The archive or trail changed while choosing a destination. Review the current trail and choose Export again."; return
         }
         guard let path = access.nativePath else {
             panelNotice = "The destination cannot be represented exactly by the native export interface."; return
         }
         panelNotice = ""
-        _ = model.exportTrail(parent, destination: path, limits: limits, accessLease: access)
+        _ = model.exportTrail(parent, destination: path, limits: limits, accessLease: access,
+            additionalArchives: additionalArchives, archiveAccessLease: archiveAccess)
     }
     private func chooseTrail() {
         guard model.canOpenTrail, readerTask == nil, let identity = model.info?.identity else { return }

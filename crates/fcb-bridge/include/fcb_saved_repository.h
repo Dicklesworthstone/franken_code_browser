@@ -147,6 +147,38 @@ char *fcb_saved_trail_export_cancelable(uint64_t handle, uint64_t operation,
     uint64_t entries, uint64_t verification_bytes, uint64_t selected_bytes,
     uint64_t output_bytes, uint64_t output_scalars,
     int32_t (*poll)(void *), void *context);
+/* Add up to seven explicitly selected supplemental FCBS archives to the
+ * retained primary. archive_paths is a borrowed array of archive_count borrowed
+ * NUL-terminated UTF-8 absolute paths, each 1..16384 bytes. Count zero permits a
+ * null array and uses the compatible single-archive receipt. Keep every input
+ * read grant plus the output write grant until entered work drains.
+ *
+ * validation_bytes <=268435456 (recommended default 268435456) is separate from
+ * member verification/selection budgets. Every supplied path, including copies
+ * of the primary or another supplemental file, pays its observed length plus
+ * one EOF probe before validation. A shared 67108864-byte directory allowance
+ * is backed by the host budget. Fully verified digests route visits; the first
+ * verified handle wins a duplicate digest and the retained primary wins its
+ * digest. Missing digests remain explicit unavailable selections.
+ *
+ * No source member reads or output creation occur until all supplied envelopes
+ * validate. Mixed receipts carry ordered additional_archives path/opened/digest
+ * records and archive_validation counters, including partial failed-validation
+ * work. validation_complete is separate from source coverage and artifact
+ * completeness. archive_path_reopened:false refers to the retained primary;
+ * opened_archive_paths counts explicitly selected supplemental inputs.
+ *
+ * Cancellation/close, create-only effects and receipt recovery follow the
+ * original export contract above. Recovery never reopens supplemental files.
+ * Optional callback/context must remain callable until return, must not block,
+ * unwind or reenter this handle, and returns nonzero to cancel.
+ */
+char *fcb_saved_trail_export_with_archives_cancelable(uint64_t handle, uint64_t operation,
+    uint64_t generation, const char *digest, const char *destination,
+    uint64_t entries, uint64_t verification_bytes, uint64_t selected_bytes,
+    uint64_t output_bytes, uint64_t output_scalars,
+    const char *const *archive_paths, uint64_t archive_count, uint64_t validation_bytes,
+    int32_t (*poll)(void *), void *context);
 char *fcb_saved_trail_export_receipt(uint64_t handle, uint64_t operation);
 
 /* Quick Open searches the already validated archive directory with the shared
