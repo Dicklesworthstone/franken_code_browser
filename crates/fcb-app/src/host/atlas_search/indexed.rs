@@ -136,6 +136,7 @@ pub(super) struct IndexQueryUsage {
     generation: u64,
     manifest: u64,
     capture_scope: IndexCaptureScope,
+    result_offset: u64,
     skipped: usize,
     verified: usize,
     fallback: usize,
@@ -145,6 +146,18 @@ pub(super) struct IndexQueryUsage {
 }
 impl IndexQueryUsage {
     pub(super) fn capture_unavailable(&self) -> usize { self.capture_unavailable }
+    pub(super) fn encode_window(&self, out: &mut Output, matches: u64, retained: usize)
+        -> Result<(), AtlasSearchError> {
+        let end = self.result_offset.checked_add(retained as u64);
+        let more = end.is_some_and(|end| matches > end);
+        out.literal(",\"result_offset\":")?; out.integer(self.result_offset)?;
+        out.literal(",\"skipped_matches\":")?; out.integer(matches.min(self.result_offset))?;
+        out.literal(",\"has_more_matches\":")?; out.boolean(more)?;
+        out.literal(",\"next_match_offset\":")?;
+        if more && retained != 0 { out.integer(end.ok_or(AtlasSearchError::IdentityExhausted)?)?; }
+        else { out.literal("null")?; }
+        Ok(())
+    }
     pub(super) fn record_structure_work(&mut self, verified: usize, scanned_bytes: u64) {
         self.verified = verified;
         self.scanned_bytes = scanned_bytes;
@@ -208,7 +221,7 @@ impl RetainedAtlasSearch {
         }
         let outside_capture_scope = retained.capture_scope.query_members_outside(atlas, scope, canceled)?;
         let usage = IndexQueryUsage { generation: index_generation, manifest: retained.engine.id().revision(),
-            capture_scope: retained.capture_scope.clone(), skipped: 0, verified: 0, fallback: 0,
+            capture_scope: retained.capture_scope.clone(), result_offset: 0, skipped: 0, verified: 0, fallback: 0,
             scanned_bytes: 0, eligible_captured: files.len(), capture_unavailable };
         Ok((IndexedStructureWork { generation: index_generation, files, cursor: 0, max_scan_bytes,
             scanned_bytes: 0, outside_capture_scope, capture_stop: retained.stop }, usage, diagnostics))
@@ -324,6 +337,22 @@ impl RetainedAtlasSearch {
         Ok(response)
     }
 
+    /// Admit a later result window over an explicitly retained index. No live
+    /// paths are opened or recaptured. Each attempt gets a fresh generation;
+    /// existing accepted rows remain usable until this candidate finishes.
+    pub fn begin_indexed_window_scoped(&mut self, atlas: &AtlasSession, generation: u64,
+        index_generation: u64, text: &str, scope: AtlasSearchScope, expression: bool,
+        count_all_matches: bool, result_offset: u64, max_matches: usize, max_scan_bytes: u64,
+        mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
+        let work = self.prepare_indexed_work_inner(atlas, generation, index_generation, text, scope,
+            max_matches, max_scan_bytes, expression, count_all_matches, result_offset, &mut canceled)?;
+        let command = if expression { "begin-indexed-expression" } else { "begin-indexed" };
+        let response = self.work_response(atlas, &work, command, &mut canceled)?;
+        self.validate(atlas)?; check(&mut canceled)?;
+        self.pending = Some(work);
+        Ok(response)
+    }
+
     fn prepare_indexed_counted_work(&mut self, atlas: &AtlasSession, generation: u64,
         index_generation: u64, needle: &str, scope: AtlasSearchScope, max_matches: usize,
         max_scan_bytes: u64, canceled: &mut impl FnMut() -> bool)
@@ -331,7 +360,7 @@ impl RetainedAtlasSearch {
         // The shared counted verifier honors both exact and Unicode lowercase
         // matching while preserving the selected scope and bounded row storage.
         self.prepare_indexed_work_inner(atlas, generation, index_generation, needle, scope,
-            max_matches, max_scan_bytes, false, true, canceled)
+            max_matches, max_scan_bytes, false, true, 0, canceled)
     }
 
     pub(super) fn prepare_indexed_work(&mut self, atlas: &AtlasSession, generation: u64, index_generation: u64,
@@ -339,12 +368,12 @@ impl RetainedAtlasSearch {
         count_all_matches: bool, canceled: &mut impl FnMut() -> bool)
         -> Result<SearchWork, AtlasSearchError> {
         self.prepare_indexed_work_inner(atlas, generation, index_generation, text, scope,
-            max_matches, max_scan_bytes, expression, count_all_matches, canceled)
+            max_matches, max_scan_bytes, expression, count_all_matches, 0, canceled)
     }
 
     fn prepare_indexed_work_inner(&mut self, atlas: &AtlasSession, generation: u64, index_generation: u64,
         text: &str, scope: AtlasSearchScope, max_matches: usize, max_scan_bytes: u64, expression: bool,
-        count_all_matches: bool, canceled: &mut impl FnMut() -> bool)
+        count_all_matches: bool, result_offset: u64, canceled: &mut impl FnMut() -> bool)
         -> Result<SearchWork, AtlasSearchError> {
         self.validate(atlas)?; self.attempt(generation)?; check(canceled)?;
         let scan_limit = if expression { MAX_ATLAS_EXPRESSION_SCAN_BYTES } else { MAX_ATLAS_SEARCH_SOURCE_BYTES as u64 };
@@ -413,20 +442,14 @@ impl RetainedAtlasSearch {
             case_sensitive: scope.case_sensitive(), normalization: UnicodeNormalization::Exact,
         });
         options.max_matches = max_matches; options.max_bytes_scanned = Some(max_scan_bytes);
-        let query = if count_all_matches && expression.is_none() && scope.is_all() {
-            OwnedIndexedQuery::new_counting(&retained.engine, parsed, options, &self.budget,
-                [ast_id, query_id], || canceled() || atlas.validate_active().is_err())?
-        } else if count_all_matches {
-            OwnedIndexedQuery::new_scoped_counting(&retained.engine, parsed, options,
-                |file| scope::includes_file(&scope_files, file), &self.budget,
-                [ast_id, query_id], || canceled() || atlas.validate_active().is_err())?
-        } else if expression.is_none() && scope.is_all() {
-            OwnedIndexedQuery::new(&retained.engine, parsed, options, &self.budget,
-                [ast_id, query_id], || canceled() || atlas.validate_active().is_err())?
+        let query = if expression.is_none() && scope.is_all() {
+            OwnedIndexedQuery::new_window(&retained.engine, parsed, options, result_offset,
+                count_all_matches, &self.budget, [ast_id, query_id],
+                || canceled() || atlas.validate_active().is_err())?
         } else {
-            OwnedIndexedQuery::new_scoped(&retained.engine, parsed, options,
-                |file| scope::includes_file(&scope_files, file), &self.budget,
-                [ast_id, query_id], || canceled() || atlas.validate_active().is_err())?
+            OwnedIndexedQuery::new_scoped_window(&retained.engine, parsed, options,
+                |file| scope::includes_file(&scope_files, file), result_offset, count_all_matches,
+                &self.budget, [ast_id, query_id], || canceled() || atlas.validate_active().is_err())?
         };
         let unavailable = query.report().unavailable_files().len();
         let eligible_captured = query.report().known_files() - unavailable;
@@ -445,7 +468,7 @@ impl RetainedAtlasSearch {
             truncated: false, complete: false, stop_reason: None, step_count: 0,
             last_step_files: 0, last_step_bytes: 0, last_step_calls: 0,
             index_usage: Some(IndexQueryUsage { generation: index_generation, manifest: retained.engine.id().revision(),
-                capture_scope: retained.capture_scope.clone(),
+                capture_scope: retained.capture_scope.clone(), result_offset,
                 skipped: 0, verified: 0, fallback: 0, scanned_bytes: 0,
                 eligible_captured, capture_unavailable: unavailable }), _lease: lease };
         for diagnostic in &retained.diagnostics {

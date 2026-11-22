@@ -323,3 +323,109 @@ fn scoped_counted_cursor_keeps_excluded_files_outside_count_and_budget() {
     assert_eq!(report.capture_results().total_matches_counted, 3);
     assert_eq!(report.capture_results().scanned_bytes, 18);
 }
+
+#[test]
+fn occurrence_windows_skip_without_retaining_prefix_and_match_independent_oracle() {
+    use fcb_search::{SearchMode, UnicodeNormalization};
+    let budget = budget();
+    let first = b"ana ".repeat(1200);
+    let utf16: Vec<u8> = "\u{feff}BANANA required".encode_utf16().flat_map(u16::to_be_bytes).collect();
+    let mut index = owned(&[("a.rs", &first), ("b.rs", &utf16), ("c.rs", b"banana required"),
+        ("d.rs", b"banana required blocked")], MembershipState::Closed, &[], IndexLimits::default(), &budget, 1);
+    let query = ParsedQuery::parse("ana required -blocked").unwrap();
+    let options = QueryOptions::new(generation(10)).with_max_matches(100)
+        .with_mode(SearchMode::DecodedText { case_sensitive: false, normalization: UnicodeNormalization::Exact });
+    let expected = index.with_index(&budget, allocation(5), || false, |view|
+        ReferenceScanOracle::scan_collection(view.manifest().documents(), &query, &options).unwrap()).unwrap();
+    assert_eq!(expected.matches.len(), 4);
+    let mut first_charge = None;
+    for (ordinal, offset) in [0u64, 1, 2, 3, 4, 1000, u64::MAX].into_iter().enumerate() {
+        for counted in [false, true] {
+            let id = 20 + ordinal as u64 * 4 + u64::from(counted) * 2;
+            let mut options = options.clone(); options.generation = generation(id); options.max_matches = 2;
+            let mut cursor = OwnedIndexedQuery::new_window(&index, query.clone(), options, offset, counted,
+                &budget, [allocation(id), allocation(id + 1)], || false).unwrap();
+            let charge = cursor.report().reserved_output_bytes();
+            assert_eq!(*first_charge.get_or_insert(charge), charge, "skip cannot enlarge output reservation");
+            finish(&mut cursor, &index, 1);
+            let wanted = expected.matches.iter().skip(usize::try_from(offset).unwrap_or(usize::MAX))
+                .take(2).cloned().collect::<Vec<_>>();
+            assert_eq!(cursor.report().capture_results().matches, wanted);
+            let seen = if counted { 4 } else { offset.saturating_add(3).min(4) };
+            assert_eq!(cursor.report().capture_results().total_matches_counted as u64, seen);
+            assert_eq!(cursor.report().result_offset(), offset);
+            assert_eq!(cursor.report().skipped_matches(), offset.min(seen));
+            assert_eq!(cursor.report().has_more_matches(), offset < 2);
+            assert_eq!(cursor.report().next_match_offset(), if offset < 2 { Some(offset + 2) } else { None });
+            assert_eq!(cursor.report().is_complete(), counted || offset >= 2);
+        }
+    }
+    // A full prefix materialization would retain 1200 rows and fail this exact
+    // scope/predicate oracle. The excluded first file contributes no ordinals.
+    assert_eq!(expected.matches[0].file_id, file(2));
+}
+
+#[test]
+fn late_windows_beyond_default_cap_keep_original_occurrence_ids_and_bounded_memory() {
+    let budget = budget();
+    let source = b"a".repeat(5000);
+    let index = owned(&[("one.rs", &source)], MembershipState::Closed, &[],
+        IndexLimits::default(), &budget, 1);
+    let mut cursor = OwnedIndexedQuery::new_window(&index, ParsedQuery::parse("aa").unwrap(),
+        QueryOptions::new(generation(10)).with_max_matches(3), 4095, false,
+        &budget, [allocation(10), allocation(11)], || false).unwrap();
+    finish(&mut cursor, &index, 1);
+    let report = cursor.report();
+    assert_eq!(report.capture_results().matches.len(), 3);
+    assert_eq!(report.capture_results().total_matches_counted, 4099);
+    assert_eq!(report.next_match_offset(), Some(4098));
+    for (index, hit) in report.capture_results().matches.iter().enumerate() {
+        assert_eq!(hit.original_byte_range.start().get(), 4095 + index as u64);
+        assert_eq!(hit.occurrence_id, 4096 + index as u64);
+    }
+    assert!(report.reserved_output_bytes() < 64 * 1024);
+}
+
+#[test]
+fn windows_keep_scope_coverage_work_limits_cancellation_and_instance_pins() {
+    let budget = budget();
+    let index = owned(&[("excluded.rs", b"needle needle"), ("selected.rs", b"needle needle needle")],
+        MembershipState::Closed, &[file(3)], IndexLimits::default(), &budget, 1);
+    let replacement = owned(&[("selected.rs", b"replacement")], MembershipState::Closed, &[],
+        IndexLimits::default(), &budget, 3);
+    let mut options = QueryOptions::new(generation(10)).with_max_matches(1);
+    options.max_bytes_scanned = Some(8);
+    let mut cursor = OwnedIndexedQuery::new_scoped_window(&index, ParsedQuery::parse("needle").unwrap(),
+        options, |file_id| file_id != file(1), 2, true, &budget,
+        [allocation(10), allocation(11)], || false).unwrap();
+    assert_eq!(cursor.step(&replacement, 1, generation(10), || false).err(), Some(IndexError::InvalidManifest));
+    finish(&mut cursor, &index, 1);
+    assert!(!cursor.report().is_complete());
+    assert_eq!(cursor.report().unavailable_files(), &[file(3)]);
+    assert_eq!(cursor.report().skipped_matches(), 1);
+    assert!(cursor.report().capture_results().matches.is_empty());
+    assert!(cursor.report().capture_results().scanned_bytes <= 8);
+    assert_eq!(cursor.report().next_match_offset(), None);
+    let mut cursor = OwnedIndexedQuery::new_window(&index, ParsedQuery::parse("needle").unwrap(),
+        QueryOptions::new(generation(20)).with_max_matches(1), 1, true, &budget,
+        [allocation(20), allocation(21)], || false).unwrap();
+    cursor.step(&index, 1, generation(20), || true).unwrap();
+    assert_eq!(cursor.report().state(), IndexedQueryState::Canceled);
+    assert!(!cursor.report().is_complete());
+    assert_eq!(cursor.report().skipped_matches(), 0);
+}
+
+#[test]
+fn full_window_on_file_boundary_reports_only_one_global_lookahead() {
+    let budget = budget();
+    let index = owned(&[("a.rs", b"aa"), ("b.rs", b"aaaa")], MembershipState::Closed,
+        &[], IndexLimits::default(), &budget, 1);
+    let mut cursor = OwnedIndexedQuery::new_window(&index, ParsedQuery::parse("a").unwrap(),
+        QueryOptions::new(generation(10)).with_max_matches(1), 1, false,
+        &budget, [allocation(10), allocation(11)], || false).unwrap();
+    finish(&mut cursor, &index, 1);
+    assert_eq!(cursor.report().capture_results().total_matches_counted, 3);
+    assert_eq!(cursor.report().capture_results().matches.len(), 1);
+    assert_eq!(cursor.report().next_match_offset(), Some(2));
+    assert!(!cursor.report().is_complete());
+}

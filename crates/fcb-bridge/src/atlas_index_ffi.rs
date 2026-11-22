@@ -237,6 +237,43 @@ unsafe fn submit_matching(handle: u64, generation: u64, index_generation: u64, n
         atlases.execute_index(handle, command, || false)
     }))
 }
+/// Admit an occurrence window over the same retained captures. Flags are 0/1;
+/// expression selects the existing bounded expression grammar, otherwise text
+/// is literal. Each window consumes a fresh query generation. The unchanged
+/// search_step/page/overlay/open_reader calls consume the resulting generation.
+/// # Safety
+/// text is readable through NUL or 1025 bytes, whichever is first. Scope strings
+/// obey fcb_atlas_search_path_scoped. No foreign borrow survives this call.
+/// Every non-null response is owned and must be freed once with fcb_free_string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_search_indexed_begin_window(handle: u64, generation: u64,
+    index_generation: u64, text: *const c_char, extensions: *const c_char, filenames: *const c_char,
+    path_kind: u64, path: *const c_char, case_sensitive: u64, expression: u64,
+    count_all_matches: u64, skip_matches: u64, max_matches: u64, max_scan_bytes: u64) -> *mut c_char {
+    reply(|| answer(handle, |atlases| {
+        let case_sensitive = parse_case_sensitive(case_sensitive)?;
+        let expression = parse_case_sensitive(expression)?;
+        let count_all_matches = parse_case_sensitive(count_all_matches)?;
+        let text = unsafe { bounded_window_text(text) }?;
+        let scope = unsafe { parse_path_scope(extensions, filenames, path_kind, path) }?
+            .with_case_sensitive(case_sensitive);
+        atlases.execute_index(handle, IndexCommand::BeginWindow { generation, index_generation,
+            text, scope: &scope, expression, count_all_matches, result_offset: skip_matches,
+            max_matches: number(max_matches)?, max_scan_bytes }, || false)
+    }))
+}
+
+unsafe fn bounded_window_text<'a>(pointer: *const c_char) -> Result<&'a str, AccessError> {
+    if pointer.is_null() { return Err(AccessError::InvalidArgument); }
+    for length in 0..=MAX_ATLAS_SEARCH_NEEDLE_BYTES {
+        if unsafe { *pointer.add(length) } == 0 {
+            let bytes = unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), length) };
+            return std::str::from_utf8(bytes).map_err(|_| AccessError::InvalidArgument);
+        }
+    }
+    Err(AccessError::InvalidArgument)
+}
+
 /// Clear the reusable index and obsolete paused work, not accepted hit captures
 /// or independently opened readers. Fresh search-attempt generation; worker only.
 #[unsafe(no_mangle)]

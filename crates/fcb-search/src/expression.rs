@@ -45,6 +45,33 @@ impl CaptureQueryScanner {
         Self::scan(doc, query, options, true, canceled)
     }
 
+    /// Retain only the requested occurrence window while verifying the same
+    /// complete capture. Skipped matches consume work, not output capacity.
+    /// Counts include skipped occurrences; expression predicates qualify the
+    /// whole document before any of its counts or rows become authoritative.
+    pub fn scan_document_window_with_cancel(doc: &SearchDocument<'_>, query: &ParsedQuery,
+        options: &QueryOptions, skip_matches: u64, count_all_matches: bool,
+        mut canceled: impl FnMut() -> bool) -> Result<SearchResult, QueryError> {
+        ReferenceScanOracle::scan_collection(&[], query, options)?;
+        if doc.file_id != doc.capture.request().file() { return Err(QueryError::InvalidRange); }
+        if canceled() { return Ok(SearchResult::empty(SearchCoverage::CanceledEarly)); }
+        if !ReferenceScanOracle::matches_path_filters(doc.path, &query.path_filters)
+            || !ReferenceScanOracle::matches_lang_filters(doc.path, &query.lang_filters) {
+            return Ok(SearchResult::empty(SearchCoverage::Exhaustive));
+        }
+        let predicates = if query.conjunction_terms.is_empty() && query.exclusion_terms.is_empty() {
+            None
+        } else { Some(Predicates::new(query, options)?) };
+        let bytes = doc.capture.bytes();
+        let revision = doc.capture.request().revision();
+        match options.mode {
+            SearchMode::RawBytes => crate::capture::scan_raw_window(bytes, doc.file_id, revision,
+                query.primary_needle.as_bytes(), options, count_all_matches, skip_matches, predicates, canceled),
+            SearchMode::DecodedText { .. } => crate::text::scan_text_window(bytes, doc.file_id, revision,
+                &query.primary_needle, options, count_all_matches, skip_matches, predicates, canceled),
+        }
+    }
+
     /// Additional simultaneous predicate capacity beyond the ordinary single
     /// needle scanner. Managed callers reserve this before entering a scan.
     /// The bound depends on the query, never on captured source size. It covers

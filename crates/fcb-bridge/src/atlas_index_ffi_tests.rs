@@ -125,3 +125,82 @@ fn counted_index_abi_preserves_rows_scope_cancellation_and_original_captures() {
     assert!(take(fcb_reader_copy_range(reader, 0, 6)).contains("62616e616e61"));
     assert_eq!(fcb_reader_close(reader), 1);
 }
+
+#[test]
+fn window_entrypoint_type_and_header_match() {
+    let _: unsafe extern "C" fn(u64, u64, u64, *const c_char, *const c_char, *const c_char,
+        u64, *const c_char, u64, u64, u64, u64, u64, u64) -> *mut c_char
+        = fcb_atlas_search_indexed_begin_window;
+    assert_eq!(include_str!("../include/fcb_atlas_index.h")
+        .matches("fcb_atlas_search_indexed_begin_window(").count(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn indexed_window_abi_reuses_captures_and_preserves_results_on_rejection_and_cancel() {
+    use crate::atlas_ffi::{fcb_atlas_create, fcb_atlas_open, fcb_atlas_close, fcb_atlas_cancel};
+    use crate::atlas_search_ffi::{fcb_atlas_search_step, fcb_atlas_search_page, fcb_atlas_search_open_reader};
+    use crate::reader_ffi::{fcb_reader_create, fcb_reader_copy_range, fcb_reader_close, FFI_TEST_LOCK};
+    use std::fs;
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let root = std::env::temp_dir().join(format!("fcb-index-window-ffi-{}-{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("a.rs"), b"banana required").unwrap();
+    fs::write(root.join("b.rs"), b"banana banana required").unwrap();
+    let root_c = CString::new(root.to_str().unwrap()).unwrap();
+    let needle = CString::new("ana").unwrap();
+    let atlas = fcb_atlas_create(); assert_ne!(atlas, 0);
+    assert!(take(unsafe { fcb_atlas_open(atlas, root_c.as_ptr(), 100) }).contains("\"status\":\"ok\""));
+    assert!(take(fcb_atlas_index_prepare(atlas, 1, 100, 1024, 4096, 65536))
+        .contains("\"capture_complete\":true"));
+    fs::write(root.join("a.rs"), b"replacement").unwrap();
+    fs::write(root.join("b.rs"), b"replacement").unwrap();
+    let null = std::ptr::null();
+    let begin = take(unsafe { fcb_atlas_search_indexed_begin_window(atlas, 2, 1, needle.as_ptr(),
+        null, null, 0, null, 1, 0, 1, 3, 2, 4096) });
+    assert!(begin.contains("\"result_offset\":\"3\""), "{begin}");
+    assert!(begin.contains("\"verification_source_bytes\":\"0\""));
+    take(fcb_atlas_search_step(atlas, 2));
+    let terminal = take(fcb_atlas_search_step(atlas, 2));
+    for expected in ["\"matches_seen\":\"6\"", "\"retained_hits\":\"2\"",
+        "\"skipped_matches\":\"3\"", "\"has_more_matches\":true", "\"next_match_offset\":\"5\"",
+        "\"search_complete\":true", "\"source_bytes_read\":\"0\"", "\"read_calls\":\"0\""] {
+        assert!(terminal.contains(expected), "missing {expected}: {terminal}");
+    }
+    for (case, expression, counted) in [(2, 0, 1), (1, 2, 1), (1, 0, 2)] {
+        let response = take(unsafe { fcb_atlas_search_indexed_begin_window(atlas, 3, 1,
+            needle.as_ptr(), null, null, 0, null, case, expression, counted, 5, 2, 4096) });
+        assert!(response.contains("INVALID_ARGUMENT"), "{response}");
+    }
+    let too_long = [b'x' as c_char; 1025];
+    let malformed = [0xffu8, 0];
+    for pointer in [null, too_long.as_ptr(), malformed.as_ptr().cast()] {
+        let response = take(unsafe { fcb_atlas_search_indexed_begin_window(atlas, 3, 1,
+            pointer, null, null, 0, null, 1, 0, 1, 5, 2, 4096) });
+        assert!(response.contains("INVALID_ARGUMENT"), "{response}");
+    }
+    assert!(take(fcb_atlas_search_page(atlas, 2, 0, 64)).contains("\"result_offset\":\"3\""));
+    let reader = fcb_reader_create(); assert_ne!(reader, 0);
+    assert!(take(fcb_atlas_search_open_reader(atlas, reader, 2, 1)).contains("\"status\":\"ok\""));
+    let expression = CString::new("ANA required -blocked").unwrap();
+    let path = CString::new("b.rs").unwrap();
+    let begin = take(unsafe { fcb_atlas_search_indexed_begin_window(atlas, 3, 1, expression.as_ptr(),
+        null, null, 2, path.as_ptr(), 0, 1, 0, 2, 2, 4096) });
+    assert!(begin.contains("\"command\":\"begin-indexed-expression\""), "{begin}");
+    let final_window = take(fcb_atlas_search_step(atlas, 3));
+    for expected in ["\"matches_seen\":\"4\"", "\"retained_hits\":\"2\"",
+        "\"result_offset\":\"2\"", "\"has_more_matches\":false", "\"next_match_offset\":null",
+        "\"search_complete\":true", "\"truncated\":true"] {
+        assert!(final_window.contains(expected), "missing {expected}: {final_window}");
+    }
+    take(unsafe { fcb_atlas_search_indexed_begin_window(atlas, 4, 1, needle.as_ptr(),
+        null, null, 0, null, 1, 0, 1, 0, 2, 4096) });
+    take(fcb_atlas_search_step(atlas, 4));
+    assert_eq!(fcb_atlas_cancel(atlas), 1);
+    assert!(take(fcb_atlas_search_step(atlas, 4)).contains("\"status\":\"error\""));
+    assert!(take(fcb_atlas_search_page(atlas, 3, 0, 64)).contains("\"result_offset\":\"2\""));
+    assert_eq!(fcb_atlas_close(atlas), 1);
+    assert!(take(fcb_reader_copy_range(reader, 3, 6)).contains("616e61"));
+    assert_eq!(fcb_reader_close(reader), 1);
+}

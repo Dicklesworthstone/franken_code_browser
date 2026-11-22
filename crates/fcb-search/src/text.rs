@@ -25,7 +25,7 @@ pub(crate) fn scan_text_chunks<'a>(
     options: &QueryOptions,
     canceled: impl FnMut() -> bool,
 ) -> Result<SearchResult, QueryError> {
-    scan_text_chunks_inner(chunks, total_bytes, file_id, revision, query, options, false, None, canceled)
+    scan_text_chunks_inner(chunks, total_bytes, file_id, revision, query, options, false, 0, None, canceled)
 }
 
 pub(crate) fn scan_text_chunks_counting<'a>(
@@ -37,7 +37,7 @@ pub(crate) fn scan_text_chunks_counting<'a>(
     options: &QueryOptions,
     canceled: impl FnMut() -> bool,
 ) -> Result<SearchResult, QueryError> {
-    scan_text_chunks_inner(chunks, total_bytes, file_id, revision, query, options, true, None, canceled)
+    scan_text_chunks_inner(chunks, total_bytes, file_id, revision, query, options, true, 0, None, canceled)
 }
 
 pub(crate) fn scan_text_expression<'query>(
@@ -46,13 +46,23 @@ pub(crate) fn scan_text_expression<'query>(
     canceled: impl FnMut() -> bool,
 ) -> Result<SearchResult, QueryError> {
     scan_text_chunks_inner(std::iter::once(Ok(bytes)), bytes.len() as u64,
-        file_id, revision, query, options, count_all_matches, Some(predicates), canceled)
+        file_id, revision, query, options, count_all_matches, 0, Some(predicates), canceled)
+}
+
+pub(crate) fn scan_text_window<'query>(
+    bytes: &[u8], file_id: FileId, revision: SourceRevision, query: &'query str,
+    options: &'query QueryOptions, count_all_matches: bool, skip_matches: u64,
+    predicates: Option<Predicates<'query>>, canceled: impl FnMut() -> bool,
+) -> Result<SearchResult, QueryError> {
+    scan_text_chunks_inner(std::iter::once(Ok(bytes)), bytes.len() as u64,
+        file_id, revision, query, options, count_all_matches, skip_matches, predicates, canceled)
 }
 
 fn scan_text_chunks_inner<'a, 'query>(
     chunks: impl IntoIterator<Item = Result<&'a [u8], QueryError>>,
     total_bytes: u64, file_id: FileId, revision: SourceRevision, query: &'query str,
-    options: &'query QueryOptions, count_all_matches: bool, predicates: Option<Predicates<'query>>,
+    options: &'query QueryOptions, count_all_matches: bool, skip_matches: u64,
+    predicates: Option<Predicates<'query>>,
     mut canceled: impl FnMut() -> bool,
 ) -> Result<SearchResult, QueryError> {
     let mut scan = TextScan {
@@ -61,6 +71,7 @@ fn scan_text_chunks_inner<'a, 'query>(
         query,
         options,
         count_all_matches,
+        skip_matches,
         predicates,
         primary_limited: false,
         file_id,
@@ -140,6 +151,7 @@ struct TextScan<'a> {
     query: &'a str,
     options: &'a QueryOptions,
     count_all_matches: bool,
+    skip_matches: u64,
     predicates: Option<Predicates<'a>>,
     primary_limited: bool,
     file_id: FileId,
@@ -241,6 +253,7 @@ impl TextScan<'_> {
                     }
                     self.result.total_matches_counted = self.result.total_matches_counted
                         .checked_add(1).ok_or(QueryError::LimitExceeded)?;
+                    if self.result.total_matches_counted as u64 <= self.skip_matches { continue; }
                     if self.result.matches.len() == self.options.max_matches {
                         if self.count_all_matches { continue; }
                         if self.predicates.is_some() {
@@ -306,6 +319,7 @@ impl TextScan<'_> {
                 }
                 self.result.total_matches_counted = self.result.total_matches_counted
                     .checked_add(1).ok_or(QueryError::LimitExceeded)?;
+                if self.result.total_matches_counted as u64 <= self.skip_matches { continue; }
                 if self.result.matches.len() == self.options.max_matches {
                     if self.count_all_matches { continue; }
                     if self.predicates.is_some() {

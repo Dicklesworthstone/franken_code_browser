@@ -196,3 +196,95 @@ fn cancellation_stale_steps_and_lowercase_counting_preserve_capture_identity() {
     counted(&lowercase, 6, 0, true);
     assert_eq!(lowercase.get("retained_source_bytes").number(), 0);
 }
+
+fn window(page: &Json, offset: u64, skipped: u64, more: bool, next: Option<u64>) {
+    assert_eq!(page.get("result_offset").number(), offset);
+    assert_eq!(page.get("skipped_matches").number(), skipped);
+    assert_eq!(page.get("has_more_matches").flag(), more);
+    if let Some(next) = next { assert_eq!(page.get("next_match_offset").number(), next); }
+    else { assert!(matches!(page.get("next_match_offset"), Json::Null)); }
+    assert_eq!(page.get("source_bytes_read").number(), 0);
+    assert_eq!(page.get("read_calls").number(), 0);
+}
+
+#[test]
+fn later_indexed_windows_reach_matches_beyond_one_thousand_without_recapturing() {
+    let original = b"ana ".repeat(1003);
+    let (fixture, atlas, mut search) = setup(&[("a.rs", &original)]);
+    search.begin_indexed_counted(&atlas, 2, 1, "ana", 1000, 65536, || false).unwrap();
+    let first = finish(&mut search, &atlas, 2);
+    counted(&first, 1003, 1000, true); window(&first, 0, 0, true, Some(1000));
+    let old_hit = search.hit(&atlas, 2, 1).unwrap();
+    fs::write(fixture.0.join("a.rs"), b"changed live source with no original matches").unwrap();
+    let begin = search.begin_indexed_window_scoped(&atlas, 3, 1, "ana", AtlasSearchScope::all(),
+        false, false, 1000, 1000, 65536, || false).unwrap();
+    let begin = decoded(begin.as_str());
+    window(&begin, 1000, 0, false, None);
+    assert_eq!(search.hit(&atlas, 2, 1).unwrap(), old_hit);
+    let page = finish(&mut search, &atlas, 3);
+    window(&page, 1000, 1000, false, None);
+    assert!(!page.get("count_all_matches").flag());
+    assert_eq!(page.get("matches_seen").number(), 1003);
+    assert_eq!(page.get("retained_hits").number(), 3);
+    assert!(page.get("search_complete").flag());
+    assert!(page.get("truncated").flag()); // Earlier windows are omitted rows.
+    let later = search.hit(&atlas, 3, 1).unwrap();
+    assert_eq!((later.original_range.start().get(), later.original_range.end().get()), (4000, 4003));
+    assert_ne!(later.original_range, old_hit.original_range);
+    assert_eq!(search.hit(&atlas, 2, 1).err(), Some(AtlasSearchError::StaleQuery));
+    let (reader, _) = search.open_reader(&atlas, owner(33903), 3, 1, || false).unwrap();
+    assert_eq!(reader.capture().bytes(), original);
+    search.begin_indexed_window_scoped(&atlas, 4, 1, "ana", AtlasSearchScope::all(),
+        false, true, 0, 1000, 65536, || false).unwrap();
+    counted(&finish(&mut search, &atlas, 4), 1003, 1000, true);
+    assert_eq!(search.hit(&atlas, 4, 1).unwrap().original_range, old_hit.original_range);
+    assert_eq!(reader.capture().bytes(), original);
+}
+
+#[test]
+fn expression_windows_preserve_scoped_predicates_utf16_spelling_and_exact_sources() {
+    let utf16: Vec<u8> = "\u{feff}BANANA BANANA required".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let (_fixture, atlas, mut search) = setup(&[("src/a.rs", b"banana required"),
+        ("src/b.rs", &utf16), ("src/c.rs", b"banana required blocked"),
+        ("elsewhere.rs", b"banana required")]);
+    let scope = AtlasSearchScope::all().with_path(AtlasSearchPathKind::Directory, "src").unwrap()
+        .with_case_sensitive(false);
+    let begin = search.begin_indexed_window_scoped(&atlas, 2, 1, "ana required -blocked lang:rust",
+        scope, true, true, 3, 2, 65536, || false).unwrap();
+    assert_eq!(decoded(begin.as_str()).get("command").text(), "begin-indexed-expression");
+    let page = finish(&mut search, &atlas, 2);
+    counted(&page, 6, 2, true); window(&page, 3, 3, true, Some(5));
+    assert_eq!(page.get("eligible_files").number(), 3);
+    assert_eq!(page.get("hits").array()[0].get("matched_text").text(), "ANA");
+    let hit = search.hit(&atlas, 2, 1).unwrap();
+    assert_eq!((hit.original_range.start().get(), hit.original_range.end().get()), (8, 14));
+    let (reader, _) = search.open_reader(&atlas, owner(33904), 2, 1, || false).unwrap();
+    assert_eq!(reader.capture().bytes(), utf16);
+}
+
+#[test]
+fn window_cancellation_stale_index_and_exhausted_work_preserve_truthful_results() {
+    let (_fixture, atlas, mut search) = setup(&[("a.rs", b"banana"), ("b.rs", b"banana banana")]);
+    search.begin_indexed_window_scoped(&atlas, 2, 1, "ana", AtlasSearchScope::all(),
+        false, true, 2, 2, 65536, || false).unwrap();
+    let accepted = finish(&mut search, &atlas, 2);
+    window(&accepted, 2, 2, true, Some(4));
+    let old = search.hit(&atlas, 2, 1).unwrap();
+    search.begin_indexed_window_scoped(&atlas, 3, 1, "ana", AtlasSearchScope::all(),
+        false, true, 4, 2, 65536, || false).unwrap();
+    assert_eq!(search.step(&atlas, 3, || true).err(), Some(AtlasSearchError::Canceled));
+    assert_eq!(search.hit(&atlas, 2, 1).unwrap(), old);
+    assert_eq!(search.begin_indexed_window_scoped(&atlas, 4, 99, "ana", AtlasSearchScope::all(),
+        false, true, 4, 2, 65536, || false).err(), Some(AtlasSearchError::StaleIndex));
+    assert_eq!(search.hit(&atlas, 2, 1).unwrap(), old);
+    search.begin_indexed_window_scoped(&atlas, 5, 1, "ana", AtlasSearchScope::all(),
+        false, true, 4, 2, 6, || false).unwrap();
+    let limited = finish(&mut search, &atlas, 5);
+    counted(&limited, 2, 0, false); window(&limited, 4, 2, false, None);
+    assert_eq!(limited.get("stop_reason").text(), "verification-byte-limit");
+    search.begin_indexed_window_scoped(&atlas, 6, 1, "ana", AtlasSearchScope::all(),
+        false, true, u64::MAX, 2, 65536, || false).unwrap();
+    let beyond = finish(&mut search, &atlas, 6);
+    counted(&beyond, 6, 0, true); window(&beyond, u64::MAX, 6, false, None);
+    assert!(beyond.get("hits").array().is_empty());
+}

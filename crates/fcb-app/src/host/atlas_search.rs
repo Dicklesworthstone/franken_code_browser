@@ -488,7 +488,10 @@ fn summary(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot) -> Resul
     out.quoted(if snapshot.structure.is_some() && snapshot.index_usage.is_some() { "retained-capture-structure" }
         else if snapshot.structure.is_some() { "live-structure-scan" }
         else if snapshot.index_usage.is_some() { "retained-ephemeral-index" } else { "live-capture-scan" })?;
-    if let Some(usage) = &snapshot.index_usage { usage.encode(out)?; }
+    if let Some(usage) = &snapshot.index_usage {
+        usage.encode(out)?;
+        if snapshot.structure.is_none() { usage.encode_window(out, snapshot.matches_seen, snapshot.hits.len())?; }
+    }
     if let Some(expression) = &snapshot.expression { expression.encode(out, &snapshot.needle)?; }
     else if let Some(structure) = &snapshot.structure { structure.encode(out)?; }
     else {

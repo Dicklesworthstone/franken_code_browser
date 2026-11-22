@@ -27,6 +27,9 @@ pub(crate) enum IndexCommand<'a> {
         scope: &'a AtlasSearchScope, max_matches: usize, max_scan_bytes: u64 },
     BeginCountedExpression { generation: u64, index_generation: u64, expression: &'a str,
         scope: &'a AtlasSearchScope, max_matches: usize, max_scan_bytes: u64 },
+    BeginWindow { generation: u64, index_generation: u64, text: &'a str,
+        scope: &'a AtlasSearchScope, expression: bool, count_all_matches: bool,
+        result_offset: u64, max_matches: usize, max_scan_bytes: u64 },
     BeginStructure { generation: u64, index_generation: u64, needle: &'a str,
         scope: &'a AtlasSearchScope, options: AtlasIndexedStructureOptions },
     Clear { generation: u64 },
@@ -71,6 +74,11 @@ impl AtlasSessions {
             IndexCommand::BeginCountedExpression { generation, index_generation, expression, scope, max_matches, max_scan_bytes } =>
                 session.search.begin_indexed_expression_counted_scoped(&session.atlas, generation, index_generation,
                     expression, scope.clone(), max_matches, max_scan_bytes, &mut stop),
+            IndexCommand::BeginWindow { generation, index_generation, text, scope, expression,
+                count_all_matches, result_offset, max_matches, max_scan_bytes } =>
+                session.search.begin_indexed_window_scoped(&session.atlas, generation, index_generation,
+                    text, scope.clone(), expression, count_all_matches, result_offset,
+                    max_matches, max_scan_bytes, &mut stop),
             IndexCommand::BeginStructure { generation, index_generation, needle, scope, options } =>
                 session.search.begin_indexed_structure(&session.atlas, generation, index_generation,
                     needle, scope.clone(), options, &mut stop),

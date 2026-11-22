@@ -27,6 +27,7 @@ pub enum IndexedQueryState { Running, Finished, Canceled, Failed }
 pub struct IndexedSearchReport<'source> {
     manifest: SearchManifestId,
     generation: QueryGeneration,
+    result_offset: u64,
     membership: MembershipState,
     unavailable: Cow<'source, [FileId]>,
     known_files: usize,
@@ -43,6 +44,19 @@ pub struct IndexedSearchReport<'source> {
 impl IndexedSearchReport<'_> {
     pub const fn manifest(&self) -> SearchManifestId { self.manifest }
     pub const fn generation(&self) -> QueryGeneration { self.generation }
+    /// Requested zero-based occurrence ordinal; independent of row retention.
+    pub const fn result_offset(&self) -> u64 { self.result_offset }
+    pub fn skipped_matches(&self) -> u64 {
+        self.result_offset.min(self.results.total_matches_counted as u64)
+    }
+    pub fn has_more_matches(&self) -> bool {
+        (self.results.total_matches_counted as u64)
+            > self.result_offset.saturating_add(self.results.matches.len() as u64)
+    }
+    pub fn next_match_offset(&self) -> Option<u64> {
+        if !self.has_more_matches() || self.results.matches.is_empty() { return None; }
+        self.result_offset.checked_add(self.results.matches.len() as u64)
+    }
     pub const fn membership(&self) -> MembershipState { self.membership }
     pub fn unavailable_files(&self) -> &[FileId] { &self.unavailable }
     pub const fn known_files(&self) -> usize { self.known_files }
@@ -109,18 +123,18 @@ impl<'source> Execution<'source> {
         unavailable: Cow<'source, [FileId]>, selected_documents: Option<Vec<usize>>, budget: &ResourceBudget,
         allocation: ResourceAllocationId, canceled: impl FnMut() -> bool)
         -> Result<Self, IndexError> {
-        Self::new_inner(index, query, options, unavailable, selected_documents, false, budget, allocation, canceled)
+        Self::new_inner(index, query, options, unavailable, selected_documents, false, 0, budget, allocation, canceled)
     }
 
     fn new_counting(index: &impl QuerySource, query: &ParsedQuery, options: QueryOptions,
         unavailable: Cow<'source, [FileId]>, selected_documents: Option<Vec<usize>>, budget: &ResourceBudget,
         allocation: ResourceAllocationId, canceled: impl FnMut() -> bool)
         -> Result<Self, IndexError> {
-        Self::new_inner(index, query, options, unavailable, selected_documents, true, budget, allocation, canceled)
+        Self::new_inner(index, query, options, unavailable, selected_documents, true, 0, budget, allocation, canceled)
     }
 
     fn new_inner(index: &impl QuerySource, query: &ParsedQuery, options: QueryOptions,
-        unavailable: Cow<'source, [FileId]>, selected_documents: Option<Vec<usize>>, count_all_matches: bool,
+        unavailable: Cow<'source, [FileId]>, selected_documents: Option<Vec<usize>>, count_all_matches: bool, result_offset: u64,
         budget: &ResourceBudget, allocation: ResourceAllocationId, mut canceled: impl FnMut() -> bool)
         -> Result<Self, IndexError> {
         if options.generation.owner() != index.id().owner() { return Err(IndexError::OwnerMismatch); }
@@ -160,7 +174,7 @@ impl<'source> Execution<'source> {
         let known_files = document_count.checked_add(unavailable.len()).ok_or(IndexError::LimitExceeded)?;
         Ok(Self { options: options.clone(), selected_documents, next_document: 0, count_all_matches,
             hit_capacity, text_capacity_per_hit,
-            report: IndexedSearchReport { manifest: index.id(), generation: options.generation,
+            report: IndexedSearchReport { manifest: index.id(), generation: options.generation, result_offset,
                 membership: index.membership(), unavailable, known_files, examined_files: 0,
                 skipped_by_index: 0, excluded_by_path: 0, scan_attempts: 0, fallback_attempts: 0,
                 state: IndexedQueryState::Running, failure: None, results, _lease: lease } })
@@ -225,17 +239,17 @@ impl<'source> Execution<'source> {
         } else if self.options.max_matches == 0 { 0 } else { remaining.max(1) };
         options.max_bytes_scanned = self.options.max_bytes_scanned
             .map(|limit| limit.saturating_sub(self.report.results.scanned_bytes));
-        let child = if self.count_all_matches {
-            CaptureQueryScanner::scan_document_counting_with_cancel(&doc, query, &options, canceled)
-        } else {
-            CaptureQueryScanner::scan_document_with_cancel(&doc, query, &options, canceled)
-        }?;
+        let skip = self.report.result_offset.saturating_sub(self.report.results.total_matches_counted as u64);
+        let child = CaptureQueryScanner::scan_document_window_with_cancel(&doc, query, &options,
+            skip, self.count_all_matches, canceled)?;
         let scanned = self.report.results.scanned_bytes.checked_add(child.scanned_bytes).ok_or(IndexError::LimitExceeded)?;
         if self.options.max_bytes_scanned.is_some_and(|limit| scanned > limit) { return Err(IndexError::LimitExceeded); }
-        let counted = if self.count_all_matches {
-            child.total_matches_counted
-        } else {
-            child.total_matches_counted.min(remaining.saturating_add(1))
+        // Child counts include skipped qualified occurrences. A full window
+        // from a prior file admits only one global lookahead even though the
+        // child verifier needs a nonzero row allowance to inspect that file.
+        let counted = if self.count_all_matches { child.total_matches_counted } else {
+            let lookahead = skip.saturating_add(remaining as u64).saturating_add(1);
+            child.total_matches_counted.min(usize::try_from(lookahead).unwrap_or(usize::MAX))
         };
         let total = self.report.results.total_matches_counted.checked_add(counted).ok_or(IndexError::LimitExceeded)?;
         let take = remaining.min(child.matches.len());
@@ -252,7 +266,8 @@ impl<'source> Execution<'source> {
             self.report.state = IndexedQueryState::Canceled;
             self.report.results.coverage = SearchCoverage::CanceledEarly;
         } else if !self.count_all_matches
-            && (total > self.options.max_matches || matches!(child.coverage, SearchCoverage::TruncatedAtLimit { .. })) {
+            && ((total as u64) > self.report.result_offset.saturating_add(self.options.max_matches as u64)
+                || matches!(child.coverage, SearchCoverage::TruncatedAtLimit { .. })) {
             self.report.results.coverage = SearchCoverage::TruncatedAtLimit { max_matches: self.options.max_matches };
             self.report.state = IndexedQueryState::Finished;
         } else if self.count_all_matches && matches!(child.coverage, SearchCoverage::TruncatedAtLimit { .. }) {
@@ -283,6 +298,16 @@ impl<'index, 'source, 'query> IndexedQuery<'index, 'source, 'query> {
         -> Result<Self, IndexError> {
         let execution = Execution::new_counting(index, query, options, Cow::Borrowed(index.manifest().unavailable()),
             None, budget, allocation, || false)?;
+        Ok(Self { index, query, execution })
+    }
+    /// Restart the same immutable universe at an occurrence ordinal, retaining
+    /// only max_matches rows. Every preceding occurrence is verified under the
+    /// same scan budget. A later window is not a new source observation.
+    pub fn new_window(index: &'index EphemeralIndex<'source>, query: &'query ParsedQuery,
+        options: QueryOptions, result_offset: u64, count_all_matches: bool,
+        budget: &ResourceBudget, allocation: ResourceAllocationId) -> Result<Self, IndexError> {
+        let execution = Execution::new_inner(index, query, options, Cow::Borrowed(index.manifest().unavailable()),
+            None, count_all_matches, result_offset, budget, allocation, || false)?;
         Ok(Self { index, query, execution })
     }
     pub fn report(&self) -> &IndexedSearchReport<'source> { &self.execution.report }
@@ -320,7 +345,7 @@ impl OwnedIndexedQuery {
     pub fn new(index: &OwnedEphemeralIndex, query: ParsedQuery, options: QueryOptions,
         budget: &ResourceBudget, allocations: [ResourceAllocationId; 2],
         canceled: impl FnMut() -> bool) -> Result<Self, IndexError> {
-        Self::new_filtered(index, query, options, None, false, budget, allocations, canceled)
+        Self::new_filtered(index, query, options, None, false, 0, budget, allocations, canceled)
     }
 
     /// Freeze explicit file eligibility before candidate or occurrence limits.
@@ -332,7 +357,7 @@ impl OwnedIndexedQuery {
     pub fn new_scoped(index: &OwnedEphemeralIndex, query: ParsedQuery, options: QueryOptions,
         mut includes_file: impl FnMut(FileId) -> bool, budget: &ResourceBudget,
         allocations: [ResourceAllocationId; 2], canceled: impl FnMut() -> bool) -> Result<Self, IndexError> {
-        Self::new_filtered(index, query, options, Some(&mut includes_file), false, budget, allocations, canceled)
+        Self::new_filtered(index, query, options, Some(&mut includes_file), false, 0, budget, allocations, canceled)
     }
 
     /// Counting variants preserve the same bounded result allocation while
@@ -340,17 +365,34 @@ impl OwnedIndexedQuery {
     pub fn new_counting(index: &OwnedEphemeralIndex, query: ParsedQuery, options: QueryOptions,
         budget: &ResourceBudget, allocations: [ResourceAllocationId; 2],
         canceled: impl FnMut() -> bool) -> Result<Self, IndexError> {
-        Self::new_filtered(index, query, options, None, true, budget, allocations, canceled)
+        Self::new_filtered(index, query, options, None, true, 0, budget, allocations, canceled)
     }
 
     pub fn new_scoped_counting(index: &OwnedEphemeralIndex, query: ParsedQuery, options: QueryOptions,
         mut includes_file: impl FnMut(FileId) -> bool, budget: &ResourceBudget,
         allocations: [ResourceAllocationId; 2], canceled: impl FnMut() -> bool) -> Result<Self, IndexError> {
-        Self::new_filtered(index, query, options, Some(&mut includes_file), true, budget, allocations, canceled)
+        Self::new_filtered(index, query, options, Some(&mut includes_file), true, 0, budget, allocations, canceled)
+    }
+
+    /// A fresh bounded window over this exact owned index. Skipped matches do
+    /// not expand retained output or source ownership. Instances remain pinned.
+    pub fn new_window(index: &OwnedEphemeralIndex, query: ParsedQuery, options: QueryOptions,
+        result_offset: u64, count_all_matches: bool, budget: &ResourceBudget,
+        allocations: [ResourceAllocationId; 2], canceled: impl FnMut() -> bool) -> Result<Self, IndexError> {
+        Self::new_filtered(index, query, options, None, count_all_matches, result_offset, budget, allocations, canceled)
+    }
+
+    pub fn new_scoped_window(index: &OwnedEphemeralIndex, query: ParsedQuery, options: QueryOptions,
+        mut includes_file: impl FnMut(FileId) -> bool, result_offset: u64, count_all_matches: bool,
+        budget: &ResourceBudget, allocations: [ResourceAllocationId; 2],
+        canceled: impl FnMut() -> bool) -> Result<Self, IndexError> {
+        Self::new_filtered(index, query, options, Some(&mut includes_file), count_all_matches,
+            result_offset, budget, allocations, canceled)
     }
 
     fn new_filtered(index: &OwnedEphemeralIndex, query: ParsedQuery, options: QueryOptions,
-        mut includes_file: Option<&mut dyn FnMut(FileId) -> bool>, count_all_matches: bool, budget: &ResourceBudget,
+        mut includes_file: Option<&mut dyn FnMut(FileId) -> bool>, count_all_matches: bool, result_offset: u64,
+        budget: &ResourceBudget,
         allocations: [ResourceAllocationId; 2], mut canceled: impl FnMut() -> bool) -> Result<Self, IndexError> {
         if allocations[0] == allocations[1] { return Err(IndexError::InvalidManifest); }
         if canceled() { return Err(IndexError::Canceled); }
@@ -382,13 +424,8 @@ impl OwnedIndexedQuery {
             }
             Some(ordinals)
         } else { None };
-        let execution = if count_all_matches {
-            Execution::new_counting(index, &query, options, Cow::Owned(unavailable), selected_documents, budget,
-                allocations[1], &mut canceled)
-        } else {
-            Execution::new(index, &query, options, Cow::Owned(unavailable), selected_documents, budget,
-                allocations[1], &mut canceled)
-        }?;
+        let execution = Execution::new_inner(index, &query, options, Cow::Owned(unavailable), selected_documents,
+            count_all_matches, result_offset, budget, allocations[1], &mut canceled)?;
         Ok(Self { identity: Arc::clone(index.query_identity()), query, execution, _query_lease: lease })
     }
     pub fn report(&self) -> &IndexedSearchReport<'static> { &self.execution.report }

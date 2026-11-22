@@ -32,7 +32,7 @@ pub(crate) fn scan_raw_chunks<'a>(
     options: &QueryOptions,
     canceled: impl FnMut() -> bool,
 ) -> Result<SearchResult, QueryError> {
-    scan_raw_chunks_inner(chunks, total_bytes, file_id, revision, needle, options, false, None, canceled)
+    scan_raw_chunks_inner(chunks, total_bytes, file_id, revision, needle, options, false, 0, None, canceled)
 }
 
 pub(crate) fn scan_raw_chunks_counting<'a>(
@@ -44,7 +44,7 @@ pub(crate) fn scan_raw_chunks_counting<'a>(
     options: &QueryOptions,
     canceled: impl FnMut() -> bool,
 ) -> Result<SearchResult, QueryError> {
-    scan_raw_chunks_inner(chunks, total_bytes, file_id, revision, needle, options, true, None, canceled)
+    scan_raw_chunks_inner(chunks, total_bytes, file_id, revision, needle, options, true, 0, None, canceled)
 }
 
 pub(crate) fn scan_raw_expression<'query>(
@@ -53,7 +53,16 @@ pub(crate) fn scan_raw_expression<'query>(
     canceled: impl FnMut() -> bool,
 ) -> Result<SearchResult, QueryError> {
     scan_raw_chunks_inner(std::iter::once(Ok(bytes)), bytes.len() as u64,
-        file_id, revision, needle, options, count_all_matches, Some(predicates), canceled)
+        file_id, revision, needle, options, count_all_matches, 0, Some(predicates), canceled)
+}
+
+pub(crate) fn scan_raw_window<'query>(
+    bytes: &[u8], file_id: FileId, revision: SourceRevision, needle: &'query [u8],
+    options: &QueryOptions, count_all_matches: bool, skip_matches: u64,
+    predicates: Option<Predicates<'query>>, canceled: impl FnMut() -> bool,
+) -> Result<SearchResult, QueryError> {
+    scan_raw_chunks_inner(std::iter::once(Ok(bytes)), bytes.len() as u64,
+        file_id, revision, needle, options, count_all_matches, skip_matches, predicates, canceled)
 }
 
 fn scan_raw_chunks_inner<'a, 'query>(
@@ -64,6 +73,7 @@ fn scan_raw_chunks_inner<'a, 'query>(
     needle: &'query [u8],
     options: &QueryOptions,
     count_all_matches: bool,
+    skip_matches: u64,
     mut predicates: Option<Predicates<'query>>,
     mut canceled: impl FnMut() -> bool,
 ) -> Result<SearchResult, QueryError> {
@@ -144,6 +154,7 @@ fn scan_raw_chunks_inner<'a, 'query>(
             for hit in batch.hits {
                 result.total_matches_counted = result.total_matches_counted
                     .checked_add(1).ok_or(QueryError::LimitExceeded)?;
+                if result.total_matches_counted as u64 <= skip_matches { continue; }
                 if result.matches.len() == options.max_matches {
                     if count_all_matches { continue; }
                     if predicates.is_some() {

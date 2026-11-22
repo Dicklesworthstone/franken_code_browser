@@ -174,6 +174,38 @@ char *fcb_atlas_search_indexed_counted_matching(uint64_t handle, uint64_t genera
     const char *filenames, uint64_t path_kind, const char *path,
     uint64_t case_sensitive, uint64_t max_matches, uint64_t max_scan_bytes);
 
+/* Retain a bounded occurrence window beyond the first max_matches results.
+ * This restarts verification over the SAME accepted index; no live path is
+ * reopened. Use a fresh query generation and the current index_generation.
+ * text is UTF-8, <=1024 bytes, readable through NUL or 1025 bytes. expression
+ * is 0 for literal text or 1 for the existing bounded expression grammar.
+ * case_sensitive and count_all_matches are also strictly 0/1. File/path scopes
+ * follow indexed_begin_matching. max_matches is 1..4096, or 0 when counting;
+ * max_scan_bytes is <=32 MiB for literal text, <=256 MiB for expressions.
+ * skip_matches is a zero-based occurrence ordinal, not a source byte offset.
+ * Preceding matches consume verification work but no retained-row capacity.
+ * Conjunction/exclusion predicates still apply to the same complete capture.
+ * Begin returns command begin-indexed or begin-indexed-expression. Continue
+ * with ordinary search_step/page; hit_id restarts at 1 within the NEW query
+ * generation. Existing accepted results survive failed/canceled replacement.
+ * Indexed text/expression replies include result_offset (requested skip),
+ * skipped_matches (preceding verified occurrences), has_more_matches and
+ * next_match_offset. All offsets/counts are decimal strings; next is null
+ * unless an actual lookahead proves more rows AND this window retained rows.
+ * matches_seen includes skipped occurrences; truncated means any observed
+ * rows were omitted, including earlier windows. A null next offset does not
+ * establish complete coverage. Offsets beyond the total return an empty
+ * window with skipped_matches < result_offset, never a clamped source target.
+ * Counts, unavailable/pending files and verification budgets retain their
+ * independent meanings. Existing calls behave as result_offset=0.
+ * Every non-null result must be freed once with fcb_free_string.
+ */
+char *fcb_atlas_search_indexed_begin_window(uint64_t handle, uint64_t generation,
+    uint64_t index_generation, const char *text, const char *extensions,
+    const char *filenames, uint64_t path_kind, const char *path,
+    uint64_t case_sensitive, uint64_t expression, uint64_t count_all_matches,
+    uint64_t skip_matches, uint64_t max_matches, uint64_t max_scan_bytes);
+
 /* Clear index and builder, not completed result captures or opened readers.
  * Result-clear leaves index/build state intact. Atlas cancellation invalidates
  * provisional query AND build state; accepted state is not rolled back. A late

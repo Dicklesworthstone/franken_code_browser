@@ -287,3 +287,54 @@ fn simultaneous_predicate_capacity_is_admitted_before_index_execution() {
     query.conjunction_terms[0].clear();
     assert_eq!(CaptureQueryScanner::scan_document(&documents[0], &query, &options()).err(), Some(QueryError::EmptyNeedle));
 }
+
+#[test]
+fn capture_windows_keep_overlap_and_same_span_expansions_in_every_matching_route() {
+    for (text, expression, mode) in [
+        ("banana required", "ana required -blocked", SearchMode::RawBytes),
+        ("banana required", "ana required -blocked", SearchMode::DecodedText {
+            case_sensitive: true, normalization: UnicodeNormalization::Exact }),
+        ("ßß required", "s required -blocked", SearchMode::DecodedText {
+            case_sensitive: false, normalization: UnicodeNormalization::CaseFold }),
+    ] {
+        let mut variants = vec![text.as_bytes().to_vec()];
+        if mode != SearchMode::RawBytes { variants.extend([utf16(text, true), utf16(text, false)]); }
+        for bytes in variants {
+            let source = capture(&bytes);
+            let document = SearchDocument::new(source.request().file(), "source.rs", &source);
+            let query = ParsedQuery::parse(expression).unwrap();
+            let options = options().with_mode(mode);
+            let reference = ReferenceScanOracle::scan_document(&document, &query, &options).unwrap();
+            for offset in 0..=reference.matches.len() + 1 {
+                let options = options.clone().with_max_matches(1);
+                let actual = CaptureQueryScanner::scan_document_window_with_cancel(&document, &query,
+                    &options, offset as u64, true, || false).unwrap();
+                assert_eq!(actual.matches, reference.matches.iter().skip(offset).take(1).cloned().collect::<Vec<_>>());
+                assert_eq!(actual.total_matches_counted, reference.total_matches_counted);
+                assert!(actual.is_complete());
+            }
+        }
+    }
+}
+
+#[test]
+fn window_prefix_does_not_establish_predicate_eligibility_or_valid_text_suffix() {
+    let prefix = "needle ".repeat(1200);
+    for suffix in [" required blocked", " unrelated"] {
+        let source = capture(format!("{prefix}{suffix}").as_bytes());
+        let doc = SearchDocument::new(source.request().file(), "a.rs", &source);
+        let query = ParsedQuery::parse("needle required -blocked").unwrap();
+        let opts = options().with_max_matches(1);
+        let result = CaptureQueryScanner::scan_document_window_with_cancel(&doc, &query, &opts, 1000, true, || false).unwrap();
+        assert!(result.matches.is_empty()); assert_eq!(result.total_matches_counted, 0);
+        assert!(result.is_complete());
+    }
+    let mut bytes = format!("{prefix} required").into_bytes(); bytes.push(0xff);
+    let source = capture(&bytes);
+    let doc = SearchDocument::new(source.request().file(), "a.rs", &source);
+    let query = ParsedQuery::parse("needle required -blocked").unwrap();
+    let result = CaptureQueryScanner::scan_document_window_with_cancel(&doc, &query,
+        &options().with_max_matches(1), 1000, true, || false).unwrap();
+    assert!(result.matches.is_empty()); assert_eq!(result.total_matches_counted, 0);
+    assert!(!result.unsupported_files.is_empty());
+}
