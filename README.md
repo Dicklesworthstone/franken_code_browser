@@ -189,11 +189,15 @@ readers and exact selection handoff to the Reading Desk. A missing or canceled
 destination preserves the current source and forward history. See
 [project documentation navigation](native/macos/README.md#project-documentation-links-and-backlinks).
 
-**Documentation relationships include UTF-16 captures.** Outgoing links and
-backlinks now decode BOM-marked UTF-16 in either byte order through the shared
-source engine. Evidence readers retain the original bytes in live projects and
-saved archives, including after the live file changes. Malformed and oversized
-documents keep coverage explicit. Executable and native verification are pending.
+**UTF-16 documentation keeps its original source identity.** BOM-marked UTF-16
+in either byte order now supports outgoing links, backlinks, heading navigation,
+Text and Styled Markdown previews, rendered Find and exact original-source copy.
+Live projects, saved archives, retained readers, Reading Desk and CLI document
+routes use the shared decoder and preserve original byte coordinates through
+non-BMP characters and BOMs. Opened readers remain usable after the live file
+changes or the originating index/archive closes. Source and decoded-input bounds
+apply independently; malformed documents and unqualified mappings remain explicit.
+Executable and native verification are pending.
 
 **Find in a Markdown preview searches the rendered document.** Literal phrases can
 cross emphasis or link markup, with a complete match count and Previous/Next navigation
@@ -207,7 +211,7 @@ for exact matching rules, limits and pending independent verification.
 row of the hit's qualified enclosing Markdown region. An explicit
 `--markdown-heading` still selects that heading. Standalone `fcb markdown`
 also accepts `--source-byte N`, a zero-based offset in the original captured
-UTF-8 bytes, including any BOM. Unmapped or unqualified automatic anchors keep
+bytes (UTF-8 or BOM-marked UTF-16), including the BOM. Unmapped or unqualified automatic anchors keep
 a labeled document-start preview and a partial result; explicit source-byte
 requests refuse them. Navigation reuses the captured source, performs no extra
 source reads, and does not claim a rendered-text hit highlight. Executable

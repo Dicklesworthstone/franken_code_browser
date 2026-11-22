@@ -313,10 +313,10 @@ fn retained_source_line_ranges_survive_live_replacement_and_index_retirement() {
 }
 
 #[test]
-fn heading_limits_do_not_turn_unqualified_source_into_a_missing_heading() {
+fn heading_limits_keep_qualified_utf16_absence_distinct_from_unsupported_source() {
     for (ordinal, (guide, status)) in [
         (vec![b'x'; MAX_DOCUMENT_LINK_SOURCE_BYTES + 1], "limited"),
-        (b"\xff\xfe#\0 \0T\0a\0r\0g\0e\0t\0".to_vec(), "unsupported"),
+        (b"\xff\xfe#\0 \0T\0a\0r\0g\0e\0t\0".to_vec(), "missing-heading"),
         (b"\xff".to_vec(), "unsupported"),
         (b"> # Target\n".to_vec(), "unsupported"),
     ].into_iter().enumerate() {
@@ -635,4 +635,38 @@ fn decoded_document_limit_keeps_other_project_links_available_and_coverage_parti
     assert_eq!(result.get("retained_links").number(), 1);
     assert_eq!(result.get("pending_markdown_files").number(), 0);
     assert_eq!(f.page(1, Direction::Incoming, Some(b"code.rs"), 0, 64).get("matching_links").number(), 1);
+}
+
+#[test]
+fn utf16_relationship_heading_opens_preview_find_and_exact_original_source() {
+    use fcb_app::host::reader::ReaderDocumentOptions;
+    for big_endian in [false, true] {
+        let encode = |text: &str| -> Vec<u8> { text.encode_utf16().flat_map(|unit|
+            if big_endian { unit.to_be_bytes() } else { unit.to_le_bytes() }).collect() };
+        let source = encode("\u{feff}[guide](guide.md#details)\r\n");
+        let prefix = "\u{feff}Before 🦀\r\n\r\n";
+        let guide = encode(&format!("{prefix}## Details\r\n\r\nRetained **body**.\r\n"));
+        let expected = encode(prefix).len() as u64;
+        let mut f = Fixture::new(&[("README.md", &source), ("guide.md", &guide)]);
+        f.build(1); f.prepare(1, 1);
+        fs::write(f.root.join("guide.md"), b"# Replacement\n").unwrap();
+        let (mut reader, response) = f.search.open_relationship_reader(&f.atlas, owner(59970),
+            1, 1, Side::Target, || false).unwrap();
+        let receipt = json(&response);
+        assert_eq!(receipt.get("fragment_status").text(), "resolved");
+        assert_eq!(receipt.get("target_range").get("start").number(), expected);
+        assert_eq!(receipt.get("initial_original_offset").number(), expected);
+        assert_eq!(receipt.get("source_sha256").text(), Sha256::digest(&guide).to_hex());
+        let end = receipt.get("target_range").get("end").number();
+        f.search.clear_index(&f.atlas, 2, || false).unwrap();
+        drop(f.search);
+        let preview = json(&reader.prepare_document(1, ReaderDocumentOptions::default(), || false).unwrap());
+        assert_eq!(preview.get("parser_source_base").number(), 2);
+        let heading = json(&reader.document_at_heading(1, "details", 1, || false).unwrap());
+        assert_eq!(heading.get("heading_original_range").get("start").number(), expected);
+        let found = json(&reader.find_document(1, "Retained body", 0, 128, || false).unwrap());
+        assert_eq!(found.get("matches_seen").number(), 1);
+        assert_eq!(json(&reader.copy_range(expected, end, || false).unwrap()).get("original_hex").text(),
+            hex(&guide[expected as usize..end as usize]));
+    }
 }

@@ -144,7 +144,7 @@ fn close_during_document_work_keeps_retiring_capacity_until_the_last_pin_is_rele
 fn invalid_document_requests_preserve_capture_and_never_become_empty_success() {
     let readers = ReaderSessions::new(); let empty = readers.create().unwrap();
     assert_eq!(readers.execute(empty, Command::Document { generation: 1, options: Default::default() }, || false).err(), Some(AccessError::NotOpen));
-    readers.supply(empty, &[0xff, 0xfe, b'#', 0]).unwrap();
+    readers.supply(empty, &[0xff, 0xfe, 0x00, 0xd8]).unwrap(); // Unpaired high surrogate.
     assert!(readers.execute(empty, Command::Document { generation: 1, options: Default::default() }, || false).is_err());
     assert!(readers.execute(empty, Command::CopyRange { start: 0, end: 4 }, || false).is_ok());
     let handle = readers.create().unwrap(); readers.supply(handle, b"# Good\n").unwrap(); prepare(&readers, handle, 1);

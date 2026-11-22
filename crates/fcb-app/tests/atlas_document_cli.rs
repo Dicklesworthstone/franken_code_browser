@@ -148,14 +148,25 @@ fn unmapped_whitespace_hit_keeps_an_explicit_incomplete_render_only_preview() {
 }
 
 #[test]
-fn unsupported_utf16_document_is_not_silently_redecoded_or_opened_as_live_utf8() {
-    let mut bytes = vec![0xff, 0xfe];
-    for unit in "# Title\n\nneedle\n".encode_utf16() { bytes.extend_from_slice(&unit.to_le_bytes()); }
-    let root = root(&bytes);
-    let (exit, search) = invoke(&root, &[]); assert_eq!(exit, EXIT_OK, "{search}");
-    let (exit, result) = invoke(&root, &["--markdown-hit", "0"]);
-    assert_eq!(exit, EXIT_ERROR, "{result}"); assert!(result.contains("DOCUMENT_READ_INVALID_UTF8"));
-    assert_eq!(fs::read(root.join("docs/README.md")).unwrap(), bytes);
+fn utf16_search_to_markdown_keeps_original_ranges_without_additional_reads() {
+    for little in [true, false] {
+        let bytes: Vec<u8> = "\u{feff}# Title\n\nneedle\n".encode_utf16()
+            .flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect();
+        let root = root(&bytes);
+        let (exit, search) = invoke(&root, &[]); assert_eq!(exit, EXIT_OK, "{search}");
+        let (exit, result) = invoke(&root, &["--markdown-hit", "0"]);
+        assert_eq!(exit, EXIT_PARTIAL, "{result}");
+        assert!(result.contains("\"text\":\"needle\""), "{result}");
+        assert!(result.contains("\"navigation\":\"source-region\""));
+        assert!(result.contains("\"requested_location_resolved\":true"));
+        assert!(result.contains("\"additional_source_bytes_read\":\"0\""));
+        let needle: Vec<u8> = "needle".encode_utf16()
+            .flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect();
+        let hex: String = needle.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert!(result.contains(&format!("\"selected_original_hex\":\"{hex}\"")), "{result}");
+        assert_eq!(payload(&result), payload(&search));
+        assert_eq!(fs::read(root.join("docs/README.md")).unwrap(), bytes);
+    }
 }
 
 #[test]

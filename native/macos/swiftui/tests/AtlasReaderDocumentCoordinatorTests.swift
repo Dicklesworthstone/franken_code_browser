@@ -98,7 +98,47 @@ import Foundation
         try await documentFind(input)
         try await documentLinks(input)
         try await documentImages(input)
+        try await utf16Documents(input)
         print("\(checks) retained-document coordinator checks passed")
+    }
+
+    @MainActor static func utf16Documents(_ input: AtlasReaderInput) async throws {
+        for (index, encoding) in ["utf16le", "utf16be"].enumerated() {
+            let boundary = DocumentBoundary(owner: UInt64(70 + index), encoding: encoding)
+            let coordinator = AtlasReaderCoordinator(transport: boundary.reader, document: boundary.document)
+            let source = try await coordinator.open(input: input)
+            check(source.identity.encoding == encoding && source.start == 2,
+                  "UTF-16 source opens with a BOM-excluding decoded page")
+            guard case .prepared(let page, let headings) = try await coordinator.document(.prepare(width: 100)) else { fatalError() }
+            check(page.inventory.sourceBase == 2 && page.inventory.identity.matches(source.identity),
+                  "Preview source coordinates keep the original captured encoding")
+            let target = page.target(at: 1)!
+            guard case .source(let selected) = try await coordinator.document(.source(target)) else { fatalError() }
+            check(selected.enclosingOriginal == target.line.enclosingOriginal && selected.visible.start == 2,
+                  "Preview-to-source handoff preserves the original UTF-16 region")
+            guard case .copy(let copied) = try await coordinator.document(.copy(target, .enclosingMarkdown)) else { fatalError() }
+            let codec: String.Encoding = encoding == "utf16le" ? .utf16LittleEndian : .utf16BigEndian
+            check(copied.value == DocumentWireFixture.hex("A **bold** line.\n".data(using: codec)!),
+                  "The C transport keeps original Markdown copy distinct from rendered text")
+            _ = try await coordinator.document(.heading(headings.target(slug: "café")!))
+            guard case .matches(let matches) = try await coordinator.document(.find(needle: "Café", first: 0)) else { fatalError() }
+            check(matches.inventory.identity.encoding == encoding && matches.total == 130,
+                  "Rendered Find uses the same UTF-16-backed retained document")
+            guard case .links(let links) = try await coordinator.document(.prepareLinks) else { fatalError() }
+            _ = try await coordinator.document(.link(links.target(id: 1)!))
+            guard case .page(let returned) = try await coordinator.document(.fromSource(offset: selected.enclosingOriginal.start)) else { fatalError() }
+            let old = returned.target(at: 1)!
+            let gate = boundary.blockNext("document-source")
+            let pending = Task { try await coordinator.document(.source(old)) }
+            try await until { gate.hasEntered }
+            coordinator.close()
+            check(boundary.snapshot.closes == 0, "UTF-16 capture retired while source handoff was in flight")
+            gate.release()
+            await rejected { _ = try await pending.value }
+            try await until { boundary.snapshot.closes == 1 }
+            check(boundary.snapshot.opens == 1 && boundary.snapshot.peak == 1,
+                  "UTF-16 preview work neither recaptures the file nor overlaps foreign calls")
+        }
     }
 
     @MainActor static func documentImages(_ input: AtlasReaderInput) async throws {

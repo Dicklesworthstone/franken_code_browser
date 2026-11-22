@@ -634,3 +634,42 @@ fn malformed_and_expanded_utf16_do_not_hide_other_saved_document_links() {
     let incoming = json(&saved.relationship_page(1, Some(3), Direction::Incoming, 0, 64, || false).unwrap());
     assert_eq!(incoming.get("matching_links").number(), 1);
 }
+
+#[test]
+fn utf16_saved_heading_targets_keep_original_ranges_in_preview_and_reading_desk() {
+    for big_endian in [false, true] {
+        let encode = |text: &str| -> Vec<u8> { text.encode_utf16().flat_map(|unit|
+            if big_endian { unit.to_be_bytes() } else { unit.to_le_bytes() }).collect() };
+        let source = encode("\u{feff}[guide](docs/guide.md#details) [missing](docs/guide.md#absent)\r\n");
+        let prefix = "\u{feff}Before 🦀\r\n\r\n";
+        let guide = encode(&format!("{prefix}## Details\r\n\r\nRetained **body**.\r\n"));
+        let expected = encode(prefix).len() as u64;
+        let f = Fixture::new(&[entry(b"README.md", &source), entry(b"docs/guide.md", &guide)], true);
+        let mut saved = f.open(56940);
+        let result = prepare(&mut saved, 1);
+        assert!(result.get("relationships_complete").flag());
+        let links = result.get("links").array();
+        assert_eq!(links[0].get("fragment_resolution").text(), "resolved");
+        assert_eq!(links[0].get("target_range").get("start").number(), expected);
+        assert_eq!(links[1].get("fragment_resolution").text(), "missing-heading");
+        let end = links[0].get("target_range").get("end").number();
+        let (mut reader, receipt) = saved.open_relationship_reader(owner(56941),
+            1, 1, Side::Target, || false).unwrap();
+        assert_eq!(json(&receipt).get("offset").number(), expected);
+        let mut desk = DeskSession::new(owner(56942), DeskLimits::default()).unwrap();
+        let opened = saved.open_relationship_desk(&mut desk, 0, 1, 1, 1, Side::Target, || false).unwrap();
+        let pane = opened.imported.change.active.unwrap();
+        assert_eq!(desk.model().selected_bytes(pane, 1).unwrap(), &guide[expected as usize..end as usize]);
+        drop(saved);
+        fs::rename(&f.path, f.root.join("moved-utf16-heading.fcbs")).unwrap();
+        let preview = json(&reader.prepare_document(1, Default::default(), || false).unwrap());
+        assert_eq!(preview.get("parser_source_base").number(), 2);
+        let heading = json(&reader.document_at_heading(1, "details", 1, || false).unwrap());
+        assert_eq!(heading.get("heading_original_range").get("start").number(), expected);
+        assert_eq!(json(&reader.find_document(1, "Retained body", 0, 128, || false).unwrap())
+            .get("matches_seen").number(), 1);
+        assert_eq!(json(&reader.copy_range(expected, end, || false).unwrap()).get("original_hex").text(),
+            hex(&guide[expected as usize..end as usize]));
+        assert_eq!(desk.model().selected_bytes(pane, 1).unwrap(), &guide[expected as usize..end as usize]);
+    }
+}

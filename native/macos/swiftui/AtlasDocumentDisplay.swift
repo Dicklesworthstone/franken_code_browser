@@ -138,8 +138,7 @@ struct AtlasDocumentDisplayPage: Sendable {
     func imageTarget(_ item: AtlasDocumentDisplayItem) -> AtlasDocumentDisplayImageTarget? {
         guard inventory.qualifiedSources, case .image = item.content, let reference = item.imageReference,
               let original = item.original,
-              original.valid(upTo: inventory.document.identity.capturedBytes, nonempty: true),
-              original.start >= inventory.document.sourceBase,
+              inventory.document.admitsOriginal(original),
               item.bounds.width > 0, item.bounds.height > 0 else { return nil }
         return .init(inventory: inventory, itemIndex: item.id, requestID: reference.requestID,
             destination: reference.destination, bounds: item.bounds, original: item.original)
@@ -548,8 +547,7 @@ enum AtlasDocumentDisplayWire {
         func imageIdentity(_ target: AtlasDocumentDisplayImageTarget,
                            authorization: AtlasDocumentImageAuthorization, command: String) throws -> UInt64? {
             guard target.inventory.qualifiedSources, let original = target.original,
-                  original.valid(upTo: target.inventory.document.identity.capturedBytes, nonempty: true),
-                  original.start >= target.inventory.document.sourceBase,
+                  target.inventory.document.admitsOriginal(original),
                   authorization.document.matches(target.inventory.document),
                   authorization.displayWidth == target.inventory.width,
                   try header.identity(handle: target.inventory.document.identity.owner)
@@ -667,8 +665,7 @@ enum AtlasDocumentDisplayWire {
             }
             if let original {
                 guard inventory.qualifiedSources,
-                      original.valid(upTo: inventory.document.identity.capturedBytes, nonempty: true),
-                      original.start >= inventory.document.sourceBase else { throw AtlasReaderError.invalidResponse }
+                      inventory.document.admitsOriginal(original) else { throw AtlasReaderError.invalidResponse }
             }
             let kind = try text("kind")
             let content: AtlasDocumentDisplayItem.Content
@@ -740,8 +737,7 @@ enum AtlasDocumentDisplayWire {
             }
             if let sourceAnchor {
                 guard inventory.qualifiedSources,
-                      sourceAnchor >= document.sourceBase,
-                      sourceAnchor <= document.identity.capturedBytes,
+                      document.admitsOriginalOffset(sourceAnchor),
                       try w.number("original_anchor") == sourceAnchor else {
                     throw AtlasReaderError.invalidResponse
                 }

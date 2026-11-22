@@ -262,7 +262,7 @@ fn utf8_bom_and_multibyte_rendered_selection_keep_original_coordinates() {
 
 #[test]
 fn unsupported_markdown_encoding_does_not_break_original_byte_reading() {
-    for bytes in [b"\xff# invalid".as_slice(), b"\xff\xfe#\0 \0A\0\n\0"] {
+    for bytes in [b"\xff# invalid".as_slice(), b"\xff\xfe#\0\x00\xd8"] {
         let mut s = desk(); let pane = adopt(&mut s, 1, bytes);
         assert_eq!(DeskDocument::prepare(&mut s, 1, pane, 1, DeskDocumentOptions::default(), || false).err(),
             Some(DeskDocumentError::Document(DocumentReadError::InvalidUtf8)));

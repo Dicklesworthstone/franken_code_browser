@@ -159,7 +159,9 @@ struct AtlasMarkdownPreviewPreference {
     var unavailableReason: String? {
         guard supported else { return "This host did not enable Markdown preview." }
         guard let identity else { return "Open a retained source capture first." }
-        guard identity.encoding == "utf8" else { return "Markdown preview requires UTF-8; the source reader remains available." }
+        guard ["utf8", "utf16le", "utf16be"].contains(identity.encoding) else {
+            return "Markdown preview supports UTF-8 and BOM-marked UTF-16. The source reader remains available for other encodings."
+        }
         guard identity.capturedBytes <= AtlasReaderDocumentLimits.sourceBytes else {
             return "Markdown preview admits at most 256 KiB of source. The larger retained file remains readable."
         }

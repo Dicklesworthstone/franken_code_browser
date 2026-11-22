@@ -213,3 +213,63 @@ fn unqualified_display_images_keep_fallbacks_but_cannot_authorize_asset_acquisit
     assert_eq!(display.unresolved_images(), 1);
     assert_eq!(display.image_request(index, id).err(), Some(NativeDisplayError::InvalidOutput));
 }
+
+#[test]
+fn utf16_styled_display_retains_exact_mapping_after_the_logical_reader_retires() {
+    let text = "# Café\n\nA **bold** paragraph.\n\n![Image](picture.png)\n";
+    for little in [true, false] {
+        let bytes: Vec<u8> = "\u{feff}".encode_utf16().chain(text.encode_utf16())
+            .flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect();
+        let budget = budget();
+        let display = {
+            let source = capture(&bytes); let reader = read(&source, &budget);
+            display(&reader, &budget, 640)
+        };
+        assert!(display.source_ranges_qualified());
+        assert!(display.glyph_count() > 0);
+        let paragraph = 2 + 2 * text[..text.find("A **bold**").unwrap()].encode_utf16().count();
+        let item = display.first_item_at_source(paragraph as u64, || false).unwrap();
+        assert_eq!(display.original_range(item).unwrap().unwrap().start().get(), paragraph as u64);
+        let mut saw_image = false;
+        for (index, entry) in display.display().items().iter().enumerate() {
+            if let Some(range) = display.original_range(index).unwrap() {
+                let (a, b) = range.as_usize_bounds().unwrap();
+                assert!(a >= 2 && a % 2 == 0 && b % 2 == 0 && b <= bytes.len());
+                let units: Vec<u16> = bytes[a..b].chunks_exact(2).map(|pair|
+                    if little { u16::from_le_bytes([pair[0], pair[1]]) }
+                    else { u16::from_be_bytes([pair[0], pair[1]]) }).collect();
+                let original = String::from_utf16(&units).unwrap();
+                assert!(text.contains(&original));
+                if let DisplayItem::Image(image) = entry {
+                    saw_image = true;
+                    let request = display.image_request(index, image.request_id).unwrap();
+                    assert_eq!(request.enclosing_original_range, range);
+                    assert_eq!(request.destination, "picture.png");
+                    assert!(original.contains("![Image](picture.png)"));
+                }
+            }
+        }
+        assert!(saw_image);
+        for invalid in [0, 1, paragraph + 1, bytes.len() + 1] {
+            assert_eq!(display.first_item_at_source(invalid as u64, || false).err(),
+                Some(NativeDisplayError::InvalidRange));
+        }
+        assert_eq!(display.first_item_at_source(bytes.len() as u64, || false).unwrap(),
+            display.display().items().len());
+    }
+}
+
+#[test]
+fn utf16_styled_source_limit_also_applies_to_decoded_parser_input() {
+    // It fits the original-byte display cap but exceeds its decoded UTF-8 cap.
+    let bytes: Vec<u8> = "\u{feff}".encode_utf16().chain("界".repeat(22_000).encode_utf16())
+        .flat_map(u16::to_le_bytes).collect();
+    let source = capture(&bytes); let budget = budget();
+    let reader = DocumentReader::prepare(&source, DocumentId::new(owner(), 1).unwrap(),
+        DocumentGeneration::new(owner(), 1).unwrap(),
+        DocumentReadOptions { max_source_bytes: 256 * 1024, max_flow_lines: 32768,
+            max_flow_items: 32768, ..Default::default() },
+        &budget, allocation(1), || false).unwrap();
+    assert_eq!(NativeDocumentDisplay::prepare(&reader, 640, &budget,
+        [allocation(2), allocation(3)], || false).err(), Some(NativeDisplayError::SourceLimit));
+}

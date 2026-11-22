@@ -23,6 +23,43 @@ private enum Fixture {
          "additional_source_bytes_read": "0", "native_presented": false, "capture_origin": "host-supplied",
          "path": ["encoding": "unix-bytes", "hex": hex(path.utf8), "display": path]]
     }
+    // Re-encode this fixed captured-source fixture through Foundation. This
+    // adapts wire coordinates; it does not imitate Markdown parsing or shaping.
+    static func encoded(_ packet: [String: Any], as encoding: String) -> [String: Any] {
+        if encoding == "utf8" { return packet }
+        precondition(["utf16le", "utf16be"].contains(encoding))
+        let codec: String.Encoding = encoding == "utf16le" ? .utf16LittleEndian : .utf16BigEndian
+        func offset(_ value: String) -> String {
+            let prefix = String(bytes: raw.prefix(Int(value)!), encoding: .utf8)!
+            return String(prefix.data(using: codec)!.count)
+        }
+        func convert(_ value: Any, key: String = "") -> Any {
+            if let object = value as? [String: Any] {
+                if ["original_range", "enclosing_original_range", "heading_original_range",
+                    "evidence_range", "requested_original_range", "visible_range"].contains(key) {
+                    return ["start": offset(object["start"] as! String),
+                            "end": offset(object["end"] as! String)]
+                }
+                return object.reduce(into: [String: Any]()) { result, pair in
+                    result[pair.key] = convert(pair.value, key: pair.key)
+                }
+            }
+            if let rows = value as? [Any] { return rows.map { convert($0, key: key) } }
+            if key == "encoding", value as? String == "utf8" { return encoding }
+            if key == "captured_bytes" { return offset(String(raw.count)) }
+            if key == "parser_source_base" { return "2" }
+            if key == "original_hex", let hex = value as? String {
+                let encoded = Array(hex.utf8)
+                let bytes = stride(from: 0, to: encoded.count, by: 2).map {
+                    UInt8(String(bytes: encoded[$0..<$0 + 2], encoding: .utf8)!, radix: 16)!
+                }
+                return self.hex(String(bytes: bytes, encoding: .utf8)!.data(using: codec)!)
+            }
+            return value
+        }
+        return convert(packet) as! [String: Any]
+    }
+
     static func page(command: String = "document-prepare", owner: UInt64 = 7, generation: UInt64 = 1,
         width: UInt64 = 100, first: UInt64 = 0, total: UInt64 = 3, headingFirst: UInt64 = 0,
         headings: UInt64 = 2) -> [String: Any] {
@@ -133,10 +170,10 @@ private enum Fixture {
     static func sourcePage(_ target: AtlasReaderDocumentTarget) -> [String: Any] {
         var out = header("document-source", owner: target.inventory.identity.owner)
         out["text_kind"] = "logical-captured-text-not-shaped"
-        out["requested_original_range"] = range(0, UInt64(raw.count)); out["visible_range"] = range(0, UInt64(raw.count))
-        out["range_limited"] = false; out["boundaries_adjusted"] = false; out["has_replacements"] = false
+        out["requested_original_range"] = range(0, UInt64(raw.count)); out["visible_range"] = range(3, UInt64(raw.count))
+        out["range_limited"] = false; out["boundaries_adjusted"] = true; out["has_replacements"] = false
         out["first_physical_line"] = NSNull(); out["next_offset"] = NSNull()
-        out["text"] = String(decoding: raw.dropFirst(3), as: UTF8.self); out["original_hex"] = hex(raw)
+        out["text"] = String(decoding: raw.dropFirst(3), as: UTF8.self); out["original_hex"] = hex(raw.dropFirst(3))
         var selected = selection(target)
         selected["original_range"] = range(paragraph.start, paragraph.end)
         selected["window_utf8_range"] = range(paragraph.start - 3, paragraph.end - 3)
@@ -307,9 +344,77 @@ private enum Fixture {
         }
         try documentLinks()
         try documentFind()
+        try utf16Documents()
         print("PASS: \(checks) document decoding, paging, copy domains, source mapping and stale-authority checks")
     }
 
+
+    @MainActor static func utf16Documents() throws {
+        for encoding in ["utf16le", "utf16be"] {
+            func encoded(_ value: [String: Any]) -> String { Fixture.json(Fixture.encoded(value, as: encoding)) }
+            let info = try AtlasReaderInfo.decode(encoded(Fixture.header("info")), handle: 7, path: Fixture.path)
+            let state = AtlasReaderDocumentState()
+            let prepare = try state.admit(.prepare(width: 100), info: info)
+            try state.accept(try prepare.decode(encoded(Fixture.page())), job: prepare)
+            let page = state.page!, target = page.target(at: 1)!
+            check(page.inventory.identity.encoding == encoding && page.inventory.sourceBase == 2,
+                  "UTF-16 preview retains its original identity and BOM")
+            for base in ["0", "1", "3"] {
+                var bad = Fixture.encoded(Fixture.page(), as: encoding); bad["parser_source_base"] = base
+                rejects("UTF-16 preview accepted the wrong BOM length") { _ = try prepare.decode(Fixture.json(bad)) }
+            }
+            var wrongRange = Fixture.encoded(Fixture.page(), as: encoding)
+            var lines = wrongRange["flow_lines"] as! [[String: Any]]
+            lines[1]["enclosing_original_range"] = Fixture.range(target.line.enclosingOriginal!.start + 1,
+                target.line.enclosingOriginal!.end)
+            wrongRange["flow_lines"] = lines
+            rejects("UTF-16 document source range split a code unit") { _ = try prepare.decode(Fixture.json(wrongRange)) }
+            rejects("UTF-16 navigation accepted an odd original offset") {
+                _ = try state.admit(.fromSource(offset: target.line.enclosingOriginal!.start + 1), info: info)
+            }
+            for mode in [AtlasReaderDocumentCopyMode.renderedText, .enclosingMarkdown] {
+                let job = try state.admit(.copy(target, mode), info: info)
+                guard case .copy(let copy) = try job.decode(encoded(Fixture.copy(target, mode: mode))) else { fatalError() }
+                check(copy.enclosingOriginal == target.line.enclosingOriginal, "Copy lost the original UTF-16 source region")
+                if mode == .renderedText { check(copy.value == target.line.text, "Rendered text copy changed encoding domain") }
+                else {
+                    let codec: String.Encoding = encoding == "utf16le" ? .utf16LittleEndian : .utf16BigEndian
+                    check(copy.value == Fixture.hex("A **bold** line.\n".data(using: codec)!),
+                          "Original Markdown copy must preserve exact encoded bytes")
+                }
+            }
+            let source = try state.admit(.source(target), info: info)
+            let packet = Fixture.encoded(Fixture.sourcePage(target), as: encoding)
+            guard case .source(let selected) = try source.decode(Fixture.json(packet)) else { fatalError() }
+            check(selected.visible.start == 2 && selected.enclosingOriginal == target.line.enclosingOriginal,
+                  "Decoded page and original selection must exclude only the capture BOM")
+            check(selected.selectionUTF8.start == Fixture.paragraph.start - 3,
+                  "UTF-8 selection offsets must not become original UTF-16 offsets")
+            var shifted = packet, selection = shifted["selection"] as! [String: Any]
+            selection["window_utf8_range"] = Fixture.range(selected.selectionUTF8.start + 1, selected.selectionUTF8.end + 1)
+            shifted["selection"] = selection
+            rejects("Shifted UTF-16 highlight reused valid original bytes") { _ = try source.decode(Fixture.json(shifted)) }
+            var wrongEndian = packet
+            let other = Fixture.encoded(Fixture.sourcePage(target), as: encoding == "utf16le" ? "utf16be" : "utf16le")
+            wrongEndian["original_hex"] = other["original_hex"]
+            wrongEndian["selection"] = other["selection"]
+            rejects("Wrong-endian bytes passed lossless source verification") { _ = try source.decode(Fixture.json(wrongEndian)) }
+            var prefix = packet; prefix["text"] = (packet["text"] as! String).replacingOccurrences(of: "Café", with: "Fake")
+            rejects("Changed page prefix kept authentic selected bytes") { _ = try source.decode(Fixture.json(prefix)) }
+            let find = try state.admit(.find(needle: "aa", first: 0), info: info)
+            guard case .matches(let matches) = try find.decode(encoded(Fixture.find())) else { fatalError() }
+            check(matches.inventory.identity.encoding == encoding && matches.rows.count == 3,
+                  "Rendered Find remains in UTF-8 while source identity remains UTF-16")
+            let links = try state.admit(.prepareLinks, info: info)
+            let preparedLinks = try links.decode(encoded(Fixture.links()))
+            try state.accept(preparedLinks, job: links)
+            let heading = state.links!.target(id: 1)!
+            let activate = try state.admit(.link(heading), info: info)
+            guard case .link(let linked) = try activate.decode(encoded(Fixture.activation(heading))) else { fatalError() }
+            check(linked.page?.inventory.sourceBase == 2, "Heading links retain UTF-16 source coordinates")
+            state.close()
+        }
+    }
 
     @MainActor static func documentFind() throws {
         let info = try AtlasReaderInfo.decode(Fixture.json(Fixture.header("info")), handle: 7, path: Fixture.path)

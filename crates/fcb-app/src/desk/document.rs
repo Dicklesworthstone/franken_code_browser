@@ -21,7 +21,7 @@ pub(super) const DOCUMENT_HELP: &str = "\nMarkdown on retained desk panes (no so
   doc-copy PANE DOCUMENT_GEN START END rendered|markdown\n\
   doc-clear PANE DOCUMENT_GEN\n\
 Prepare/reflow uses a new increasing document generation, separate from queries.\n\
-The source must be complete UTF-8 (BOM supported), at most 64 KiB on this CLI\n\
+The source must be complete UTF-8 or BOM-marked UTF-16, at most 64 KiB on this CLI\n\
 route. Unsupported bytes remain readable/copyable with ordinary desk commands.\n\
 Width is 4..512 logical columns. Pages are zero-based and contain 1..128 rows.\n\
 Preview coordinates are rendered UTF-8 bytes, not source bytes or native glyphs.\n\

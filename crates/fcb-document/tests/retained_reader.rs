@@ -108,7 +108,7 @@ fn owner_source_limits_invalid_encoding_and_denied_memory_fail_before_publicatio
         Some(DocumentReadError::OwnerMismatch));
     assert_eq!(DocumentReader::prepare(&source, id(), generation(1),
         DocumentReadOptions { max_source_bytes: 2, ..Default::default() }, &budget, allocation(1), || false).err(), Some(DocumentReadError::SourceLimit));
-    let invalid = capture(&[0xff, 0xfe, b'#', 0]);
+    let invalid = capture(&[0xff, 0xfe, b'#']); // Incomplete UTF-16 code unit.
     assert_eq!(DocumentReader::prepare(&invalid, id(), generation(1), Default::default(), &budget, allocation(1), || false).err(),
         Some(DocumentReadError::InvalidUtf8));
     let tiny = ResourceBudget::new(owner(), ByteLength::new(1)).unwrap();
@@ -139,7 +139,7 @@ fn cancellation_can_discard_preparation_without_affecting_an_older_reader() {
 
 #[test]
 fn empty_and_bom_only_documents_have_valid_empty_views() {
-    for bytes in [b"".as_slice(), &[0xef, 0xbb, 0xbf]] {
+    for bytes in [b"".as_slice(), &[0xef, 0xbb, 0xbf], &[0xff, 0xfe], &[0xfe, 0xff]] {
         let source = capture(bytes); let budget = budget(); let reader = read(&source, &budget);
         assert_eq!(reader.total_lines(), 0); assert!(reader.headings().is_empty());
         assert!(reader.window(0, 10).unwrap().whole_document_visible());
@@ -195,4 +195,99 @@ fn every_rendered_scalar_boundary_has_flow_context_even_in_layout_separator_gaps
         }
         assert!(reader.window_at_rendered(reader.rendered_text().len(), 1).unwrap().lines().is_empty());
     }
+}
+
+fn utf16(text: &str, little: bool) -> Vec<u8> {
+    "\u{feff}".encode_utf16().chain(text.encode_utf16())
+        .flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect()
+}
+fn original_utf16_offset(text: &str, utf8_offset: usize) -> usize {
+    2 + 2 * text[..utf8_offset].encode_utf16().count()
+}
+
+#[test]
+fn utf16_previews_headings_copy_and_source_navigation_keep_original_coordinates() {
+    let text = "# Café 😀\r\n\r\nA **bold 😀** paragraph.\r\n\r\n## Details\r\n\r\nEnd.\r\n";
+    for little in [true, false] {
+        let bytes = utf16(text, little);
+        let source = capture(&bytes); let budget = budget(); let reader = read(&source, &budget);
+        assert_eq!(reader.source_base(), 2);
+        assert!(reader.rendered_text().contains("bold 😀"));
+        assert_eq!(reader.capture().bytes(), bytes);
+        reader.qualify_heading_source_ranges(&budget, allocation(2), || false).unwrap();
+        let heading = reader.heading("details").unwrap();
+        let original = reader.original_span(heading.source_span).unwrap();
+        let expected = original_utf16_offset(text, text.find("## Details").unwrap());
+        assert_eq!(original.start().get(), expected as u64);
+        assert_eq!(reader.window_at_source(original.start(), 2).unwrap().first_index(),
+            reader.window_at_heading("details", 2).unwrap().first_index());
+
+        let start = reader.rendered_text().find("bold 😀").unwrap();
+        let selection = reader.selection(TextSelectionRange::new(start, start + "bold 😀".len())).unwrap();
+        assert_eq!(selection.rendered_text, "bold 😀");
+        let (a, b) = selection.enclosing_original_range.as_usize_bounds().unwrap();
+        assert_eq!(a, original_utf16_offset(text, text.find("A **bold").unwrap()));
+        assert_eq!(selection.enclosing_original_bytes, &bytes[a..b]);
+        assert!(selection.enclosing_original_bytes.windows(utf16("**bold 😀**", little).len() - 2)
+            .any(|chunk| chunk == &utf16("**bold 😀**", little)[2..]));
+
+        let emoji = original_utf16_offset(text, text.find('😀').unwrap());
+        for invalid in [0, 1, 3, emoji + 1, emoji + 2, emoji + 3, bytes.len() + 1] {
+            assert_eq!(reader.window_at_source(fcb_core::ByteOffset::new(invalid as u64), 1).err(),
+                Some(DocumentReadError::InvalidRange), "invalid original offset {invalid}");
+        }
+        assert!(reader.window_at_source(fcb_core::ByteOffset::new(bytes.len() as u64), 1).unwrap().lines().is_empty());
+        let inside_decoded = text.find('é').unwrap() + 1;
+        assert_eq!(reader.original_span(SourceSpan { start: inside_decoded, end: inside_decoded }).err(),
+            Some(DocumentReadError::InvalidOutput));
+    }
+}
+
+#[test]
+fn utf16_decode_and_parser_expansion_are_bounded_before_layout() {
+    let budget = budget();
+    for bytes in [
+        vec![0xff, 0xfe, b'#'],
+        vec![0xff, 0xfe, 0x00, 0xd8],
+        vec![0xfe, 0xff, 0xdc, 0x00],
+    ] {
+        let source = capture(&bytes);
+        assert_eq!(DocumentReader::prepare(&source, id(), generation(1), Default::default(),
+            &budget, allocation(1), || false).err(), Some(DocumentReadError::InvalidUtf8));
+    }
+    // Each non-ASCII BMP character uses two original bytes but three parser
+    // bytes. The two admission limits are independent.
+    let source = capture(&utf16(&"界".repeat(16), true));
+    assert_eq!(source.bytes().len(), 34);
+    assert_eq!(DocumentReader::prepare(&source, id(), generation(1),
+        DocumentReadOptions { max_source_bytes: 40, ..Default::default() },
+        &budget, allocation(1), || false).err(), Some(DocumentReadError::SourceLimit));
+    // Reference expansion checks must see decoded "]:" and "[" characters.
+    let amplified = format!("[a]: {}\n\n{}", "x".repeat(8192), "[a] ".repeat(2048));
+    let source = capture(&utf16(&amplified, true));
+    assert_eq!(DocumentReader::prepare(&source, id(), generation(1), Default::default(),
+        &budget, allocation(1), || false).err(), Some(DocumentReadError::EngineBudget));
+    // A literal replacement scalar is valid source, unlike malformed input.
+    let source = capture(&utf16("# A \u{fffd}\n", false));
+    assert!(read(&source, &budget).rendered_text().contains('\u{fffd}'));
+}
+
+#[test]
+fn utf16_owned_layout_retains_its_map_and_cancellation_releases_candidate_admission() {
+    let budget = budget();
+    let reader = {
+        let source = capture(&utf16("# Retained\n\nText.\n", true));
+        read(&source, &budget).into_owned(&budget, allocation(2)).unwrap()
+    };
+    assert_eq!(reader.original_span(reader.headings()[0].source_span).unwrap().start().get(), 2);
+    reader.validate_delivery(reader.capture(), generation(1)).unwrap();
+    let source = capture(&utf16("# Replacement\n", false));
+    let mut polls = 0;
+    assert_eq!(DocumentReader::prepare(&source, id(), generation(2), Default::default(),
+        &budget, allocation(3), || { polls += 1; polls >= 2 }).err(), Some(DocumentReadError::Canceled));
+    // Reusing the allocation after refusal proves its decoder lease retired.
+    let replacement = DocumentReader::prepare(&source, id(), generation(2), Default::default(),
+        &budget, allocation(3), || false).unwrap();
+    assert!(replacement.rendered_text().contains("Replacement"));
+    assert!(reader.rendered_text().contains("Retained"));
 }

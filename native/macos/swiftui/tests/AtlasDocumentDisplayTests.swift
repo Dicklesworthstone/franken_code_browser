@@ -331,7 +331,65 @@ import CryptoKit
             preconditionFailure("Saved error schema entered current-root image route")
         } catch AtlasReaderError.invalidResponse { }
     }
+    static func utf16Documents() throws {
+        for encoding in ["utf16le", "utf16be"] {
+            let identity = AtlasReaderIdentity(owner: 7, file: 2, revision: 3, capturedBytes: 20,
+                pathBytes: document.identity.pathBytes, encoding: encoding, displayPath: "/p/README.md")
+            let retained = AtlasReaderDocumentInventory(identity: identity, generation: 5,
+                width: 80, totalLines: 1, totalHeadings: 0, renderedBytes: 5, sourceBase: 2)
+            func decoded(_ packet: [String: Any], anchor: UInt64? = nil) throws -> AtlasDocumentDisplayPage {
+                try AtlasDocumentDisplayWire.page(json(packet), document: retained,
+                    command: anchor == nil ? "document-display-prepare" : "document-display-from-source",
+                    first: anchor == nil ? 0 : nil, width: 200, sourceAnchor: anchor)
+            }
+            var packet = wire(), row = item()
+            packet["encoding"] = encoding
+            row["enclosing_original_range"] = ["start": "2", "end": "20"]
+            packet["display_items"] = [row]
+            let page = try decoded(packet)
+            precondition(page.inventory.document.identity.encoding == encoding)
+            precondition(page.items[0].original == .init(start: 2, end: 20))
+            for range in [
+                ["start": "0", "end": "20"],
+                ["start": "3", "end": "20"],
+                ["start": "2", "end": "19"]
+            ] {
+                var invalid = packet, badRow = row
+                badRow["enclosing_original_range"] = range
+                invalid["display_items"] = [badRow]
+                do {
+                    _ = try decoded(invalid)
+                    preconditionFailure("Accepted UTF-16 Styled source outside code-unit boundaries")
+                } catch { }
+            }
+            packet["command"] = "document-display-from-source"
+            packet["original_anchor"] = "8"
+            let anchored = try decoded(packet, anchor: 8)
+            precondition(anchored.items[0].original == .init(start: 2, end: 20))
+            packet["original_anchor"] = "9"
+            do {
+                _ = try decoded(packet, anchor: 9)
+                preconditionFailure("Accepted an interior UTF-16 code-unit Styled anchor")
+            } catch { }
+
+            packet = imagePageWire()
+            packet["encoding"] = encoding
+            var imageRow = (packet["display_items"] as! [[String: Any]])[0]
+            imageRow["enclosing_original_range"] = ["start": "2", "end": "20"]
+            packet["display_items"] = [imageRow]
+            let imagePage = try decoded(packet)
+            precondition(imagePage.imageTargets.count == 1)
+            precondition(imagePage.imageTargets[0].original == .init(start: 2, end: 20))
+            let validImage = imagePage.items[0]
+            let invalidImage = AtlasDocumentDisplayItem(id: validImage.id, bounds: validImage.bounds,
+                original: .init(start: 3, end: 20), content: validImage.content,
+                imageReference: validImage.imageReference)
+            precondition(imagePage.imageTarget(invalidImage) == nil)
+        }
+    }
+
     static func main() throws {
+        try utf16Documents()
         try savedImageReceipts()
         let accepted = try decode(wire())
         precondition(accepted.items.count == 1 && accepted.first == 0 && accepted.next == nil)

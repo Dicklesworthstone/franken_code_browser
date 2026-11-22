@@ -171,6 +171,13 @@ struct AtlasReaderDocumentInventory: Sendable {
             && totalLines == other.totalLines && totalHeadings == other.totalHeadings
             && renderedBytes == other.renderedBytes && sourceBase == other.sourceBase
     }
+    func admitsOriginal(_ range: AtlasDocumentByteRange, nonempty: Bool = true) -> Bool {
+        range.valid(upTo: identity.capturedBytes, nonempty: nonempty) && range.start >= sourceBase
+            && (identity.encoding == "utf8" || (range.start.isMultiple(of: 2) && range.end.isMultiple(of: 2)))
+    }
+    func admitsOriginalOffset(_ offset: UInt64) -> Bool {
+        admitsOriginal(.init(start: offset, end: offset), nonempty: false)
+    }
 }
 
 struct AtlasReaderDocumentLine: Identifiable, Sendable, Equatable {
@@ -704,7 +711,7 @@ struct AtlasReaderDocumentJob: Sendable {
             case .findMatch(let target):
                 guard matches?.target(id: target.match.id) == target else { throw AtlasReaderError.invalidInput }
             case .fromSource(let offset):
-                guard offset >= inventory.sourceBase, offset <= info.identity.capturedBytes else { throw AtlasReaderError.invalidInput }
+                guard inventory.admitsOriginalOffset(offset) else { throw AtlasReaderError.invalidInput }
             case .source(let target), .copy(let target, _):
                 guard page?.target(at: target.line.id) == target else { throw AtlasReaderError.invalidInput }
             case .links(let first):
@@ -722,8 +729,7 @@ struct AtlasReaderDocumentJob: Sendable {
                       first <= displayInventory.totalItems else { throw AtlasReaderError.invalidInput }
             case .displayFromSource(let offset):
                 guard let displayInventory, displayInventory.document.matches(inventory),
-                      displayInventory.qualifiedSources, offset >= inventory.sourceBase,
-                      offset <= info.identity.capturedBytes else { throw AtlasReaderError.invalidInput }
+                      displayInventory.qualifiedSources, inventory.admitsOriginalOffset(offset) else { throw AtlasReaderError.invalidInput }
             case .prepareLinks, .prepare: break
             }
         }
@@ -837,7 +843,8 @@ private struct AtlasReaderDocumentWire: Decodable {
     }
     func inventory(identity: AtlasReaderIdentity, generation: UInt64) throws -> AtlasReaderDocumentInventory {
         guard generation > 0, try number("document_generation") == generation,
-              identity.encoding == "utf8", identity.capturedBytes <= AtlasReaderDocumentLimits.sourceBytes,
+              ["utf8", "utf16le", "utf16be"].contains(identity.encoding),
+              identity.capturedBytes <= AtlasReaderDocumentLimits.sourceBytes,
               try flag("document_ready"), try flag("layout_complete"), try !flag("native_shaped"),
               try text("rendering") == "logical-frankenmarkdown-flow",
               try text("source_mapping") == "enclosing-regions-not-glyph-exact" else { throw AtlasReaderError.invalidResponse }
@@ -846,7 +853,9 @@ private struct AtlasReaderDocumentWire: Decodable {
         let base = try number("parser_source_base")
         guard (4...512).contains(width), lines <= AtlasReaderDocumentLimits.flowLines,
               headings <= AtlasReaderDocumentLimits.blocks, bytes <= 64 * 1024 * 1024,
-              (base == 0 || base == 3), base <= identity.capturedBytes else { throw AtlasReaderError.invalidResponse }
+              base <= identity.capturedBytes,
+              (identity.encoding == "utf8" ? (base == 0 || base == 3)
+                  : (base == 2 && identity.capturedBytes.isMultiple(of: 2))) else { throw AtlasReaderError.invalidResponse }
         return .init(identity: identity, generation: generation, width: width, totalLines: lines,
             totalHeadings: headings, renderedBytes: bytes, sourceBase: base)
     }
@@ -881,7 +890,7 @@ private struct AtlasReaderDocumentWire: Decodable {
             }
             previousEnd = range.end
             if let original = row.enclosing_original_range {
-                guard original.valid(upTo: inventory.identity.capturedBytes, nonempty: true), original.start >= inventory.sourceBase else {
+                guard inventory.admitsOriginal(original) else {
                     throw AtlasReaderError.invalidResponse
                 }
             }
@@ -902,8 +911,7 @@ private struct AtlasReaderDocumentWire: Decodable {
                   row.title.utf8.count <= Int(AtlasReaderDocumentLimits.sourceBytes),
                   slugs.insert(Data(row.slug.utf8)).inserted,
                   let offset = AtlasReaderWire.integer(row.rendered_utf8_offset), offset <= inventory.renderedBytes,
-                  row.original_range.valid(upTo: inventory.identity.capturedBytes, nonempty: true),
-                  row.original_range.start >= inventory.sourceBase else { throw AtlasReaderError.invalidResponse }
+                  inventory.admitsOriginal(row.original_range) else { throw AtlasReaderError.invalidResponse }
             return .init(slug: row.slug, title: row.title, renderedOffset: offset, original: row.original_range)
         }
         return .init(id: UUID(), inventory: inventory, first: first, rows: headings, next: next)
@@ -1015,8 +1023,7 @@ private struct AtlasReaderDocumentWire: Decodable {
         let page = try self.page(inventory, expectedFirst: row.kind == .start ? 0 : nil)
         if row.kind == .heading {
             guard let fragment = row.fragment, try text("heading_slug").utf8.elementsEqual(fragment.utf8),
-                  try range("heading_original_range").valid(upTo: inventory.identity.capturedBytes, nonempty: true),
-                  try range("heading_original_range").start >= inventory.sourceBase else {
+                  inventory.admitsOriginal(try range("heading_original_range")) else {
                 throw AtlasReaderError.invalidResponse
             }
         } else if try !absent(["heading_slug", "heading_original_range"]) {
@@ -1037,8 +1044,7 @@ private struct AtlasReaderDocumentWire: Decodable {
     func copy(_ target: AtlasReaderDocumentTarget, mode: AtlasReaderDocumentCopyMode) throws -> AtlasReaderDocumentCopy {
         try selection(target)
         let original = try range("enclosing_original_range")
-        guard original.valid(upTo: target.inventory.identity.capturedBytes, nonempty: true),
-              original.start >= target.inventory.sourceBase, original.length <= AtlasReaderLimits.maximumPageBytes else {
+        guard target.inventory.admitsOriginal(original), original.length <= AtlasReaderLimits.maximumPageBytes else {
             throw AtlasReaderError.invalidResponse
         }
         let value: String
@@ -1064,7 +1070,7 @@ private struct AtlasReaderDocumentWire: Decodable {
         let sourceLength = target.inventory.identity.capturedBytes
         let text = try text("text"), pageHex = try self.text("original_hex")
         let padding = AtlasReaderDocumentLimits.context + 4
-        guard raw.valid(upTo: sourceLength, nonempty: true), raw.start >= target.inventory.sourceBase,
+        guard target.inventory.admitsOriginal(raw),
               visible.valid(upTo: sourceLength), requested.valid(upTo: sourceLength),
               requested.start == raw.start - min(padding, raw.start),
               requested.end == raw.end + min(padding, sourceLength - raw.end),
@@ -1081,19 +1087,23 @@ private struct AtlasReaderDocumentWire: Decodable {
               AtlasReaderWire.validHex(pageHex, bytes: visible.length),
               AtlasReaderWire.validHex(hex, bytes: raw.length) else { throw AtlasReaderError.invalidResponse }
         if let next = try optionalNumber("next_offset"), next != visible.end { throw AtlasReaderError.invalidResponse }
-        let pageBytes = Array(pageHex.utf8), decoded = Array(text.utf8)
+        let pageBytes = Array(pageHex.utf8)
+        // Rust owns both coordinate ranges. Verify the lossless page and both
+        // endpoints through the existing source-reader reverse-encoding check;
+        // equal text at another offset must not authorize the wrong passage.
         guard pageBytes[Int((raw.start - visible.start) * 2)..<Int((raw.end - visible.start) * 2)].elementsEqual(hex.utf8),
-              String(bytes: decoded[Int(utf8.start)..<Int(utf8.end)], encoding: .utf8) != nil,
-              decoded[Int(utf8.start)..<Int(utf8.end)].elementsEqual(Self.hexBytes(hex)) else {
+              let start = AtlasReaderPosition.caret(in: text, atUTF8: utf8.start),
+              let end = AtlasReaderPosition.caret(in: text, atUTF8: utf8.end),
+              try AtlasReaderPosition.verifiesSourceOffset(text: text, utf8Offset: utf8.start,
+                  utf16Offset: start.offset, originalHex: pageHex, visibleStart: visible.start,
+                  originalOffset: raw.start, encoding: target.inventory.identity.encoding, hasReplacements: false),
+              try AtlasReaderPosition.verifiesSourceOffset(text: text, utf8Offset: utf8.end,
+                  utf16Offset: end.offset, originalHex: pageHex, visibleStart: visible.start,
+                  originalOffset: raw.end, encoding: target.inventory.identity.encoding, hasReplacements: false) else {
             throw AtlasReaderError.invalidResponse
         }
         return .init(target: target, visible: visible, text: text, originalHex: pageHex,
             enclosingOriginal: raw, selectionUTF8: utf8, selectedHex: hex)
-    }
-    private static func hexBytes(_ validatedHex: String) -> [UInt8] {
-        let bytes = Array(validatedHex.utf8)
-        func nibble(_ b: UInt8) -> UInt8 { b <= 57 ? b - 48 : b - 87 }
-        return stride(from: 0, to: bytes.count, by: 2).map { nibble(bytes[$0]) * 16 + nibble(bytes[$0 + 1]) }
     }
     private struct Selection: Decodable {
         let fields: AtlasReaderDocumentWire

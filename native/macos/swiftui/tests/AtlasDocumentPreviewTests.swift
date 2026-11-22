@@ -70,7 +70,7 @@ import Foundation
             generation += 1
             displayInventory = nil
             inventory = .init(identity: identity, generation: generation, width: width,
-                totalLines: totalLines, totalHeadings: totalHeadings, renderedBytes: renderedBytes, sourceBase: 3)
+                totalLines: totalLines, totalHeadings: totalHeadings, renderedBytes: renderedBytes, sourceBase: identity.encoding == "utf8" ? 3 : 2)
             return .prepared(page(first: 0), headings(first: 0))
         }
         switch request {
@@ -349,7 +349,7 @@ import Foundation
             check(m.page?.id == accepted && m.page?.inventory.width == 100, "Out-of-order old reflow cannot replace newest page")
         }
         do {
-            for (encoding, bytes) in [("utf16le", UInt64(100)), ("unsupported", 100),
+            for (encoding, bytes) in [("unsupported", UInt64(100)),
                                       ("utf8", AtlasReaderDocumentLimits.sourceBytes + 1)] {
                 let f = Fixture(), m = f.model()
                 m.bind(identity: Fixture.identity(bytes: bytes, encoding: encoding), sourceOffset: 0)
@@ -446,6 +446,19 @@ import Foundation
         await sourceFollowing()
         await styledNavigationTransactions()
         await documentFind()
+        for encoding in ["utf16le", "utf16be"] {
+            let f = Fixture(); f.identity = Fixture.identity(encoding: encoding)
+            let m = f.model()
+            m.bind(identity: f.identity, sourceOffset: 0)
+            check(m.canPrepare && m.unavailableReason == nil, "BOM-marked UTF-16 admits Markdown preview")
+            m.prepare(); await wait { !m.busy }
+            check(m.page?.inventory.sourceBase == 2 && m.page?.inventory.identity.encoding == encoding,
+                  "UTF-16 preview keeps the correct BOM and captured source identity")
+            m.fromSource()
+            await wait { !m.busy }
+            check(f.lastSourceAnchor == 2, "Follow source starts after the original UTF-16 BOM")
+            m.close()
+        }
         print("AtlasDocumentPreviewTests: \(checks) checks passed")
     }
 
@@ -578,7 +591,7 @@ import Foundation
                   "A delayed old-capture reply cannot replace the new retained Markdown")
         }
         do {
-            for (encoding, bytes) in [("utf16le", UInt64(100)),
+            for (encoding, bytes) in [("unsupported", UInt64(100)),
                                        ("utf8", AtlasReaderDocumentLimits.sourceBytes + 1)] {
                 let f = Fixture(), m = f.model(), request = UUID()
                 m.bind(identity: Fixture.identity(bytes: bytes, encoding: encoding), sourceOffset: 0)

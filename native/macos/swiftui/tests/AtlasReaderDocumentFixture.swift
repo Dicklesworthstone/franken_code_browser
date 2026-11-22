@@ -26,13 +26,50 @@ enum DocumentWireFixture {
         var out = header(command, owner: owner)
         out["text_kind"] = "logical-captured-text-not-shaped"
         out["requested_original_range"] = range(0, UInt64(raw.count))
-        out["visible_range"] = range(0, UInt64(raw.count))
-        out["range_limited"] = false; out["boundaries_adjusted"] = false; out["has_replacements"] = false
+        out["visible_range"] = range(3, UInt64(raw.count))
+        out["range_limited"] = false; out["boundaries_adjusted"] = true; out["has_replacements"] = false
         out["first_physical_line"] = NSNull(); out["next_offset"] = NSNull()
         out["text"] = String(decoding: raw.dropFirst(3), as: UTF8.self)
-        out["original_hex"] = hex(raw)
+        out["original_hex"] = hex(raw.dropFirst(3))
         return out
     }
+    // Re-encode this fixed captured-source fixture through Foundation. This
+    // adapts wire coordinates; it does not imitate Markdown parsing or shaping.
+    static func encoded(_ packet: [String: Any], as encoding: String) -> [String: Any] {
+        if encoding == "utf8" { return packet }
+        precondition(["utf16le", "utf16be"].contains(encoding))
+        let codec: String.Encoding = encoding == "utf16le" ? .utf16LittleEndian : .utf16BigEndian
+        func offset(_ value: String) -> String {
+            let prefix = String(bytes: raw.prefix(Int(value)!), encoding: .utf8)!
+            return String(prefix.data(using: codec)!.count)
+        }
+        func convert(_ value: Any, key: String = "") -> Any {
+            if let object = value as? [String: Any] {
+                if ["original_range", "enclosing_original_range", "heading_original_range",
+                    "evidence_range", "requested_original_range", "visible_range"].contains(key) {
+                    return ["start": offset(object["start"] as! String),
+                            "end": offset(object["end"] as! String)]
+                }
+                return object.reduce(into: [String: Any]()) { result, pair in
+                    result[pair.key] = convert(pair.value, key: pair.key)
+                }
+            }
+            if let rows = value as? [Any] { return rows.map { convert($0, key: key) } }
+            if key == "encoding", value as? String == "utf8" { return encoding }
+            if key == "captured_bytes" { return offset(String(raw.count)) }
+            if key == "parser_source_base" { return "2" }
+            if key == "original_hex", let hex = value as? String {
+                let encoded = Array(hex.utf8)
+                let bytes = stride(from: 0, to: encoded.count, by: 2).map {
+                    UInt8(String(bytes: encoded[$0..<$0 + 2], encoding: .utf8)!, radix: 16)!
+                }
+                return self.hex(String(bytes: bytes, encoding: .utf8)!.data(using: codec)!)
+            }
+            return value
+        }
+        return convert(packet) as! [String: Any]
+    }
+
     static func page(_ command: String, owner: UInt64, generation: UInt64, width: UInt64,
         first: UInt64 = 0, headingFirst: UInt64 = 0) -> [String: Any] {
         let total: UInt64 = 70, headingCount: UInt64 = 65
@@ -122,12 +159,13 @@ final class DocumentCallGate: @unchecked Sendable {
 final class DocumentBoundary: @unchecked Sendable {
     struct Counts { var opens = 0; var closes = 0; var calls = 0; var active = 0; var peak = 0 }
     let owner: UInt64
+    let encoding: String
     private let lock = NSLock()
     private var counts = Counts()
     private var width: UInt64 = 100
     private var gate: (String, DocumentCallGate)?
     private var corrupt = false
-    init(owner: UInt64 = 7) { self.owner = owner }
+    init(owner: UInt64 = 7, encoding: String = "utf8") { self.owner = owner; self.encoding = encoding }
     var snapshot: Counts { lock.withLock { counts } }
     func blockNext(_ command: String) -> DocumentCallGate {
         let next = DocumentCallGate()
@@ -187,16 +225,16 @@ final class DocumentBoundary: @unchecked Sendable {
             if command == "document-from-source" { out["original_anchor"] = String(start) }
         }
         if corrupt { out["source_revision"] = "999" }
-        return DocumentWireFixture.json(out)
+        return DocumentWireFixture.json(DocumentWireFixture.encoded(out, as: encoding))
     }
     var reader: AtlasReaderTransport {
         .init(create: { [self] in owner }, open: { [self] handle, path, _ in
             precondition(handle == owner && path == DocumentWireFixture.path)
             lock.withLock { counts.opens += 1 }
-            return DocumentWireFixture.json(DocumentWireFixture.header("info", owner: owner))
+            return DocumentWireFixture.json(DocumentWireFixture.encoded(DocumentWireFixture.header("info", owner: owner), as: encoding))
         }, window: { [self] handle, offset, _ in
             precondition(handle == owner && offset == 0)
-            return DocumentWireFixture.json(DocumentWireFixture.sourcePage("window", owner: owner))
+            return DocumentWireFixture.json(DocumentWireFixture.encoded(DocumentWireFixture.sourcePage("window", owner: owner), as: encoding))
         }, lines: { _, _, _, _ in nil }, cancel: { _ in true }, close: { [self] handle in
             precondition(handle == owner)
             lock.withLock { precondition(counts.active == 0); counts.closes += 1 }

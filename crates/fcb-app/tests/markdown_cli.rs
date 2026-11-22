@@ -181,7 +181,7 @@ fn oversized_and_unsupported_inputs_are_errors_not_prefix_documents() {
     let (exit, out, _) = invoke(&arguments(&path, &["--json", "--max-source-bytes", "4"]));
     assert_eq!(exit, EXIT_ERROR); assert!(out.contains("DOCUMENT_READ_SOURCE_LIMIT"));
     assert!(!out.contains("\"document_complete\":true"));
-    let path = file(&[0xff, 0xfe, b'#', 0, b' ', 0]);
+    let path = file(&[0xff, 0xfe, b'#', 0, 0x00, 0xd8]); // Unpaired high surrogate.
     for options in [vec!["--json"], vec!["--json", "--source-byte", "2"]] {
         let (exit, out, _) = invoke(&arguments(&path, &options));
         assert_eq!(exit, EXIT_ERROR); assert!(out.contains("DOCUMENT_READ_INVALID_UTF8"));
@@ -237,4 +237,58 @@ fn help_does_not_require_a_source_or_a_runtime() {
     let (exit, out, err) = invoke(&args); assert_eq!(exit, EXIT_OK); assert!(err.is_empty());
     assert!(out.contains("fcb markdown FILE"));
     assert!(out.contains("--source-byte"));
+}
+
+#[test]
+fn utf16_markdown_cli_preserves_original_heading_anchors_and_copy_bytes() {
+    let text = "# First\n\nOpening.\n\n## Second\n\nA **bold** phrase.\n";
+    for little in [true, false] {
+        let bytes: Vec<u8> = "\u{feff}".encode_utf16().chain(text.encode_utf16())
+            .flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect();
+        let path = file(&bytes);
+        let (exit, out, err) = invoke(&arguments(&path, &["--json"]));
+        assert_eq!(exit, EXIT_OK, "{out} {err}");
+        assert!(out.contains("\"document_complete\":true"));
+        assert!(out.contains("\"text\":\"A bold phrase.\""));
+        assert!(out.contains("\"slug\":\"second\""));
+        assert!(out.contains("\"original_range\":{\"start\":\"2\""));
+        let offset = 2 + 2 * text[..text.find("## Second").unwrap()].encode_utf16().count();
+        let at = offset.to_string();
+        let (exit, out, _) = invoke(&arguments(&path, &["--json", "--source-byte", &at]));
+        assert_eq!(exit, EXIT_PARTIAL, "{out}");
+        assert!(out.contains("\"navigation\":\"source-region\""));
+        assert!(out.contains("\"text\":\"Second\""));
+        assert!(!out.contains("\"text\":\"First\""));
+        let odd = (offset + 1).to_string();
+        let (exit, out, _) = invoke(&arguments(&path, &["--json", "--source-byte", &odd]));
+        assert_eq!(exit, EXIT_ERROR, "{out}");
+        assert!(out.contains("DOCUMENT_READ_INVALID_RANGE"));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn utf16_markdown_cli_copy_keeps_rendered_text_and_original_bytes_separate() {
+    for little in [true, false] {
+        let text = "A **bold** phrase.\n";
+        let encoded: Vec<u8> = text.encode_utf16()
+            .flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect();
+        let mut bytes = if little { vec![0xff, 0xfe] } else { vec![0xfe, 0xff] };
+        bytes.extend_from_slice(&encoded);
+        let path = file(&bytes);
+        let (exit, out, err) = invoke(&arguments(&path,
+            &["--json", "--copy-start", "2", "--copy-end", "6"]));
+        assert_eq!(exit, EXIT_OK, "{out} {err}");
+        assert!(out.contains("\"rendered_text\":\"bold\""));
+        let encoded_bold: Vec<u8> = "**bold**".encode_utf16()
+            .flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect();
+        let hex: String = encoded_bold.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert!(out.contains(&hex), "{out}");
+        let (exit, out, err) = invoke(&arguments(&path, &["--copy-start", "2", "--copy-end", "6"]));
+        assert_eq!(exit, EXIT_OK, "{out} {err}");
+        assert!(out.contains("[rendered text selection]\nbold"));
+        assert!(out.contains("decoded as text; not literal selection"));
+        assert!(out.contains("**bold**"), "{out}");
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
 }

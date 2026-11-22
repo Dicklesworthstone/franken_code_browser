@@ -15,6 +15,8 @@ use crate::{DocumentBudgets, DocumentError, DocumentFlowLine, DocumentSession,
     SourceSpan, TextSelectionRange};
 
 mod heading_provenance;
+mod source_encoding;
+pub(crate) use source_encoding::DocumentSourceEncoding;
 
 pub const MAX_DOCUMENT_SOURCE_BYTES: usize = 256 * 1024;
 pub const MAX_DOCUMENT_WINDOW_LINES: usize = 1024;
@@ -99,7 +101,7 @@ pub struct DocumentReader<'capture> {
     capture: Cow<'capture, CompleteCapture>,
     session: DocumentSession,
     output: HeadlessDocumentOutput,
-    source_base: usize,
+    source_encoding: DocumentSourceEncoding,
     options: DocumentReadOptions,
     _lease: ResourceLease,
     _source_lease: Option<ResourceLease>,
@@ -115,25 +117,27 @@ impl<'capture> DocumentReader<'capture> {
         if id.owner() != owner || generation.owner() != owner { return Err(DocumentReadError::OwnerMismatch); }
         let bytes = capture.bytes();
         if bytes.len() > options.max_source_bytes { return Err(DocumentReadError::SourceLimit); }
-        std::str::from_utf8(bytes).map_err(|_| DocumentReadError::InvalidUtf8)?;
-        // Reserve before the parser/session/semantic-fixture allocations. This
-        // conservative managed envelope is not an OS process-footprint bound.
-        // Share the existing reference-amplification admission policy with link
-        // extraction. A bounded source can still expand into an oversized AST.
-        let parse_charge = crate::links::parse_workspace(bytes).map_err(|_| DocumentReadError::EngineBudget)?;
-        let charge = Some(parse_charge)
-            .and_then(|n| n.checked_add(options.max_flow_lines * 256))
+        // Reserve decoder/map storage before allocating it. The parser and
+        // provenance audit always consume the decoded UTF-8 view, while source
+        // selection and capture identity remain in the original byte domain.
+        let decoder_charge = DocumentSourceEncoding::workspace(bytes)?;
+        let fixed_charge = decoder_charge.checked_add(options.max_flow_lines * 256)
             .and_then(|n| n.checked_add(options.max_flow_items * 512))
             .and_then(|n| n.checked_add(1024 * 1024 + size_of::<Self>()))
             .ok_or(DocumentReadError::InvalidLimits)?;
-        let lease = budget.try_reserve_managed(owner, allocation, ByteLength::new(charge as u64))
+        let lease = budget.try_reserve_managed(owner, allocation, ByteLength::new(fixed_charge as u64))
             .map_err(|_| DocumentReadError::ResourceDenied)?;
-        // A UTF-8 BOM is a source encoding header, not Markdown syntax. Strip
-        // ONLY that header for the parser, then translate every source span back
-        // to the original capture. Internal parser-view bytes confer no new ID.
-        let source_base = if bytes.starts_with(&[0xef, 0xbb, 0xbf]) { 3 } else { 0 };
+        let source_encoding = DocumentSourceEncoding::build(bytes, options.max_source_bytes)?;
+        if canceled() { return Err(DocumentReadError::Canceled); }
+        let text = source_encoding.text(bytes)?;
+        // Reference amplification must be measured in parser input, not raw
+        // UTF-16, whose interleaved zero bytes hide the upstream "]:" gate.
+        let parse_charge = crate::links::parse_workspace(text.as_bytes())
+            .map_err(|_| DocumentReadError::EngineBudget)?;
+        let charge = fixed_charge.checked_add(parse_charge).ok_or(DocumentReadError::InvalidLimits)?;
+        lease.reconcile(ByteLength::new(charge as u64)).map_err(|_| DocumentReadError::ResourceDenied)?;
         let parser_capture = CompleteCapture::new(*capture.request(),
-            ByteLength::new((bytes.len() - source_base) as u64), Arc::from(&bytes[source_base..]))
+            ByteLength::new(text.len() as u64), Arc::from(text.as_bytes()))
             .map_err(|_| DocumentReadError::InvalidRange)?;
         if canceled() { return Err(DocumentReadError::Canceled); }
         let session = DocumentSession::new(id, &parser_capture, generation)?;
@@ -143,7 +147,7 @@ impl<'capture> DocumentReader<'capture> {
             DocumentBudgets { max_blocks: options.max_blocks, max_bytes: options.max_source_bytes,
                 max_lines: options.max_flow_lines, max_items: options.max_flow_items })?;
         if canceled() { return Err(DocumentReadError::Canceled); }
-        let reader = Self { capture: Cow::Borrowed(capture), session, output, source_base, options,
+        let reader = Self { capture: Cow::Borrowed(capture), session, output, source_encoding, options,
             _lease: lease, _source_lease: None };
         reader.validate_output(&mut canceled)?;
         Ok(reader)
@@ -162,14 +166,18 @@ impl<'capture> DocumentReader<'capture> {
         let source_lease = budget.try_reserve_managed(self.capture.request().file().owner(), allocation,
             ByteLength::new(charge as u64)).map_err(|_| DocumentReadError::ResourceDenied)?;
         Ok(DocumentReader { capture: Cow::Owned(self.capture.into_owned()), session: self.session,
-            output: self.output, source_base: self.source_base, options: self.options,
+            output: self.output, source_encoding: self.source_encoding, options: self.options,
             _lease: self._lease, _source_lease: Some(source_lease) })
     }
 
     pub fn capture(&self) -> &CompleteCapture { self.capture.as_ref() }
     pub fn generation(&self) -> DocumentGeneration { self.session.generation() }
     pub fn options(&self) -> DocumentReadOptions { self.options }
-    pub fn source_base(&self) -> usize { self.source_base }
+    /// Original encoding-header length; parser offsets need original_span(),
+    /// since UTF-16 source coordinates are not a constant byte translation.
+    pub fn source_base(&self) -> usize { self.source_encoding.source_base() }
+    pub(crate) fn source_encoding(&self) -> &DocumentSourceEncoding { &self.source_encoding }
+    pub(crate) fn parser_text(&self) -> &str { self.session.source_text() }
     pub fn total_lines(&self) -> usize { self.output.lines.len() }
     pub fn headings(&self) -> &[HeadingSourceAnchor] { self.output.source_map.headings() }
     pub fn rendered_text(&self) -> &str { self.output.source_map.rendered_text() }
@@ -182,17 +190,18 @@ impl<'capture> DocumentReader<'capture> {
         if generation != self.generation() { return Err(DocumentReadError::StaleGeneration); }
         Ok(())
     }
-    /// Convert upstream parser-relative primary-source bytes, including the BOM
-    /// translation. Empty/synthetic spans must not be called exact source text.
+    /// Convert upstream parser-relative UTF-8 coordinates to the exact original
+    /// capture, including UTF-16 and its BOM. Empty/synthetic spans must not be
+    /// called exact source text.
     pub fn original_span(&self, span: SourceSpan) -> Result<ByteRange, DocumentReadError> {
-        let text = self.session.source_text();
-        if span.start > span.end || text.get(span.start..span.end).is_none() {
-            return Err(DocumentReadError::InvalidOutput);
-        }
-        let start = span.start.checked_add(self.source_base).ok_or(DocumentReadError::InvalidRange)?;
-        let end = span.end.checked_add(self.source_base).ok_or(DocumentReadError::InvalidRange)?;
-        ByteRange::new(ByteOffset::new(start as u64), ByteOffset::new(end as u64))
-            .map_err(|_| DocumentReadError::InvalidRange)
+        self.source_encoding.original_span(self.capture.bytes(), span)
+    }
+    /// Check an original captured-byte anchor independently of whether upstream
+    /// Markdown provenance maps it to a rendered row. Invalid encoding boundaries
+    /// cannot become fallback navigation, even when the layout is unqualified.
+    pub fn validate_source_offset(&self, original: ByteOffset) -> Result<(), DocumentReadError> {
+        let offset = usize::try_from(original.get()).map_err(|_| DocumentReadError::InvalidRange)?;
+        self.source_encoding.validate_original_offset(self.capture.bytes(), offset)
     }
     /// Zero-based logical flow rows, not original source line numbers. EOF is a
     /// valid empty window. No prefix materialization is done by this operation.
@@ -225,18 +234,15 @@ impl<'capture> DocumentReader<'capture> {
     /// Navigate from original source to the FIRST logical row of its enclosing
     /// upstream-mapped source region. This is a block-level correspondence, not
     /// an exact glyph/column or a claim that all source bytes are rendered.
-    /// Unmapped syntax, BOM bytes and interior UTF-8 offsets are refused. Source
+    /// Unmapped syntax, BOM bytes and interior encoded scalars are refused. Source
     /// EOF maps to the valid empty document window. Work is bounded by flow rows.
     pub fn window_at_source(&self, original: ByteOffset, count: usize)
         -> Result<DocumentWindow<'_, 'capture>, DocumentReadError> {
         if count == 0 || count > MAX_DOCUMENT_WINDOW_LINES { return Err(DocumentReadError::InvalidRange); }
-        let offset = usize::try_from(original.get()).map_err(|_| DocumentReadError::InvalidRange)?;
-        let bytes = self.capture.bytes();
-        if offset < self.source_base || offset > bytes.len()
-            || !std::str::from_utf8(bytes).map_err(|_| DocumentReadError::InvalidUtf8)?.is_char_boundary(offset) {
-            return Err(DocumentReadError::InvalidRange);
+        self.validate_source_offset(original)?;
+        if original.get() == self.capture.bytes().len() as u64 {
+            return self.window(self.total_lines(), count);
         }
-        if offset == bytes.len() { return self.window(self.total_lines(), count); }
         for line in &self.output.lines {
             let range = self.original_span(line.source_span)?;
             if range.start().get() <= original.get() && original.get() < range.end().get() {
@@ -278,6 +284,7 @@ impl<'capture> DocumentReader<'capture> {
         let (start, end) = original.as_usize_bounds().map_err(|_| DocumentReadError::InvalidRange)?;
         let bytes = self.capture.bytes().get(start..end).ok_or(DocumentReadError::InvalidOutput)?;
         Ok(DocumentReadingSelection { rendered_range: range, rendered_text: rendered,
+            enclosing_markdown_text: enclosing,
             enclosing_original_range: original, enclosing_original_bytes: bytes })
     }
     fn validate_output(&self, canceled: &mut impl FnMut() -> bool) -> Result<(), DocumentReadError> {
@@ -324,6 +331,9 @@ impl DocumentWindow<'_, '_> {
 pub struct DocumentReadingSelection<'a> {
     pub rendered_range: TextSelectionRange,
     pub rendered_text: &'a str,
+    /// Decoded UTF-8 Markdown for text presentation. The exact encoded capture
+    /// remains separately available through enclosing_original_bytes.
+    pub enclosing_markdown_text: &'a str,
     pub enclosing_original_range: ByteRange,
     pub enclosing_original_bytes: &'a [u8],
 }

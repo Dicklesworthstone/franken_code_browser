@@ -6,7 +6,7 @@
 //! admits resources, binds source/layout identities and validates publication.
 //! It performs no I/O, asset loading, native calls or implicit runtime work.
 
-use fcb_core::{ByteLength, ByteOffset, ByteRange, DocumentGeneration,
+use fcb_core::{ByteLength, ByteRange, DocumentGeneration,
     ResourceAllocationId, ResourceBudget, ResourceLease};
 use fcb_source::CompleteCapture;
 use franken_markdown::{DisplayItem, DisplayList, DisplayRect, FontFamily, ResumableFlowDisplay, SourceSpan};
@@ -14,7 +14,7 @@ use franken_markdown::display::VectorShapeType;
 use franken_markdown::flow_display::{FlowDisplayLimits, FlowLayoutError, FlowLayoutOptions};
 use franken_markdown::fonts::BundledFlowFonts;
 use franken_markdown::text::{Direction, FontId};
-use crate::reader::{DocumentReadError, DocumentReader};
+use crate::reader::{DocumentReadError, DocumentReader, DocumentSourceEncoding};
 
 pub const MAX_DISPLAY_SOURCE_BYTES: usize = 64 * 1024;
 pub const MAX_DISPLAY_ITEMS: usize = 8192;
@@ -65,7 +65,7 @@ pub struct NativeDocumentDisplay {
     capture: CompleteCapture,
     generation: DocumentGeneration,
     width_points: u32,
-    source_base: usize,
+    source_encoding: DocumentSourceEncoding,
     source_ranges_qualified: bool,
     qualified_spans: Vec<SourceSpan>,
     display: DisplayList,
@@ -101,10 +101,8 @@ impl NativeDocumentDisplay {
         if !(160..=4096).contains(&width_points) { return Err(NativeDisplayError::InvalidLimits); }
         let capture = document.capture();
         if capture.bytes().len() > MAX_DISPLAY_SOURCE_BYTES { return Err(NativeDisplayError::SourceLimit); }
-        let source_base = document.source_base();
-        let source = std::str::from_utf8(capture.bytes().get(source_base..)
-            .ok_or(NativeDisplayError::InvalidOutput)?)
-            .map_err(|_| NativeDisplayError::InvalidOutput)?;
+        let source = document.parser_text();
+        if source.len() > MAX_DISPLAY_SOURCE_BYTES { return Err(NativeDisplayError::SourceLimit); }
         let parse_charge = crate::links::parse_workspace(source.as_bytes())
             .map_err(|_| NativeDisplayError::EngineLimit)?;
         // Includes simultaneous AST/projection/layout candidates, retained runs,
@@ -113,6 +111,7 @@ impl NativeDocumentDisplay {
         let charge = parse_charge.checked_add(MAX_DISPLAY_GLYPHS * 256)
             .and_then(|n| n.checked_add(MAX_DISPLAY_ITEMS * 512))
             .and_then(|n| n.checked_add(24 * 1024 * 1024 + source.len()))
+            .and_then(|n| n.checked_add(document.source_encoding().retained_charge()))
             .ok_or(NativeDisplayError::ResourceDenied)?;
         let lease = budget.try_reserve_managed(capture.request().file().owner(), allocations[0],
             ByteLength::new(charge as u64)).map_err(|_| NativeDisplayError::ResourceDenied)?;
@@ -154,7 +153,8 @@ impl NativeDocumentDisplay {
         let display = display.map_err(layout_error)?;
         check(&mut canceled)?;
         let mut candidate = Self { capture: capture.clone(), generation: document.generation(),
-            width_points, source_base, source_ranges_qualified: qualified_spans.is_some(),
+            width_points, source_encoding: document.source_encoding().clone(),
+            source_ranges_qualified: qualified_spans.is_some(),
             qualified_spans: qualified_spans.unwrap_or_default(), display, fonts,
             font_ids: Vec::with_capacity(6), unresolved_images: 0, glyph_count: 0, _lease: lease };
         candidate.validate(&mut canceled)?;
@@ -235,26 +235,22 @@ impl NativeDocumentDisplay {
         if !self.source_ranges_qualified { return Ok(None); }
         let span = item.source_span();
         if span.start == span.end { return Ok(None); }
-        let start = span.start.checked_add(self.source_base).ok_or(NativeDisplayError::InvalidOutput)?;
-        let end = span.end.checked_add(self.source_base).ok_or(NativeDisplayError::InvalidOutput)?;
-        ByteRange::new(ByteOffset::new(start as u64), ByteOffset::new(end as u64))
+        self.source_encoding.original_span(self.capture.bytes(), span)
             .map(Some).map_err(|_| NativeDisplayError::InvalidOutput)
     }
 
     /// Restore a viewport through the original captured source, never by
     /// scaling logical rows into unrelated glyph geometry. The result names the
     /// first retained item in the verified enclosing block, not an exact glyph.
-    /// Whitespace gaps, BOM bytes and interior UTF-8 positions are not anchors.
+    /// Whitespace gaps, BOM bytes and interior encoded scalars are not anchors.
     pub fn first_item_at_source(&self, offset: u64, mut canceled: impl FnMut() -> bool)
         -> Result<usize, NativeDisplayError> {
         check(&mut canceled)?;
         if !self.source_ranges_qualified { return Err(NativeDisplayError::InvalidOutput); }
         let offset = usize::try_from(offset).map_err(|_| NativeDisplayError::InvalidRange)?;
-        let source = std::str::from_utf8(self.capture.bytes()).map_err(|_| NativeDisplayError::InvalidOutput)?;
-        if offset < self.source_base || offset > source.len() || !source.is_char_boundary(offset) {
-            return Err(NativeDisplayError::InvalidRange);
-        }
-        if offset == source.len() { return Ok(self.display.items().len()); }
+        self.source_encoding.validate_original_offset(self.capture.bytes(), offset)
+            .map_err(|_| NativeDisplayError::InvalidRange)?;
+        if offset == self.capture.bytes().len() { return Ok(self.display.items().len()); }
         for index in 0..self.display.items().len() {
             if index.is_multiple_of(256) { check(&mut canceled)?; }
             if let Some(range) = self.original_range(index)?
@@ -269,7 +265,7 @@ impl NativeDocumentDisplay {
         if self.display.items().len() > MAX_DISPLAY_ITEMS { return Err(NativeDisplayError::EngineLimit); }
         let total = self.display.total_bounds();
         valid_rect(total)?;
-        let source = std::str::from_utf8(&self.capture.bytes()[self.source_base..])
+        let source = self.source_encoding.text(self.capture.bytes())
             .map_err(|_| NativeDisplayError::InvalidOutput)?;
         let mut text_bytes = 0_usize;
         let mut font_bytes = 0_usize;

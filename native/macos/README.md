@@ -1361,7 +1361,10 @@ Markdown link extraction accepts UTF-8 and BOM-marked UTF-16 in either byte
 order. The 256 KiB source bound applies separately to original bytes and decoded
 parser input. Each occurrence retains the whole original Markdown capture as
 evidence, including its BOM. Malformed or oversized documents leave coverage
-partial while other links remain available; captured UTF-16 targets stay readable.
+partial while other links remain available. UTF-16 targets support heading
+navigation, Markdown preview and rendered Find through the same retained reader,
+including after the project index or saved archive closes. Exact source copies
+keep their original byte order and spelling.
 
 **Rebuild links** reuses the prepared source captures. **Refresh sources**
 captures the current project again so file edits can affect the inventory.
@@ -2022,8 +2025,9 @@ geometry and camera position. A source/preview/source toggle reuses the retained
 source; a warm return to preview reuses the prepared display. Changing the file
 scope refits those same immutable windows without moving an older frame's tiles.
 
-The initial atlas rich-display allowance is **64 KiB of UTF-8 source**, at a
-fixed 640-point document width and at most 64 retained display windows. A limit,
+The initial atlas rich-display allowance is **64 KiB for each of the original
+source and decoded UTF-8 input**, at a fixed 640-point document width and at most
+64 retained display windows. A limit,
 unsupported layout, invalid source correspondence or unavailable display service
 keeps the captured source readable and labels the fallback. Optional rich
 content cannot displace a source preview that fits its budget. Image slots
@@ -2065,11 +2069,21 @@ and physical-Mac visual, wheel and frame-cadence qualification.
 Open a retained source file and choose **Markdown**, or **Split preview** to keep
 the source alongside the document. The native reader prepares a **Styled**
 view by default when the host supplies the rich-display capability and the
-capture fits its 64 KiB source limit. **Text** keeps the selectable logical
-preview available for UTF-8 captures up to **256 KiB**. Larger supported
+capture fits its 64 KiB source and decoded-input limits. **Text** keeps the selectable
+logical preview available for UTF-8 and BOM-marked UTF-16 captures up to **256 KiB**
+in each of those domains. Larger supported
 documents automatically use Text with an explanation; choosing Styled keeps
 that logical preview and its navigation available. The **Columns** field and
 **Reflow** control change the width without reopening the file.
+
+UTF-16LE and UTF-16BE previews use the shared source decoder before upstream
+Markdown parsing. Heading links, source following, rendered Find, Styled source
+regions and enclosing-Markdown copies retain coordinates in the original capture,
+including its two-byte BOM and surrogate pairs. Rendered text uses its separate
+UTF-8 coordinate domain. Text copy presents decoded content; original-source copy
+keeps the exact encoded bytes. A malformed sequence, odd byte offset or position
+inside a surrogate pair cannot become an approximate source selection. The same
+rules apply to live projects, saved archives, Reading Desk and CLI document views.
 
 Styled pages draw FrankenMarkdown's shaped glyph IDs and positions using the
 exact bundled font bytes supplied by the retained reader. Headings, prose,

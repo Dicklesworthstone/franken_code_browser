@@ -320,3 +320,52 @@ fn rendered_find_pages_navigate_actual_c_reader_flow_and_reject_retired_layouts(
         .contains("READER_SESSION_NO_DOCUMENT"));
     assert!(first.contains("\"document_generation\":\"1\""), "owned reply outlives its retired layout");
 }
+
+#[test]
+fn utf16_native_document_transport_preserves_heading_source_copy_and_styled_ranges() {
+    let _guard = crate::reader_ffi::FFI_TEST_LOCK.lock().unwrap();
+    struct OpenReader(u64);
+    impl Drop for OpenReader {
+        fn drop(&mut self) { crate::reader_ffi::fcb_reader_close(self.0); }
+    }
+    let text = "# Target\n\nA **bold** phrase.\n\n[Jump](#target)\n";
+    for little in [true, false] {
+        let bytes: Vec<u8> = "\u{feff}".encode_utf16().chain(text.encode_utf16())
+            .flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect();
+        let handle = OpenReader(crate::reader_ffi::fcb_reader_create());
+        assert_ne!(handle.0, 0);
+        crate::reader_ffi::registry().unwrap().supply(handle.0, &bytes).unwrap();
+        let prepared = take(fcb_reader_document(handle.0, 1, 80, 65536, 8192, 8192, 4096));
+        assert!(prepared.contains("\"document_ready\":true"), "{prepared}");
+        assert!(prepared.contains("\"parser_source_base\":\"2\""), "{prepared}");
+        assert!(prepared.contains(if little { "\"encoding\":\"utf16le\"" } else { "\"encoding\":\"utf16be\"" }));
+        let heading = CString::new("target").unwrap();
+        let selected = take(unsafe { fcb_reader_document_heading(handle.0, 1, heading.as_ptr(), 4) });
+        assert!(selected.contains("\"heading_original_range\":{\"start\":\"2\""), "{selected}");
+        let copied = take(fcb_reader_document_copy(handle.0, 1, 0, 6, 1));
+        let expected: String = bytes[2..2 + 2 * "# Target".len()].iter().map(|byte| format!("{byte:02x}")).collect();
+        assert!(copied.contains(&expected), "{copied}");
+        let needle = CString::new("bold phrase").unwrap();
+        let found = take(unsafe { fcb_reader_document_find(handle.0, 1, needle.as_ptr(), 0, 64) });
+        assert!(found.contains("\"matches_seen\":\"1\""), "{found}");
+        assert!(found.contains("\"additional_source_bytes_read\":\"0\""));
+        let links = take(fcb_reader_document_links_prepare(handle.0, 1, 64));
+        assert!(links.contains("\"retained_links\":\"1\""), "{links}");
+        let jump = take(fcb_reader_document_link(handle.0, 1, 1, 4));
+        assert!(jump.contains("\"activated\":true"), "{jump}");
+        let display = take(fcb_reader_document_display(handle.0, 1, 640));
+        assert!(display.contains("\"glyph_shaped\":true"), "{display}");
+        assert!(display.contains("\"source_ranges_qualified\":true"));
+        let paragraph = (2 + 2 * text[..text.find("A **bold").unwrap()].encode_utf16().count()) as u64;
+        let shown = take(fcb_reader_document_display_from_source(handle.0, 1, paragraph, 4));
+        assert!(shown.contains("\"command\":\"document-display-from-source\""), "{shown}");
+        assert!(shown.contains(&format!("\"original_anchor\":\"{paragraph}\"")));
+        for invalid in [0, 1, paragraph + 1] {
+            let refused = take(fcb_reader_document_from_source(handle.0, 1, invalid, 4));
+            assert!(refused.contains("\"status\":\"error\""), "{refused}");
+        }
+        let exact = take(crate::reader_ffi::fcb_reader_copy_range(handle.0, 0, bytes.len() as u64));
+        let whole: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert!(exact.contains(&whole));
+    }
+}

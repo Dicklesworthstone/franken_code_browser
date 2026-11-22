@@ -280,8 +280,7 @@ fn clearing_document_does_not_clear_source_search_or_outline() {
 
 #[test]
 fn unsupported_document_encoding_and_size_leave_ordinary_source_reading_available() {
-    let utf16: Vec<u8> = "\u{feff}# Header\n".encode_utf16().flat_map(u16::to_le_bytes).collect();
-    for bytes in [utf16, vec![0xff, 0x61]] {
+    for bytes in [vec![0xff, 0xfe, b'#'], vec![0xff, 0x61]] {
         let mut reader = reader(&bytes);
         assert_eq!(reader.prepare_document(1, Default::default(), || false).err(),
             Some(ReaderSessionError::Document(DocumentReadError::InvalidUtf8)));
@@ -339,4 +338,38 @@ fn live_replacement_and_raw_filename_cannot_change_document_bytes() {
     assert!(result.as_str().contains("7261772dff0a2e6d64"));
     assert!(reader.document_at_heading(1, "original", 1, || false).is_ok());
     assert!(reader.document_at_heading(1, "changed", 1, || false).is_err());
+}
+
+#[test]
+fn utf16_preview_rows_find_headings_and_copy_use_one_original_capture() {
+    let text = "# Target\r\n\r\nA **bold** phrase with 😀.\r\n";
+    for little in [true, false] {
+        let bytes: Vec<u8> = "\u{feff}".encode_utf16().chain(text.encode_utf16())
+            .flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect();
+        let mut reader = reader(&bytes);
+        let prepared = reader.prepare_document(1, Default::default(), || false).unwrap();
+        let page = parse(prepared.as_str().as_bytes()).unwrap();
+        assert_eq!(page.get("parser_source_base").number(), 2);
+        let (start, end, expected) = selected(&reader, "bold");
+        let copied = reader.copy_document_selection(1, start, end, DocumentCopyMode::EnclosingMarkdown, || false).unwrap();
+        let copied = parse(copied.as_str().as_bytes()).unwrap();
+        assert_eq!(copied.get("original_hex").text(), hex(&expected));
+        assert_eq!(copied.get("enclosing_original_range").get("start").number(),
+            (2 + 2 * text[..text.find("A **bold").unwrap()].encode_utf16().count()) as u64);
+        let shown = reader.copy_document_selection(1, start, end, DocumentCopyMode::RenderedText, || false).unwrap();
+        assert_eq!(parse(shown.as_str().as_bytes()).unwrap().get("text").text(), "bold");
+        let source = reader.document_selection_source(1, start, end, 1024, || false).unwrap();
+        let source = parse(source.as_str().as_bytes()).unwrap();
+        assert_eq!(source.get("selection").get("original_range"), copied.get("enclosing_original_range"));
+        let heading = reader.document_at_heading(1, "target", 4, || false).unwrap();
+        assert_eq!(parse(heading.as_str().as_bytes()).unwrap().get("heading_original_range").get("start").number(), 2);
+        let found = reader.find_document(1, "bold phrase", 0, 64, || false).unwrap();
+        let found = parse(found.as_str().as_bytes()).unwrap();
+        assert_eq!(found.get("matches_seen").number(), 1);
+        assert!(found.get("match_count_complete").flag());
+        assert_eq!(found.get("additional_source_bytes_read").number(), 0);
+        assert!(reader.document_at_source(1, 3, 4, || false).is_err());
+        assert_eq!(reader.capture().bytes(), bytes);
+        assert!(reader.document_window(1, 0, 64, || false).unwrap().as_str().contains("bold phrase"));
+    }
 }

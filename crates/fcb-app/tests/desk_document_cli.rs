@@ -125,7 +125,7 @@ fn utf8_bom_and_scalar_boundaries_are_not_rendered_byte_offsets() {
 
 #[test]
 fn unsupported_preview_bytes_still_support_exact_original_copy() {
-    for bytes in [b"\xffinvalid".as_slice(), b"\xff\xfe#\0 \0A\0\n\0"] {
+    for bytes in [b"\xffinvalid".as_slice(), b"\xff\xfe#\0\x00\xd8"] {
         let (_, source) = fixture(bytes);
         let (exit, rows) = invoke(&format!("0\topen\t{}\n1\tdoc-prepare\t1\t1\t80\n1\tselect\t1\t0\t{}\n3\tcopy\t1\n3\tquit\n", source.display(), bytes.len()));
         assert_eq!(exit, EXIT_ERROR); assert_eq!(error(&rows[1]), "DOCUMENT_READ_INVALID_UTF8");
@@ -171,4 +171,25 @@ fn bad_pages_stale_desk_revision_and_invalid_commands_do_not_discard_preview() {
     assert_eq!(result(&rows[7]).get("headings").array()[0].get("slug").text(), "title");
     assert_eq!(rows[8].get("accepted_revision").number(), 1);
     assert_eq!(rows[8].get("documents").array().len(), 1);
+}
+
+#[test]
+fn utf16_desk_preview_selection_and_original_copy_preserve_the_opened_bytes() {
+    for little in [true, false] {
+        let bytes: Vec<u8> = "\u{feff}Hello **world**.\r\n".encode_utf16()
+            .flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect();
+        let (_, source) = fixture(&bytes);
+        let (exit, rows) = invoke(&format!("0\topen\t{}\n1\tdoc-prepare\t1\t1\t80\n1\tdoc-copy\t1\t1\t6\t11\trendered\n1\tdoc-copy\t1\t1\t6\t11\tmarkdown\n1\tdoc-select\t1\t1\t6\t11\n5\tcopy\t1\n5\tquit\n", source.display()));
+        assert_eq!(exit, EXIT_OK);
+        assert_eq!(result(&rows[2]).get("text").text(), "world");
+        let range = result(&rows[3]).get("enclosing_original_range");
+        let a = range.get("start").number() as usize;
+        let b = range.get("end").number() as usize;
+        assert_eq!(a, 2);
+        let expected: String = bytes[a..b].iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(result(&rows[3]).get("original_hex").text(), expected);
+        assert_eq!(result(&rows[5]).get("original_hex"), result(&rows[3]).get("original_hex"));
+        assert_eq!(result(&rows[6]).get("initial_source_bytes_read").number(), bytes.len() as u64);
+        assert_eq!(fs::read(&source).unwrap(), bytes);
+    }
 }

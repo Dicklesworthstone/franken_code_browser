@@ -23,12 +23,12 @@ const HELP: &str = "Captured Markdown reading\n\n\
   --copy-start N --copy-end N  Rendered UTF-8 byte selection; end exclusive\n\
 Defaults: 100 logical columns, first rendered line 1, 40 rendered lines.\n\
 Rendered line numbers are NOT original source line numbers. Width uses logical\n\
-character cells, not native shaping. UTF-8, including an initial BOM, is supported.\n\
-UTF-16 and malformed UTF-8 are refused; ordinary fcb read remains available.\n\
+character cells, not native shaping. UTF-8 and BOM-marked UTF-16 are supported.\n\
+Malformed text is refused; ordinary fcb read remains available.\n\
 Headings use upstream canonical slugs without a leading #. --heading, --line\n\
 and --source-byte are alternatives. Source bytes are zero-based ORIGINAL capture\n\
 offsets, including any BOM; they open the first row of an upstream-mapped region,\n\
-not an exact rendered glyph. Unmapped syntax, BOM/interior UTF-8 bytes and\n\
+not an exact rendered glyph. Unmapped syntax, BOM/interior encoded scalars and\n\
 unqualified provenance refuse; source EOF opens an empty final window.\n\
 Copy returns rendered text and separately labeled enclosing\n\
 original Markdown, not an invented source concatenation. -- ends options.\n\
@@ -252,11 +252,7 @@ pub(crate) fn write_capture(capture: &CompleteCapture, options: &ViewOptions, js
     // upstream provenance cannot qualify an exact heading or enclosing copy.
     // Invalid capture coordinates are never a reason to silently start elsewhere.
     if let Some(original) = options.source_byte {
-        let offset = usize::try_from(original).map_err(|_| DocumentReadError::InvalidRange)?;
-        if offset < reader.source_base() || offset > capture.bytes().len()
-            || !std::str::from_utf8(capture.bytes()).map_err(|_| DocumentReadError::InvalidUtf8)?.is_char_boundary(offset) {
-            return Err(DocumentReadError::InvalidRange.into());
-        }
+        reader.validate_source_offset(ByteOffset::new(original))?;
     }
     let mut qualified = true;
     if options.heading.is_some() || options.copy.is_some() || options.source_byte.is_some() {
@@ -350,8 +346,8 @@ pub(crate) fn write_capture(capture: &CompleteCapture, options: &ViewOptions, js
         if let Some((start, end)) = options.copy {
             let selected = reader.selection(TextSelectionRange::new(start, end))?;
             out.literal("[rendered text selection]\n")?; out.human_text(selected.rendered_text)?;
-            out.literal("\n[enclosing original Markdown; not literal selection]\n")?;
-            out.human_text(std::str::from_utf8(selected.enclosing_original_bytes).map_err(|_| DocumentReadError::InvalidUtf8)?)?;
+            out.literal("\n[enclosing original Markdown decoded as text; not literal selection]\n")?;
+            out.human_text(selected.enclosing_markdown_text)?;
             out.literal("\n")?;
         }
         if !window.whole_document_visible() { out.literal("[bounded document window; use --line/--heading/--source-byte to navigate]\n")?; }
