@@ -1,6 +1,6 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//! Real C-boundary line navigation; no fabricated successful reader receipts.
+//! Real C-boundary line and typed-column navigation over retained observations.
 
 use super::*;
 use std::{ffi::{CStr, CString}, fs::{self, OpenOptions}, os::unix::fs::FileExt,
@@ -153,4 +153,98 @@ fn c_line_limits_missing_and_cancellation_never_replace_accepted_pages() {
     assert!(retained.contains("\"additional_source_bytes_read\":\"0\""));
     assert_eq!(fcb_observed_reader_close(handle), 1);
     assert!(lines(handle, 1, 1, 64, 1024, 1).contains("OBSERVED_READER_HANDLE_UNKNOWN"));
+}
+
+fn position(handle: u64, line: u64, column: u64, kind: u64,
+    bytes: u64, scan: u64, encoding: u64) -> String {
+    take(unsafe { fcb_observed_reader_position(handle, line, column, kind, bytes, scan, encoding,
+        None, std::ptr::null_mut()) })
+}
+
+#[test]
+fn c_position_inside_giant_line_retains_same_scan_context_and_exact_bytes() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let (root, croot) = root();
+    let path = root.join("source");
+    let file = OpenOptions::new().read(true).write(true).create_new(true).open(&path).unwrap();
+    let target = 33 * 1024 * 1024u64;
+    file.set_len(target + 7).unwrap();
+    file.write_at(b"needle\n", target).unwrap();
+    let handle = open(&croot);
+    let page = position(handle, 1, target + 1, 1, 64, 64 * 1024 * 1024, 1);
+    assert!(page.contains("\"status\":\"ok\""), "{page}");
+    assert!(page.contains("\"command\":\"position\""));
+    assert!(page.contains("\"position_navigation\":{"));
+    assert_eq!(number(&page, "original_offset"), target);
+    assert!(page.contains("needle"), "{page}");
+    assert!(!page.contains("\"whole_file_immutable\":true"));
+    assert!(page.len() < 16 * 1024, "giant prefix cannot become retained output");
+    let observation = number(&page, "observation");
+    let info = take(fcb_observed_reader_info(handle));
+    assert!(number(&info, "payload_bytes_read") > target);
+    assert!(number(&info, "retained_payload_bytes") <= 80);
+
+    file.write_at(b"edited", target).unwrap();
+    fs::rename(&path, root.join("retired-name")).unwrap();
+    fs::write(&path, b"replacement\n").unwrap();
+    let retained = take(fcb_observed_reader_retained(handle, observation));
+    assert!(retained.contains("needle"), "{retained}");
+    assert_eq!(number(&retained, "original_offset"), target);
+    assert!(retained.contains("\"additional_source_bytes_read\":\"0\""));
+    let copied = take(fcb_observed_reader_copy(handle, observation, target, target + 6));
+    assert!(copied.contains("\"original_hex\":\"6e6565646c65\""), "{copied}");
+    assert_eq!(info, take(fcb_observed_reader_info(handle)));
+    assert_eq!(fcb_observed_reader_close(handle), 1);
+}
+
+#[test]
+fn c_position_typed_columns_keep_utf16_boundaries_and_failed_navigation_history() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    for encoding in [2, 3] {
+        let (root, croot) = root();
+        let encode = |text: &str| text.encode_utf16().flat_map(|unit| if encoding == 2 {
+            unit.to_le_bytes()
+        } else { unit.to_be_bytes() }).collect::<Vec<_>>();
+        let prefix = encode("\u{feff}one\r\n");
+        fs::write(root.join("source"), encode("\u{feff}one\r\nAé😀Z\r\n")).unwrap();
+        let handle = open(&croot);
+        let expected = prefix.len() as u64 + 8;
+        let mut accepted = 0;
+        for (column, kind) in [(4, 1), (5, 2), (8, 3)] {
+            let page = position(handle, 2, column, kind, 64, 1024, encoding);
+            assert!(page.contains("\"status\":\"ok\""), "{page}");
+            assert_eq!(number(&page, "original_offset"), expected);
+            accepted = number(&page, "observation");
+            let copied = take(fcb_observed_reader_copy(handle, accepted, expected, expected + 2));
+            assert!(copied.contains(&format!("\"original_hex\":\"{}\"", original_hex(&encode("Z")))));
+        }
+        for (column, kind) in [(4, 2), (3, 3), (5, 3)] {
+            let refused = position(handle, 2, column, kind, 64, 1024, encoding);
+            assert!(refused.contains("OBSERVED_READER_INVALID_RANGE"), "{refused}");
+        }
+        assert!(position(handle, 3, 1, 1, 64, 1024, encoding).contains("OBSERVED_READER_LINE_MISSING"));
+        assert!(position(handle, 2, 99, 1, 64, 1024, encoding).contains("OBSERVED_READER_COLUMN_MISSING"));
+        let limited = position(handle, 2, 4, 1, 64, 4, encoding);
+        assert!(limited.contains("OBSERVED_READER_POSITION_SCAN_BYTE_LIMIT"), "{limited}");
+        assert!(!limited.contains("COLUMN_MISSING"));
+        let before = take(fcb_observed_reader_info(handle));
+        for (line, column, kind, bytes, scan, code) in [
+            (0, 1, 1, 64, 1024, encoding), (1, 0, 1, 64, 1024, encoding),
+            (1, 1, 0, 64, 1024, encoding), (1, 1, 4, 64, 1024, encoding),
+            (1, 1, 1, 3, 1024, encoding), (1, 1, 1, 262_145, 1024, encoding),
+            (1, 1, 1, 64, 0, encoding), (1, 1, 1, 64, (4u64 << 30) + 1, encoding),
+            (1, 1, 1, 64, 1024, 0), (1, 1, 1, 64, 1024, 4),
+        ] {
+            assert!(position(handle, line, column, kind, bytes, scan, code).contains("\"status\":\"error\""));
+        }
+        assert_eq!(before, take(fcb_observed_reader_info(handle)), "invalid requests cannot spend source I/O");
+        let canceled = take(unsafe { fcb_observed_reader_position(handle, 2, 4, 1, 64, 1024, encoding,
+            Some(cancel_now), std::ptr::null_mut()) });
+        assert!(canceled.contains("\"exit_code\":\"130\""), "{canceled}");
+        let retained = take(fcb_observed_reader_retained(handle, accepted));
+        assert!(retained.contains("\"position_navigation\":{"));
+        assert_eq!(number(&retained, "original_offset"), expected);
+        assert!(retained.contains("\"additional_source_bytes_read\":\"0\""));
+        assert_eq!(fcb_observed_reader_close(handle), 1);
+    }
 }

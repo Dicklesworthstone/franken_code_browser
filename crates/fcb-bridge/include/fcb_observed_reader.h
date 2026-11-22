@@ -89,6 +89,32 @@ char *fcb_observed_reader_lines(uint64_t handle, uint64_t first_line,
     uint64_t line_count, uint64_t max_bytes, uint64_t max_scan_bytes,
     uint64_t encoding, fcb_observed_reader_poll poll, void *context);
 
+/* Resolve a one-based physical line and typed one-based logical column by
+ * scanning the SAME opened descriptor from byte zero. column_kind is
+ * 1=Unicode scalar, 2=UTF-16 code unit, 3=decoded UTF-8 byte. Tabs count as one
+ * unit; a leading BOM and CR/LF/CRLF terminators do not count as content.
+ * A content-end caret is valid. Interior UTF-8 scalar bytes and UTF-16
+ * surrogate splits are refused rather than rounded to another position.
+ *
+ * max_bytes is 4..262144 for bounded context around the resolved point; the
+ * complete physical line need not fit. max_scan_bytes is 1..4294967296 and a
+ * separate 1048576-read-call cap applies. Both the point and its context bytes
+ * come from this same scan, with bounded scratch independent of line length.
+ * No old line index or locate-then-reread route can combine different source.
+ *
+ * Success returns command "position" with a fresh retained observation and
+ * position_navigation: line, column, column_kind, original_offset, the
+ * page-local window_utf8_offset, scan/retention limits and actual read work.
+ * Retained/copy/selection receipts preserve the original page's navigation
+ * evidence even when copying only part of it. This is an observed logical
+ * location, not whole-file immutability or native grapheme/shaping proof.
+ * Missing-at-EOF, work limits, changed metadata and cancellation are distinct
+ * errors; previously accepted observations stay available.
+ */
+char *fcb_observed_reader_position(uint64_t handle, uint64_t line, uint64_t column,
+    uint64_t column_kind, uint64_t max_bytes, uint64_t max_scan_bytes,
+    uint64_t encoding, fcb_observed_reader_poll poll, void *context);
+
 /* No payload reread. Both commands require an exact retained observation ID.
  * Copy returns original bytes as hex, never silently truncated or decoded. */
 char *fcb_observed_reader_retained(uint64_t handle, uint64_t observation);

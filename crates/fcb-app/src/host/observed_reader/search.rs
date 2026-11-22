@@ -313,7 +313,7 @@ impl ObservedReaderSession {
         let sha256 = extent_sha256(context.bytes, &mut canceled)?;
         let mut candidate = Observation { extent, plan: ExtentWindowRequest { visible, capture: context.original },
             requested_bytes, encoding: query.encoding, sha256, io: ExtentReadStats::default(),
-            find_hit: None, line_navigation: None };
+            find_hit: None, line_navigation: None, position_navigation: None };
         let text = decode(&candidate, &self.budget, [decode_id, clipped_decode_id], &mut canceled)?;
         let matched = text.source_to_text(hit.original_range()).map_err(|_| ObservedReaderError::SearchContextUnavailable)?;
         let selection = text.text_selection(matched).map_err(|_| ObservedReaderError::SearchContextUnavailable)?;

@@ -125,7 +125,7 @@ impl ObservedReaderSession {
         drop(scanned);
         let sha256 = extent_sha256(extent.bytes(), &mut canceled)?;
         let candidate = Observation { extent, plan: ExtentWindowRequest { visible, capture },
-            requested_bytes: max_bytes, encoding, sha256, io, find_hit: None, line_navigation: Some(receipt) };
+            requested_bytes: max_bytes, encoding, sha256, io, find_hit: None, line_navigation: Some(receipt), position_navigation: None };
         let [decode_id, clipped_decode_id] = self.allocations()?;
         let text = decode(&candidate, &self.budget, [decode_id, clipped_decode_id], &mut canceled)?;
         // Line windows are already scalar/CRLF aligned. Only the shared
@@ -141,7 +141,7 @@ impl ObservedReaderSession {
 
 /// File::try_clone shares a seek cursor on Unix. Positioned reads let every
 /// line request start at zero without disturbing window/search operations.
-struct PositionedReader<'a> { file: &'a File, offset: u64 }
+pub(super) struct PositionedReader<'a> { pub(super) file: &'a File, pub(super) offset: u64 }
 impl Read for PositionedReader<'_> {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
         #[cfg(unix)] {

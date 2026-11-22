@@ -8,28 +8,10 @@
 use std::mem::size_of;
 use fcb::search::ExtentText;
 use fcb::source::{CaptureEncodingMap, DetectedEncoding, MappingSpan, StatefulChunkDecoder};
-use fcb_core::{DecodedUtf8Offset, ScalarIndex, Utf16CodeUnitOffset};
+use fcb::source::position::{ColumnPositionError, column_in_chunk};
+pub use fcb::source::position::SourceColumnKind as ReaderColumnKind;
 use super::{AppError, ByteLength, ByteOffset, HostResponse, LineNumber, LineWindowScanner,
     Output, ReaderSession, ReaderSessionError, WindowTarget, LINE_SCAN_STEP, check, range, window_limit};
-
-/// Logical units counted from the decoded content start of one physical line.
-/// Columns are one-based. Tabs count as one scalar/code unit/UTF-8 byte; these
-/// are not display cells, graphemes, glyph positions or bidirectional order.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReaderColumnKind {
-    UnicodeScalar,
-    Utf16CodeUnit,
-    DecodedUtf8Byte,
-}
-impl ReaderColumnKind {
-    pub const fn code(self) -> &'static str {
-        match self {
-            Self::UnicodeScalar => "unicode_scalar",
-            Self::Utf16CodeUnit => "utf16_code_unit",
-            Self::DecodedUtf8Byte => "decoded_utf8_byte",
-        }
-    }
-}
 
 #[derive(Clone, Copy)]
 pub(super) struct ReaderPosition {
@@ -73,7 +55,7 @@ impl ReaderSession {
     pub fn read_position(&mut self, line: u64, column: u64, kind: ReaderColumnKind,
         max_bytes: usize, mut canceled: impl FnMut() -> bool) -> Result<HostResponse, ReaderSessionError> {
         window_limit(max_bytes)?;
-        let target = column.checked_sub(1).ok_or(ReaderSessionError::InvalidRange)?;
+        if column == 0 { return Err(ReaderSessionError::InvalidRange); }
         let first = LineNumber::new(line)?;
         check(&mut canceled)?;
         let start = self.position_line_start(first, &mut canceled)?;
@@ -86,7 +68,7 @@ impl ReaderSession {
             .ok_or(AppError::Admission)?;
         let lease = self.budget.try_reserve_managed(self.owner(), allocation, ByteLength::new(charge as u64))
             .map_err(|_| AppError::Admission)?;
-        let offset = locate_column(self.capture.bytes(), self.encoding, start, target, kind, &mut canceled)?;
+        let offset = locate_column(self.capture.bytes(), self.encoding, start, column, kind, &mut canceled)?;
         drop(lease); // Column scratch is gone before admitting the page decoder.
         check(&mut canceled)?;
 
@@ -126,7 +108,7 @@ impl ReaderSession {
     }
 }
 
-fn locate_column(bytes: &[u8], encoding: DetectedEncoding, start: ByteOffset, target: u64,
+fn locate_column(bytes: &[u8], encoding: DetectedEncoding, start: ByteOffset, column: u64,
     kind: ReaderColumnKind, canceled: &mut impl FnMut() -> bool) -> Result<ByteOffset, ReaderSessionError> {
     let first = usize::try_from(start.get()).map_err(|_| ReaderSessionError::InvalidRange)?;
     let remaining = bytes.get(first..).ok_or(ReaderSessionError::InvalidRange)?;
@@ -134,14 +116,14 @@ fn locate_column(bytes: &[u8], encoding: DetectedEncoding, start: ByteOffset, ta
     for chunk in remaining.chunks(POSITION_DECODE_BYTES) {
         check(canceled)?;
         let map = decoder.decode_chunk(chunk)?;
-        if let Some(offset) = column_in_chunk(&map, target, kind)? {
+        if let Some(offset) = column_in_chunk(&map, column, kind).map_err(column_error)? {
             check(canceled)?;
             return Ok(offset);
         }
     }
     check(canceled)?;
     if let Some(map) = decoder.finish()? {
-        if let Some(offset) = column_in_chunk(&map, target, kind)? {
+        if let Some(offset) = column_in_chunk(&map, column, kind).map_err(column_error)? {
             check(canceled)?;
             return Ok(offset);
         }
@@ -149,25 +131,10 @@ fn locate_column(bytes: &[u8], encoding: DetectedEncoding, start: ByteOffset, ta
     Err(ReaderSessionError::MissingColumn)
 }
 
-fn column_in_chunk(map: &CaptureEncodingMap, target: u64, kind: ReaderColumnKind)
-    -> Result<Option<ByteOffset>, ReaderSessionError> {
-    let terminator = map.decoded_text().find(|ch| ch == '\r' || ch == '\n');
-    let content = &map.decoded_text()[..terminator.unwrap_or(map.decoded_text().len())];
-    let (base, count) = match kind {
-        ReaderColumnKind::UnicodeScalar => (map.base_scalar_offset(), content.chars().count() as u64),
-        ReaderColumnKind::Utf16CodeUnit => (map.base_utf16_offset(), content.encode_utf16().count() as u64),
-        ReaderColumnKind::DecodedUtf8Byte => (map.base_decoded_offset(), content.len() as u64),
-    };
-    let end = base.checked_add(count).ok_or(ReaderSessionError::InvalidRange)?;
-    if target < base { return Err(ReaderSessionError::InvalidRange); }
-    if target <= end {
-        let offset = match kind {
-            ReaderColumnKind::UnicodeScalar => map.scalar_to_byte_offset(ScalarIndex::new(target))?,
-            ReaderColumnKind::Utf16CodeUnit => map.utf16_to_byte_offset(Utf16CodeUnitOffset::new(target))?,
-            ReaderColumnKind::DecodedUtf8Byte => map.decoded_utf8_to_byte_offset(DecodedUtf8Offset::new(target))?,
-        };
-        return Ok(Some(offset));
+fn column_error(error: ColumnPositionError) -> ReaderSessionError {
+    match error {
+        ColumnPositionError::InvalidRange => ReaderSessionError::InvalidRange,
+        ColumnPositionError::MissingColumn => ReaderSessionError::MissingColumn,
+        ColumnPositionError::Source(error) => ReaderSessionError::Source(error),
     }
-    if terminator.is_some() { return Err(ReaderSessionError::MissingColumn); }
-    Ok(None)
 }

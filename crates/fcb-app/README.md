@@ -1580,3 +1580,39 @@ rectangles for repeated file IDs and world bounds before constructing a bounded
 direct-neighbor view on the worker. Older list-only receipts remain supported;
 a response with incomplete geometry fields is rejected. Existing exact-reader
 admission, lexical/document evidence levels and page limits remain unchanged.
+
+## Typed positions in observed large files
+
+`ObservedReaderSession::read_position(line, column, kind, max_bytes,
+max_scan_bytes, encoding, canceled)` reaches a one-based physical line and
+one-based logical column without retaining the complete file or line. The
+public C counterpart is `fcb_observed_reader_position`. Column kinds use the
+same shared source mapping as the retained reader: Unicode scalars, UTF-16 code
+units, or decoded UTF-8 bytes. Source BOMs and CR/LF/CRLF terminators do not count
+as content. A content-end caret is valid; interior scalar or surrogate positions
+are refused.
+
+The worker scans the existing opened descriptor from byte zero, keeping bounded
+rolling context during that same pass. It never locates against one observation
+and rereads current bytes to construct another. At most 256 KiB of page content,
+bounded decoder context, 4 GiB of total input and 1,048,576 read calls are admitted.
+The shared scanner processes at most 16 KiB per step; scratch is independent of
+line length. Limits and cancellation preserve accepted observations while
+charging work already spent.
+
+Successful `fcb.observed-reader/1` pages use command `position` and carry
+`position_navigation`: requested line/column/kind, exact original offset,
+page-relative decoded UTF-8 offset, scan and selected-byte limits, actual scanned
+input, payload bytes read and read calls. Scanning can stop counting columns
+before the following page context finishes reading, so payload bytes may exceed
+scanned input. Before/after descriptor metadata must agree; this remains
+non-atomic observed evidence, with `whole_file_immutable:false`.
+
+Retained-window, copy and selection receipts preserve this navigation object
+unchanged, including its offset relative to the original accepted page. History
+and copy perform no source reads. A page beginning within the scanned target line
+can report that line as `first_physical_line`; a prefix containing earlier lines
+uses only independently known file-prefix evidence. Missing lines, missing
+columns, scalar splits, scan exhaustion and read-call exhaustion remain distinct.
+Source, host and C-boundary regression cases are authored; independent executable
+verification remains pending.

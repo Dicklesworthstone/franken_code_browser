@@ -31,6 +31,7 @@ pub mod ignore;
 pub mod huge_line;
 pub mod line_index;
 pub mod path;
+pub mod position;
 pub mod restoration;
 pub mod old_anchor;
 pub mod reconciliation;

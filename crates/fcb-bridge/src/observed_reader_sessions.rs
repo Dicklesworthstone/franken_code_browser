@@ -7,7 +7,7 @@
 use std::{mem::size_of, path::Path, sync::{Arc, Mutex, MutexGuard, TryLockError,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}};
 use fcb_app::host::{HostResponse, observed_reader::{ObservedReaderSession,
-    ObservedReaderError, ObservedReaderEncoding, ObservedReaderSearchKind}};
+    ObservedReaderError, ObservedReaderEncoding, ObservedReaderSearchKind}, reader::ReaderColumnKind};
 use fcb_core::{ArenaOwnerId, ByteLength, ResourceAllocationId, ResourceBudget, ResourceLease};
 
 pub(super) const MAX_SESSIONS: usize = 4;
@@ -66,6 +66,8 @@ pub(super) enum Command<'a> {
     Window { offset: u64, bytes: usize, encoding: ObservedReaderEncoding },
     Lines { first_line: u64, line_count: u64, max_bytes: usize, max_scan_bytes: u64,
         encoding: ObservedReaderEncoding },
+    Position { line: u64, column: u64, kind: ReaderColumnKind, max_bytes: usize,
+        max_scan_bytes: u64, encoding: ObservedReaderEncoding },
     Retained { observation: u64 },
     Copy { observation: u64, start: u64, end: u64 },
     ResolveSelection { observation: u64, utf8_start: u64, utf8_end: u64 },
@@ -187,6 +189,8 @@ impl ObservedReaderSessions {
             Command::Window { offset, bytes, encoding } => reader.read_window(offset, bytes, encoding, &mut stop),
             Command::Lines { first_line, line_count, max_bytes, max_scan_bytes, encoding } =>
                 reader.read_lines(first_line, line_count, max_bytes, max_scan_bytes, encoding, &mut stop),
+            Command::Position { line, column, kind, max_bytes, max_scan_bytes, encoding } =>
+                reader.read_position(line, column, kind, max_bytes, max_scan_bytes, encoding, &mut stop),
             Command::Retained { observation } => reader.retained_window(observation, &mut stop),
             Command::Copy { observation, start, end } => reader.copy_range(observation, start, end, &mut stop),
             Command::ResolveSelection { observation, utf8_start, utf8_end } =>

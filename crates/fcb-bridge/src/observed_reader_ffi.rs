@@ -145,6 +145,30 @@ pub unsafe extern "C" fn fcb_observed_reader_lines(handle: u64, first_line: u64,
     }))
 }
 
+/// Resolve a typed one-based line/column and retain its bounded context during
+/// the same forward observation, including positions inside giant source lines.
+/// Original bytes, decoded UTF-8 bytes and UTF-16 units remain separate.
+/// # Safety
+/// If supplied, poll/context obey the same worker lifetime contract as open.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_observed_reader_position(handle: u64, line: u64,
+    column: u64, column_kind: u64, max_bytes: u64, max_scan_bytes: u64, encoding: u64,
+    poll: Option<SearchCancellationCallback>, context: *mut c_void) -> *mut c_char {
+    reply(|| answer(handle, |readers| {
+        use fcb_app::host::reader::ReaderColumnKind;
+        let kind = match column_kind {
+            1 => ReaderColumnKind::UnicodeScalar,
+            2 => ReaderColumnKind::Utf16CodeUnit,
+            3 => ReaderColumnKind::DecodedUtf8Byte,
+            _ => return Err(AccessError::InvalidArgument),
+        };
+        let encoding = decode_encoding(encoding)?;
+        let max_bytes = usize::try_from(max_bytes).map_err(|_| AccessError::InvalidArgument)?;
+        readers.execute(handle, Command::Position { line, column, kind, max_bytes, max_scan_bytes, encoding },
+            || poll.is_some_and(|poll| unsafe { poll(context) != 0 }))
+    }))
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn fcb_observed_reader_retained(handle: u64, observation: u64) -> *mut c_char {
     reply(|| answer(handle, |readers| readers.execute(handle, Command::Retained { observation }, || false)))
