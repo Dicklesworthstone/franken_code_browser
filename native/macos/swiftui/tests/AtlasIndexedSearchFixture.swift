@@ -10,6 +10,7 @@ final class IndexedFixture: @unchecked Sendable {
         var ruleFingerprint: String?
         var fallback = false
         var hitCount = 2
+        var captureBytes = 4096
         var countedMatches: UInt64? = nil
         var pathHex = "612e7273"
         var fileID: UInt64 = 1
@@ -43,6 +44,7 @@ final class IndexedFixture: @unchecked Sendable {
         var capturePathScope: AtlasSearchPathScope = .workspace
         var caseSensitive = true
         var countAllMatches = false
+        var resultOffset: UInt64?
         var expression: String?
         var structureMode: AtlasSearchMode?
         var nameMode: AtlasSearchNameMode = .contains
@@ -128,6 +130,17 @@ final class IndexedFixture: @unchecked Sendable {
         return transport
     }
 
+    var windowTransport: AtlasIndexedSearchTransport {
+        var transport = countedTransport
+        transport.windowQueryBegin = { h, g, index, query, scope, pathScope, caseSensitive, expression, countAll, skip in
+            precondition(index == 1)
+            return try self.response("query-begin", h, generation: g, needle: expression ? "" : query,
+                scope: scope, pathScope: pathScope, caseSensitive: caseSensitive,
+                countAllMatches: countAll, resultOffset: skip, expression: expression ? query : nil)
+        }
+        return transport
+    }
+
     var structuralTransport: AtlasIndexedSearchTransport {
         var transport = self.transport
         transport.structureQueryBegin = { h, g, index, mode, nameMode, needle, scope, pathScope in
@@ -144,6 +157,7 @@ final class IndexedFixture: @unchecked Sendable {
                           pathScope: AtlasSearchPathScope = .workspace,
                           caseSensitive: Bool = true,
                           countAllMatches: Bool = false,
+                          resultOffset: UInt64? = nil,
                           expression: String? = nil,
                           structureMode: AtlasSearchMode? = nil,
                           nameMode: AtlasSearchNameMode = .contains,
@@ -174,6 +188,8 @@ final class IndexedFixture: @unchecked Sendable {
             s.pathScope = pathScope
             s.caseSensitive = caseSensitive
             s.countAllMatches = countAllMatches
+            s.resultOffset = resultOffset
+            if let resultOffset { events.append("query-window:\(resultOffset)") }
             s.expression = expression
             s.structureMode = structureMode; s.nameMode = nameMode
             if let structureMode { events.append("query-structure:\(structureMode.rawValue):\(nameMode.rawValue)") }
@@ -197,7 +213,7 @@ final class IndexedFixture: @unchecked Sendable {
             : captureEligible - c.pending - captureUnavailable)
         let capturePending = captureEligible - captured - captureUnavailable
         precondition(captureEligible <= c.files && captured >= 0 && captureUnavailable >= 0 && capturePending >= 0)
-        let totalBytes = captured == 0 ? 0 : 4096 + max(0, captured - 1) * 100
+        let totalBytes = captured == 0 ? 0 : c.captureBytes + max(0, captured - 1) * 100
         var value: [String: Any] = ["schema": "fcb.atlas-search/1", "status": "ok", "owner": String(h),
             "source_manifest": "1", "layout_revision": "3", "scope": "all", "workspace_files": String(c.files),
             "catalogued_files": String(c.files), "index_generation": "1"]
@@ -227,7 +243,7 @@ final class IndexedFixture: @unchecked Sendable {
         } else if phase.hasPrefix("build") {
             let examined = min(s.buildStep, captureEligible - capturePending)
             let unavailable = max(0, examined - captured), available = examined - unavailable
-            let bytes = available == 0 ? 0 : 4096 + max(0, available - 1) * 100
+            let bytes = available == 0 ? 0 : c.captureBytes + max(0, available - 1) * 100
             let running = phase == "build-begin" || examined < captureEligible - capturePending
             let fields: [String: Any] = ["command": phase == "build-begin" ? "index-begin" : "index-step",
                 "index_build_in_progress": running, "capture_complete": !running && capturePending == 0
@@ -246,10 +262,10 @@ final class IndexedFixture: @unchecked Sendable {
             precondition(sourceFile == c.fileID)
             let path: [String: Any] = ["encoding": "unix-bytes", "hex": c.pathHex, "display": "a.rs"]
             let fields: [String: Any] = ["command": "index-open-reader", "capture_manifest": "2", "selection_namespace": "index-source",
-                "file_id": String(c.fileID), "source_revision": "1", "capture_byte_length": "4096", "capture_sha256": c.digest,
+                "file_id": String(c.fileID), "source_revision": "1", "capture_byte_length": String(c.captureBytes), "capture_sha256": c.digest,
                 "path": path, "reader_owner": String(reader), "source_reopened": false, "source_observation": "retained-index-capture",
                 "reader": ["schema": "fcb.reader-session/1", "status": "ok", "command": "info", "owner": String(reader),
-                    "file_id": "1", "source_revision": "1", "captured_bytes": "4096", "encoding": c.encoding, "path": path,
+                    "file_id": "1", "source_revision": "1", "captured_bytes": String(c.captureBytes), "encoding": c.encoding, "path": path,
                     "capture_origin": "host-supplied", "initial_source_bytes_read": "0", "initial_read_calls": "0",
                     "additional_source_bytes_read": "0", "native_presented": false]]
             value.merge(fields, uniquingKeysWith: { _, n in n })
@@ -265,10 +281,21 @@ final class IndexedFixture: @unchecked Sendable {
             let examined = min(s.queryStep, available)
             let scanned = s.caseSensitive && s.structureMode == nil ? min(1, examined) : examined
             let skipped = max(0, examined - scanned)
-            let running = phase == "query-begin" || examined < available
-            let count = examined > 0 ? (scoped ? c.scopedHitCount ?? c.hitCount : c.hitCount) : 0
-            let matches = s.countAllMatches && examined > 0 ? (c.countedMatches ?? UInt64(count)) : UInt64(count)
-            let complete = !running && pending == 0 && unavailable == 0
+            let configuredCount = examined > 0 ? (scoped ? c.scopedHitCount ?? c.hitCount : c.hitCount) : 0
+            let observed = examined > 0 ? (c.countedMatches ?? UInt64(configuredCount)) : 0
+            let matches: UInt64
+            let count: Int
+            if let offset = s.resultOffset {
+                matches = s.countAllMatches ? observed : min(observed, offset + 1001)
+                count = Int(min(1000, matches - min(offset, matches)))
+            } else {
+                count = configuredCount
+                matches = s.countAllMatches && examined > 0 ? observed : UInt64(count)
+            }
+            let hasMore = s.resultOffset.map { matches > $0 + UInt64(count) } ?? false
+            let stoppedAtWindow = s.resultOffset != nil && !s.countAllMatches && hasMore
+            let running = phase == "query-begin" || (examined < available && !stoppedAtWindow)
+            let complete = !running && !stoppedAtWindow && pending == 0 && unavailable == 0
                 && (!s.pathScope.isVisible || c.captureVisibleMissing == 0) && c.discovery
             let first = phase == "page" ? start : 0, end = min(count, first + (phase == "page" ? 128 : 64))
             var rows: [[String: Any]] = []
@@ -276,10 +303,11 @@ final class IndexedFixture: @unchecked Sendable {
                 for n in first..<end {
                     let width = s.structureMode != nil ? s.needle.utf8.count
                         : (s.caseSensitive ? (s.expression == nil ? 1 : s.needle.utf8.count) : c.insensitiveRangeBytes)
-                    let range: [String: String] = ["start": String(n * 2), "end": String(n * 2 + width)]
+                    let position = Int(s.resultOffset ?? 0) + n
+                    let range: [String: String] = ["start": String(position * 2), "end": String(position * 2 + width)]
                     let path: [String: String] = ["encoding": "unix-bytes", "hex": c.pathHex, "display": "a.rs"]
                     var row: [String: Any] = ["hit_id": String(n + 1), "file_id": String(c.fileID), "source_revision": "1",
-                        "capture_sha256": c.digest, "capture_byte_length": "4096", "original_range": range, "path": path]
+                        "capture_sha256": c.digest, "capture_byte_length": String(c.captureBytes), "original_range": range, "path": path]
                     if !s.caseSensitive { row["matched_text"] = c.insensitiveText }
                     else if s.expression != nil { row["matched_text"] = s.needle }
                     if let mode = s.structureMode {
@@ -301,12 +329,20 @@ final class IndexedFixture: @unchecked Sendable {
                 "skipped_by_index": String(skipped), "fallback_files": String(c.fallback || !s.caseSensitive ? scanned : 0),
                 "unavailable_files": String(unavailable), "pending_files": String(eligible - expressionExcluded - examined - unavailable),
                 "retained_hits": String(count), "displayed_hits": String(count), "matches_seen": String(matches), "step_count": String(s.queryStep),
-                "verification_source_bytes": String(scanned == 0 ? 0 : min(4096, totalBytes)), "source_bytes_read": "0", "read_calls": "0",
+                "verification_source_bytes": String(scanned == 0 ? 0 : min(c.captureBytes, totalBytes)), "source_bytes_read": "0", "read_calls": "0",
                 "search_in_progress": running, "search_complete": complete,
-                "truncated": matches > UInt64(count), "stop_reason": running ? NSNull() : (pending > 0
-                    ? (capturePending > 0 ? "source-byte-limit" : "capture-scope") : "all-files-examined"),
+                "truncated": matches > UInt64(count), "stop_reason": running ? NSNull() : (stoppedAtWindow ? "match-limit" : (pending > 0
+                    ? (capturePending > 0 ? "source-byte-limit" : "capture-scope") : "all-files-examined")),
                 "hits": rows, "next_offset": end < count ? String(end) : NSNull()]
             value.merge(fields, uniquingKeysWith: { _, n in n })
+            if let offset = s.resultOffset {
+                value["result_offset"] = String(offset)
+                value["skipped_matches"] = String(min(offset, matches))
+                value["has_more_matches"] = hasMore
+                value["next_match_offset"] = hasMore && count > 0 ? String(offset + UInt64(count)) : NSNull()
+                value["count_all_matches"] = s.countAllMatches
+                value["match_count_complete"] = complete
+            }
             if let mode = s.structureMode {
                 value["command"] = phase == "query-begin" ? "begin-indexed-structure" : (phase == "page" ? "page" : "step")
                 value["mode"] = mode.wireMode; value["search_strategy"] = "retained-capture-structure"

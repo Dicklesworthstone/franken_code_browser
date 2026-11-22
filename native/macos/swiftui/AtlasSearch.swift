@@ -388,6 +388,8 @@ struct AtlasSearchReport: Sendable {
     var visibleMissingFiles: Int = 0
     var expression: AtlasSearchExpression? = nil
     var discoveryPolicy: AtlasDiscoveryPolicy = .repositoryRules
+    /// One bounded result window over the same explicitly retained index.
+    var resultWindow: AtlasSearchResultWindow? = nil
     var isInProgress: Bool { progress?.isRunning == true }
     var isWorkspaceScope: Bool { fileScope.isAll && pathScope.isWorkspace }
     var resultLabel: String { mode == .text && !caseSensitive ? "case-insensitive matches" : mode.resultLabel }
@@ -409,7 +411,7 @@ struct AtlasSearchReport: Sendable {
     }
     private var resultSummary: String {
         let count = hits.count
-        let nounCount = countAllMatches ? matchesSeen : UInt64(count)
+        let nounCount = countAllMatches || resultWindow != nil ? matchesSeen : UInt64(count)
         let noun: String
         switch mode {
         case .text:
@@ -424,6 +426,22 @@ struct AtlasSearchReport: Sendable {
             ? " Heuristic declaration candidates; compiler resolution and reference completeness are not claimed."
             : (mode == .occurrences ? " Exact token spelling, including comments and literals; compiler resolution is not claimed."
                 : (mode.isTextual && !caseSensitive ? " Compared using Unicode lowercase; source spelling is preserved." : ""))
+        if let window = resultWindow {
+            let shown = window.rangeLabel
+            if let progress, progress.isRunning {
+                return "Finding result window from match \(window.offset + 1): \(matchesSeen) occurrences verified; \(progress.examinedFiles) of \(progress.cataloguedFiles) eligible files examined."
+                    + qualification
+            }
+            let found = matchCountComplete ? "\(matchesSeen) \(noun)" : "At least \(matchesSeen) \(noun)"
+            var result = "\(found); \(shown)."
+            if !complete {
+                result += " Search coverage is partial."
+                if unavailableFiles > 0 { result += " \(unavailableFiles) unavailable files." }
+                if unsupportedFiles > 0 { result += " \(unsupportedFiles) unsupported text files." }
+            }
+            if window.hasMore { result += " Next results opens the following window from these same captures." }
+            return result + qualification
+        }
         if let progress, progress.isRunning {
             let membership = isWorkspaceScope ? "catalogued" : "eligible"
             let found = countAllMatches
@@ -544,6 +562,60 @@ struct AtlasSearchReport: Sendable {
 
 /// Validated, immutable input to the admitted search mode. Admission does
 /// not trim whitespace or normalize Unicode: those bytes are the query.
+/// A native capability for one immutable captured-index session and its exact
+/// query policy. It grants no filesystem access and cannot prepare a replacement
+/// index. UUID is private session identity, not a substitute for wire validation.
+struct AtlasSearchResultWindowSource: Sendable {
+    let index: UUID
+    let root, query: String
+    let fileScope: AtlasSearchFileScope
+    let pathScope: AtlasSearchPathScope
+    let mode: AtlasSearchMode
+    let caseSensitive, countAllMatches: Bool
+    let discoveryPolicy: AtlasDiscoveryPolicy
+
+    init(index: UUID, input: AtlasSearchInput, countAllMatches: Bool) {
+        self.index = index; root = input.root; query = input.query
+        fileScope = input.fileScope; pathScope = input.pathScope; mode = input.mode
+        caseSensitive = input.caseSensitive; self.countAllMatches = countAllMatches
+        discoveryPolicy = input.discoveryPolicy
+    }
+    func matches(_ input: AtlasSearchInput, countAllMatches: Bool) -> Bool {
+        root.utf8.elementsEqual(input.root.utf8) && query.utf8.elementsEqual(input.query.utf8)
+            && fileScope == input.fileScope && pathScope == input.pathScope && mode == input.mode
+            && caseSensitive == input.caseSensitive && self.countAllMatches == countAllMatches
+            && discoveryPolicy == input.discoveryPolicy
+    }
+}
+
+struct AtlasSearchResultWindowRequest: Sendable {
+    let source: AtlasSearchResultWindowSource
+    let offset: UInt64
+}
+
+struct AtlasSearchResultWindow: Sendable {
+    static let capacity: UInt64 = 1000
+    let source: AtlasSearchResultWindowSource
+    let offset, skipped: UInt64
+    let retained: Int
+    let hasMore: Bool
+    let nextOffset: UInt64?
+
+    var previous: AtlasSearchResultWindowRequest? {
+        guard offset > 0 else { return nil }
+        return AtlasSearchResultWindowRequest(source: source,
+            offset: offset > Self.capacity ? offset - Self.capacity : 0)
+    }
+    var next: AtlasSearchResultWindowRequest? {
+        guard hasMore, let nextOffset, retained > 0, nextOffset > offset else { return nil }
+        return AtlasSearchResultWindowRequest(source: source, offset: nextOffset)
+    }
+    var rangeLabel: String {
+        guard retained > 0 else { return "no retained matches in this window" }
+        return "showing matches \(offset + 1)–\(offset + UInt64(retained))"
+    }
+}
+
 struct AtlasSearchInput: Sendable {
     let root: String
     let query: String
@@ -557,6 +629,7 @@ struct AtlasSearchInput: Sendable {
     /// and other modes stay bounded. Explicit choices are never substituted.
     let countAllMatches: Bool?
     let discoveryPolicy: AtlasDiscoveryPolicy
+    let resultWindow: AtlasSearchResultWindowRequest?
     var countsLiveMatches: Bool { countAllMatches ?? (mode == .text && caseSensitive) }
     func countsIndexedMatches(supportsCounting: Bool) -> Bool {
         countAllMatches ?? (mode == .text && caseSensitive && supportsCounting)
@@ -567,7 +640,8 @@ struct AtlasSearchInput: Sendable {
          pathScope: AtlasSearchPathScope = .workspace,
          mode: AtlasSearchMode = .text, nameMode: AtlasSearchNameMode = .contains,
          caseSensitive: Bool = true, countAllMatches: Bool? = nil,
-         discoveryPolicy: AtlasDiscoveryPolicy = .repositoryRules) throws {
+         discoveryPolicy: AtlasDiscoveryPolicy = .repositoryRules,
+         resultWindow: AtlasSearchResultWindowRequest? = nil) throws {
         guard !root.isEmpty, root.utf8.count <= 16_384, !root.utf8.contains(0),
               !query.isEmpty, query.utf8.count <= 1_024, !query.utf8.contains(0) else {
             throw AtlasSearchError.invalidRequest
@@ -581,8 +655,17 @@ struct AtlasSearchInput: Sendable {
         self.caseSensitive = mode.isTextual ? caseSensitive : true
         self.countAllMatches = mode.isTextual ? countAllMatches : false
         self.discoveryPolicy = discoveryPolicy
+        self.resultWindow = resultWindow
+        if let resultWindow {
+            guard mode.isTextual, resultWindow.offset <= 32 * 1024 * 1024,
+                  resultWindow.source.matches(self,
+                    countAllMatches: self.countAllMatches ?? resultWindow.source.countAllMatches) else {
+                throw AtlasSearchError.invalidRequest
+            }
+        }
     }
     func requireLegacyScope() throws {
+        guard resultWindow == nil else { throw AtlasSearchError.unavailable }
         guard discoveryPolicy == .repositoryRules else { throw AtlasSearchError.unsupportedDiscoveryPolicy }
         guard mode == .text else { throw AtlasSearchError.invalidRequest }
         guard caseSensitive else { throw AtlasSearchError.unsupportedMatching }

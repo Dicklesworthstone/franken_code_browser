@@ -306,6 +306,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     @State private var searchReport: AtlasSearchReport?
     @State private var searchPresentation: AtlasSearchPresentation?
     @State private var searchPending = false
+    @State private var searchWindowPending = false
     // Created on the first search request, not on every SwiftUI view rebuild.
     @State private var searchCoordinator: AtlasSearchCoordinator?
     @State private var workspaceSearch: AtlasWorkspaceSearch?
@@ -1219,6 +1220,28 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                     Text("Some match rows are unavailable or exceed the overlay limit. File outlines show returned matches.")
                         .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 10)
                 }
+            }
+            if searchIsCurrent, let report = searchReport, !report.isInProgress,
+               let window = report.resultWindow {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(window.rangeLabel).font(.caption).foregroundStyle(.secondary)
+                    HStack {
+                        Button("Previous results") {
+                            if let request = window.previous { runSearch(debounce: false, window: request) }
+                        }
+                        .disabled(searchPending || window.previous == nil)
+                        .accessibilityLabel("Previous captured search result window")
+                        Spacer()
+                        Button("Next results") {
+                            if let request = window.next { runSearch(debounce: false, window: request) }
+                        }
+                        .disabled(searchPending || window.next == nil)
+                        .accessibilityLabel("Next captured search result window")
+                    }
+                    .controlSize(.small)
+                    .help("Verify another bounded result window in the same captured files. Refresh starts a new capture.")
+                }
+                .padding(.horizontal, 10).padding(.bottom, 8)
             }
             if query.isEmpty && !loadingProject && !displayedFiles.isEmpty {
                 // Catalog membership, not an eager source/Metal tile, makes a
@@ -2817,7 +2840,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             }
         }
         searchCoordinator?.cancel()
-        searchPending = false
+        searchPending = false; searchWindowPending = false
         hits = []; selectedHit = nil; selectedMatch = nil
         selectedReaderSelection = nil
         searchReport = nil; searchPresentation = nil
@@ -2935,7 +2958,13 @@ private struct AtlasPreparedProjectRefresh: Sendable {
 
     private func runSearch() { runSearch(debounce: false) }
 
-    private func runSearch(debounce: Bool) {
+    private func runSearch(debounce: Bool, window: AtlasSearchResultWindowRequest? = nil) {
+        if let window {
+            guard wantsCapturedIndex, searchIsCurrent, !searchPending,
+                  let accepted = searchReport?.resultWindow,
+                  accepted.source.index == window.source.index,
+                  accepted.previous?.offset == window.offset || accepted.next?.offset == window.offset else { return }
+        }
         let requestedText = query
         let requestedRoot = root
         guard !loadingProject, !requestedText.isEmpty, !requestedRoot.isEmpty else { return }
@@ -2975,9 +3004,9 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 pathScope: pathScope,
                 mode: searchMode, nameMode: searchMode.effectiveNameMode(searchNameMode),
                 caseSensitive: effectiveSearchCaseSensitive, countAllMatches: effectiveSearchCountAllMatches,
-                discoveryPolicy: requestedContext.discoveryPolicy)
-            clearSearch()
-            searchPending = true
+                discoveryPolicy: requestedContext.discoveryPolicy, resultWindow: window)
+            if window == nil { clearSearch() }
+            searchPending = true; searchWindowPending = window != nil
             searchTitle = input.pathScope.isVisible ? "Searching frozen atlas files" : "Searching project"
             searchSummary = input.pathScope.isVisible
                 ? "Searching \(visibleScope?.snapshot.count ?? 0) files from the frozen atlas view. Moving the camera does not change this query's membership."
@@ -2993,6 +3022,10 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 if input.pathScope.isVisible {
                     searchSummary += " Scope: \(visibleScope?.snapshot.count ?? 0) files from the frozen atlas view."
                 }
+            }
+            if let window {
+                searchTitle = "Finding result window"
+                searchSummary = "Verifying matches from \(window.offset + 1) in the same captured files. The accepted results and reader stay available."
             }
             status = searchSummary
             let coordinator = searchCoordinator ?? AtlasSearchCoordinator(scopedWork: AtlasNativeSearch.runScoped)
@@ -3010,11 +3043,29 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 searchPending = false
                 switch result {
                 case .success(let report):
+                    if let window {
+                        guard let received = report.resultWindow,
+                              received.offset == window.offset,
+                              received.source.index == window.source.index else {
+                            searchWindowPending = false
+                            status = AtlasSearchError.invalidResponse.message
+                            searchSummary = status + " The previous results remain available."
+                            return
+                        }
+                        if report.isInProgress {
+                            searchPending = true
+                            searchSummary = report.summary + " The previous result window remains displayed."
+                            status = searchSummary
+                            return
+                        }
+                    }
+                    searchWindowPending = false
                     guard report.discoveryPolicy == requestedContext.discoveryPolicy else {
                         status = AtlasSearchError.invalidResponse.message
                         searchSummary = status; searchTitle = "Search unavailable"
                         return
                     }
+                    if window != nil { selectedHit = nil; selectedMatch = nil }
                     searchPending = report.isInProgress
                     prepareSearchOverlay(report, context: searchContext)
                     searchReport = report
@@ -3026,14 +3077,15 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                             ? (report.pathScope.isVisible ? "Searching frozen atlas files" : "Searching project")
                             : (report.complete ? "No matches" : "Partial search"))
                 case .failure(let error):
+                    searchWindowPending = false
                     status = error.message
-                    searchSummary = status
+                    searchSummary = status + (window == nil ? "" : " The previous result window and reader are unchanged.")
                     if case .canceled = error { searchTitle = "Search canceled" }
                     else { searchTitle = "Search unavailable" }
                 }
             }
         } catch {
-            searchPending = false
+            searchPending = false; searchWindowPending = false
             status = (error as? AtlasSearchError)?.message ?? "Search failed. Results are unavailable."
             searchSummary = status
             searchTitle = "Search unavailable"
@@ -3052,9 +3104,11 @@ private struct AtlasPreparedProjectRefresh: Sendable {
 
     private func cancelSearch() {
         searchCoordinator?.cancel()
-        searchPending = false
+        let preservedWindow = searchWindowPending
+        searchPending = false; searchWindowPending = false
         searchTitle = "Search canceled"
         searchSummary = AtlasSearchError.canceled.message
+            + (preservedWindow ? " The previous result window and reader are unchanged." : "")
         status = searchSummary
     }
 

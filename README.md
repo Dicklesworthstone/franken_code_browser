@@ -174,6 +174,14 @@ paths; unsubmitted note-editor drafts remain protected separately. See
 [local recovery](native/macos/README.md#recovering-reading-desk-work) for the
 opt-in, storage limits and pending native verification.
 
+**Captured workspace search reaches later matches.** With **Captured index**
+enabled, Text and Expression searches offer **Previous results** and **Next
+results** beyond the first 1,000 hits. Every window uses the same retained
+captures and exact query scope, with bounded witnesses, separate total counts
+and explicit partial coverage. The accepted results and reader survive canceled
+or failed replacements. See [later result windows](native/macos/README.md#later-result-windows-in-a-captured-index).
+Executable and physical-Mac verification remain pending.
+
 **Project relationships keep your reading place.** Documentation links and
 backlinks open exact captured sources. Their Markdown preview can follow local
 links through the retained inventory, with Back/Forward across three retained

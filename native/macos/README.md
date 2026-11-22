@@ -1236,7 +1236,7 @@ Widening a query beyond that captured scope can therefore leave files
 uncaptured until Refresh. Indexed queries and result activation do no live
 source reads.
 
-Both routes retain at most 1,000 primary matches. **Count all matches** starts
+Each live query or captured-index result window retains at most 1,000 primary matches. **Count all matches** starts
 enabled for Text and Expression searches, with either case choice, across live
 captures and the retained workspace index. Counting continues through the
 admitted scope after navigation rows fill; expressions count primary occurrences
@@ -1266,6 +1266,33 @@ Host, C-boundary and native decoder/transport regressions accompany this
 integration. They have not been executed in this code-first session; Rust and
 Swift compilation, executable qualification and physical-Mac interaction
 verification remain pending.
+
+### Later result windows in a captured index
+
+With **Captured index** enabled, **Previous results** and **Next results** reach
+matches after the first 1,000 for Text and Expression searches. The sidebar
+shows the current ordinal range separately from the total count and coverage.
+Each window keeps at most 1,000 exact source witnesses, while a completed count
+can include every match in the admitted captures.
+
+Changing windows verifies the same immutable captures with the same query,
+case choice, counting choice, file types and location scope. It performs no
+additional source reads. Skipped matches still consume the verification-work
+budget, so a far window can remain partial when that budget is exhausted.
+Next is available only when the engine has actually observed a later match;
+an absent Next button does not make partial coverage complete.
+
+The accepted rows and current reader stay available while a later window is
+prepared. A failed or canceled replacement preserves them. Refresh, a changed
+project grant, or another query invalidates the old continuation rather than
+opening current files under its capture identity. A successful window receives
+fresh query and presentation identities, keeping delayed clicks from selecting
+a different occurrence with the same local row number.
+
+The shared engine, host, C ABI, native worker and transport have regression
+sources for later windows, overlapping matches, UTF-16, expression predicates,
+cancellation, scope changes and retained reader ownership. Executable Rust/Swift
+and physical-Mac verification remain pending.
 
 ## Project documentation links and backlinks
 

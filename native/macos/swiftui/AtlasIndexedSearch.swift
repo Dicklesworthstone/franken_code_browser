@@ -32,6 +32,10 @@ struct AtlasIndexedSearchTransport: Sendable {
     /// Missing capability must refuse before discovery or source capture.
     var structureQueryBegin: (@Sendable (UInt64, UInt64, UInt64, AtlasSearchMode, AtlasSearchNameMode,
         String, AtlasSearchFileScope, AtlasSearchPathScope) throws -> String?)? = nil
+    /// A bounded result window reruns verification over this same immutable
+    /// index. The Bool arguments are case-sensitive, expression and count-all.
+    var windowQueryBegin: (@Sendable (UInt64, UInt64, UInt64, String, AtlasSearchFileScope,
+        AtlasSearchPathScope, Bool, Bool, Bool, UInt64) throws -> String?)? = nil
     /// Legacy openers retain repository-rules defaults; explicit opt-in must
     /// never silently reuse their narrower discovery universe.
     var openWithPolicy: (@Sendable (UInt64, String, AtlasDiscoveryPolicy, AtlasSearchCancellation) throws -> String?)? = nil
@@ -54,6 +58,7 @@ struct AtlasPreparedIndex: Sendable {
 /// retires the private builder. No partial index is advertised as queryable.
 final class AtlasIndexedSearch: @unchecked Sendable {
     private final class Session {
+        let id = UUID()
         let owner: AtlasSearchCaptureOwner
         let root: String
         let grant: ObjectIdentifier?
@@ -132,9 +137,19 @@ final class AtlasIndexedSearch: @unchecked Sendable {
         guard input.discoveryPolicy == .repositoryRules || transport.openWithPolicy != nil else {
             throw AtlasSearchError.unsupportedDiscoveryPolicy
         }
-        let countAllMatches = input.countsIndexedMatches(supportsCounting: transport.countedQueryBegin != nil)
+        let usesWindows = input.mode.isTextual && transport.windowQueryBegin != nil
+        let resultOffset: UInt64? = usesWindows ? (input.resultWindow?.offset ?? 0) : nil
+        let countAllMatches = input.countsIndexedMatches(
+            supportsCounting: transport.countedQueryBegin != nil || usesWindows)
+        if let requested = input.resultWindow {
+            guard usesWindows, requested.source.matches(input, countAllMatches: countAllMatches) else {
+                throw AtlasSearchError.invalidRequest
+            }
+        }
         if !input.mode.isTextual {
             guard transport.structureQueryBegin != nil else { throw AtlasSearchError.unavailable }
+        } else if usesWindows {
+            // This single capability admits every textual query policy.
         } else if countAllMatches {
             guard input.mode == .expression ? transport.countedExpressionQueryBegin != nil
                 : transport.countedQueryBegin != nil else { throw AtlasSearchError.unsupportedCounting }
@@ -154,6 +169,11 @@ final class AtlasIndexedSearch: @unchecked Sendable {
             let grant = access.reference.map(ObjectIdentifier.init)
             let reused = cached.map { $0.root.utf8.elementsEqual(root.utf8) && $0.grant == grant
                 && $0.discoveryPolicy == input.discoveryPolicy } == true
+            if let requested = input.resultWindow {
+                // A page request may never recapture an edited live tree or
+                // borrow another root/grant's equally numbered index.
+                guard reused, cached?.id == requested.source.index else { throw AtlasSearchError.unavailable }
+            }
             if !reused {
                 cached = nil
                 // Publish a successfully finished index before the next cancel
@@ -173,6 +193,10 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                 if !input.mode.isTextual {
                     guard let structure = transport.structureQueryBegin else { throw AtlasSearchError.unavailable }
                     return try structure(handle, generation, basis.index, input.mode, input.nameMode, query, scope, pathScope)
+                }
+                if let window = transport.windowQueryBegin {
+                    return try window(handle, generation, basis.index, query, scope, pathScope,
+                        input.caseSensitive, input.mode == .expression, countAllMatches, resultOffset ?? 0)
                 }
                 if countAllMatches {
                     let counted = input.mode == .expression ? transport.countedExpressionQueryBegin
@@ -198,7 +222,8 @@ final class AtlasIndexedSearch: @unchecked Sendable {
             }
             var page = try AtlasIndexedQueryPage(began,
                 basis: basis, generation: generation, needle: query, scope: scope, pathScope: pathScope,
-                caseSensitive: input.caseSensitive, mode: input.mode, nameMode: input.nameMode, countAllMatches: countAllMatches,
+                caseSensitive: input.caseSensitive, mode: input.mode, nameMode: input.nameMode,
+                countAllMatches: countAllMatches, resultOffset: resultOffset,
                 command: !input.mode.isTextual ? "begin-indexed-structure"
                     : (input.mode == .expression ? "begin-indexed-expression" : "begin-indexed"))
             var result = AtlasIndexedAccumulator()
@@ -213,7 +238,7 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                     let tail = try AtlasIndexedQueryPage(owner.call { try transport.page($0, generation, UInt64(start), 128) },
                         basis: basis, generation: generation, needle: query, scope: scope, pathScope: pathScope,
                         caseSensitive: input.caseSensitive, mode: input.mode, nameMode: input.nameMode,
-                        countAllMatches: countAllMatches, command: "page")
+                        countAllMatches: countAllMatches, resultOffset: resultOffset, command: "page")
                     try result.append(tail, start: start, limit: 128)
                 }
                 let state = page.state
@@ -221,6 +246,12 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                     root: root, needle: page.expression?.primaryNeedle ?? query, hits: result.hits,
                     caseSensitive: input.caseSensitive, mode: input.mode,
                     importReader: transport.sourceReader)
+                let window: AtlasSearchResultWindow? = usesWindows ? state.resultWindow.map { receipt in
+                    AtlasSearchResultWindow(source: AtlasSearchResultWindowSource(index: session.id,
+                        input: input, countAllMatches: countAllMatches),
+                        offset: receipt.offset, skipped: receipt.skipped, retained: state.retained,
+                        hasMore: receipt.hasMore, nextOffset: receipt.next)
+                } : nil
                 let report = AtlasSearchReport(hits: result.hits.map(\.hit), complete: state.complete,
                     truncated: state.truncated, unavailableFiles: state.unavailable,
                     unsupportedFiles: state.structureCoverage?.unsupportedFiles ?? 0,
@@ -238,7 +269,7 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                     fileScope: scope, excludedFiles: basis.files - state.eligible, pathScope: pathScope,
                     mode: input.mode, nameMode: input.nameMode, structureCoverage: state.structureCoverage,
                     caseSensitive: input.caseSensitive, visibleMissingFiles: state.visibleMissing,
-                    expression: state.expression, discoveryPolicy: input.discoveryPolicy)
+                    expression: state.expression, discoveryPolicy: input.discoveryPolicy, resultWindow: window)
                 try check(cancellation)
                 if !state.running { return report }
                 let now = ProcessInfo.processInfo.systemUptime
@@ -249,7 +280,7 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                 page = try AtlasIndexedQueryPage(owner.call { try transport.queryStep($0, generation, cancellation) },
                     basis: basis, generation: generation, needle: query, scope: scope, pathScope: pathScope,
                     caseSensitive: input.caseSensitive, mode: input.mode, nameMode: input.nameMode,
-                    countAllMatches: countAllMatches, command: "step")
+                    countAllMatches: countAllMatches, resultOffset: resultOffset, command: "step")
             }
         } catch {
             if cancellation.isCanceled { throw AtlasSearchError.canceled }

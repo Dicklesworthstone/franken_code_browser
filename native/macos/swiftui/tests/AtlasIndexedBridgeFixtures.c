@@ -161,6 +161,29 @@ char *fcb_atlas_structure_indexed_begin(uint64_t h, uint64_t g, uint64_t index, 
     }
     ++calls; return result();
 }
+char *fcb_atlas_search_indexed_begin_window(uint64_t h, uint64_t g, uint64_t index, const char *query,
+        const char *extensions, const char *filenames, uint64_t path_kind, const char *path,
+        uint64_t case_sensitive, uint64_t expression, uint64_t count_all, uint64_t skip,
+        uint64_t hits, uint64_t bytes) {
+    assert(h == handle && index == 1 && hits == 1000 && query);
+    if (g == 80) {
+        assert(!strcmp(query, "exact text") && !extensions && !filenames && path_kind == 0 && !path);
+        assert(case_sensitive == 1 && expression == 0 && count_all == 1 && skip == 1000);
+        assert(bytes == 32 * 1024 * 1024);
+    } else if (g == 81) {
+        assert(!strcmp(query, "\"exact text\" required -excluded lang:rs"));
+        assert(extensions && !strcmp(extensions, "rs") && filenames && !filenames[0]);
+        assert(path_kind == 1 && path && !strcmp(path, "src"));
+        assert(case_sensitive == 0 && expression == 1 && count_all == 0 && skip == 2000);
+        assert(bytes == 256 * 1024 * 1024);
+    } else {
+        assert(g == 82 && !strcmp(query, "exact text") && !extensions && !filenames);
+        assert(path_kind == 3 && path && !strcmp(path, "612e7273,ff2e7273"));
+        assert(case_sensitive == 0 && expression == 0 && count_all == 0 && skip == 0);
+        assert(bytes == 32 * 1024 * 1024);
+    }
+    ++calls; return result();
+}
 char *fcb_atlas_search_step_cancelable(uint64_t h, uint64_t g, int32_t (*poll)(void *), void *ctx) {
     assert(h == handle && g == 44); ++calls; poll_now(poll, ctx); return result();
 }

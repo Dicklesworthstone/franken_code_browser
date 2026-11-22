@@ -15,6 +15,9 @@ swiftc -swift-version 6 -warnings-as-errors "$@" \
 swiftc -swift-version 6 -warnings-as-errors "$@" "$src/AtlasWorkspaceSearch.swift" \
     "$src/tests/AtlasIndexedSearchFixture.swift" "$src/tests/AtlasWorkspaceSearchTests.swift" -o "$out/workspace"
 "$out/workspace"
+swiftc -swift-version 6 -warnings-as-errors "$@" "$src/AtlasWorkspaceSearch.swift" \
+    "$src/tests/AtlasIndexedSearchFixture.swift" "$src/tests/AtlasIndexedResultWindowTests.swift" -o "$out/windows"
+"$out/windows"
 clang -std=gnu11 -Wall -Wextra -Werror -c "$src/tests/AtlasIndexedBridgeFixtures.c" -o "$out/fixture.o"
 swiftc -swift-version 6 -warnings-as-errors "$@" "$src/AtlasIndexedSearchBridge.swift" \
     "$src/tests/AtlasIndexedBridgeTests.swift" "$out/fixture.o" -o "$out/bridge"

@@ -53,7 +53,13 @@ import Foundation
             let worker = index ?? makeIndex()
             index = worker
             scopedWork = worker.runScoped
-        } else { scopedWork = live }
+        } else {
+            let live = self.live
+            scopedWork = { input, flag, access, publish in
+                guard input.resultWindow == nil else { throw AtlasSearchError.unavailable }
+                return try live(input, flag, access, publish)
+            }
+        }
         let work: Work = { root, query, flag, access, publish in
             try scopedWork(AtlasSearchInput(root: root, query: query), flag, access, publish)
         }

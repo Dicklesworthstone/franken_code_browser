@@ -92,6 +92,34 @@ import Foundation
             preconditionFailure("Text mode admitted to structural bridge") }
         catch AtlasSearchError.invalidRequest { checks += 1 }
         check(calls() == beforeStructure + 3)
+        let beforeWindows = calls()
+        check(try t.windowQueryBegin!(h, 80, 1, "exact text", .all, .workspace, true, false, true, 1000) != nil)
+        check(try t.windowQueryBegin!(h, 81, 1, expression, AtlasSearchFileScope(extensions: ["rs"]),
+            AtlasSearchPathScope(kind: .directory, path: "src"), false, true, false, 2000) != nil)
+        check(live() == 0 && calls() == beforeWindows + 2)
+        #if canImport(CryptoKit)
+        check(try t.windowQueryBegin!(h, 82, 1, "exact text", .all,
+            AtlasSearchPathScope(visiblePaths: [[255, 46, 114, 115], Array("a.rs".utf8)]),
+            false, false, false, 0) != nil)
+        check(live() == 0 && calls() == beforeWindows + 3)
+        #endif
+        let beforeInvalidWindow = calls()
+        do { _ = try t.windowQueryBegin!(h, 80, 1, "exact text", .all, .workspace,
+                true, false, true, UInt64.max)
+            preconditionFailure("Unbounded window offset crossed the ABI") }
+        catch AtlasSearchError.invalidRequest { checks += 1 }
+        check(calls() == beforeInvalidWindow)
+        mode(1)
+        check(try t.windowQueryBegin!(h, 80, 1, "exact text", .all, .workspace,
+            true, false, true, 1000) == nil && live() == 0)
+        for bad: Int32 in [2, 3] {
+            mode(bad)
+            do { _ = try t.windowQueryBegin!(h, 80, 1, "exact text", .all, .workspace,
+                    true, false, true, 1000)
+                preconditionFailure("Malformed window response accepted") }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
+            check(live() == 0)
+        }
         mode(1); check(try t.structureQueryBegin!(h, 70, 1, .symbols, .prefix, "SomeName", .all, .workspace) == nil && live() == 0)
         for bad: Int32 in [2, 3] {
             mode(bad)
