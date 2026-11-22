@@ -15,7 +15,7 @@ use fcb::search::{ResourceAllocationId, ResourceBudget,
     snapshot::{SnapshotData, SnapshotEntry}, trail::{TrailBytes, TrailEntry, TrailError, TrailReadError, MAX_TRAIL_BYTES, MAX_TRAIL_ITEMS}};
 use fcb::store::{Sha256, Sha256Digest};
 use fcb_app::host::{HostResponse, saved_repository::{SavedRepositorySession,
-    trail::{SavedTrailError as Error, MAX_SAVED_TRAIL_PAGE}}};
+    trail::{SavedTrailError as Error, SavedTrailArchiveRequest, SavedTrailWriteParent, MAX_SAVED_TRAIL_PAGE}}};
 
 fn range(start: u64, end: u64) -> ByteRange { ByteRange::new(ByteOffset::new(start), ByteOffset::new(end)).unwrap() }
 fn json(response: &HostResponse) -> Json { parse(response.as_str().as_bytes()).unwrap() }
@@ -220,4 +220,163 @@ fn empty_trails_and_maximum_length_reference_pages_are_valid_explicit_states() {
     assert_eq!(page.get("items").array().len(), MAX_SAVED_TRAIL_PAGE);
     assert_eq!(page.get("items").array()[31].get("rationale").text(), note);
     assert_eq!(page.get("ready_items").number(), 0);
+}
+
+
+const SUPPLEMENTAL_SOURCE: &[u8] = b"\xff\xfea\0b\0\n\0";
+fn supplemental_fixture(n: u64) -> (Fixture, Fixture, SavedRepositorySession, SavedTrailWriteParent, PathBuf) {
+    let primary = Fixture::new(&[entry(b"src/raw-\xff.rs", b"primary source\n")], true);
+    let other = Fixture::new(&[entry(b"a.rs", b"other first member"), entry(b"b.rs", b""),
+        entry(b"src/raw-\xff.rs", SUPPLEMENTAL_SOURCE), SnapshotEntry {
+            path: b"z.rs", observed_bytes: 8, data: SnapshotData::Unavailable("SOURCE_NOT_CAPTURED") }], false);
+    let mut saved = primary.open(n);
+    let other_digest = other.open(n + 1).archive_digest();
+    let first = visit(saved.archive_digest(), b"src/raw-\xff.rs", b"primary source\n", range(0, 7), "Primary visit");
+    let second = visit(other_digest, b"src/raw-\xff.rs", SUPPLEMENTAL_SOURCE, range(2, 6), "Other archive é\0λ");
+    let path = trail(&primary, "supplemental-tour.fcbt", &[first, second,
+        TrailEntry { range: range(3, 5), rationale: "Exact bytes inside UTF-16 units", ..second },
+        TrailEntry { range: range(8, 8), rationale: "Point at end", ..second },
+        TrailEntry { path: b"missing.rs", ..second },
+        TrailEntry { source: Sha256Digest::new([8; 32]), ..second },
+        TrailEntry { path: b"z.rs", ..second }]);
+    let bytes = fs::read(&path).unwrap();
+    let digest = fcb::search::trail::TrailView::open(&bytes, || false).unwrap().digest();
+    saved.attach_trail(5, &path, || false).unwrap();
+    (primary, other, saved, SavedTrailWriteParent { generation: 5, digest }, path)
+}
+fn supplemental_request<'a>(trail: SavedTrailWriteParent, item: usize, path: &'a std::path::Path)
+    -> SavedTrailArchiveRequest<'a> {
+    SavedTrailArchiveRequest { trail, item, archive: path, validation_bytes: 256 * 1024 * 1024 }
+}
+
+#[test]
+fn explicit_supplemental_visits_preserve_primary_authority_and_independent_exact_readers() {
+    let (primary, other, mut saved, trail, trail_path) = supplemental_fixture(58100);
+    saved.search(12, "primary", 4, || false).unwrap();
+    let page = json(&saved.trail_page(5, 0, 32, || false).unwrap());
+    let primary_before = reads(&mut saved);
+    fs::rename(&primary.path, primary.root.join("moved-primary.fcbs")).unwrap();
+    fs::write(&primary.path, b"unrelated current pathname").unwrap();
+    fs::rename(&trail_path, primary.root.join("moved-tour.fcbt")).unwrap();
+    fs::write(&trail_path, b"unrelated current trail").unwrap();
+    let mut retained = Vec::new(); let mut previous_file = 0;
+    for (item, exact) in [(1, "61006200"), (2, "0062"), (3, "")] {
+        let (mut reader, response) = saved.open_trail_reader_with_archive(owner(58110 + item as u64),
+            supplemental_request(trail, item, &other.path), || false).unwrap();
+        let receipt = json(&response);
+        assert_eq!(receipt.get("command").text(), "trail-archive-open-reader");
+        assert_eq!(receipt.get("archive_digest"), page.get("archive_digest"));
+        assert_eq!(receipt.get("entry"), &page.get("items").array()[item]);
+        assert_eq!(receipt.get("entry").get("readiness").text(), "other-archive");
+        assert_eq!(receipt.get("entry").get("file_id"), &Json::Null);
+        assert_eq!(receipt.get("source_archive").get("digest"), receipt.get("entry").get("archive_digest"));
+        assert_eq!(receipt.get("source_archive").get("path").get("display").text(), other.path.to_str().unwrap());
+        assert_eq!(receipt.get("source_archive").get("members_total").number(), 4);
+        assert_eq!(receipt.get("source_archive").get("captured_members").number(), 3);
+        assert!(!receipt.get("source_archive").get("discovery_complete").flag());
+        let resolved = receipt.get("resolved_member");
+        assert_eq!(resolved.get("member").number(), 2);
+        assert_eq!(resolved.get("file_id").number(), 3);
+        assert!(resolved.get("captured").flag());
+        assert_eq!(resolved.get("source_digest"), receipt.get("source_digest"));
+        assert_eq!(resolved.get("path"), receipt.get("entry").get("path"));
+        assert_eq!(receipt.get("member"), resolved.get("member"));
+        let file = receipt.get("file_id").number();
+        assert!(file > receipt.get("members_total").number() && file > previous_file);
+        assert_eq!(receipt.get("source_revision").number(), file); previous_file = file;
+        assert_eq!(receipt.get("reader_owner").number(), 58110 + item as u64);
+        assert_eq!(receipt.get("reader").get("owner").number(), 58110 + item as u64);
+        assert_eq!(receipt.get("reader").get("file_id").number(), 1);
+        assert_eq!(receipt.get("member_bytes_read").number(), SUPPLEMENTAL_SOURCE.len() as u64);
+        assert_eq!(receipt.get("primary_member_bytes_read").number(), 0);
+        assert_eq!(receipt.get("primary_member_read_calls").number(), 0);
+        assert!(!receipt.get("archive_path_reopened").flag());
+        assert!(!receipt.get("live_source_reopened").flag());
+        assert!(receipt.get("accepted_trail_unchanged").flag());
+        assert!(receipt.get("accepted_query_unchanged").flag());
+        let validation = receipt.get("archive_validation");
+        assert_eq!(validation.get("supplied_archives").number(), 2);
+        assert_eq!(validation.get("validated_archives").number(), 2);
+        assert_eq!(validation.get("distinct_archives").number(), 2);
+        assert_eq!(validation.get("duplicate_archives").number(), 0);
+        assert_eq!(validation.get("opened_archive_paths").number(), 1);
+        assert_eq!(validation.get("validation_bytes_read").number(), other.bytes.len() as u64);
+        assert_eq!(validation.get("validation_bytes_admitted").number(), other.bytes.len() as u64 + 1);
+        assert!(validation.get("validation_complete").flag());
+        assert_eq!(reader.capture().bytes(), SUPPLEMENTAL_SOURCE);
+        let start = receipt.get("selection").get("start").number();
+        let end = receipt.get("selection").get("end").number();
+        assert_eq!(json(&reader.copy_range(start, end, || false).unwrap()).get("original_hex").text(), exact);
+        retained.push(reader);
+    }
+    assert_eq!(reads(&mut saved), primary_before);
+    assert_eq!(json(&saved.trail_page(5, 0, 32, || false).unwrap()).get("items"), page.get("items"));
+    assert!(saved.results(12, 0, 4, || false).is_ok());
+    assert_eq!(saved.trail_generation(), Some(5));
+    fs::rename(&other.path, other.root.join("moved-supplemental.fcbs")).unwrap();
+    fs::write(&other.path, b"unrelated later bytes").unwrap();
+    saved.detach_trail(6, || false).unwrap(); drop(saved);
+    for reader in retained { assert_eq!(reader.capture().bytes(), SUPPLEMENTAL_SOURCE); }
+}
+
+#[test]
+fn supplemental_reader_rejects_stale_wrong_or_unavailable_pins_without_primary_reads() {
+    let (primary, other, mut saved, trail, _) = supplemental_fixture(58120);
+    let before = reads(&mut saved);
+    let missing = other.root.join("not-granted.fcbs");
+    let invalid_parent = SavedTrailWriteParent { digest: Sha256Digest::new([7; 32]), ..trail };
+    assert_eq!(saved.open_trail_reader_with_archive(owner(58122),
+        supplemental_request(SavedTrailWriteParent { generation: 6, ..trail }, 1, &missing), || false).err(),
+        Some(Error::StaleGeneration));
+    assert_eq!(saved.open_trail_reader_with_archive(owner(58122),
+        supplemental_request(invalid_parent, 1, &missing), || false).err(), Some(Error::ParentMismatch));
+    assert_eq!(saved.open_trail_reader_with_archive(owner(58122),
+        supplemental_request(trail, 0, &missing), || false).err(), Some(Error::InvalidLimits));
+    assert_eq!(saved.open_trail_reader_with_archive(owner(58122),
+        supplemental_request(trail, usize::MAX, &missing), || false).err(),
+        Some(Error::Trail(TrailReadError::Format(TrailError::MissingItem))));
+    assert_eq!(saved.open_trail_reader_with_archive(owner(58122),
+        supplemental_request(trail, 1, &primary.path), || false).err(),
+        Some(Error::Trail(TrailReadError::OtherArchive)));
+    for (item, error) in [(4, TrailReadError::MissingMember), (5, TrailReadError::ChangedSource),
+        (6, TrailReadError::UnavailableMember)] {
+        assert_eq!(saved.open_trail_reader_with_archive(owner(58122),
+            supplemental_request(trail, item, &other.path), || false).err(), Some(Error::Trail(error)));
+    }
+    assert_eq!(saved.open_trail_reader_with_archive(owner(58122), SavedTrailArchiveRequest {
+        validation_bytes: other.bytes.len() as u64, ..supplemental_request(trail, 1, &other.path) }, || false).err(),
+        Some(Error::ExportValidationByteLimit));
+    assert_eq!(saved.open_trail_reader_with_archive(owner(58122), SavedTrailArchiveRequest {
+        validation_bytes: 256 * 1024 * 1024 + 1, ..supplemental_request(trail, 1, &missing) }, || false).err(),
+        Some(Error::InvalidLimits));
+    assert_eq!(reads(&mut saved), before);
+    assert_eq!(saved.trail_generation(), Some(5));
+    let (reader, _) = saved.open_trail_reader_with_archive(owner(58123),
+        supplemental_request(trail, 1, &other.path), || false).unwrap();
+    assert_eq!(reader.capture().bytes(), SUPPLEMENTAL_SOURCE);
+}
+
+#[test]
+fn supplemental_cancellation_and_corruption_never_publish_a_candidate_or_change_the_trail() {
+    let (_, other, mut saved, trail, _) = supplemental_fixture(58130);
+    let before = reads(&mut saved);
+    let request = supplemental_request(trail, 1, &other.path);
+    let mut complete_polls = 0;
+    saved.open_trail_reader_with_archive(owner(58132), request, || { complete_polls += 1; false }).unwrap();
+    for stop_at in [1, 2, complete_polls / 2, complete_polls - 1] {
+        let mut polls = 0;
+        let error = saved.open_trail_reader_with_archive(owner(58133), request, || {
+            polls += 1; polls >= stop_at
+        }).err().unwrap();
+        assert!(error.is_canceled(), "stop_at={stop_at}, observed={polls}, error={error}");
+        assert_eq!(saved.trail_generation(), Some(5));
+    }
+    let at = other.bytes.windows(SUPPLEMENTAL_SOURCE.len()).position(|part| part == SUPPLEMENTAL_SOURCE).unwrap();
+    let mut corrupted = other.bytes.clone(); corrupted[at + 2] ^= 1;
+    fs::write(&other.path, &corrupted).unwrap();
+    assert!(saved.open_trail_reader_with_archive(owner(58133), request, || false).is_err());
+    fs::write(&other.path, &other.bytes).unwrap();
+    let (reader, _) = saved.open_trail_reader_with_archive(owner(58134), request, || false).unwrap();
+    assert_eq!(reader.capture().bytes(), SUPPLEMENTAL_SOURCE);
+    assert_eq!(reads(&mut saved), before);
 }

@@ -900,10 +900,21 @@ order, repeated visits, exact original byte ranges and user rationale. Use
 
 A trail can reference several archives. Every entry remains visible, including
 ones marked **Requires a different saved archive**, missing, uncaptured or
-changed. Select the matching archive explicitly and open the trail there to
-read those entries. Readiness comes from the currently opened archive's
-manifest; opening an entry independently verifies its actual saved payload,
-source digest, length and original range before creating the reader.
+changed. For an entry in another archive, choose **Choose archive and open…**
+and select its FCBS file. The selected file must match the visit's archive
+digest, then prove its exact member path, source digest, length and original
+range before the independent reader opens. The current archive, accepted trail
+and search stay available; the selected file is used for this capture only.
+A wrong archive or failed read leaves the current reader intact.
+
+The archive picker is also available when **Previous trail item** or **Next
+trail item** reaches an other-archive visit. **Back** and **Forward** restore
+retained primary and supplemental readers, and the same trail controls keep
+following the original sequence. The supplemental reader supports exact source
+copying and **Keep trail range in Desk** after its temporary file grant ends.
+Archive-local document links, images and trail authoring require their own
+archive authority; a supplemental reader does not inherit the primary
+archive's authority for those operations.
 
 The reader's **Previous trail item** and **Next trail item** follow the saved
 sequence across page boundaries. An unavailable visit leaves its rationale
@@ -914,12 +925,20 @@ original range for notes and bookmarks, including zero-length point bookmarks
 and selections that span several reader pages.
 
 Attachment reads at most 4 MiB and 1,024 entries. Pages contain at most 32
-entries and load reference metadata only. Source comes from the opened saved
-archive, with a bounded initial 16 KiB context window. An independent reader
-retains its verified bytes after the trail or archive closes. Failed or
+entries and load reference metadata only. Source comes from the retained primary
+archive or the explicitly selected supplemental file, with a bounded initial
+16 KiB context window. Supplemental opening reuses full-envelope validation
+with a 256 MiB byte allowance and 64 MiB directory admission; a stale trail
+selection is rejected before opening the supplied path. The file grant lasts
+through verification and capture, including canceled worker drain. An independent
+reader retains its verified bytes after the trail or archive closes. Failed or
 early-canceled replacements preserve the preceding attachment. Late cancellation
 can arrive after acceptance; **Reload state** recovers the accepted attachment
 after an unavailable reply without reopening the trail pathname.
+
+Supplemental visit opening has host, registry, C ABI and native fixture coverage
+in source. Executable regression and physical-Mac picker/lifetime verification
+remain pending the independent strict-RCH verification campaign.
 
 ### Creating and extending a trail in the native reader
 

@@ -37,6 +37,18 @@ private final class AtlasSavedTrailArchiveAccess {
     init(_ files: [AtlasSavedFileAccess]) { self.files = files }
 }
 
+/// The panel grants exactly one chosen archive; the expected digest identifies
+/// its required saved contents and never substitutes for the native grant.
+@MainActor private func chooseSavedTrailArchive(for entry: AtlasSavedTrailEntry) -> AtlasSavedFileAccess? {
+    let panel = NSOpenPanel()
+    panel.title = "Open a saved archive for this trail item"
+    panel.prompt = "Open source"
+    panel.message = "Choose the saved FCB archive with digest \(entry.archiveDigest). Its exact captured source opens in an independent reader after validation, within a 256 MiB archive-read limit."
+    panel.canChooseFiles = true; panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
+    guard panel.runModal() == .OK, let url = panel.url else { return nil }
+    return AtlasSavedFileAccess(selectedURL: url)
+}
+
 /// A selected FCBS archive is a complete independent browsing entry point. The
 /// list owns only bounded metadata pages; source reads happen through verified
 /// empty-reader handoffs on the worker, never through displayed member names.
@@ -416,7 +428,9 @@ private final class AtlasSavedTrailArchiveAccess {
                     }.disabled(model.selectedTrailItem == nil || (model.selectedTrailItem ?? 0) + 1 >= page.total)
                     Spacer()
                     if let entry = model.selectedTrailEntry {
-                        Button("Open selected source") { openTrail(entry, from: page) }.disabled(!entry.canOpen)
+                        Button(entry.readiness == .otherArchive ? "Choose archive and open…" : "Open selected source") {
+                            openTrail(entry, from: page)
+                        }.disabled(entry.readiness == .otherArchive ? !model.canOpenTrailArchive(entry, from: page) : !entry.canOpen)
                     }
                 }.controlSize(.small).disabled(!model.canOperate || !model.trailIsCurrent || readerTask != nil)
                 if page.items.isEmpty {
@@ -447,7 +461,7 @@ private final class AtlasSavedTrailArchiveAccess {
                 VStack(alignment: .leading, spacing: 12) {
                     Text("Follow a saved sequence of exact source ranges and notes.").font(.title3)
                     Text("Choose an FCBT reading trail for the opened saved repository. Items for other archives, uncaptured members or changed sources stay visible with their notes. Select those archives explicitly to read their matching entries.")
-                    Text("The trail contains references and rationale. Source comes only from the saved archive you opened.")
+                    Text("The trail contains references and rationale. Sources come from the opened archive or another saved archive you explicitly choose for an item.")
                         .font(.caption).foregroundStyle(.secondary)
                     Text("Open a captured source and choose Add to reading trail to create a new trail or append a reviewed range and rationale to the attached trail as a new file.")
                         .font(.caption).foregroundStyle(.secondary)
@@ -464,8 +478,9 @@ private final class AtlasSavedTrailArchiveAccess {
                         Text(verbatim: entry.path.display).multilineTextAlignment(.leading)
                     }.frame(maxWidth: .infinity, alignment: .leading)
                 }.buttonStyle(.plain).disabled(!model.canOperate || !model.trailIsCurrent || readerTask != nil)
-                Button("Open source") { openTrail(entry, from: page) }
-                    .disabled(!entry.canOpen || !model.canOperate || !model.trailIsCurrent || readerTask != nil)
+                Button(entry.readiness == .otherArchive ? "Choose archive and open…" : "Open source") { openTrail(entry, from: page) }
+                    .disabled(readerTask != nil || (entry.readiness == .otherArchive
+                        ? !model.canOpenTrailArchive(entry, from: page) : !entry.canOpen || !model.canOperate || !model.trailIsCurrent))
             }
             Text(entry.range.label).font(.caption.monospaced()).textSelection(.enabled)
             Text(entry.readiness.label).font(.caption.weight(.medium))
@@ -1348,6 +1363,21 @@ private final class AtlasSavedTrailArchiveAccess {
         panelNotice = ""; model.buildIndex(destination: path, accessLease: access)
     }
     private func openTrail(_ entry: AtlasSavedTrailEntry, from page: AtlasSavedTrailPage) {
+        if entry.readiness == .otherArchive {
+            guard readerTask == nil, model.canOpenTrailArchive(entry, from: page),
+                  let access = chooseSavedTrailArchive(for: entry) else { return }
+            guard readerTask == nil, model.canOpenTrailArchive(entry, from: page) else {
+                panelNotice = "The archive or trail changed while choosing a source. Select the current item again."; return
+            }
+            guard let path = access.nativePath, AtlasSavedIndexBuildRequest.validDestination(path) else {
+                panelNotice = "The selected archive filename cannot be represented exactly by the native open interface."; return
+            }
+            launchReader {
+                try await model.openTrailArchive(entry, from: page, path: path, accessLease: access,
+                    readerTransport: .native, search: .native, outline: .native, document: .native)
+            }
+            return
+        }
         launchReader {
             try await model.openTrailItem(entry, from: page, readerTransport: .native,
                 search: .native, outline: .native, document: .native)
@@ -1444,6 +1474,10 @@ private final class AtlasSavedTrailArchiveAccess {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(capture.member.path.display).font(.headline).lineLimit(2).textSelection(.enabled)
                     Text(capture.evidenceLabel).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                    if let source = capture.supplementalTrailSource {
+                        Text("Selected archive: \(String(reflecting: source.path))")
+                            .font(.caption).foregroundStyle(.secondary).lineLimit(2).textSelection(.enabled)
+                    }
                 }
                 Spacer()
                 Button("Add to reading trail…") {
@@ -1566,6 +1600,10 @@ private final class AtlasSavedTrailArchiveAccess {
                     if !selected.rationale.isEmpty {
                         Text(verbatim: selected.rationale).font(.caption).textSelection(.enabled)
                     }
+                    if selected.readiness == .otherArchive, let page = archive.trailPage {
+                        Button("Choose archive and open…") { openTrailArchive(selected, from: page) }
+                            .disabled(linkTask != nil || !archive.canOpenTrailArchive(selected, from: page))
+                    }
                     Text("This reader still shows item \(entry.id + 1). Previous and Next continue from item \(selected.id + 1).")
                         .font(.caption).foregroundStyle(.secondary)
                 }
@@ -1594,6 +1632,37 @@ private final class AtlasSavedTrailArchiveAccess {
                 linkNotice = Task.isCancelled ? "Trail navigation canceled. The current captured reader remains available."
                     : ((error as? AtlasSavedError)?.message ?? (error as? AtlasReaderError)?.message
                         ?? "The trail item could not be opened. The current reader remains available.")
+            }
+        }
+    }
+    private func openTrailArchive(_ entry: AtlasSavedTrailEntry, from page: AtlasSavedTrailPage) {
+        let source = capture
+        guard linkTask == nil, archive.canNavigateTrail(from: source), archive.canOpenTrailArchive(entry, from: page),
+              let access = chooseSavedTrailArchive(for: entry) else { return }
+        guard linkTask == nil, history.current.id == source.id, archive.canNavigateTrail(from: source),
+              archive.canOpenTrailArchive(entry, from: page) else {
+            linkNotice = "The current reader or trail changed while choosing a source. Select the current item again."; return
+        }
+        guard let path = access.nativePath, AtlasSavedIndexBuildRequest.validDestination(path) else {
+            linkNotice = "The selected archive filename cannot be represented exactly by the native open interface."; return
+        }
+        let ticket = UUID(); linkOperation = ticket
+        linkNotice = "Validating the selected archive and opening trail item \(entry.id + 1)…"
+        linkTask = Task {
+            defer { if linkOperation == ticket { linkTask = nil } }
+            do {
+                let candidate = try await archive.openTrailArchive(entry, from: page, path: path, accessLease: access,
+                    readerTransport: .native, search: .native, outline: .native, document: .native)
+                guard linkOperation == ticket, !Task.isCancelled, history.current.id == source.id,
+                      archive.canNavigateTrail(from: source), history.accept(candidate) else {
+                    candidate.reader.close(); return
+                }
+                matchNotice = ""; linkNotice = "Opened the exact range from the selected archive. Back restores the previous reader."
+            } catch {
+                guard linkOperation == ticket else { return }
+                linkNotice = Task.isCancelled ? "Trail navigation canceled. The current captured reader remains available."
+                    : ((error as? AtlasSavedError)?.message ?? (error as? AtlasReaderError)?.message
+                        ?? "The selected archive could not provide this exact source. The current reader remains available.")
             }
         }
     }

@@ -109,6 +109,30 @@ import Foundation
         }
         precondition(count(9) == beforeMixed + 7 && count(4) == beforeFreed + 6,
             "every nonnull mixed export response must be freed exactly once")
-        print("Saved trail public-header ABI, full-width IDs, exact archive arrays, cancellation and response ownership fixtures passed")
+        let otherEntry = try JSONDecoder().decode(AtlasSavedTrailEntry.self, from: Data(fixture.encode([
+            "item": "0", "archive_digest": String(repeating: "e", count: 64), "source_digest": member.digest!,
+            "source_bytes": String(member.observedBytes), "path": fixture.path(member.path.bytes, member.path.display),
+            "original_range": ["start": "202", "end": "208"], "rationale": "Visit another saved revision",
+            "evidence": "explicit-user-selection", "readiness": "other-archive",
+            "member": NSNull(), "file_id": NSNull(), "source_revision": NSNull()
+        ]).utf8))
+        let visit = try AtlasSavedTrailArchiveReaderRequest(trail: parent, entry: otherEntry, path: "/visit-e\u{301}.fcbs")
+        let beforeVisits = count(10), beforeVisitFrees = count(4)
+        mode(0)
+        precondition(transport.openArchiveReader!(owner, reader, visit, AtlasSearchCancellation()) == "{}")
+        precondition(count(10) == beforeVisits + 1 && count(4) == beforeVisitFrees + 1)
+        for (saved, destination) in [(UInt64(0), reader), (owner - 1, reader), (owner, UInt64(0)), (owner, owner)] {
+            precondition(transport.openArchiveReader!(saved, destination, visit, AtlasSearchCancellation()) == nil)
+        }
+        precondition(transport.openArchiveReader!(owner, reader, visit, canceled) == nil && count(10) == beforeVisits + 1)
+        mode(1)
+        precondition(transport.openArchiveReader!(owner, reader, visit, AtlasSearchCancellation()) == nil)
+        precondition(count(4) == beforeVisitFrees + 1)
+        for invalidMode in [Int32(2), 3, 4] {
+            mode(invalidMode)
+            precondition(transport.openArchiveReader!(owner, reader, visit, AtlasSearchCancellation()) == nil)
+        }
+        precondition(count(10) == beforeVisits + 5 && count(4) == beforeVisitFrees + 4)
+        print("Saved trail public-header ABI, full-width IDs, exact archive arrays/visits, cancellation and response ownership fixtures passed")
     }
 }

@@ -73,6 +73,37 @@ char *fcb_saved_trail_detach(uint64_t handle, uint64_t generation);
 char *fcb_saved_open_trail_reader(uint64_t handle, uint64_t reader,
     uint64_t generation, uint64_t item);
 
+/* Open one other-archive trail visit from an explicitly selected FCBS file.
+ * The generation AND expected trail_digest pin the accepted immutable trail.
+ * archive_path is a borrowed NUL-terminated UTF-8 absolute path (1..16384 bytes),
+ * never an entry label. validation_bytes <=268435456 independently bounds full
+ * envelope validation (observed file length plus one EOF probe); directories
+ * share the existing 67108864-byte admission. A wrong archive digest, member
+ * digest/length/path/range, stale request, budget refusal or cancellation during
+ * preparation leaves the reader destination empty. Admission of that empty destination precedes
+ * archive I/O. The original saved archive and trail are preserved.
+ *
+ * Success command is trail-archive-open-reader. Its envelope identifies the
+ * primary session; entry is the unchanged original other-archive reference.
+ * source_archive identifies the explicitly validated supplemental digest/path
+ * and catalog counts. resolved_member is local to that digest and uses ordinary
+ * catalog member/file=ordinal+1; top-level file_id/source_revision instead name
+ * fresh staging identities above the primary member interval. The nested
+ * reader has its own destination owner and capture identities. Never route the
+ * supplemental catalog member through a primary archive-local API.
+ *
+ * The reader owns copied, digest-verified bytes and survives releasing the
+ * supplemental grant, moving either archive, or detaching/closing the trail.
+ * Keep the grant and optional callback/context alive until the worker returns.
+ * Callback rules, owned reply/freeing, and late reader-acceptance reconciliation
+ * follow the existing reader contract; cancellation cannot imply rollback.
+ */
+char *fcb_saved_open_trail_reader_with_archive_cancelable(uint64_t handle,
+    uint64_t reader, uint64_t generation, uint64_t item, const char *trail_digest,
+    const char *archive_path, uint64_t validation_bytes,
+    int32_t (*poll)(void *), void *context);
+
+
 /* Author a NEW immutable FCBT from an exact saved-member byte range. The host
  * verifies bytes using the retained archive descriptor, never its pathname or
  * a live source file. member is zero-based; start <= end <= captured length.

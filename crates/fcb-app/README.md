@@ -112,6 +112,17 @@ only and do not change the archive attached to trail browsing. See
 [native source-pack export](../../native/macos/README.md#exporting-a-saved-trail-with-its-source)
 for presets, coverage and pending verification.
 
+Individual mixed-archive visits can also open from one explicitly selected FCBS
+file through `SavedRepositorySession::open_trail_reader_with_archive`. The
+request pins the accepted trail generation, digest and item before archive I/O,
+then uses the shared bounded envelope validator and exact trail reader. The
+prepared reader owns verified bytes independently of the primary session and
+supplemental file grant. The receipt preserves the original other-archive entry,
+identifies the actual source archive and resolved member separately, and uses
+fresh staging source identities outside the primary member interval. See
+[following saved trails](../../native/macos/README.md#following-saved-reading-trails)
+for the native picker and pending independent verification.
+
 On macOS, human `fcb open` and bare `fcb` can hand off to an installed native app.
 This CLI lane does not claim completion of all FCB-057 acceptance criteria.
 

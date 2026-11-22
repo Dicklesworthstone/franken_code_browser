@@ -23,6 +23,9 @@ pub use write::{SavedTrailWriteParent, SavedTrailWriteRequest};
 /// Self-contained evidence export from the explicitly retained archive.
 pub mod export;
 pub use export::{SavedTrailExportLimits, SavedTrailExportRequest};
+/// Exact individual visits from an explicitly selected supplemental archive.
+mod archive_reader;
+pub use archive_reader::SavedTrailArchiveRequest;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SavedTrailError {

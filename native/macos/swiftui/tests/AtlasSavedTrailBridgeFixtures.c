@@ -5,10 +5,10 @@
 
 /* Header-checked marshaling and owned-response fixture. Real FCBT/archive
  * resolution and payload verification remain in the Rust service fixtures. */
-static uint64_t calls[10];
+static uint64_t calls[11];
 static int result_mode;
 void fixture_saved_trail_mode(int mode) { result_mode = mode; }
-uint64_t fixture_saved_trail_count(uint64_t index) { assert(index < 10); return calls[index]; }
+uint64_t fixture_saved_trail_count(uint64_t index) { assert(index < 11); return calls[index]; }
 static char *reply(void) {
     if (result_mode == 1) return NULL;
     if (result_mode == 2) {
@@ -106,4 +106,15 @@ char *fcb_saved_trail_export_with_archives_cancelable(uint64_t handle, uint64_t 
         for (size_t i = 0; i < 7; i++) assert(paths[i] && strcmp(paths[i], expected[i]) == 0);
     }
     calls[9]++; return reply();
+}
+
+char *fcb_saved_open_trail_reader_with_archive_cancelable(uint64_t handle, uint64_t reader,
+    uint64_t generation, uint64_t item, const char *digest, const char *path, uint64_t validation_bytes,
+    int32_t (*poll)(void *), void *context) {
+    assert(handle == UINT64_MAX - 10 && reader == UINT64_MAX - 8 && generation == UINT64_MAX - 9 && item == 0);
+    assert(digest && strlen(digest) == 64);
+    for (size_t i = 0; i < 64; i++) assert(digest[i] == 'a');
+    assert(path && strcmp(path, "/visit-e\xcc\x81.fcbs") == 0);
+    assert(validation_bytes == 256 * 1024 * 1024 && poll && context && poll(context) == 0);
+    calls[10]++; return reply();
 }

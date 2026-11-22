@@ -373,6 +373,122 @@ struct AtlasSavedReaderReceipt: Sendable {
     }
 }
 
+/// This capability identifies the captured supplemental source, while the
+/// primary identity authorizes only navigation within the accepted trail.
+/// It never supplies an archive-local document/image or authoring capability.
+struct AtlasSavedTrailArchiveSource: Sendable {
+    let primary: AtlasSavedIdentity
+    let archiveDigest: String
+    let path: String
+    let sourceFile, sourceRevision: UInt64
+}
+
+struct AtlasSavedTrailArchiveReaderReceipt: Sendable {
+    let member: AtlasSavedMember
+    let reader: AtlasSavedReaderReceipt
+    let source: AtlasSavedTrailArchiveSource
+    static func decode(_ json: String?, request: AtlasSavedTrailArchiveReaderRequest, destination: UInt64) throws -> Self {
+        guard let json, !json.isEmpty, json.utf8.count <= 1024 * 1024 else { throw AtlasSavedError.unavailable }
+        let primary = request.trail.identity, entry = request.entry
+        let data = try AtlasSavedWire.admit(json, handle: primary.owner, command: "trail-archive-open-reader", identity: primary)
+        do {
+            let w = try JSONDecoder().decode(Wire.self, from: data)
+            let member = w.resolved_member, source = w.source_archive, validation = w.archive_validation
+            guard destination > 0, destination != primary.owner,
+                  w.trail_generation.value == request.trail.generation, w.trail_digest == request.trail.digest,
+                  w.item.value == entry.id, w.entry.matches(entry), w.reader_owner.value == destination,
+                  w.member.value == member.id, w.file_id.value > primary.members,
+                  w.source_revision.value == w.file_id.value,
+                  member.captured, member.id < source.members_total.value,
+                  member.path.bytes == entry.path.bytes, member.digest == entry.sourceDigest,
+                  member.observedBytes == entry.sourceBytes, w.source_digest == entry.sourceDigest,
+                  w.path.bytes == entry.path.bytes, w.source_bytes.value == entry.sourceBytes,
+                  w.selection == entry.range, w.offset.value == entry.range.start,
+                  source.digest == entry.archiveDigest, source.path.bytes == Array(request.path.utf8),
+                  (1...65_536).contains(source.members_total.value),
+                  source.captured_members.value > 0, source.captured_members.value <= source.members_total.value,
+                  w.source_observation == "verified-saved-member", w.archive_scope == "explicit-supplemental-archive",
+                  !w.archive_path_reopened, !w.live_source_reopened, w.accepted_trail_unchanged, w.accepted_query_unchanged,
+                  w.primary_member_bytes_read.value == 0, w.primary_member_read_calls.value == 0,
+                  w.member_bytes_read.value == entry.sourceBytes,
+                  (entry.sourceBytes == 0 && w.member_read_calls.value == 0) ||
+                    (entry.sourceBytes > 0 && w.member_read_calls.value > 0 && w.member_read_calls.value <= 1_048_576),
+                  validation.routing == "verified-archive-digest", validation.duplicate_policy == "first-verified-handle",
+                  validation.validation_scope == "explicit-supplemental-archive-envelopes",
+                  validation.validation_admission == "observed-file-length-plus-one-eof-probe",
+                  validation.supplied_archives.value == 2, validation.validated_archives.value == 2,
+                  validation.distinct_archives.value == 2, validation.duplicate_archives.value == 0,
+                  validation.opened_archive_paths.value == 1, validation.validation_complete,
+                  validation.max_archives.value == 8, validation.max_directory_bytes.value == 64 * 1024 * 1024,
+                  validation.max_validation_bytes.value == request.validationBytes,
+                  validation.validation_bytes_read.value > 0,
+                  validation.validation_bytes_read.value <= validation.validation_bytes_admitted.value,
+                  validation.validation_bytes_admitted.value <= request.validationBytes,
+                  validation.validation_read_calls.value > 0,
+                  validation.retained_directory_bytes.value <= validation.peak_directory_bytes.value,
+                  validation.peak_directory_bytes.value <= validation.max_directory_bytes.value,
+                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let readerObject = object["reader"] as? [String: Any],
+                  let windowObject = object["window"] as? [String: Any] else { throw AtlasSavedError.invalidResponse }
+            func nested(_ object: [String: Any]) throws -> String {
+                String(decoding: try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]), as: UTF8.self)
+            }
+            let readerJSON = try nested(readerObject)
+            let info = try AtlasReaderInfo.decodeRetainedInitialization(readerJSON, handle: destination, pathBytes: entry.path.bytes)
+            guard info.identity.capturedBytes == entry.sourceBytes, info.captureSHA256 == entry.sourceDigest else {
+                throw AtlasSavedError.invalidResponse
+            }
+            let window = try AtlasReaderPage.decode(nested(windowObject), info: info,
+                request: .window(offset: entry.range.contextStart, bytes: 16 * 1024))
+            return Self(member: member, reader: AtlasSavedReaderReceipt(readerJSON: readerJSON, window: window, match: nil),
+                source: AtlasSavedTrailArchiveSource(primary: primary, archiveDigest: source.digest, path: request.path,
+                    sourceFile: w.file_id.value, sourceRevision: w.source_revision.value))
+        } catch let error as AtlasSavedError { throw error }
+        catch { throw AtlasSavedError.invalidResponse }
+    }
+    private struct SourceArchive: Decodable {
+        let path: AtlasSavedPath
+        let digest: String
+        let members_total, captured_members: AtlasSavedNumber
+        let discovery_complete: Bool
+    }
+    private struct Validation: Decodable {
+        let routing, duplicate_policy, validation_scope, validation_admission: String
+        let supplied_archives, validated_archives, distinct_archives, duplicate_archives, opened_archive_paths: AtlasSavedNumber
+        let max_archives, max_directory_bytes, max_validation_bytes: AtlasSavedNumber
+        let validation_bytes_read, validation_bytes_admitted, validation_read_calls: AtlasSavedNumber
+        let retained_directory_bytes, peak_directory_bytes: AtlasSavedNumber
+        let validation_complete: Bool
+    }
+    private struct Wire: Decodable {
+        let trail_generation, item, reader_owner, member, file_id, source_revision, source_bytes, offset: AtlasSavedNumber
+        let member_bytes_read, member_read_calls, primary_member_bytes_read, primary_member_read_calls: AtlasSavedNumber
+        let trail_digest, source_digest, source_observation, archive_scope: String
+        let path: AtlasSavedPath
+        let entry: AtlasSavedTrailEntry
+        let selection: AtlasSavedTrailRange
+        let resolved_member: AtlasSavedMember
+        let source_archive: SourceArchive
+        let archive_validation: Validation
+        let archive_path_reopened, live_source_reopened, accepted_trail_unchanged, accepted_query_unchanged: Bool
+    }
+}
+
+final class AtlasSavedTrailArchiveReaderReceiptBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: AtlasSavedTrailArchiveReaderReceipt?
+    func set(_ receipt: AtlasSavedTrailArchiveReaderReceipt) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard value == nil else { throw AtlasSavedError.invalidResponse }
+        value = receipt
+    }
+    func accepted() throws -> AtlasSavedTrailArchiveReaderReceipt {
+        lock.lock(); defer { lock.unlock() }
+        guard let value else { throw AtlasSavedError.invalidResponse }
+        return value
+    }
+}
+
 /// The initializer runs on the reader worker. Its bounded receipt crosses back
 /// under this lock; no worker mutates observable native state.
 final class AtlasSavedReaderReceiptBox: @unchecked Sendable {
@@ -397,14 +513,21 @@ final class AtlasSavedReaderReceiptBox: @unchecked Sendable {
     /// Membership authority for onward links, not a live filesystem grant.
     /// The independent source reader remains usable when this archive closes.
     let archiveIdentity: AtlasSavedIdentity?
+    let supplementalTrailSource: AtlasSavedTrailArchiveSource?
+    var trailNavigationIdentity: AtlasSavedIdentity? {
+        guard case .trail = origin else { return nil }
+        return supplementalTrailSource?.primary ?? archiveIdentity
+    }
     let member: AtlasSavedMember
     let origin: AtlasSavedReaderOrigin
     let match: AtlasSavedMatchEvidence?
     private let trailIdentity: AtlasReaderIdentity?
     init(reader: AtlasPagedReaderModel, owner: UInt64, member: AtlasSavedMember, origin: AtlasSavedReaderOrigin,
-        match: AtlasSavedMatchEvidence? = nil, archiveIdentity: AtlasSavedIdentity? = nil) {
+        match: AtlasSavedMatchEvidence? = nil, archiveIdentity: AtlasSavedIdentity? = nil,
+        supplementalTrailSource: AtlasSavedTrailArchiveSource? = nil) {
         self.reader = reader; self.owner = owner; self.member = member; self.origin = origin; self.match = match
-        self.archiveIdentity = archiveIdentity
+        self.archiveIdentity = supplementalTrailSource == nil ? archiveIdentity : nil
+        self.supplementalTrailSource = supplementalTrailSource
         if case .trail = origin { trailIdentity = reader.page?.identity } else { trailIdentity = nil }
     }
     var evidenceLabel: String {
@@ -441,8 +564,15 @@ final class AtlasSavedReaderReceiptBox: @unchecked Sendable {
         return page.identity.matches(match.identity)
     }
     var canUseTrailRange: Bool {
-        guard case .trail(_, _, let entry) = origin, entry.matches(member),
+        guard case .trail(_, _, let entry) = origin,
               reader.canPin, let identity = trailIdentity, let page = reader.page else { return false }
+        if let source = supplementalTrailSource {
+            guard archiveIdentity == nil, source.primary.owner == owner, source.archiveDigest == entry.archiveDigest,
+                  source.sourceFile > source.primary.members, source.sourceRevision == source.sourceFile,
+                  entry.readiness == .otherArchive, member.captured, member.path.bytes == entry.path.bytes,
+                  member.digest == entry.sourceDigest, member.observedBytes == entry.sourceBytes,
+                  reader.retainedCaptureSHA256 == entry.sourceDigest else { return false }
+        } else if !entry.matches(member) { return false }
         return page.identity.matches(identity) && identity.capturedBytes == entry.sourceBytes &&
             identity.pathBytes == entry.path.bytes
     }
@@ -478,8 +608,19 @@ final class AtlasSavedReaderReceiptBox: @unchecked Sendable {
     mutating func back() { if canBack { position -= 1 } }
     mutating func forward() { if canForward { position += 1 } }
     @discardableResult mutating func accept(_ candidate: AtlasSavedReaderCapture) -> Bool {
-        guard !closed, let archive = current.archiveIdentity,
-              candidate.archiveIdentity == archive, candidate.owner == archive.owner,
+        let sameArchive = current.archiveIdentity.map {
+            candidate.archiveIdentity == $0 && candidate.owner == $0.owner
+        } ?? false
+        let sameTrail: Bool
+        if let primary = current.trailNavigationIdentity, candidate.trailNavigationIdentity == primary,
+           case .trail(let generation, let digest, _) = current.origin,
+           case .trail(let nextGeneration, let nextDigest, _) = candidate.origin {
+            sameTrail = candidate.owner == primary.owner && current.owner == primary.owner &&
+                generation == nextGeneration && digest == nextDigest &&
+                current.reader.retainedRegistryDomain != nil &&
+                current.reader.retainedRegistryDomain == candidate.reader.retainedRegistryDomain
+        } else { sameTrail = false }
+        guard !closed, sameArchive || sameTrail,
               !entries.contains(where: { $0.id == candidate.id }) else { return false }
         for retired in entries.dropFirst(position + 1) { retired.reader.close() }
         entries.removeSubrange((position + 1)..<entries.count)

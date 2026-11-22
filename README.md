@@ -124,8 +124,11 @@ debuggers and terminals are outside its initial release scope.
 
 **Saved reading trails connect exact source with user notes.** The native Saved Repository
 window opens FCBT trails, keeps mixed-archive and unavailable visits visible, and follows
-ordered ranges through independently verified archived readers. Ranges can be retained in
-the Reading Desk, including point bookmarks and selections spanning several pages. See
+ordered ranges through independently verified archived readers. For a visit in another
+archive, **Choose archive and open…** verifies an explicitly selected FCBS file and opens
+its exact range while retaining the current archive and trail. Back/Forward keeps both
+captures available. Ranges can be retained in the Reading Desk, including point bookmarks
+and selections spanning several pages. See
 [the native workflow](native/macos/README.md#following-saved-reading-trails) to create a new
 trail or append a saved-source selection with a rationale. Each save creates a new file,
 preserving the previous trail and all its visits. The CLI offers the same immutable trail

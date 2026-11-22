@@ -10,7 +10,7 @@ use fcb_app::host::{HostResponse, saved_repository::{SavedRepositorySession, Sav
     SnapshotLimits, Sha256Digest}};
 use fcb_app::host::saved_repository::relationships::{SavedRelationshipError, RelationshipDirection, RelationshipSide};
 use fcb_app::host::saved_repository::imports::{SavedImportError, SavedImportDirection, SavedImportSide};
-use fcb_app::host::saved_repository::trail::{SavedTrailError, SavedTrailWriteRequest, SavedTrailExportRequest};
+use fcb_app::host::saved_repository::trail::{SavedTrailError, SavedTrailWriteRequest, SavedTrailExportRequest, SavedTrailArchiveRequest};
 use fcb_app::host::saved_repository::paths::SavedPathOptions;
 use fcb_app::host::saved_repository::index_build::SavedIndexBuildLimits;
 use fcb_app::host::saved_repository::desk::SavedDeskError;
@@ -365,6 +365,23 @@ impl SavedSessions {
                     session.open_trail_reader(owner, generation, item, reader_stop).map_err(AccessError::from),
             }
         }, &mut stop);
+        cell.validate(epoch)?;
+        result
+    }
+    /// Prepare a supplemental trail visit inside the same saved/reader lock
+    /// and epoch order as primary activation. Destination admission happens
+    /// before the selected supplemental path is opened. No archive is attached.
+    pub(super) fn open_trail_reader_with_archive(&self, handle: u64, readers: &ReaderSessions,
+        reader: u64, request: SavedTrailArchiveRequest<'_>, mut canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, AccessError> {
+        let cell = self.get(handle)?;
+        let epoch = cell.epoch.load(Ordering::Acquire);
+        let mut state = lock(&cell.state)?;
+        cell.validate(epoch)?;
+        let session = state.as_mut().ok_or(AccessError::NotOpen)?;
+        let mut stop = || cell.validate(epoch).is_err() || canceled();
+        let result = readers.initialize_prepared(reader, |owner, reader_stop|
+            session.open_trail_reader_with_archive(owner, request, reader_stop).map_err(AccessError::from), &mut stop);
         cell.validate(epoch)?;
         result
     }

@@ -207,6 +207,25 @@ struct AtlasSavedTrailTransport: Sendable {
     var export: (@Sendable (UInt64, AtlasSavedTrailExportRequest) -> String?)? = nil
     var exportReceipt: (@Sendable (UInt64, UInt64) -> String?)? = nil
     var exportWithArchives: (@Sendable (UInt64, AtlasSavedTrailExportRequest, AtlasSearchCancellation) -> String?)? = nil
+    var openArchiveReader: (@Sendable (UInt64, UInt64, AtlasSavedTrailArchiveReaderRequest, AtlasSearchCancellation) -> String?)? = nil
+}
+
+/// A single explicit archive grant for one frozen other-archive trail visit.
+/// The selected file must prove the entry's archive digest before source I/O.
+struct AtlasSavedTrailArchiveReaderRequest: Sendable {
+    static let maximumValidationBytes: UInt64 = 256 * 1024 * 1024
+    let trail: AtlasSavedTrailParent
+    let entry: AtlasSavedTrailEntry
+    let path: String
+    let validationBytes: UInt64
+    init(trail: AtlasSavedTrailParent, entry: AtlasSavedTrailEntry, path: String,
+        validationBytes: UInt64 = Self.maximumValidationBytes) throws {
+        guard trail.generation > 0, AtlasSavedWire.digest(trail.digest), entry.id < trail.items,
+              entry.readiness == .otherArchive, AtlasSavedIndexBuildRequest.validDestination(path),
+              validationBytes <= Self.maximumValidationBytes else { throw AtlasSavedError.invalidInput }
+        try entry.validate(in: trail.identity)
+        self.trail = trail; self.entry = entry; self.path = path; self.validationBytes = validationBytes
+    }
 }
 
 struct AtlasSavedTrailExportLimits: Sendable, Equatable {

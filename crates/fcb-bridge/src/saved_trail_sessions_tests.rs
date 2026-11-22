@@ -224,3 +224,91 @@ fn trail_export_cancel_and_close_keep_effect_receipts_through_writer_drain() {
         }
     }
 }
+
+
+const SUPPLEMENTAL_READER_SOURCE: &[u8] = b"Explicit supplemental captured source, not the primary member.\n";
+fn supplemental_reader_fixture(fixture: &Fixture) -> (PathBuf, fcb_app::host::saved_repository::trail::SavedTrailWriteParent) {
+    use fcb_app::host::saved_repository::trail::SavedTrailWriteParent;
+    let owner = ArenaOwnerId::new(9026).unwrap();
+    let budget = ResourceBudget::new(owner, ByteLength::new(64 * 1024 * 1024)).unwrap();
+    let other = SnapshotBytes::encode(owner, true, "supplemental-reader", &[SnapshotEntry {
+        path: b"a.rs", observed_bytes: SUPPLEMENTAL_READER_SOURCE.len() as u64,
+        data: SnapshotData::Captured(SUPPLEMENTAL_READER_SOURCE) }], Default::default(),
+        &budget, ResourceAllocationId::new(1).unwrap(), || false).unwrap();
+    let path = fixture.archive.with_extension("supplemental.fcbs"); fs::write(&path, other.bytes()).unwrap();
+    let old_bytes = fs::read(&fixture.trail).unwrap();
+    let old = fcb::search::trail::TrailView::open(&old_bytes, || false).unwrap();
+    let first = old.entry(0).unwrap();
+    let second = TrailEntry { archive: other.digest(), source: Sha256::digest(SUPPLEMENTAL_READER_SOURCE),
+        source_length: SUPPLEMENTAL_READER_SOURCE.len() as u64,
+        range: ByteRange::new(ByteOffset::new(9), ByteOffset::new(21)).unwrap(),
+        rationale: "Explicit supplemental visit", ..first };
+    let trail = TrailBytes::encode(owner, "Mixed reader destinations", None, &[first, second],
+        &budget, ResourceAllocationId::new(2).unwrap(), || false).unwrap();
+    fs::write(&fixture.trail, trail.bytes()).unwrap();
+    (path, SavedTrailWriteParent { generation: 1, digest: trail.digest() })
+}
+
+#[test]
+fn supplemental_reader_destination_admission_and_independent_lifetime_share_existing_registry() {
+    use fcb_app::host::saved_repository::trail::SavedTrailArchiveRequest;
+    let fixture = fixture(); let (supplemental, parent) = supplemental_reader_fixture(&fixture);
+    let saved = SavedSessions::new(); let readers = ReaderSessions::new(); let handle = open(&saved, &fixture);
+    attach(&saved, handle, &fixture.trail, 1).unwrap();
+    let accepted = page(&saved, handle, 1).unwrap();
+    let before = saved.execute(handle, Command::Info, || false).unwrap();
+    let request = SavedTrailArchiveRequest { trail: parent, item: 1, archive: &supplemental,
+        validation_bytes: 256 * 1024 * 1024 };
+    let reader = readers.create().unwrap();
+    let response = saved.open_trail_reader_with_archive(handle, &readers, reader, request, || false).unwrap();
+    assert!(response.as_str().contains("\"command\":\"trail-archive-open-reader\""));
+    assert!(response.as_str().contains("\"readiness\":\"other-archive\""));
+    assert!(response.as_str().contains("\"validation_complete\":true"));
+    assert!(response.as_str().contains("Explicit supplemental captured source"));
+    let missing = fixture.archive.with_extension("not-selected.fcbs");
+    assert_eq!(saved.open_trail_reader_with_archive(handle, &readers, reader,
+        SavedTrailArchiveRequest { archive: &missing, ..request }, || false).err(),
+        Some(AccessError::Reader(reader_sessions::AccessError::AlreadyOpen)));
+    let empty = readers.create().unwrap();
+    assert!(saved.open_trail_reader_with_archive(handle, &readers, empty,
+        SavedTrailArchiveRequest { archive: &fixture.archive, ..request }, || false).is_err());
+    assert_eq!(readers.execute(empty, ReaderCommand::Info, || false).err(),
+        Some(reader_sessions::AccessError::NotOpen));
+    let after = saved.execute(handle, Command::Info, || false).unwrap();
+    assert_eq!(number(before.as_str(), "member_bytes_read"), number(after.as_str(), "member_bytes_read"));
+    assert_eq!(number(before.as_str(), "member_read_calls"), number(after.as_str(), "member_read_calls"));
+    assert_eq!(page(&saved, handle, 1).unwrap().as_str(), accepted.as_str());
+    saved.execute(handle, Command::DetachTrail { generation: 2 }, || false).unwrap();
+    saved.close(handle).unwrap();
+    fs::rename(&supplemental, fixture.archive.with_extension("moved-supplemental.fcbs")).unwrap();
+    fs::write(&supplemental, b"unrelated current pathname").unwrap();
+    assert!(readers.execute(reader, ReaderCommand::Window { offset: 0, bytes: 256 }, || false)
+        .unwrap().as_str().contains("Explicit supplemental captured source"));
+    readers.close(empty).unwrap(); readers.close(reader).unwrap();
+}
+
+#[test]
+fn cancellation_of_either_owner_rejects_supplemental_preparation_without_poisoning_retry() {
+    use fcb_app::host::saved_repository::trail::SavedTrailArchiveRequest;
+    for cancel_reader in [false, true] {
+        let fixture = fixture(); let (supplemental, parent) = supplemental_reader_fixture(&fixture);
+        let saved = SavedSessions::new(); let readers = ReaderSessions::new(); let handle = open(&saved, &fixture);
+        attach(&saved, handle, &fixture.trail, 1).unwrap();
+        let reader = readers.create().unwrap(); let mut polls = 0;
+        let request = SavedTrailArchiveRequest { trail: parent, item: 1, archive: &supplemental,
+            validation_bytes: 256 * 1024 * 1024 };
+        assert!(saved.open_trail_reader_with_archive(handle, &readers, reader, request, || {
+            polls += 1;
+            if polls == 4 {
+                if cancel_reader { readers.cancel(reader).unwrap(); } else { saved.cancel(handle).unwrap(); }
+            }
+            false
+        }).is_err());
+        assert_eq!(readers.execute(reader, ReaderCommand::Info, || false).err(),
+            Some(reader_sessions::AccessError::NotOpen));
+        assert!(page(&saved, handle, 1).is_ok());
+        let response = saved.open_trail_reader_with_archive(handle, &readers, reader, request, || false).unwrap();
+        assert!(response.as_str().contains("Explicit supplemental captured source"));
+        readers.close(reader).unwrap(); saved.close(handle).unwrap();
+    }
+}

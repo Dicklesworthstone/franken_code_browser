@@ -21,6 +21,10 @@ import Foundation
     _ entries: UInt64, _ verificationBytes: UInt64, _ selectedBytes: UInt64,
     _ outputBytes: UInt64, _ outputScalars: UInt64) -> UnsafeMutablePointer<CChar>?
 private typealias SavedTrailExportPoll = @convention(c) (UnsafeMutableRawPointer?) -> Int32
+@_silgen_name("fcb_saved_open_trail_reader_with_archive_cancelable") private func savedTrailArchiveReader(_ handle: UInt64,
+    _ reader: UInt64, _ generation: UInt64, _ item: UInt64, _ digest: UnsafePointer<CChar>?,
+    _ path: UnsafePointer<CChar>?, _ validationBytes: UInt64,
+    _ poll: SavedTrailExportPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_trail_export_with_archives_cancelable") private func savedTrailExportWithArchives(_ handle: UInt64,
     _ operation: UInt64, _ generation: UInt64, _ digest: UnsafePointer<CChar>?, _ destination: UnsafePointer<CChar>?,
     _ entries: UInt64, _ verificationBytes: UInt64, _ selectedBytes: UInt64, _ outputBytes: UInt64, _ outputScalars: UInt64,
@@ -93,6 +97,21 @@ extension AtlasSavedTrailTransport {
                             paths, UInt64(request.additionalArchives.count), limits.archiveValidationBytes, poll,
                             Unmanaged.passUnretained(cancellation).toOpaque()))
                     }
+                }
+            }
+        }
+    }, openArchiveReader: { handle, reader, request, cancellation in
+        guard handle > 0, handle == request.trail.identity.owner, reader > 0, reader != handle,
+              !cancellation.isCanceled else { return nil }
+        let poll: SavedTrailExportPoll = { context in
+            guard let context else { return 1 }
+            return Unmanaged<AtlasSearchCancellation>.fromOpaque(context).takeUnretainedValue().isCanceled ? 1 : 0
+        }
+        return withExtendedLifetime(cancellation) {
+            request.trail.digest.withCString { digest in
+                request.path.withCString { path in
+                    take(savedTrailArchiveReader(handle, reader, request.trail.generation, request.entry.id,
+                        digest, path, request.validationBytes, poll, Unmanaged.passUnretained(cancellation).toOpaque()))
                 }
             }
         }

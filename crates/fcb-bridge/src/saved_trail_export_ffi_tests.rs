@@ -88,5 +88,5 @@ fn supplemental_export_c_abi_binds_the_path_inventory_and_rejects_invalid_arrays
     fs::write(&destination, b"external change after worker drain").unwrap();
     assert_eq!(take(fcb_saved_trail_export_receipt(saved, 1)), response);
     assert_eq!(fs::read(&destination).unwrap(), b"external change after worker drain");
-    assert!(take(fcb_saved_close(saved)).contains("\"status\":\"ok\""));
+    assert_eq!(fcb_saved_close(saved), 1);
 }

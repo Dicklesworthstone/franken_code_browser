@@ -2,6 +2,13 @@ import Foundation
 import Observation
 import Dispatch
 
+/// The reader initializer owns this opaque native grant through its complete
+/// worker call. Cancellation never operates on or prematurely releases it.
+private final class AtlasSavedTrailSourceAccess: @unchecked Sendable {
+    let reference: AnyObject?
+    init(_ reference: AnyObject?) { self.reference = reference }
+}
+
 private final class AtlasSavedIndexAccess: @unchecked Sendable {
     let generation: UInt64
     let pin, path: String
@@ -774,7 +781,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
     }
     func canNavigateTrail(from capture: AtlasSavedReaderCapture) -> Bool {
         guard canOperate, trailIsCurrent, let page = trailPage,
-              capture.archiveIdentity == page.identity,
+              capture.trailNavigationIdentity == page.identity,
               case .trail(let generation, let digest, _) = capture.origin else { return false }
         return generation == page.generation && digest == page.digest
     }
@@ -788,6 +795,64 @@ private final class AtlasSavedSession: @unchecked Sendable {
         return try await openReader(saved: page.identity, ordinal: ordinal, expected: nil,
             origin: .trail(generation: page.generation, digest: page.digest, entry: entry),
             readerTransport: readerTransport, search: search, outline: outline, document: document)
+    }
+    func canOpenTrailArchive(_ entry: AtlasSavedTrailEntry, from page: AtlasSavedTrailPage) -> Bool {
+        canOperate && trailIsCurrent && trails?.openArchiveReader != nil && entry.readiness == .otherArchive &&
+            trailPage?.matchesAttachment(page) == true && trailPage?.start == page.start &&
+            trailPage?.items.contains(where: { $0.matches(entry) }) == true &&
+            page.items.contains(where: { $0.matches(entry) })
+    }
+    func openTrailArchive(_ entry: AtlasSavedTrailEntry, from page: AtlasSavedTrailPage, path: String,
+        accessLease: AnyObject?, validationBytes: UInt64 = AtlasSavedTrailArchiveReaderRequest.maximumValidationBytes,
+        readerTransport: AtlasReaderTransport, search: AtlasReaderSearchTransport? = nil,
+        outline: AtlasReaderOutlineTransport? = nil, document: AtlasReaderDocumentTransport? = nil) async throws -> AtlasSavedReaderCapture {
+        guard canOpenTrailArchive(entry, from: page), let lease = session, let open = trails?.openArchiveReader,
+              let domain = readerDomain, readerTransport.comparison?.domain == domain else { throw AtlasSavedError.unavailable }
+        let request = try AtlasSavedTrailArchiveReaderRequest(trail: AtlasSavedTrailParent(page), entry: entry,
+            path: path, validationBytes: validationBytes)
+        try Task.checkCancellation()
+        let access = AtlasSavedTrailSourceAccess(accessLease), flag = AtlasSearchCancellation()
+        // This one-shot archive closes after capture. It cannot inherit the
+        // primary archive's image provider or manufacture a live-root grant.
+        var capturedDocument = document
+        capturedDocument?.savedImages = nil
+        let reader = AtlasPagedReaderModel(transport: readerTransport, search: search, outline: outline, document: capturedDocument)
+        let origin = AtlasSavedReaderOrigin.trail(generation: page.generation, digest: page.digest, entry: entry)
+        cancellation = flag; busy = true; selectedTrailItem = entry.id
+        notice = "Validating the selected archive and opening the exact saved trail range…"
+        defer { finish() }
+        do {
+            return try await withTaskCancellationHandler(operation: {
+                let receipt = AtlasSavedTrailArchiveReaderReceiptBox()
+                // Empty-reader admission precedes archive validation and member
+                // I/O. No preliminary open consumes the grant outside its owner.
+                try await reader.openRetained(pathBytes: entry.path.bytes, offset: entry.range.contextStart,
+                    registryDomain: domain) { destination in
+                    guard !flag.isCanceled else { throw AtlasSavedError.canceled }
+                    return try withExtendedLifetime((lease, access)) {
+                        let accepted = try AtlasSavedTrailArchiveReaderReceipt.decode(
+                            open(lease.handle, destination, request, flag), request: request, destination: destination)
+                        try receipt.set(accepted)
+                        return accepted.reader.readerJSON
+                    }
+                }
+                try Task.checkCancellation()
+                guard !closed, !flag.isCanceled, session === lease, info?.identity == page.identity,
+                      trailIsCurrent, let current = trailPage, request.trail.matches(current) else {
+                    throw AtlasSavedError.canceled
+                }
+                let accepted = try receipt.accepted()
+                try accepted.reader.validateInitialPage(reader.page)
+                let capture = AtlasSavedReaderCapture(reader: reader, owner: page.identity.owner,
+                    member: accepted.member, origin: origin, supplementalTrailSource: accepted.source)
+                notice = "Opened the exact trail range from the selected saved archive. The primary archive and trail are unchanged."
+                return capture
+            }, onCancel: { flag.cancel(); lease.cancel() })
+        } catch {
+            // A malformed or canceled reply may follow reader initialization.
+            // Retire that exact destination; never replay the selected pathname.
+            reader.close(); notice = Self.message(error); throw error
+        }
     }
     /// Sequence navigation deliberately visits unavailable entries too. It
     /// leaves their notes selected in the trail instead of silently skipping.
@@ -1642,7 +1707,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
         canOperate && ownsDocumentSource(source)
     }
     private func ownsDocumentSource(_ source: AtlasSavedReaderCapture) -> Bool {
-        guard !closed, let archive = source.archiveIdentity, let info, let session,
+        guard !closed, source.supplementalTrailSource == nil, let archive = source.archiveIdentity, let info, let session,
               info.identity == archive, session.handle == archive.owner, source.owner == archive.owner,
               let domain = readerDomain, source.reader.retainedRegistryDomain == domain,
               source.member.captured, let digest = source.member.digest,

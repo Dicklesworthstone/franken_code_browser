@@ -3,7 +3,9 @@
 //! Pointer conversion for explicit FCBT attachment. Validation, immutable
 //! references, readiness and exact saved-source reader copies stay in the host.
 
-use super::{AccessError, Command, Selection, Path, answer, c_char, cstr, number, reply};
+use std::ffi::c_void;
+use fcb_app::host::saved_repository::trail::{SavedTrailArchiveRequest, SavedTrailWriteParent};
+use super::{AccessError, Command, Selection, Path, answer, c_char, cstr, number, pin, reply};
 
 /// Read one bounded FCBT file, retaining all its reference/note bytes. The
 /// accepted trail never reopens this path or any entry's source pathname.
@@ -41,6 +43,36 @@ pub extern "C" fn fcb_saved_open_trail_reader(handle: u64, reader: u64,
     reply(|| answer(handle, |sessions| {
         let readers = crate::reader_ffi::registry().ok_or(crate::reader_sessions::AccessError::UnknownHandle)?;
         sessions.open_reader(handle, readers, reader, Selection::Trail { generation, item: number(item)? }, || false)
+    }))
+}
+
+/// Resolve one frozen other-archive visit through an explicit file grant.
+/// Source preparation admits an empty reader before any archive I/O. The
+/// primary saved session and accepted trail are not replaced or reattached.
+/// # Safety
+/// trail_digest/archive_path are readable NUL-terminated UTF-8 until return.
+/// The selected read grant and optional callback/context remain valid through
+/// the entered worker call. The callback must not block, unwind, or reenter
+/// either handle. Free non-null JSON exactly once with fcb_free_string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_saved_open_trail_reader_with_archive_cancelable(handle: u64,
+    reader: u64, generation: u64, item: u64, trail_digest: *const c_char,
+    archive_path: *const c_char, validation_bytes: u64,
+    poll: Option<crate::SearchCancellationCallback>, context: *mut c_void) -> *mut c_char {
+    reply(|| answer(handle, |sessions| {
+        if generation == 0 || validation_bytes > 256 * 1024 * 1024 {
+            return Err(AccessError::InvalidArgument);
+        }
+        let digest = pin(unsafe { cstr(trail_digest) }.ok_or(AccessError::InvalidArgument)?)?;
+        let path = unsafe { cstr(archive_path) }.ok_or(AccessError::InvalidArgument)?;
+        if path.is_empty() || path.len() > 16_384 || !Path::new(path).is_absolute() {
+            return Err(AccessError::InvalidArgument);
+        }
+        let request = SavedTrailArchiveRequest { trail: SavedTrailWriteParent { generation, digest },
+            item: number(item)?, archive: Path::new(path), validation_bytes };
+        let readers = crate::reader_ffi::registry().ok_or(crate::reader_sessions::AccessError::UnknownHandle)?;
+        sessions.open_trail_reader_with_archive(handle, readers, reader, request,
+            || poll.is_some_and(|poll| unsafe { poll(context) != 0 }))
     }))
 }
 

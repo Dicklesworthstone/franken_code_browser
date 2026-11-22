@@ -99,3 +99,60 @@ fn c_trail_pointer_stale_and_page_validation_do_not_install_or_read_unready_sour
     let unknown = take(fcb_saved_trail_page(u64::MAX, 1, 0, 1));
     assert!(unknown.len() < 4096 && unknown.contains("SAVED_HANDLE_UNKNOWN"));
 }
+
+
+#[test]
+fn c_supplemental_reader_abi_requires_explicit_pin_and_keeps_primary_trail_intact() {
+    let _guard = crate::reader_ffi::FFI_TEST_LOCK.lock().unwrap();
+    let _: unsafe extern "C" fn(u64, u64, u64, u64, *const c_char, *const c_char, u64,
+        Option<crate::SearchCancellationCallback>, *mut c_void) -> *mut c_char
+        = fcb_saved_open_trail_reader_with_archive_cancelable;
+    let header = include_str!("../include/fcb_saved_repository.h");
+    assert_eq!(header.matches("fcb_saved_open_trail_reader_with_archive_cancelable(").count(), 1);
+    let (root, archive_path, trail_path) = fixture();
+    let owner = ArenaOwnerId::new(9027).unwrap();
+    let budget = ResourceBudget::new(owner, ByteLength::new(64 * 1024 * 1024)).unwrap();
+    let source = b"Explicit supplemental source is copied independently.\n";
+    let archive = SnapshotBytes::encode(owner, true, "supplemental-c-reader", &[SnapshotEntry {
+        path: b"a-\xff.rs", observed_bytes: source.len() as u64, data: SnapshotData::Captured(source) }],
+        Default::default(), &budget, ResourceAllocationId::new(1).unwrap(), || false).unwrap();
+    let supplemental_path = root.join("other.fcbs"); std::fs::write(&supplemental_path, archive.bytes()).unwrap();
+    let old_bytes = std::fs::read(root.join("tour.fcbt")).unwrap();
+    let old = fcb::search::trail::TrailView::open(&old_bytes, || false).unwrap();
+    let first = old.entry(0).unwrap();
+    let second = TrailEntry { archive: archive.digest(), source: Sha256::digest(source), source_length: source.len() as u64,
+        range: ByteRange::new(ByteOffset::new(9), ByteOffset::new(21)).unwrap(), rationale: "Other side", ..first };
+    let trail = TrailBytes::encode(owner, "C supplemental reader", None, &[first, second],
+        &budget, ResourceAllocationId::new(2).unwrap(), || false).unwrap();
+    std::fs::write(root.join("tour.fcbt"), trail.bytes()).unwrap();
+    let digest = CString::new(trail.digest().to_hex()).unwrap();
+    let selected = CString::new(supplemental_path.to_str().unwrap()).unwrap();
+    let relative = CString::new("relative.fcbs").unwrap();
+    let saved = fcb_saved_create(); assert_ne!(saved, 0);
+    take(unsafe { fcb_saved_open(saved, archive_path.as_ptr()) });
+    take(unsafe { fcb_saved_trail_attach(saved, 1, trail_path.as_ptr()) });
+    let reader = crate::reader_ffi::fcb_reader_create(); assert_ne!(reader, 0);
+    let original = take(fcb_saved_trail_page(saved, 1, 0, 32));
+    for (pin, path) in [(std::ptr::null(), selected.as_ptr()), (digest.as_ptr(), std::ptr::null()),
+        (digest.as_ptr(), relative.as_ptr()), (digest.as_ptr(), archive_path.as_ptr())] {
+        let response = take(unsafe { fcb_saved_open_trail_reader_with_archive_cancelable(saved, reader, 1, 1,
+            pin, path, 256 * 1024 * 1024, None, std::ptr::null_mut()) });
+        assert!(response.contains("\"status\":\"error\""));
+        assert!(take(crate::reader_ffi::fcb_reader_info(reader)).contains("READER_HANDLE_NOT_OPEN"));
+    }
+    assert!(take(fcb_saved_open_trail_reader(saved, reader, 1, 1)).contains("\"status\":\"error\""));
+    let response = take(unsafe { fcb_saved_open_trail_reader_with_archive_cancelable(saved, reader, 1, 1,
+        digest.as_ptr(), selected.as_ptr(), 256 * 1024 * 1024, None, std::ptr::null_mut()) });
+    assert!(response.contains("\"command\":\"trail-archive-open-reader\""));
+    assert!(response.contains("\"validation_complete\":true"));
+    assert!(response.contains("\"resolved_member\":"));
+    assert!(response.contains("\"selection\":{\"start\":\"9\",\"end\":\"21\"}"));
+    assert!(response.contains("Explicit supplemental source is copied independently."));
+    assert_eq!(number(&response, "primary_member_bytes_read"), 0);
+    assert_eq!(take(fcb_saved_trail_page(saved, 1, 0, 32)), original);
+    assert_eq!(fcb_saved_close(saved), 1);
+    std::fs::rename(&supplemental_path, root.join("moved-other.fcbs")).unwrap();
+    assert!(take(crate::reader_ffi::fcb_reader_window(reader, 0, 256))
+        .contains("Explicit supplemental source is copied independently."));
+    assert_eq!(crate::reader_ffi::fcb_reader_close(reader), 1);
+}
