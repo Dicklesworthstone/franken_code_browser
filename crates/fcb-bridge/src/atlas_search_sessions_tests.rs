@@ -143,3 +143,61 @@ fn independent_atlas_handles_never_share_captures_or_query_state() {
     assert!(atlases.execute(b, Command::SearchOverlay { generation: 1 }, || false).is_ok());
     atlases.close(b).unwrap();
 }
+
+#[test]
+fn include_excluded_bypasses_failed_rules_without_relabeling_the_other_session() {
+    let fixture = Fixture::new(); let atlases = AtlasSessions::new();
+    fs::create_dir(fixture.0.join("nested")).unwrap();
+    fs::write(fixture.0.join("nested/.gitignore"), b"[broken\n").unwrap();
+    fs::write(fixture.0.join("nested/hidden.rs"), b"rule-bypass needle\n").unwrap();
+    let rules = fixture.open(&atlases);
+    let included = atlases.create().unwrap();
+    let open = atlases.open_with_policy(included, &fixture.0, Default::default(),
+        CatalogDiscoveryPolicy::IncludeExcluded, || false).unwrap();
+    assert!(open.as_str().contains("\"discovery_policy\":\"all-regular-files/no-rule-files-v1\""));
+    assert!(open.as_str().contains("\"rule_files_enabled\":false,\"rule_policy\":null"));
+    assert!(open.as_str().contains("\"discovery_complete\":true"));
+    let narrow = atlases.execute(rules, find(1, "rule-bypass"), || false).unwrap();
+    assert!(narrow.as_str().contains("\"discovery_policy\":\"repository-rules-v1"));
+    assert!(narrow.as_str().contains("\"discovery_complete\":false"));
+    assert!(narrow.as_str().contains("\"retained_hits\":\"0\""));
+    assert!(narrow.as_str().contains("RULE_UNSUPPORTED_PATTERN"));
+    let broad = atlases.execute(included, find(1, "rule-bypass"), || false).unwrap();
+    assert!(broad.as_str().contains("\"search_complete\":true"));
+    assert!(broad.as_str().contains("\"retained_hits\":\"1\""));
+    assert!(broad.as_str().contains("\"rule_files_enabled\":false,\"rule_policy\":null"));
+    assert!(matches!(atlases.open_with_policy(rules, &fixture.0, Default::default(),
+        CatalogDiscoveryPolicy::IncludeExcluded, || false), Err(AccessError::AlreadyOpen)));
+    atlases.close(included).unwrap();
+    let retained = atlases.execute(rules, Command::SearchPage { generation: 1, start: 0, limit: 10 }, || false).unwrap();
+    assert!(retained.as_str().contains("\"discovery_policy\":\"repository-rules-v1"));
+    assert!(retained.as_str().contains("\"retained_hits\":\"0\""));
+    atlases.close(rules).unwrap();
+}
+
+#[test]
+fn policy_open_cancellation_preserves_other_handles_and_keeps_empty_handle_retryable() {
+    let fixture = Fixture::new(); let atlases = AtlasSessions::new();
+    let independent = fixture.open(&atlases);
+    atlases.execute(independent, find(1, "needle"), || false).unwrap();
+    for policy in [CatalogDiscoveryPolicy::RepositoryRules, CatalogDiscoveryPolicy::IncludeExcluded] {
+        let handle = atlases.create().unwrap();
+        let mut canceled = false;
+        let result = atlases.open_with_policy(handle, &fixture.0, Default::default(), policy, || {
+            if !canceled {
+                canceled = true;
+                atlases.cancel(handle).unwrap();
+                assert!(atlases.execute(independent, Command::Info, || false).is_ok());
+            }
+            false
+        });
+        assert!(matches!(result, Err(AccessError::Canceled)));
+        assert!(matches!(atlases.execute(handle, Command::Info, || false), Err(AccessError::NotOpen)));
+        let response = atlases.open_with_policy(handle, &fixture.0, Default::default(), policy, || false).unwrap();
+        assert!(response.as_str().contains(&format!("\"discovery_policy\":\"{}", policy.name())));
+        let kept = atlases.execute(independent, Command::SearchPage { generation: 1, start: 0, limit: 10 }, || false).unwrap();
+        assert!(kept.as_str().contains("\"retained_hits\":\"1\""));
+        atlases.close(handle).unwrap();
+    }
+    atlases.close(independent).unwrap();
+}

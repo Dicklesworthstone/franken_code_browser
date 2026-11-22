@@ -29,6 +29,28 @@ extern "C" {
  */
 uint64_t fcb_atlas_create(void);
 char *fcb_atlas_open(uint64_t handle, const char *root, uint64_t max_files);
+
+/* Cooperative worker discovery. poll may be NULL; otherwise return zero to
+ * continue or nonzero to stop. poll/context remain valid until return, must
+ * not unwind or reenter this session, and are never retained. This cannot
+ * abort a syscall. NULL means cancellation/refusal, never an empty workspace.
+ * A late cancellation can suppress delivery AFTER initialization; inspect or
+ * close the known handle, never assume rollback. Close on a worker even after
+ * NULL. The compatibility entrypoint always uses repository rules.
+ *
+ * discovery_policy: 0 repository-rules-v1, 1 all-regular-files/no-rule-files-v1.
+ * Policy 1 bypasses product/repository exclusions and rule-configuration reads,
+ * while retaining root confinement, symlink/special-object refusal and limits.
+ * Other values return NULL before root/callback/handle access. Supported values
+ * require the ordinary pointer/callback lifetime contract above. Opening an
+ * already-open handle is refused; changing policy requires a new handle.
+ * Open/info/search retain the actual discovery_policy identity, including its
+ * rule fingerprint when present, and the existing rule-policy coverage receipt.
+ */
+char *fcb_atlas_open_cancelable(uint64_t handle, const char *root, uint64_t max_files,
+    int32_t (*poll)(void *), void *context);
+char *fcb_atlas_open_with_policy_cancelable(uint64_t handle, const char *root,
+    uint64_t max_files, uint64_t discovery_policy, int32_t (*poll)(void *), void *context);
 char *fcb_atlas_info(uint64_t handle);
 
 /* Plan generations strictly increase across accepted or failed admitted

@@ -5,7 +5,7 @@
 
 use std::{ffi::c_char, path::Path, sync::OnceLock};
 use fcb_app::host::{HostResponse, atlas_session::{AtlasAction, AtlasExtensionScope, AtlasScope,
-    AtlasSession, AtlasSessionOptions}};
+    AtlasSession, AtlasSessionOptions}, catalog_session::CatalogDiscoveryPolicy};
 use fcb_core::Point2D;
 use super::{cstr, reply, string_out};
 use super::atlas_sessions::{AccessError, AtlasSessions, Command};
@@ -165,12 +165,34 @@ mod tests;
 pub unsafe extern "C" fn fcb_atlas_open_cancelable(handle: u64, root: *const c_char,
     max_files: u64, poll: Option<super::search_ffi::SearchCancellationCallback>,
     context: *mut std::ffi::c_void) -> *mut c_char {
+    unsafe { fcb_atlas_open_with_policy_cancelable(handle, root, max_files, 0, poll, context) }
+}
+
+/// Open one retained atlas under the explicit shared discovery policy:
+/// 0 repository rules (the compatibility default), 1 include excluded files.
+/// Unknown policy values return null before pointer, callback or registry access.
+/// A policy change requires a new handle; an open session is never relabeled.
+/// # Safety
+/// For a supported policy, root/poll/context follow fcb_atlas_open_cancelable's
+/// contract. A late cancellation can suppress the reply after installation;
+/// inspect or close the known handle rather than assuming initialization rolled
+/// back. No callbacks are retained. Free non-null JSON once with fcb_free_string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_open_with_policy_cancelable(handle: u64, root: *const c_char,
+    max_files: u64, discovery_policy: u64,
+    poll: Option<super::search_ffi::SearchCancellationCallback>,
+    context: *mut std::ffi::c_void) -> *mut c_char {
     reply(|| {
+        let policy = match discovery_policy {
+            0 => CatalogDiscoveryPolicy::RepositoryRules,
+            1 => CatalogDiscoveryPolicy::IncludeExcluded,
+            _ => return None,
+        };
         let canceled = || poll.is_some_and(|poll| unsafe { poll(context) != 0 });
         if canceled() { return None; }
         let root = unsafe { cstr(root) }?;
-        let response = ATLASES.get()?.open(handle, Path::new(root),
-            AtlasSessionOptions { max_files: number(max_files).ok()?, ..Default::default() }, canceled).ok()?;
+        let response = ATLASES.get()?.open_with_policy(handle, Path::new(root),
+            AtlasSessionOptions { max_files: number(max_files).ok()?, ..Default::default() }, policy, canceled).ok()?;
         if canceled() { return None; }
         string_out(response.as_str())
     })

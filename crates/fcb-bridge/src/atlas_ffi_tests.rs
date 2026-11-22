@@ -126,6 +126,16 @@ fn c_atlas_scope_filters_display_and_labels_responses() {
 fn c_atlas_function_types_match_header() {
     let _: extern "C" fn() -> u64 = fcb_atlas_create;
     let _: unsafe extern "C" fn(u64, *const c_char, u64) -> *mut c_char = fcb_atlas_open;
+    let _: unsafe extern "C" fn(u64, *const c_char, u64,
+        Option<crate::search_ffi::SearchCancellationCallback>, *mut std::ffi::c_void) -> *mut c_char
+        = fcb_atlas_open_cancelable;
+    let _: unsafe extern "C" fn(u64, *const c_char, u64, u64,
+        Option<crate::search_ffi::SearchCancellationCallback>, *mut std::ffi::c_void) -> *mut c_char
+        = fcb_atlas_open_with_policy_cancelable;
+    let header = include_str!("../include/fcb_atlas_sessions.h");
+    for symbol in ["fcb_atlas_open(", "fcb_atlas_open_cancelable(", "fcb_atlas_open_with_policy_cancelable("] {
+        assert_eq!(header.matches(symbol).count(), 1, "{symbol}");
+    }
     let _: extern "C" fn(u64) -> *mut c_char = fcb_atlas_info;
     let _: extern "C" fn(u64, u64) -> *mut c_char = fcb_atlas_view;
     let _: extern "C" fn(u64, u64, f64, f64) -> *mut c_char = fcb_atlas_pan;
@@ -173,4 +183,149 @@ fn c_atlas_back_and_forward_restore_camera_endpoints_and_refocus_branches_histor
     take(fcb_atlas_focus(a, 7, root));
     assert!(take(fcb_atlas_forward(a, 8)).contains("ATLAS_SESSION_EMPTY_HISTORY"));
     assert_eq!(fcb_atlas_close(a), 1);
+}
+
+struct OpenPoll {
+    polls: AtomicU64,
+    stop_at: u64,
+}
+unsafe extern "C" fn poll_open(context: *mut std::ffi::c_void) -> i32 {
+    let state = unsafe { &*context.cast::<OpenPoll>() };
+    i32::from(state.polls.fetch_add(1, Ordering::Relaxed) + 1 >= state.stop_at)
+}
+fn open_poll_context(state: &OpenPoll) -> *mut std::ffi::c_void {
+    std::ptr::from_ref(state).cast_mut().cast()
+}
+
+#[test]
+fn c_policy_open_search_and_reader_preserve_scope_and_exact_captured_source() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join(".gitignore"), b"ignored.rs\n").unwrap();
+    fs::write(fixture.0.join(".fcbignore"), b"custom.rs\n").unwrap();
+    fs::write(fixture.0.join("ignored.rs"), b"hidden needle\n").unwrap();
+    fs::write(fixture.0.join("custom.rs"), b"custom needle\n").unwrap();
+    fs::create_dir(fixture.0.join("target")).unwrap();
+    fs::write(fixture.0.join("target/generated.rs"), b"generated needle\n").unwrap();
+    std::os::unix::fs::symlink("ignored.rs", fixture.0.join("alias.rs")).unwrap();
+    let root = CString::new(fixture.0.to_str().unwrap()).unwrap();
+    let legacy = fixture.open();
+    let compatible = fcb_atlas_create(); assert_ne!(compatible, 0);
+    let compatibility = take(unsafe {
+        fcb_atlas_open_cancelable(compatible, root.as_ptr(), 100, None, std::ptr::null_mut())
+    });
+    assert!(compatibility.contains("\"discovery_policy\":\"repository-rules-v1"));
+    let included = fcb_atlas_create(); assert_ne!(included, 0);
+    let opened = take(unsafe {
+        fcb_atlas_open_with_policy_cancelable(included, root.as_ptr(), 100, 1, None, std::ptr::null_mut())
+    });
+    assert!(opened.contains("\"discovery_policy\":\"all-regular-files/no-rule-files-v1\""));
+    assert!(opened.contains("\"rule_files_enabled\":false,\"rule_policy\":null"));
+    let query = CString::new("needle").unwrap();
+    for (handle, hits) in [(legacy, 1), (compatible, 1), (included, 4)] {
+        let found = take(unsafe {
+            super::search::fcb_atlas_search(handle, 1, query.as_ptr(), 16, 100, 1024, 8192)
+        });
+        assert!(found.contains(&format!("\"retained_hits\":\"{hits}\"")), "{found}");
+        if handle == included {
+            assert!(found.contains("\"discovery_policy\":\"all-regular-files/no-rule-files-v1\""));
+            assert!(found.contains("\"rule_files_enabled\":false,\"rule_policy\":null"));
+            assert!(!found.contains("\"display\":\"alias.rs\""), "include-excluded must not follow symlinks");
+        } else {
+            assert!(found.contains("\"discovery_policy\":\"repository-rules-v1"));
+            assert!(found.contains("\"rule_files_enabled\":true"));
+        }
+    }
+    let hidden = CString::new("hidden needle").unwrap();
+    let found = take(unsafe {
+        super::search::fcb_atlas_search(included, 2, hidden.as_ptr(), 16, 100, 1024, 8192)
+    });
+    assert!(found.contains("\"retained_hits\":\"1\""), "{found}");
+    assert!(found.contains("\"display\":\"ignored.rs\""), "{found}");
+    fs::write(fixture.0.join("ignored.rs"), b"changed current source").unwrap();
+    let reader = fcb_reader_create(); assert_ne!(reader, 0);
+    let opened_reader = take(super::search::fcb_atlas_search_open_reader(included, reader, 2, 1));
+    assert!(opened_reader.contains("\"source_reopened\":false"), "{opened_reader}");
+    assert_eq!(fcb_atlas_close(included), 1);
+    assert!(take(fcb_reader_copy_range(reader, 0, 14)).contains("68696464656e206e6565646c650a"));
+    assert!(take(super::search::fcb_atlas_search_page(legacy, 1, 0, 16)).contains("\"retained_hits\":\"1\""));
+    assert_eq!(fcb_reader_close(reader), 1);
+    assert_eq!(fcb_atlas_close(compatible), 1); assert_eq!(fcb_atlas_close(legacy), 1);
+}
+
+#[test]
+fn c_policy_open_refuses_invalid_policy_without_callbacks_or_handle_changes() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new(); let root = CString::new(fixture.0.to_str().unwrap()).unwrap();
+    let handle = fcb_atlas_create(); assert_ne!(handle, 0);
+    let empty = take(fcb_atlas_info(handle));
+    let poll = OpenPoll { polls: AtomicU64::new(0), stop_at: u64::MAX };
+    for policy in [2, u64::MAX] {
+        assert!(unsafe {
+            fcb_atlas_open_with_policy_cancelable(handle, std::ptr::null(), 100, policy,
+                Some(poll_open), open_poll_context(&poll))
+        }.is_null());
+    }
+    assert_eq!(poll.polls.load(Ordering::Relaxed), 0);
+    assert_eq!(take(fcb_atlas_info(handle)), empty);
+    for policy in [0, 1] {
+        for limit in [0, 20_001, u64::MAX] {
+            assert!(unsafe {
+                fcb_atlas_open_with_policy_cancelable(handle, root.as_ptr(), limit, policy,
+                    None, std::ptr::null_mut())
+            }.is_null());
+        }
+        assert!(unsafe {
+            fcb_atlas_open_with_policy_cancelable(handle, std::ptr::null(), 100, policy,
+                None, std::ptr::null_mut())
+        }.is_null());
+        assert_eq!(take(fcb_atlas_info(handle)), empty);
+    }
+    let opened = take(unsafe {
+        fcb_atlas_open_with_policy_cancelable(handle, root.as_ptr(), 100, 0, None, std::ptr::null_mut())
+    });
+    assert!(opened.contains("\"discovery_policy\":\"repository-rules-v1"));
+    let before = take(fcb_atlas_info(handle));
+    assert!(unsafe {
+        fcb_atlas_open_with_policy_cancelable(handle, root.as_ptr(), 100, 2,
+            Some(poll_open), open_poll_context(&poll))
+    }.is_null());
+    assert_eq!(poll.polls.load(Ordering::Relaxed), 0);
+    assert_eq!(take(fcb_atlas_info(handle)), before);
+    assert_eq!(fcb_atlas_close(handle), 1);
+}
+
+#[test]
+fn c_policy_open_cancellation_keeps_early_handles_retryable_and_late_handles_owned() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new(); let root = CString::new(fixture.0.to_str().unwrap()).unwrap();
+    for policy in [0, 1] {
+        let probe = OpenPoll { polls: AtomicU64::new(0), stop_at: u64::MAX };
+        let handle = fcb_atlas_create(); assert_ne!(handle, 0);
+        take(unsafe {
+            fcb_atlas_open_with_policy_cancelable(handle, root.as_ptr(), 100, policy,
+                Some(poll_open), open_poll_context(&probe))
+        });
+        let total = probe.polls.load(Ordering::Relaxed); assert!(total > 2);
+        assert_eq!(fcb_atlas_close(handle), 1);
+        for stop_at in [1, 2, total] {
+            let handle = fcb_atlas_create(); assert_ne!(handle, 0);
+            let stop = OpenPoll { polls: AtomicU64::new(0), stop_at };
+            assert!(unsafe {
+                fcb_atlas_open_with_policy_cancelable(handle, root.as_ptr(), 100, policy,
+                    Some(poll_open), open_poll_context(&stop))
+            }.is_null());
+            let info = take(fcb_atlas_info(handle));
+            if stop_at < total {
+                assert!(info.contains("ATLAS_HANDLE_NOT_OPEN"), "{info}");
+                assert!(take(unsafe {
+                    fcb_atlas_open_with_policy_cancelable(handle, root.as_ptr(), 100, policy,
+                        None, std::ptr::null_mut())
+                }).contains("\"status\":\"ok\""));
+            } else {
+                assert!(info.contains("\"status\":\"ok\""), "late null is not rollback: {info}");
+            }
+            assert_eq!(fcb_atlas_close(handle), 1);
+        }
+    }
 }

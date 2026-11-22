@@ -10,7 +10,7 @@ use fcb_app::host::{HostResponse, atlas_session::{AtlasAction, AtlasScope,
     AtlasSession, AtlasSessionError, AtlasSessionOptions},
     atlas_search::{AtlasSearchError, AtlasSearchOptions, AtlasSearchScope, AtlasStructureOptions, RetainedAtlasSearch},
     atlas_stream_search::{AtlasStreamSearchError, RetainedAtlasStreamSearch},
-    atlas_paths::{AtlasPathError, RetainedAtlasPaths}};
+    atlas_paths::{AtlasPathError, RetainedAtlasPaths}, catalog_session::CatalogDiscoveryPolicy};
 use fcb_core::{ArenaOwnerId, ByteLength, Point2D, ResourceAllocationId, ResourceBudget, ResourceLease};
 use super::reader_sessions::{self, ReaderSessions};
 
@@ -181,7 +181,11 @@ impl AtlasSessions {
         cells.iter().flatten().find(|cell| cell.id == handle).cloned().ok_or(AccessError::Unknown)
     }
     pub(super) fn open(&self, handle: u64, root: &Path, options: AtlasSessionOptions,
-        mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
+        self.open_with_policy(handle, root, options, CatalogDiscoveryPolicy::RepositoryRules, canceled)
+    }
+    pub(super) fn open_with_policy(&self, handle: u64, root: &Path, options: AtlasSessionOptions,
+        policy: CatalogDiscoveryPolicy, mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
         let cell = self.get(handle)?;
         let epoch = cell.epoch.load(Ordering::Acquire);
         let mut state = lock(&cell.state)?;
@@ -190,7 +194,7 @@ impl AtlasSessions {
         let mut stop = || cell.validate(epoch).is_err() || canceled();
         let result = (|| {
             let owner = ArenaOwnerId::new(handle).map_err(|_| AccessError::InvalidArgument)?;
-            let mut candidate = AtlasSession::open(owner, root, options, &mut stop)?;
+            let mut candidate = AtlasSession::open_with_policy(owner, root, options, policy, &mut stop)?;
             let search = RetainedAtlasSearch::new(&candidate)?;
             let paths = RetainedAtlasPaths::new(&candidate)?;
             let stream = RetainedAtlasStreamSearch::new(&candidate)?;
