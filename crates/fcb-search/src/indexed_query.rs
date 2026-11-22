@@ -76,7 +76,7 @@ pub(crate) trait QuerySource {
     fn count(&self) -> usize;
     fn document(&self, ordinal: usize) -> SearchDocument<'_>;
     fn may_match(&self, ordinal: usize, query: &ParsedQuery, options: &QueryOptions) -> Result<bool, IndexError>;
-    fn fallback(&self, ordinal: usize, options: &QueryOptions, needle: usize) -> bool;
+    fn fallback(&self, ordinal: usize, options: &QueryOptions, needle: &[u8]) -> bool;
 }
 impl QuerySource for EphemeralIndex<'_> {
     fn id(&self) -> SearchManifestId { self.manifest().id() }
@@ -86,7 +86,7 @@ impl QuerySource for EphemeralIndex<'_> {
     fn may_match(&self, ordinal: usize, query: &ParsedQuery, options: &QueryOptions) -> Result<bool, IndexError> {
         EphemeralIndex::may_match(self, ordinal, query, options)
     }
-    fn fallback(&self, ordinal: usize, options: &QueryOptions, needle: usize) -> bool {
+    fn fallback(&self, ordinal: usize, options: &QueryOptions, needle: &[u8]) -> bool {
         self.uses_fallback(ordinal, options, needle)
     }
 }
@@ -215,7 +215,7 @@ impl<'source> Execution<'source> {
             && !index.may_match(ordinal, query, &self.options)? {
             self.report.skipped_by_index += 1; return Ok(());
         }
-        if index.fallback(ordinal, &self.options, query.primary_needle.len()) { self.report.fallback_attempts += 1; }
+        if index.fallback(ordinal, &self.options, query.primary_needle.as_bytes()) { self.report.fallback_attempts += 1; }
         self.report.scan_attempts += 1;
         let retained = self.report.results.matches.len();
         let remaining = self.options.max_matches.saturating_sub(retained);

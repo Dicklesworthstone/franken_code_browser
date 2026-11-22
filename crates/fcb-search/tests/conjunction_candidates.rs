@@ -161,19 +161,19 @@ fn incompatible_decoders_normalization_and_malformed_sources_remain_candidates()
     let folded = SearchMode::DecodedText { case_sensitive: false, normalization: UnicodeNormalization::CaseFold };
     let canonical = SearchMode::DecodedText { case_sensitive: true, normalization: UnicodeNormalization::Canonical };
     let cases = [
-        (utf16("banana allow", true, true), "ana allow", exact, None, 2, true),
-        (utf16("banana allow", false, true), "ana allow", exact, None, 2, true),
+        (utf16("banana allow", true, true), "ana allow", exact, None, 2, true, 1),
+        (utf16("banana allow", false, true), "ana allow", exact, None, 2, true, 1),
         // BOM-less ASCII UTF-16 is also valid UTF-8 bytes. The declared decoder
         // must prevent using missing UTF-8 grams as a negative certificate.
-        (utf16("banana allow", true, false), "ana allow", exact, Some(DetectedEncoding::Utf16Le), 2, true),
-        (utf16("banana allow", false, false), "ana allow", exact, Some(DetectedEncoding::Utf16Be), 2, true),
-        (b"BANANA ALLOW".to_vec(), "ana allow", insensitive, None, 2, true),
-        ("banana Straße".as_bytes().to_vec(), "ana STRASSE", folded, None, 2, true),
-        ("banana e\u{0301}".as_bytes().to_vec(), "ana é", canonical, None, 2, true),
-        (b"banana\xff".to_vec(), "ana missing", exact, None, 0, false),
-        (b"banana".to_vec(), "ana missing", exact, Some(DetectedEncoding::Unsupported), 0, false),
+        (utf16("banana allow", true, false), "ana allow", exact, Some(DetectedEncoding::Utf16Le), 2, true, 1),
+        (utf16("banana allow", false, false), "ana allow", exact, Some(DetectedEncoding::Utf16Be), 2, true, 1),
+        (b"BANANA ALLOW".to_vec(), "ana allow", insensitive, None, 2, true, 0),
+        ("banana Straße".as_bytes().to_vec(), "ana STRASSE", folded, None, 2, true, 1),
+        ("banana e\u{0301}".as_bytes().to_vec(), "ana é", canonical, None, 2, true, 1),
+        (b"banana\xff".to_vec(), "ana missing", exact, None, 0, false, 1),
+        (b"banana".to_vec(), "ana missing", exact, Some(DetectedEncoding::Unsupported), 0, false, 1),
     ];
-    for (bytes, raw, mode, encoding, count, complete) in cases {
+    for (bytes, raw, mode, encoding, count, complete, fallback) in cases {
         let capture = capture(1, &bytes);
         let documents = [document("source", &capture)];
         let budget = budget();
@@ -189,7 +189,7 @@ fn incompatible_decoders_normalization_and_malformed_sources_remain_candidates()
         assert_eq!(report.capture_results().match_count(), count);
         assert_eq!(report.skipped_by_index(), 0);
         assert_eq!(report.scan_attempts(), 1);
-        assert_eq!(report.fallback_attempts(), 1);
+        assert_eq!(report.fallback_attempts(), fallback);
         if !complete { assert_eq!(report.capture_results().unsupported_files, [capture.request().file()]); }
     }
 }

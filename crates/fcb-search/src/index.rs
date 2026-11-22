@@ -185,6 +185,7 @@ struct Segment {
     start: usize,
     len: usize,
     utf8: bool,
+    ascii: bool,
     coverage: SegmentCoverage,
 }
 
@@ -263,7 +264,7 @@ impl<'a> EphemeralIndex<'a> {
                 refusal = Some(UncoveredReason::BuildByteLimit);
             }
             let mut segment = Segment {
-                start: grams.len(), len: 0, utf8: false,
+                start: grams.len(), len: 0, utf8: false, ascii: false,
                 coverage: SegmentCoverage::Indexed,
             };
             if refusal.is_none() {
@@ -282,7 +283,11 @@ impl<'a> EphemeralIndex<'a> {
                 } else if scratch.len() > gram_capacity.saturating_sub(grams.len()) {
                     refusal = Some(UncoveredReason::TotalGramLimit);
                 } else {
-                    segment.utf8 = std::str::from_utf8(bytes).is_ok();
+                    // This proof covers the complete capture, not just the
+                    // sampled query grams. Unicode elsewhere can contribute
+                    // normalized matches whose raw grams are different.
+                    segment.ascii = bytes.is_ascii();
+                    segment.utf8 = segment.ascii || std::str::from_utf8(bytes).is_ok();
                     segment.len = scratch.len();
                     grams.extend_from_slice(&scratch);
                 }
@@ -314,7 +319,8 @@ impl<'a> EphemeralIndex<'a> {
 
     /// A false return certifies the absence of a required positive term.
     /// True means "verify", never "there is a match". Unknown encodings,
-    /// normalization and uncovered segments cannot borrow byte-index negatives.
+    /// non-ASCII normalization and uncovered segments cannot borrow byte-index
+    /// negatives. ASCII normalization uses bounded case variants of raw grams.
     /// Short terms need verification, but do not disable probes for other terms.
     /// Exclusions and metadata filters never become required source trigrams.
     pub fn may_match(
@@ -325,8 +331,8 @@ impl<'a> EphemeralIndex<'a> {
         may_match_segment(segment, &self.grams, query, options)
     }
 
-    pub(crate) fn uses_fallback(&self, document_index: usize, options: &QueryOptions, needle_len: usize) -> bool {
-        needle_len < 3 || !compatible_segment(&self.segments[document_index], options)
+    pub(crate) fn uses_fallback(&self, document_index: usize, options: &QueryOptions, needle: &[u8]) -> bool {
+        segment_uses_fallback(&self.segments[document_index], options, needle)
     }
 
     pub(crate) fn validate_options(&self, options: &QueryOptions) -> Result<(), IndexError> {
@@ -354,10 +360,10 @@ fn may_match_segment(segment: &Segment, grams: &[u32], query: &ParsedQuery,
     for needle in std::iter::once(needle)
         .chain(query.conjunction_terms.iter().map(|term| term.as_bytes()))
         .take(crate::MAX_QUERY_TOKENS) {
-        if needle.len() < 3 { continue; }
+        if !compatible_needle(needle, options.mode) { continue; }
         let last = needle.len() - 3;
         for offset in [0, last / 2, last] {
-            if keys.binary_search(&gram(&needle[offset..offset + 3])).is_err() { return Ok(false); }
+            if !contains_gram(keys, &needle[offset..offset + 3], options.mode) { return Ok(false); }
         }
     }
     Ok(true)
@@ -369,7 +375,37 @@ fn compatible_segment(segment: &Segment, options: &QueryOptions) -> bool {
         SearchMode::DecodedText { case_sensitive: true, normalization: UnicodeNormalization::Exact } => {
             segment.utf8 && matches!(options.declared_encoding, None | Some(DetectedEncoding::Utf8 { .. }))
         }
-        _ => false,
+        SearchMode::DecodedText { .. } => {
+            segment.ascii && matches!(options.declared_encoding, None | Some(DetectedEncoding::Utf8 { .. }))
+        }
+    }
+}
+fn compatible_needle(needle: &[u8], mode: SearchMode) -> bool {
+    needle.len() >= 3 && match mode {
+        SearchMode::RawBytes |
+        SearchMode::DecodedText { case_sensitive: true, normalization: UnicodeNormalization::Exact } => true,
+        // A Unicode needle can fold to ASCII (for example Kelvin sign to k).
+        // Such terms must retain direct verification even in an ASCII capture.
+        SearchMode::DecodedText { .. } => needle.is_ascii(),
+    }
+}
+fn segment_uses_fallback(segment: &Segment, options: &QueryOptions, needle: &[u8]) -> bool {
+    !compatible_segment(segment, options) || !compatible_needle(needle, options.mode)
+}
+fn contains_gram(keys: &[u32], bytes: &[u8], mode: SearchMode) -> bool {
+    let insensitive = matches!(mode, SearchMode::DecodedText { case_sensitive: false, .. }
+        | SearchMode::DecodedText { normalization: UnicodeNormalization::CaseFold, .. });
+    if !insensitive { return keys.binary_search(&gram(bytes)).is_ok(); }
+    let lower = [bytes[0].to_ascii_lowercase(), bytes[1].to_ascii_lowercase(), bytes[2].to_ascii_lowercase()];
+    let case_bits = gram(&lower.map(|byte| if byte.is_ascii_lowercase() { 0x20 } else { 0 }));
+    let folded = gram(&lower);
+    let mut variant = case_bits;
+    // At most eight raw spellings per trigram, independent of needle length.
+    // Any present spelling admits exact verification; it never proves a hit.
+    loop {
+        if keys.binary_search(&(folded ^ variant)).is_ok() { return true; }
+        if variant == 0 { return false; }
+        variant = (variant - 1) & case_bits;
     }
 }
 fn source_refusal(size: usize, limits: IndexLimits) -> Option<UncoveredReason> {

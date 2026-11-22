@@ -12,7 +12,7 @@ use std::{mem::{size_of, take}, sync::Arc};
 use fcb_core::{ByteLength, FileId, ResourceAllocationId, ResourceBudget, ResourceLease};
 use fcb_source::CompleteCapture;
 use super::super::{EphemeralIndex, IndexError, IndexStatistics, MembershipState,
-    SearchManifest, SearchManifestId, Segment, compatible_segment, may_match_segment};
+    SearchManifest, SearchManifestId, Segment, may_match_segment, segment_uses_fallback};
 use crate::{SearchDocument, ParsedQuery, QueryOptions};
 use crate::indexed_query::QuerySource;
 
@@ -157,8 +157,8 @@ impl QuerySource for OwnedEphemeralIndex {
         let segment = self.segments.get(ordinal).ok_or(IndexError::InvalidManifest)?;
         may_match_segment(segment, &self.grams, query, options)
     }
-    fn fallback(&self, ordinal: usize, options: &QueryOptions, needle: usize) -> bool {
-        needle < 3 || !compatible_segment(&self.segments[ordinal], options)
+    fn fallback(&self, ordinal: usize, options: &QueryOptions, needle: &[u8]) -> bool {
+        segment_uses_fallback(&self.segments[ordinal], options, needle)
     }
 }
 struct Restore<'slot, 'source> {
