@@ -29,7 +29,7 @@ private final class SavedImportFixture: @unchecked Sendable {
          "evidence_precision": "exact-import-source-range", "resolution_domain": "declared-catalog-candidates",
          "compiler_resolved": false, "semantic_complete": false,
          "extractor": "franken-markdown-d6fbd1d5/import-statements-v7",
-         "extraction_policy": "rust-use-tree-js-literal-loads-python-cpp-go-java-v7", "resolver": "fcb-closed-catalog-imports-v7"]
+         "extraction_policy": "rust-use-tree-js-literal-loads-python-cpp-go-java-v7", "resolver": "fcb-closed-catalog-imports-v8"]
     }
     func link(_ id: UInt64) -> [String: Any] {
         let target = base.members[id == 1 ? 3 : 4]
@@ -235,6 +235,46 @@ private final class SavedImportFixture: @unchecked Sendable {
         targetRows[0]["lexical_import_kind"] = "rust-use"
         targetRows[0]["resolution_basis"] = "ambiguous-rust-crate-root"
         forgedTarget["links"] = targetRows; reject { _ = try decode(forgedTarget) }
+    }
+    private static func pythonAbsoluteWire(_ f: SavedImportFixture, identity: AtlasSavedIdentity) throws {
+        let decode: ([String: Any]) throws -> AtlasSavedImports = {
+            try AtlasSavedImports.decode(f.base.encode($0), identity: identity, generation: 1,
+                direction: .all, member: nil, start: 0, limit: 64)
+        }
+        let original = f.page(identity.owner, generation: 1)
+        for kind in ["python-import", "python-from"] {
+            var value = original, rows = original["links"] as! [[String: Any]]
+            for i in rows.indices {
+                rows[i]["language"] = "python"; rows[i]["lexical_import_kind"] = kind
+                rows[i]["destination"] = "pkg.worker"; rows[i]["resolution_basis"] = "python-absolute-module-candidate"
+                rows[i]["source_path"] = f.base.path(Array("src/pkg/main.py".utf8), "src/pkg/main.py")
+                rows[i]["target_path"] = f.base.path(Array("src/pkg/worker.py".utf8), "src/pkg/worker.py")
+            }
+            value["links"] = rows
+            let page = try decode(value)
+            precondition(page.links[0].canOpenTarget && !page.links[1].canOpenTarget)
+            precondition(page.links[0].resolutionLabel.contains("Captured Python source-file candidate")
+                && page.links[0].resolutionLabel.contains("runtime import binding is not resolved"))
+            precondition(page.links[1].resolutionLabel.contains("recorded without source bytes"))
+            for (key, wrong) in [("language", "rust"), ("lexical_import_kind", "rust-use"),
+                ("destination", ".worker"), ("resolution_basis", "external-specifier")] {
+                var bad = value, changed = rows
+                changed[0][key] = wrong; bad["links"] = changed; reject { _ = try decode(bad) }
+            }
+            var forged = value, foreign = rows
+            foreign[0]["language"] = "rust"; foreign[0]["lexical_import_kind"] = "rust-use"
+            forged["links"] = foreign; reject { _ = try decode(forged) }
+            for resolution in ["missing", "ambiguous", "external", "unresolved"] {
+                var bad = value, changed = rows
+                changed[0]["resolution"] = resolution
+                for key in ["target_member", "target_file_id", "target_path", "target_revision", "target_digest", "target_bytes"] {
+                    changed[0][key] = NSNull()
+                }
+                bad["links"] = changed; reject { _ = try decode(bad) }
+            }
+            var old = value; old["resolver"] = "fcb-closed-catalog-imports-v7"
+            reject { _ = try decode(old) }
+        }
     }
     private static func javaWire(_ f: SavedImportFixture, identity: AtlasSavedIdentity) throws {
         let decode: ([String: Any]) throws -> AtlasSavedImports = {
@@ -460,6 +500,7 @@ private final class SavedImportFixture: @unchecked Sendable {
         try cppWire(f, identity: identity)
         try goWire(f, identity: identity)
         try javaWire(f, identity: identity)
+        try pythonAbsoluteWire(f, identity: identity)
         try javascriptLoadWire(f, identity: identity)
         precondition(accepted.complete && accepted.links[0].sourcePath.bytes == f.base.rawPath)
         precondition(accepted.links[0].canOpenTarget && !accepted.links[1].canOpenTarget)

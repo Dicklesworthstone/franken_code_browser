@@ -8,6 +8,7 @@ use super::{ImportFact, ImportKind, ImportLanguage};
 mod rust;
 mod go;
 mod java;
+mod python;
 pub use go::{CapturedGoModule, GoModuleLocation, find_go_module, go_package_source,
     resolve_go_import, MAX_GO_MODULE_SOURCE_BYTES};
 
@@ -56,10 +57,13 @@ impl<T> ImportResolution<T> {
 /// Attributes and unmodeled source scopes remain unresolved. Multiple matching
 /// paths are ambiguous even if a callback maps them to the same target identity.
 /// No extension preference is inferred.
-/// Python admits only explicit relative module candidates: leading dots climb
-/// the source directory, then dotted names become components, with .py and
-/// /__init__.py as the complete finite set. Absolute imports remain external;
-/// no sys.path, package execution, namespace-package or NFKC inference occurs.
+/// Python relative module candidates use leading dots to climb the source
+/// directory, then dotted names become components, with .py and /__init__.py as
+/// the complete finite set. Absolute names probe those same two suffixes under
+/// the catalog root, src/, and at most one enclosing regular-package root
+/// established by consecutive catalogued __init__.py parents. Distinct targets
+/// remain ambiguous; absent candidates remain external. These are filename
+/// candidates, with no sys.path, execution, namespace-root or NFKC inference.
 /// C/C++ quoted includes admit only the exact source-relative catalog path.
 /// Angle includes remain external; computed includes remain unresolved. No
 /// include directories, compilation database, macro expansion or header suffix
@@ -185,7 +189,7 @@ fn python_module<T: Copy + Eq>(
             && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
     }) { return unsupported(); }
     if dots == 0 {
-        return ImportResolution::without(ImportResolutionKind::External, "external-specifier");
+        return python::resolve_absolute(source_path, destination, lookup);
     }
     if kind != ImportKind::PythonFrom { return unsupported(); }
     let Some(mut path) = CatalogPath::parent(source_path) else { return unsupported(); };

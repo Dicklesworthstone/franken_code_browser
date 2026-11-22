@@ -223,9 +223,11 @@ fn finite_python_resolution_preserves_native_parent_bytes_and_does_not_infer_imp
 fn absolute_ambiguous_missing_and_root_escape_outcomes_never_guess_a_target() {
     let imports = build(b"import os.path\nfrom pkg.tools import Thing\nfrom .helper import Thing\nfrom ...outside import Thing\n", 20);
     for fact in &imports.facts()[..2] {
-        let result = resolve_import::<usize>(b"pkg/main.py", fact, |_| panic!("absolute imports cannot inspect sys.path or local lookalikes"));
+        let mut calls = 0;
+        let result = resolve_import::<usize>(b"pkg/main.py", fact, |_| { calls += 1; None });
         assert_eq!(result.kind, ImportResolutionKind::External);
         assert_eq!(result.basis, "external-specifier");
+        assert_eq!(calls, 5, "one absent package marker and four finite catalog candidates, never sys.path");
     }
     let relative = &imports.facts()[2];
     let result = resolve_import(b"pkg/main.py", relative,
@@ -236,6 +238,47 @@ fn absolute_ambiguous_missing_and_root_escape_outcomes_never_guess_a_target() {
     assert_eq!(result.kind, ImportResolutionKind::Missing, "stub discovery is not runtime module resolution");
     let result = resolve_import::<usize>(b"pkg/main.py", &imports.facts()[3], |_| panic!("root escape looked up"));
     assert_eq!(result.kind, ImportResolutionKind::Unresolved);
+}
+
+#[test]
+fn absolute_imports_and_from_statements_follow_exact_catalog_candidates() {
+    let source = b"import acme.tools as tools\nfrom acme.tools import Thing\nfrom acme import Other\n";
+    let imports = build(source, 20);
+    assert_eq!(destinations(&imports), ["acme.tools", "acme.tools", "acme"]);
+    let paths: &[&[u8]] = &[b"src/acme/tools.py", b"src/acme/__init__.py", b"src/acme/Other.py"];
+    for (ordinal, target) in [0, 0, 1].into_iter().enumerate() {
+        let result = resolve_import(b"src/acme/main.py", &imports.facts()[ordinal], |path| {
+            paths.iter().position(|candidate| *candidate == path)
+        });
+        assert_eq!(result.target, Some(target));
+        assert_eq!(result.basis, "python-absolute-module-candidate");
+    }
+    assert_eq!(imports.source_bytes(1).unwrap(), b"import acme.tools as tools");
+    assert_eq!(imports.source_bytes(2).unwrap(), b"from acme.tools import Thing");
+    assert_ne!(imports.facts()[0].original_range(), imports.facts()[1].original_range(),
+        "two statements keep separate evidence even with the same candidate target");
+    assert_eq!(specifier(source, &imports, 2), b"acme", "the imported member is not a module edge");
+}
+
+#[test]
+fn absolute_utf16_navigation_preserves_the_original_spaced_statement() {
+    let text = "# \u{1f600}\r\nfrom acme . tools import Thing as Alias\r\n";
+    for big in [false, true] {
+        let source = utf16(text, big);
+        let imports = build(&source, 20);
+        let fact = &imports.facts()[0];
+        assert_eq!(fact.destination(), "acme.tools");
+        assert_eq!(imports.source_bytes(1).unwrap(),
+            &utf16("from acme . tools import Thing as Alias", big)[2..]);
+        assert_eq!(specifier(&source, &imports, 0), &utf16("acme . tools", big)[2..]);
+        let result = resolve_import(b"src/acme/main.py", fact, |path| {
+            (path == b"src/acme/tools.py").then_some(1)
+        });
+        assert_eq!(result.target, Some(1));
+        assert_eq!(result.basis, "python-absolute-module-candidate");
+        assert_eq!(fact.original_range().start().get(), 14);
+        assert!(imports.validate_source(&source, file(), revision(), generation()).is_ok());
+    }
 }
 
 #[test]

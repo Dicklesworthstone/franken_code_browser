@@ -910,7 +910,12 @@ The projection reuses the shared Rust, JavaScript/TypeScript/JSX/TSX and Python
 extractor and closed-manifest resolver. Each occurrence retains its original
 statement and specifier byte ranges, source digest, language, extraction policy
 and explicit resolution outcome. Python relative imports consider the finite
-`.py` and `/__init__.py` candidates; absolute Python imports remain external.
+`.py` and `/__init__.py` candidates. Absolute imports check those filenames under
+the catalog root, `src/`, and one enclosing regular-package root inferred only
+from consecutive catalogued `__init__.py` parents. Unique paths report
+`python-absolute-module-candidate`; conflicting paths remain ambiguous without
+root priority, and absent candidates remain external. This is a filename policy,
+not Python runtime binding or imported-member resolution.
 These are lexical relationships with `compiler_resolved: false` and
 `semantic_complete: false`. They do not inspect a runtime import path, execute
 project code, install dependencies, or fetch external packages.

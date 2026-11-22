@@ -1393,11 +1393,24 @@ source; additional leading dots ascend catalog directories without escaping
 the root. `from . import helper` offers the corresponding `.helper` candidate.
 Its exact specifier evidence is the imported name `helper`; the displayed
 destination combines that name with the statement's relative prefix.
-Multiple possible paths remain ambiguous, with no target chosen. Absolute
-imports such as `import requests` and `from package import value` retain
-readable evidence but do not search `sys.path`, execute package code, or infer
-installed dependencies. A catalog candidate does not establish a Python runtime
-binding. Bare-relative wildcard imports have no guessed target.
+Absolute `import package.worker` and `from package.worker import Tool` consider
+`.py` and `/__init__.py` paths under the catalog root, its conventional `src/`
+directory, and at most one enclosing regular-package root established by
+consecutive catalogued `__init__.py` parents of the importing source. A missing
+marker stops that ancestry walk. Identical roots are deduplicated; multiple
+possible paths remain ambiguous with no priority or target chosen. An absolute
+name with no candidate remains external.
+
+These lookups use catalog metadata only. They do not search `sys.path`, execute
+package code, inspect build configuration, infer namespace-package roots or
+installed dependencies, or resolve imported members to additional modules.
+The native display labels absolute results as **Python source-file candidates**
+and says that runtime import binding is not resolved. Absolute resolution admits
+at most 64 source-directory and destination components, a 1 KiB destination,
+16 KiB candidate paths and 70 catalog lookups, using fixed scratch storage.
+Bare-relative wildcard imports have no guessed target. Live and saved regression
+cases cover exact retained readers, UTF-16 ranges, raw parent names, conflicting
+roots and unavailable captures; executable and native verification remain pending.
 
 C and C++ literal includes participate in both Project and Saved Repository
 Imports. Quoted `#include "header.h"` can open an exact source-relative catalog

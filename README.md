@@ -190,6 +190,15 @@ build configuration are not resolved. See
 [project import navigation](native/macos/README.md#project-import-navigation)
 for the supported layouts and pending independent verification.
 
+**Python absolute imports now navigate project-local candidates.**
+`import package.worker` and `from package.worker import Tool` check conventional
+catalog, `src/` and enclosing regular-package roots in live projects and saved
+archives. Unique candidates open retained source and participate in incoming
+relationships; competing paths stay ambiguous. This finite filename policy
+does not establish Python runtime binding or execute package code. See
+[project import navigation](native/macos/README.md#project-import-navigation)
+for limits. Executable and native verification remain pending.
+
 **City uses the same map.** Its buildings retain the current file footprints and IDs;
 height is a bounded logarithmic transform of **observed file bytes**, capped at 1 GiB,
 with explicit unknown and partial-catalog counts. Camera movement does not discover

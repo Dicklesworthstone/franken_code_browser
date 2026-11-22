@@ -22,7 +22,7 @@ enum AtlasSavedImportWire {
               w.resolution_domain == "declared-catalog-candidates",
               w.extractor == "franken-markdown-d6fbd1d5/import-statements-v7",
               w.extraction_policy == "rust-use-tree-js-literal-loads-python-cpp-go-java-v7",
-              w.resolver == "fcb-closed-catalog-imports-v7",
+              w.resolver == "fcb-closed-catalog-imports-v8",
               !w.compiler_resolved, !w.semantic_complete else { throw AtlasSavedError.invalidResponse }
     }
 
@@ -86,6 +86,10 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
             return type + (canOpenTarget ? " captured" : " recorded without source bytes")
                 + "; declarations and classpath are not resolved"
         }
+        if resolutionBasis == "python-absolute-module-candidate" {
+            return (canOpenTarget ? "Captured Python source-file candidate" : "Python source-file candidate recorded without source bytes")
+                + "; runtime import binding is not resolved"
+        }
         if resolutionBasis == "go-module-package-file-candidate" {
             let availability = canOpenTarget ? "Captured representative Go package file" : "Representative Go package file has no captured bytes"
             return availability + "; build constraints are not evaluated"
@@ -147,7 +151,7 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
               ["captured", "unavailable", "missing", "ambiguous", "external", "unresolved"].contains(resolution),
               ["exact-relative-path", "unique-relative-module-candidate", "rust-module-file-candidate",
                "rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "ambiguous-rust-crate-root",
-               "python-relative-module-candidate", "cpp-source-relative-include-candidate",
+               "python-relative-module-candidate", "python-absolute-module-candidate", "cpp-source-relative-include-candidate",
                "go-module-package-file-candidate", "go-module-context-unavailable", "go-nested-module-boundary",
                "java-source-file-candidate", "java-enclosing-type-candidate", "unresolved-java-wildcard",
                "unresolved-cpp-include", "unresolved-rust-use", "external-specifier",
@@ -161,12 +165,15 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
         if resolutionBasis == "python-relative-module-candidate" && (language != "python" || kind != "python-from") {
             throw AtlasSavedError.invalidResponse
         }
+        if resolutionBasis == "python-absolute-module-candidate" && (language != "python" || destination.hasPrefix(".")) {
+            throw AtlasSavedError.invalidResponse
+        }
         if ["javascript", "typescript", "jsx", "tsx"].contains(language)
             && !["exact-relative-path", "unique-relative-module-candidate", "external-specifier",
                 "unsupported-specifier", "no-catalog-target", "ambiguous-catalog-target"].contains(resolutionBasis) {
             throw AtlasSavedError.invalidResponse
         }
-        if language == "python" && !["python-relative-module-candidate", "external-specifier",
+        if language == "python" && !["python-relative-module-candidate", "python-absolute-module-candidate", "external-specifier",
             "unsupported-specifier", "no-catalog-target", "ambiguous-catalog-target"].contains(resolutionBasis) {
             throw AtlasSavedError.invalidResponse
         }
@@ -196,7 +203,8 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
         switch resolution {
         case "captured", "unavailable": acceptedBases = ["exact-relative-path", "unique-relative-module-candidate",
             "rust-module-file-candidate", "rust-use-module-file-candidate", "rust-use-module-prefix-candidate",
-            "python-relative-module-candidate", "cpp-source-relative-include-candidate", "go-module-package-file-candidate",
+            "python-relative-module-candidate", "python-absolute-module-candidate",
+            "cpp-source-relative-include-candidate", "go-module-package-file-candidate",
             "java-source-file-candidate", "java-enclosing-type-candidate"]
         case "missing": acceptedBases = ["no-catalog-target"]
         case "ambiguous": acceptedBases = ["ambiguous-catalog-target", "ambiguous-rust-crate-root"]

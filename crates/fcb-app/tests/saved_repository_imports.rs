@@ -273,7 +273,7 @@ fn saved_rust_use_tree_pages_preserve_leaf_identity_and_original_utf16_evidence(
         let result = prepare(&mut saved, 1);
         assert!(result.get("imports_complete").flag());
         assert_eq!(result.get("links_seen").number(), 5);
-        assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v7");
+        assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v8");
         let rows = result.get("links").array();
         for (index, (destination, spelling)) in [
             ("crate::shared", "self"), ("crate::shared::Thing", "Thing"),
@@ -356,7 +356,7 @@ fn shared_language_extractors_publish_exact_occurrences_and_metadata_only_revers
     assert_eq!(result.get("import_generation").number(), 7);
     assert_eq!(result.get("projection").text(), "lexical-source-imports");
     assert_eq!(result.get("evidence_precision").text(), "exact-import-source-range");
-    assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v7");
+    assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v8");
     assert_eq!(result.get("extraction_policy").text(), "rust-use-tree-js-literal-loads-python-cpp-go-java-v7");
     assert_eq!(result.get("completeness_scope").text(), "parsed-source-imports-in-saved-manifest");
     assert!(!result.get("compiler_resolved").flag());
@@ -465,6 +465,86 @@ fn saved_rust_root_and_module_ambiguity_keep_evidence_without_target_authority()
         assert!(incoming.get("links").array().is_empty(), "ambiguous files must not acquire reverse links");
     }
     assert_eq!(reads(&mut saved), before);
+}
+
+#[test]
+fn saved_python_absolute_imports_keep_utf16_evidence_and_raw_package_roots() {
+    let statement = "from project.worker import Task";
+    let target = b"class Task:\n    pass\n";
+    for big in [false, true] {
+        let source = utf16(&format!("# \u{1f40d} archived Python\r\n{statement}\r\n"), big);
+        let f = Fixture::new(&[entry(b"packages/\xff/project/__init__.py", b""),
+            entry(b"packages/\xff/project/main.py", &source),
+            entry(b"packages/\xff/project/worker.py", target)], true);
+        let mut saved = f.open(58070 + u64::from(big) * 10);
+        let page = prepare(&mut saved, 1);
+        assert!(page.get("imports_complete").flag());
+        assert_eq!(page.get("links_seen").number(), 1);
+        let row = link(&page, b"packages/\xff/project/main.py", "project.worker");
+        assert_eq!(row.get("language").text(), "python");
+        assert_eq!(row.get("resolution").text(), "captured");
+        assert_eq!(row.get("resolution_basis").text(), "python-absolute-module-candidate");
+        assert_eq!(range(&source, row.get("evidence_range")), &utf16(statement, big)[2..]);
+        assert_eq!(range(&source, row.get("specifier_range")), &utf16("project.worker", big)[2..]);
+        assert_eq!(row.get("target_path").get("hex").text(), hex(b"packages/\xff/project/worker.py"));
+        let before = reads(&mut saved);
+        let incoming = json(&saved.import_page(1, Some(row.get("target_member").number()),
+            Direction::Incoming, 0, 64, || false).unwrap());
+        assert_eq!(incoming.get("links").array().len(), 1);
+        assert_eq!(&incoming.get("links").array()[0], row);
+        assert_eq!(reads(&mut saved), before);
+        let id = row.get("link_id").number();
+        let (mut evidence, receipt) = saved.open_import_reader(owner(58071 + u64::from(big) * 10),
+            1, id, Side::Evidence, || false).unwrap();
+        assert_eq!(json(&receipt).get("selection"), row.get("evidence_range"));
+        let (mut reader, receipt) = saved.open_import_reader(owner(58072 + u64::from(big) * 10),
+            1, id, Side::Target, || false).unwrap();
+        assert_eq!(json(&receipt).get("source_digest").text(), Sha256::digest(target).to_hex());
+        assert!(!json(&receipt).get("live_source_reopened").flag());
+        saved.clear_imports(2, || false).unwrap(); drop(saved);
+        fs::rename(&f.path, f.root.join("moved-python.fcbs")).unwrap();
+        assert_eq!(copy_all(&mut evidence).get("original_hex").text(), hex(&source));
+        assert_eq!(copy_all(&mut reader).get("original_hex").text(), hex(target));
+        assert!(!f.root.join("packages").exists(), "saved navigation must not materialize live source paths");
+    }
+}
+
+#[test]
+fn saved_python_absolute_candidates_keep_ambiguity_unavailability_and_external_separate() {
+    let source = b"import ambiguous\nimport blocked\nfrom local.worker import Task\nimport external.library\n";
+    let f = Fixture::new(&[entry(b"ambiguous.py", b""),
+        SnapshotEntry { path: b"blocked.py", observed_bytes: 77, data: SnapshotData::Unavailable("READ_DENIED") },
+        entry(b"main.py", source), entry(b"src/ambiguous/__init__.py", b""),
+        entry(b"src/local/worker.py", b"class Task: pass\n")], true);
+    let mut saved = f.open(58090);
+    let page = prepare(&mut saved, 1);
+    assert!(!page.get("imports_complete").flag());
+    assert_eq!(page.get("unavailable_source_members").number(), 1);
+    for (destination, resolution, basis) in [
+        ("ambiguous", "ambiguous", "ambiguous-catalog-target"),
+        ("blocked", "unavailable", "python-absolute-module-candidate"),
+        ("local.worker", "captured", "python-absolute-module-candidate"),
+        ("external.library", "external", "external-specifier"),
+    ] {
+        let row = link(&page, b"main.py", destination);
+        assert_eq!(row.get("resolution").text(), resolution);
+        assert_eq!(row.get("resolution_basis").text(), basis);
+        if resolution == "captured" { continue; }
+        let before = reads(&mut saved);
+        let expected = if resolution == "unavailable" { Error::TargetUnavailable } else { Error::UnresolvedTarget };
+        assert_eq!(saved.open_import_reader(owner(58091), 1, row.get("link_id").number(), Side::Target, || false).err(),
+            Some(expected));
+        assert_eq!(reads(&mut saved), before);
+    }
+    let blocked = link(&page, b"main.py", "blocked");
+    assert_eq!(blocked.get("target_member").number(), 1);
+    let incoming = json(&saved.import_page(1, Some(1), Direction::Incoming, 0, 64, || false).unwrap());
+    assert_eq!(incoming.get("matching_links").number(), 1);
+    assert_eq!(&incoming.get("links").array()[0], blocked);
+    for member in [0, 3] {
+        assert_eq!(json(&saved.import_page(1, Some(member), Direction::Incoming, 0, 64, || false).unwrap())
+            .get("matching_links").number(), 0);
+    }
 }
 
 #[test]

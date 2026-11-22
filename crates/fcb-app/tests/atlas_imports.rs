@@ -92,7 +92,7 @@ fn coverage(page: &Json) {
     assert_eq!(page.get("relationship_kind").text(), "lexical-import");
     assert_eq!(page.get("resolution_domain").text(), "declared-catalog-candidates");
     assert_eq!(page.get("extractor").text(), "franken-markdown-d6fbd1d5/import-statements-v7");
-    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v7");
+    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v8");
     assert_eq!(page.get("extraction_policy").text(), "rust-use-tree-js-literal-loads-python-cpp-go-java-v7");
     assert!(!page.get("compiler_resolved").flag()); assert!(!page.get("semantic_complete").flag());
     assert_eq!(page.get("source_files").number(), page.get("captured_source_files").number()
@@ -785,6 +785,62 @@ fn raw_non_utf8_parent_paths_resolve_only_to_the_exact_captured_catalog_spelling
 
 
 #[test]
+fn python_absolute_imports_navigate_conventional_roots_without_reopening_live_sources() {
+    let source = b"import helper as local\nfrom library.worker import Task\nimport conflict.item\nimport external.library\n";
+    let worker = b"class Task:\n    pass\n";
+    let mut f = Fixture::new(&[
+        ("tools/main.py", source), ("helper.py", b"VALUE = 1\n"), ("src/library/worker.py", worker),
+        ("conflict/item.py", b"VALUE = 2\n"), ("src/conflict/item.py", b"VALUE = 3\n"),
+        ("packages/service/project/__init__.py", b""),
+        ("packages/service/project/main.py", b"import project.worker\n"),
+        ("packages/service/project/worker.py", b"VALUE = 4\n"),
+    ]);
+    f.build(1);
+    let page = f.prepare(1, 1);
+    assert!(page.get("relationships_complete").flag());
+    assert_eq!(page.get("retained_links").number(), 5);
+    for (path, destination, target) in [
+        (b"tools/main.py".as_slice(), "helper", b"helper.py".as_slice()),
+        (b"tools/main.py".as_slice(), "library.worker", b"src/library/worker.py".as_slice()),
+        (b"packages/service/project/main.py".as_slice(), "project.worker",
+            b"packages/service/project/worker.py".as_slice()),
+    ] {
+        let row = link(&page, path, destination);
+        assert_eq!(row.get("resolution").text(), "captured");
+        assert_eq!(row.get("resolution_basis").text(), "python-absolute-module-candidate");
+        assert_eq!(row.get("target_path").get("hex").text(), hex(target));
+        let incoming = f.page(1, Direction::Incoming, Some(target), 0, 64);
+        assert_eq!(incoming.get("matching_links").number(), 1);
+        assert_eq!(&incoming.get("links").array()[0], row);
+    }
+    let row = link(&page, b"tools/main.py", "library.worker");
+    assert_eq!(range(row.get("evidence_range"), source), b"from library.worker import Task");
+    assert_eq!(range(row.get("specifier_range"), source), b"library.worker");
+    for (destination, resolution) in [("conflict.item", "ambiguous"), ("external.library", "external")] {
+        let refused = link(&page, b"tools/main.py", destination);
+        assert_eq!(refused.get("resolution").text(), resolution);
+        assert_eq!(refused.get("target_file_id"), &Json::Null);
+        assert_eq!(f.search.open_import_reader(&f.atlas, owner(72980), 1,
+            refused.get("link_id").number(), Side::Target, || false).err(), Some(Error::ImportTargetUnavailable));
+    }
+    for path in [b"conflict/item.py".as_slice(), b"src/conflict/item.py"] {
+        assert_eq!(f.page(1, Direction::Incoming, Some(path), 0, 64).get("matching_links").number(), 0);
+    }
+    fs::write(f.root.join("tools/main.py"), b"import changed\n").unwrap();
+    fs::write(f.root.join("src/library/worker.py"), b"class Changed: pass\n").unwrap();
+    let id = row.get("link_id").number();
+    let (evidence, receipt) = f.search.open_import_reader(&f.atlas, owner(72981), 1, id, Side::Evidence, || false).unwrap();
+    assert_eq!(json(&receipt).get("relationship"), row);
+    assert_eq!(json(&receipt).get("additional_source_bytes_read").number(), 0);
+    let (target, receipt) = f.search.open_import_reader(&f.atlas, owner(72982), 1, id, Side::Target, || false).unwrap();
+    assert!(!json(&receipt).get("source_reopened").flag());
+    assert_eq!(json(&receipt).get("additional_source_bytes_read").number(), 0);
+    f.search.clear_index(&f.atlas, 2, || false).unwrap();
+    assert_eq!(evidence.capture().bytes(), source);
+    assert_eq!(target.capture().bytes(), worker);
+}
+
+#[test]
 fn python_relative_imports_share_incoming_navigation_and_exact_retained_readers() {
     let source = b"# captured Python source\nfrom .worker import Tool\nfrom . import helper as alias\nimport external.library\nfrom .ambiguous import Value\nfrom ...outside import Nope\n";
     let worker = b"class Tool:\n    pass\n";
@@ -798,7 +854,7 @@ fn python_relative_imports_share_incoming_navigation_and_exact_retained_readers(
     let page = f.prepare(1, 1);
     assert!(page.get("relationships_complete").flag(), "{page:?}");
     assert_eq!(page.get("retained_links").number(), 5);
-    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v7");
+    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v8");
 
     let row = link(&page, b"pkg/main.py", ".worker");
     assert_eq!(row.get("language").text(), "python");

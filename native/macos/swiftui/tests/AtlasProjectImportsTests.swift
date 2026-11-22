@@ -161,8 +161,38 @@ import Foundation
             refuse(bad, index: index)
         }
 
-        // Absolute Python imports keep readable source evidence without
-        // assigning a local module by guessing sys.path or package execution.
+        for kind in ["python-import", "python-from"] {
+            var candidate = value, candidateRows = rows
+            for i in candidateRows.indices {
+                candidateRows[i]["lexical_import_kind"] = kind
+                candidateRows[i]["destination"] = "pkg.worker"
+                candidateRows[i]["resolution_basis"] = "python-absolute-module-candidate"
+                candidateRows[i]["target_path"] = ProjectLinksFixture.path("src/pkg/worker.py")
+            }
+            candidate["links"] = candidateRows
+            let admitted = try decode(candidate, index: index).links[0]
+            precondition(admitted.canOpenTarget && admitted.importEvidence?.kind == kind)
+            precondition(admitted.target?.path.bytes == Array("src/pkg/worker.py".utf8)
+                && admitted.label.contains("runtime import binding is not resolved"))
+            for (key, wrong) in [("language", "rust"), ("lexical_import_kind", "rust-use"),
+                ("destination", ".worker"), ("resolution_basis", "external-specifier")] {
+                var bad = candidate, changed = candidateRows
+                changed[0][key] = wrong; bad["links"] = changed; refuse(bad, index: index)
+            }
+            for resolution in ["external", "missing", "ambiguous", "unresolved"] {
+                var bad = candidate, changed = candidateRows
+                changed[0]["resolution"] = resolution
+                for key in ["target_file_id", "target_path", "target_revision", "target_sha256", "target_bytes"] {
+                    changed[0][key] = NSNull()
+                }
+                bad["links"] = changed; refuse(bad, index: index)
+            }
+            var old = candidate; old["resolver"] = "fcb-closed-catalog-imports-v7"
+            refuse(old, index: index)
+        }
+
+        // Absolute names without a declared catalog candidate retain readable
+        // evidence without granting runtime package or sys.path authority.
         var external = value, externalRows = rows
         for i in externalRows.indices {
             externalRows[i]["lexical_import_kind"] = "python-import"
