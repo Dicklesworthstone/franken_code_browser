@@ -33,6 +33,8 @@ mod file_finder_sessions;
 mod file_finder_ffi;
 mod catalog_stream_sessions;
 mod catalog_stream_ffi;
+mod catalog_structure_sessions;
+mod catalog_structure_ffi;
 mod search_ffi;
 mod snapshot_export_ffi;
 pub use search_ffi::{fcb_search_workspace_cancelable, SearchCancellationCallback};

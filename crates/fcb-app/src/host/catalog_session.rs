@@ -21,6 +21,12 @@ mod content_search;
 pub use content_search::{CatalogContentSearchError, CatalogContentSearchMode, CatalogContentSearchOptions,
     CatalogContentSearchSession, MAX_CATALOG_STREAM_STEPS};
 pub(crate) use content_search::cli::CatalogSearchProgress;
+mod structure_search;
+pub use structure_search::{CatalogStructureSearchError, CatalogStructureSearchMode,
+    CatalogStructureSearchOptions, CatalogStructureSearchSession, MAX_CATALOG_STRUCTURE_HITS,
+    MAX_CATALOG_STRUCTURE_PAGE, MAX_CATALOG_STRUCTURE_STEPS, MAX_CATALOG_STRUCTURE_QUERY_BYTES,
+    MAX_CATALOG_STRUCTURE_SCAN_BYTES, MAX_CATALOG_STRUCTURE_READ_CALLS,
+    MAX_CATALOG_STRUCTURE_RETAINED_SOURCE_BYTES};
 
 use std::{collections::VecDeque, fs, mem::size_of, path::Path};
 use fcb::{ArenaOwnerId, ByteLength, FileId};

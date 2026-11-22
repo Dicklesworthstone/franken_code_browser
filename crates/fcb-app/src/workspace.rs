@@ -319,6 +319,17 @@ pub(crate) struct IoCounts { pub(crate) bytes: u64, pub(crate) calls: u64 }
 pub(crate) fn read_capture(root: &Path, request: CaptureRequest, path: &NormalizedPath, limit: usize,
     total_limit: u64, io: &mut IoCounts, budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool)
     -> Result<CompleteCapture, SourceError> {
+    read_capture_with_call_limit(root, request, path, limit, total_limit, MAX_READ_CALLS,
+        io, budget, allocation(38), canceled)
+}
+
+/// The same exact whole-capture admission with a caller-owned cumulative read
+/// allowance and allocation identity. Exhaustion never substitutes a prefix.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn read_capture_with_call_limit(root: &Path, request: CaptureRequest, path: &NormalizedPath,
+    limit: usize, total_limit: u64, max_read_calls: u64, io: &mut IoCounts,
+    budget: &ResourceBudget, read_allocation: fcb::search::ResourceAllocationId,
+    canceled: &mut impl FnMut() -> bool) -> Result<CompleteCapture, SourceError> {
     if canceled() { return Err(SourceError::Canceled); }
     let native = checked_source_path(root, path)?;
     let (file, metadata) = input::open_regular(&native).map_err(|_| SourceError::CaptureUnavailable)?;
@@ -330,17 +341,21 @@ pub(crate) fn read_capture(root: &Path, request: CaptureRequest, path: &Normaliz
         let range = ByteRange::new(ByteOffset::new(0), ByteOffset::new(metadata.len())).map_err(|_| SourceError::InvalidRange)?;
         read_request = read_request.with_range(range)?;
     }
-    let mut read = reader.begin(read_request, budget, allocation(38)).map_err(|_| SourceError::CaptureUnavailable)?;
+    let mut read = reader.begin(read_request, budget, read_allocation).map_err(|_| SourceError::CaptureUnavailable)?;
     while read.state() == ExtentReadState::Pending {
         if canceled() { return Err(SourceError::Canceled); }
-        if io.calls >= MAX_READ_CALLS { return Err(SourceError::CaptureUnavailable); }
+        if io.calls >= max_read_calls { return Err(SourceError::CaptureUnavailable); }
         let before = read.stats();
-        let status = read.step(ExtentStepBudget { max_bytes: 64 * 1024, max_calls: (MAX_READ_CALLS - io.calls).min(32) as usize }, &mut *canceled);
+        let status = read.step(ExtentStepBudget { max_bytes: 64 * 1024, max_calls: (max_read_calls - io.calls).min(32) as usize }, &mut *canceled);
         let after = read.stats();
         io.bytes += after.bytes_read - before.bytes_read; io.calls += after.read_calls - before.read_calls;
-        status.map_err(|_| if canceled() { SourceError::Canceled } else { SourceError::CaptureUnavailable })?;
+        status.map_err(|error| if error == fcb::search::ExtentError::Canceled || canceled() {
+            SourceError::Canceled
+        } else { SourceError::CaptureUnavailable })?;
     }
-    let extent = read.finish(&mut *canceled).map_err(|_| if canceled() { SourceError::Canceled } else { SourceError::CaptureUnavailable })?;
+    let extent = read.finish(&mut *canceled).map_err(|error| if error == fcb::search::ExtentError::Canceled || canceled() {
+            SourceError::Canceled
+        } else { SourceError::CaptureUnavailable })?;
     if !extent.request_filled() || !extent.covers_whole_observation()
         || extent.final_length() != Some(length) || extent.consistency() != ExtentConsistency::UnchangedMetadata {
         return Err(SourceError::MetadataMismatch);
