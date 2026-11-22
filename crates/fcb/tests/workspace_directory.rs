@@ -32,10 +32,11 @@ fn finish(catalog: &mut WorkspaceCatalog) {
 #[test]
 fn focused_membership_has_a_separate_budget_and_retains_original_root_authority() {
     let root = root();
-    fs::write(root.join("a.rs"), b"x").unwrap();
-    fs::write(root.join("b.rs"), b"x").unwrap();
-    fs::create_dir(root.join("zz-focused")).unwrap();
-    fs::write(root.join("zz-focused/kept.rs"), b"\xff\x00binary").unwrap();
+    let candidates = ["first-focused", "second-focused"];
+    for directory in candidates {
+        fs::create_dir(root.join(directory)).unwrap();
+        fs::write(root.join(directory).join("kept.rs"), b"\xff\x00binary").unwrap();
+    }
     let grant = RootGrant::new(RootId::new(owner(), 1).unwrap(), RawPath::from_path(&root));
     let budget = ResourceBudget::new(owner(), ByteLength::new(256 * 1024 * 1024)).unwrap();
     let limits = WorkspaceLimits { max_files: 1, max_file_bytes: 0, max_source_bytes: 0,
@@ -46,21 +47,27 @@ fn focused_membership_has_a_separate_budget_and_retains_original_root_authority(
     finish(&mut project);
     assert!(!project.discovery_complete());
     assert!(project.directory().is_none());
-    assert!(project.entries().iter().all(|entry|
-        !entry.path().as_bytes().starts_with(b"zz-focused/")));
+    assert_eq!(project.entries().len(), 1);
+    // Native enumeration order is unspecified. Select a folder whose file is
+    // actually absent from the accepted capped catalog, whichever arrived first.
+    let selected = candidates.into_iter().find(|directory| {
+        let path = format!("{directory}/kept.rs");
+        project.entries().iter().all(|entry| entry.path().as_bytes() != path.as_bytes())
+    }).expect("a one-file catalog must omit one of the two candidate folders");
+    let selected_path = format!("{selected}/kept.rs");
 
-    let directory = NormalizedPath::from_dirent_name(b"zz-focused").unwrap();
+    let directory = NormalizedPath::from_dirent_name(selected.as_bytes()).unwrap();
     let mut focused = WorkspaceCatalog::open_rule_aware_in_directory(grant.clone(), directory,
         SearchManifestId::new(owner(), 2).unwrap(), FileId::new(owner(), 100).unwrap(),
         limits, RuleLimits::default(), &budget, [allocation(3), allocation(4)]).unwrap();
     finish(&mut focused);
     assert!(focused.discovery_complete());
-    assert_eq!(focused.directory().unwrap().as_bytes(), b"zz-focused");
+    assert_eq!(focused.directory().unwrap().as_bytes(), selected.as_bytes());
     assert_eq!(focused.grant().root_path(), grant.root_path());
     assert_eq!(focused.grant().root_id(), grant.root_id());
     assert!(std::sync::Arc::ptr_eq(focused.grant().token(), grant.token()));
     assert_eq!(focused.entries().len(), 1);
-    assert_eq!(focused.entries()[0].path().as_bytes(), b"zz-focused/kept.rs");
+    assert_eq!(focused.entries()[0].path().as_bytes(), selected_path.as_bytes());
     assert_eq!(focused.file_id(0).unwrap().get(), 100);
     assert_eq!(focused.limits().max_files, 1);
     assert_eq!(focused.limits().max_source_bytes, 0);

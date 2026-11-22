@@ -5,17 +5,23 @@
 #include <assert.h>
 static char *response;
 static unsigned calls, allocated, freed;
-static uint64_t requested_policy;
+static uint64_t requested_policy, requested_directory_length;
+static uint8_t requested_directory[2048];
 static int cancel_during_call;
 extern void project_fixture_cancel(void *);
 void project_fixture_set(const char *json, int cancel) {
     free(response); response = json ? strdup(json) : NULL;
     calls = allocated = freed = 0; cancel_during_call = cancel;
-    requested_policy = UINT64_MAX;
+    requested_policy = UINT64_MAX; requested_directory_length = 0;
 }
 unsigned project_fixture_count(unsigned kind) { return kind == 0 ? calls : (kind == 1 ? allocated : freed); }
 uint64_t project_fixture_policy(void) { return requested_policy; }
-char *fcb_project_catalog_with_policy_cancelable(const char *root, uint64_t limit, uint64_t policy,
+uint64_t project_fixture_directory_length(void) { return requested_directory_length; }
+uint8_t project_fixture_directory_byte(uint64_t index) {
+    assert(index < requested_directory_length);
+    return requested_directory[index];
+}
+static char *metadata_reply(const char *root, uint64_t limit, uint64_t policy,
         int32_t (*poll)(void *), void *context) {
     ++calls; requested_policy = policy;
     assert(policy <= 1);
@@ -24,6 +30,18 @@ char *fcb_project_catalog_with_policy_cancelable(const char *root, uint64_t limi
     if (cancel_during_call) { project_fixture_cancel(context); assert(poll(context) != 0); }
     if (!response) return NULL;
     ++allocated; return strdup(response);
+}
+char *fcb_project_catalog_with_policy_cancelable(const char *root, uint64_t limit, uint64_t policy,
+        int32_t (*poll)(void *), void *context) {
+    requested_directory_length = 0;
+    return metadata_reply(root, limit, policy, poll, context);
+}
+char *fcb_project_directory_catalog_cancelable(const char *root, const uint8_t *directory,
+        uint64_t directory_len, uint64_t limit, uint64_t policy, int32_t (*poll)(void *), void *context) {
+    assert(directory && directory_len > 0 && directory_len <= sizeof requested_directory);
+    memcpy(requested_directory, directory, (size_t)directory_len);
+    requested_directory_length = directory_len;
+    return metadata_reply(root, limit, policy, poll, context);
 }
 void fcb_free_string(char *p) { if (p) { ++freed; free(p); } }
 // Referenced by the unchanged compatibility/source operations. Calling any

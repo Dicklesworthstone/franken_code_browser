@@ -8,6 +8,18 @@ char *fcb_project_catalog_with_policy_cancelable(const char *root, uint64_t limi
         poll_fn poll, void *context) {
     (void)root; (void)limit; (void)policy; (void)poll; (void)context; return NULL;
 }
+
+// The worker now links the directory route. Viewport-source fixtures must not
+// silently accept metadata discovery as a source read.
+#include <stdint.h>
+#include <assert.h>
+char *fcb_project_directory_catalog_cancelable(const char *root, const uint8_t *directory,
+        uint64_t directory_len, uint64_t max_files, uint64_t policy, int32_t (*poll)(void *), void *context) {
+    (void)root; (void)directory; (void)directory_len; (void)max_files; (void)policy; (void)poll; (void)context;
+    assert(0 && "directory catalog used during viewport source test");
+    return 0;
+}
+
 char *fcb_atlas_layout_cancelable(const char *root, poll_fn poll, void *context) {
     (void)root; (void)poll; (void)context; return NULL;
 }

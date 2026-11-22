@@ -16,6 +16,7 @@ struct AtlasProjectOpening {
     private var progressiveReady = false
     private(set) var projectID = UUID()
     private(set) var catalog: AtlasProjectCatalog?
+    private(set) var catalogRevision = UUID()
     private(set) var hasAtlas = false
 
     var isDiscovering: Bool { phase == .discovering }
@@ -47,6 +48,7 @@ struct AtlasProjectOpening {
     @discardableResult mutating func acceptCatalog(_ report: AtlasProjectCatalog, for ticket: Ticket) -> Bool {
         guard accepts(ticket), phase == .discovering else { return false }
         catalog = report
+        catalogRevision = UUID()
         hasOpenableFiles = report.entries.contains { $0.sourcePath != nil }
         active = nil; phase = .ready
         return true
@@ -59,7 +61,8 @@ struct AtlasProjectOpening {
     }
     @discardableResult mutating func acceptPreviewCatalog(_ report: AtlasProjectCatalog, for ticket: Ticket) -> Bool {
         guard accepts(ticket), phase == .preparing, progressiveReady, !hasAtlas else { return false }
-        catalog = report; hasOpenableFiles = report.entries.contains { $0.sourcePath != nil }
+        catalog = report; catalogRevision = UUID()
+        hasOpenableFiles = report.entries.contains { $0.sourcePath != nil }
         return true
     }
     @discardableResult mutating func finishPreviews(_ ticket: Ticket, available: Bool) -> Bool {
@@ -75,6 +78,21 @@ struct AtlasProjectOpening {
         in project: UUID, hasOpenableFiles: Bool) -> Bool {
         guard projectID == project, phase == .ready, progressiveReady, !hasAtlas else { return false }
         catalog = report
+        catalogRevision = UUID()
+        self.hasOpenableFiles = hasOpenableFiles
+        hasAtlas = true
+        return true
+    }
+    /// Prepare a same-project directory transaction on a copy of this value.
+    /// The host publishes that copy only after the matching layout is admitted.
+    /// A failed or canceled candidate leaves the accepted catalog and its row
+    /// identities intact; replacing the catalog never replaces the root grant.
+    @discardableResult mutating func replaceAtlasCatalog(_ report: AtlasProjectCatalog,
+        in project: UUID, replacing expected: UUID, hasOpenableFiles: Bool) -> Bool {
+        guard projectID == project, catalogRevision == expected, phase == .ready,
+              canBrowse else { return false }
+        catalog = report
+        catalogRevision = UUID()
         self.hasOpenableFiles = hasOpenableFiles
         hasAtlas = true
         return true
@@ -90,14 +108,14 @@ struct AtlasProjectOpening {
     }
     mutating func close() {
         projectID = UUID()
-        active = nil; phase = .idle; catalog = nil
+        active = nil; phase = .idle; catalog = nil; catalogRevision = UUID()
         hasAtlas = false; hasOpenableFiles = false; progressiveReady = false
     }
     /// Resolve the selected member of this exact catalog, never the same row
     /// number in a replacement project. Non-UTF-8 members remain known entries;
     /// callers must still require sourcePath before using the UTF-8 opener.
-    func file(_ id: UInt64, in project: UUID) -> AtlasProjectCatalog.Entry? {
-        guard project == projectID else { return nil }
+    func file(_ id: UInt64, in project: UUID, catalogRevision expected: UUID? = nil) -> AtlasProjectCatalog.Entry? {
+        guard project == projectID, expected.map({ $0 == catalogRevision }) ?? true else { return nil }
         return catalog?.entries.first { $0.id == id }
     }
 }

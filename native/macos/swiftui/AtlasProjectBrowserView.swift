@@ -17,6 +17,8 @@ import SwiftUI
     var searchProject: ((AtlasReaderSelectionQuery) -> Void)? = nil
     var canChangeDiscoveryPolicy = true
     var changeDiscoveryPolicy: ((AtlasDiscoveryPolicy) -> Void)? = nil
+    var canFocusDirectory = false
+    var focusDirectory: ((AtlasProjectBrowserFile, AtlasProjectBrowserPage) throws -> Void)? = nil
     @State private var capture: AtlasProjectBrowserCapture?
     @State private var readerTask: Task<Void, Never>?
     @State private var readerNotice = ""
@@ -104,6 +106,12 @@ import SwiftUI
                                     .disabled(!canReadRanges || !model.canOperate || readerTask != nil)
                                     .accessibilityLabel("Read current ranges of " + file.display)
                                     .help("Open bounded observations of this current project file, including files larger than 32 MiB")
+                            }.contextMenu {
+                                if focusDirectory != nil {
+                                    Button("Focus containing folder") { focus(file, from: page) }
+                                        .disabled(!canFocusDirectory || !model.canOperate || readerTask != nil)
+                                        .help("Focus the text atlas on this file's containing folder.")
+                                }
                             }
                         }.listStyle(.inset).id("\(info.owner):\(page.id)")
                     }
@@ -155,6 +163,16 @@ import SwiftUI
             // in-flight open cannot be transferred to the replacement catalog.
             readerTask?.cancel()
             readerNotice = ""
+        }
+    }
+    private func focus(_ file: AtlasProjectBrowserFile, from page: AtlasProjectBrowserPage) {
+        guard canFocusDirectory, readerTask == nil, let focusDirectory else { return }
+        do {
+            try focusDirectory(file, page)
+            readerNotice = "Preparing the containing folder's atlas."
+        } catch {
+            readerNotice = (error as? AtlasProjectBrowserError)?.message
+                ?? "This folder cannot be focused. Choose a current file page or a shallower folder."
         }
     }
     private func observe(_ file: AtlasProjectBrowserFile, from page: AtlasProjectBrowserPage) {

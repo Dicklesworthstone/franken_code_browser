@@ -19,25 +19,37 @@ fn file(root: &Path, name: impl AsRef<Path>, bytes: &[u8]) {
 #[test]
 fn a_folder_beyond_the_root_catalog_cap_gets_its_own_complete_atlas() {
     let root = root();
-    file(&root, "a.rs", b"x"); file(&root, "b.rs", b"x");
-    file(&root, "zz-focused/kept.rs", b"SOURCE_PAYLOAD_MUST_NOT_APPEAR");
+    let candidates = ["first-focused", "second-focused"];
+    for directory in candidates {
+        file(&root, format!("{directory}/kept.rs"), b"SOURCE_PAYLOAD_MUST_NOT_APPEAR");
+    }
     let initial = prepare(&root, 1, || false).unwrap();
     assert!(initial.as_str().contains("\"discovery_complete\":false"));
-    assert!(!initial.as_str().contains("\"display\":\"zz-focused/kept.rs\""));
-    let focused = prepare_directory(&root, b"zz-focused", 1,
+    assert!(initial.as_str().contains("\"catalogued_files\":\"1\""));
+    // Discover the omitted candidate from the response instead of assuming a
+    // particular read_dir order on this filesystem.
+    let selected = candidates.into_iter().find(|directory| {
+        let path = format!("\"display\":\"{directory}/kept.rs\"");
+        !initial.as_str().contains(path.as_str())
+    }).expect("a one-file catalog must omit one of the two candidate folders");
+    let focused = prepare_directory(&root, selected.as_bytes(), 1,
         CatalogDiscoveryPolicy::RepositoryRules, || false).unwrap();
     let text = focused.as_str();
     assert!(text.contains("\"schema\":\"fcb.project-directory-catalog/1\""));
     assert!(text.contains("\"command\":\"directory-catalog\""));
     assert!(text.contains("\"directory\":{\"encoding\":\"unix-bytes\""));
-    assert!(text.contains("\"display\":\"zz-focused\""));
+    assert!(text.contains(format!("\"display\":\"{selected}\"").as_str()));
     assert!(text.contains("\"path_basis\":\"project-root\""));
-    assert!(text.contains("\"display\":\"zz-focused/kept.rs\""));
+    assert!(text.contains(format!("\"display\":\"{selected}/kept.rs\"").as_str()));
     assert!(text.contains("\"catalogued_files\":\"1\""));
     assert!(text.contains("\"discovery_complete\":true"));
     assert!(text.contains("\"payload_bytes_read\":\"0\",\"read_calls\":\"0\""));
     assert!(!text.contains("SOURCE_PAYLOAD_MUST_NOT_APPEAR"));
-    assert!(!text.contains("\"display\":\"a.rs\""));
+    for directory in candidates {
+        if directory != selected {
+            assert!(!text.contains(format!("\"display\":\"{directory}/kept.rs\"").as_str()));
+        }
+    }
 }
 
 #[test]

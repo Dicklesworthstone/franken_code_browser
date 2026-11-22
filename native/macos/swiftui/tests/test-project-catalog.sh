@@ -33,6 +33,9 @@ clang -std=gnu11 -Wall -Wextra -Werror -c "$src/tests/AtlasProjectCatalogFixture
 swiftc -swift-version 6 -warnings-as-errors "$out/Support.swift" "$src/AtlasProjectCatalog.swift" \
     "$src/AtlasProjectWorker.swift" "$src/tests/AtlasProjectCatalogBridgeTests.swift" "$out/fixture.o" -o "$out/bridge"
 "$out/bridge"
+swiftc -swift-version 6 -warnings-as-errors "$out/Support.swift" "$src/AtlasProjectCatalog.swift" \
+    "$src/AtlasProjectWorker.swift" "$src/tests/AtlasDirectoryCatalogBridgeTests.swift" "$out/fixture.o" -o "$out/directory-bridge"
+"$out/directory-bridge"
 printf 'Retained test artifacts: %s\n' "$out"
 python3 - "$src" "$out/Context.swift" <<'PY'
 from pathlib import Path
@@ -47,6 +50,9 @@ PY
 swiftc -swift-version 6 -warnings-as-errors "$out/Context.swift" "$src/AtlasProjectCatalog.swift" \
     "$src/AtlasProjectOpening.swift" "$src/tests/AtlasProjectOpeningTests.swift" -o "$out/opening"
 "$out/opening"
+swiftc -swift-version 6 -warnings-as-errors "$out/Context.swift" "$src/AtlasProjectCatalog.swift" \
+    "$src/AtlasProjectOpening.swift" "$src/tests/AtlasDirectoryFocusTests.swift" -o "$out/directory-focus"
+"$out/directory-focus"
 set --
 if [ "$(uname -s)" = Linux ]; then set -- -static-stdlib; fi
 swiftc "$@" -swift-version 6 -warnings-as-errors \
