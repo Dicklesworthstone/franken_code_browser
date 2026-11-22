@@ -2,6 +2,26 @@ import Foundation
 import CoreGraphics
 import Observation
 
+/// A camera location relative to one accepted file parcel. The owner keeps the
+/// original root-relative file path separately and resolves new parcel geometry
+/// before restoring. Zoom is relative to fitting that parcel in the viewport;
+/// no obsolete layout coordinates or screen dimensions survive a folder change.
+struct AtlasParcelCameraAnchor: Equatable, Sendable {
+    let relativeX: Double
+    let relativeY: Double
+    let zoomFactor: Double
+
+    init?(relativeX: Double, relativeY: Double, zoomFactor: Double) {
+        // The nearest parcel can be outside the viewport center, so relative
+        // coordinates are not restricted to its interior. Bound the ratios to
+        // keep even a corrupt or degenerate parcel from retaining huge values.
+        guard relativeX.isFinite, relativeY.isFinite, zoomFactor.isFinite,
+              abs(relativeX) <= 1_000_000, abs(relativeY) <= 1_000_000,
+              (0.000001...1_000_000).contains(zoomFactor) else { return nil }
+        self.relativeX = relativeX; self.relativeY = relativeY; self.zoomFactor = zoomFactor
+    }
+}
+
 /// Main-thread presentation receipt, deliberately not observable: accepting a
 /// frame must not schedule another SwiftUI render. Input targets visible pixels.
 final class AtlasPresentedFrame {
@@ -38,6 +58,16 @@ final class AtlasPresentedFrame {
     }
     private var navigationRevision: UUID?
     private var navigationHistory = AtlasNavigationHistory<Location>()
+    private enum PresentationDestination {
+        case parcel(AtlasParcelCameraAnchor, CGRect)
+        case overview(CGRect)
+    }
+    private struct PresentationRestore {
+        let revision: UUID
+        let destination: PresentationDestination
+    }
+    private var pendingPresentationRestore: PresentationRestore?
+    private var presentationRevision: UUID?
     var scale: Double = 0.2
     var offsetX: Double = 0
     var offsetY: Double = 0
@@ -73,12 +103,129 @@ final class AtlasPresentedFrame {
     /// old view's queued button action cannot navigate the replacement atlas.
     func bindNavigation(to revision: UUID, preservingHistory: Bool = false) {
         guard navigationRevision != revision else { return }
+        let preservesPresentation = preservingHistory && navigationRevision != nil && presentationRevision == navigationRevision
         stopMotion()
+        pendingPresentationRestore = nil
         isDragging = false
         lastTranslation = .zero
         lastDragTime = nil
         navigationRevision = revision
+        presentationRevision = preservesPresentation ? revision : nil
         if !preservingHistory { navigationHistory.reset() }
+    }
+
+    /// Use the same intended endpoint as an anchor snapshot when choosing its
+    /// semantic parcel. An unpresented replacement layout has no old pose to save.
+    func presentationCenter(revision: UUID) -> CGPoint? {
+        guard navigationRevision == revision else { return nil }
+        if let pending = pendingPresentationRestore, pending.revision == revision {
+            switch pending.destination {
+            case let .parcel(anchor, bounds): return Self.anchorCenter(anchor, bounds: bounds)
+            case let .overview(bounds): return CGPoint(x: bounds.midX, y: bounds.midY)
+            }
+        }
+        guard presentationRevision == revision else { return nil }
+        return navigationLocation(viewport: viewportSize)?.center
+    }
+
+    /// Only a not-yet-consumed restore may keep its original semantic parcel.
+    /// Ordinary panning snapshots should choose the parcel now under the center.
+    func pendingPresentationAnchor(relativeTo bounds: CGRect, revision: UUID) -> AtlasParcelCameraAnchor? {
+        guard navigationRevision == revision, let pending = pendingPresentationRestore, pending.revision == revision,
+              case let .parcel(anchor, restoredBounds) = pending.destination, restoredBounds == bounds else { return nil }
+        return anchor
+    }
+
+    func presentationAnchor(relativeTo bounds: CGRect, revision: UUID) -> AtlasParcelCameraAnchor? {
+        guard navigationRevision == revision, Self.validPresentationBounds(bounds) else { return nil }
+        if let anchor = pendingPresentationAnchor(relativeTo: bounds, revision: revision) { return anchor }
+        guard presentationRevision == revision,
+              let location = navigationLocation(viewport: viewportSize) else { return nil }
+        let fitScale = min(viewportSize.width / bounds.width, viewportSize.height / bounds.height)
+        guard fitScale.isFinite, fitScale > 0 else { return nil }
+        return AtlasParcelCameraAnchor(relativeX: (location.center.x - bounds.minX) / bounds.width,
+            relativeY: (location.center.y - bounds.minY) / bounds.height,
+            zoomFactor: location.scale / fitScale)
+    }
+
+    /// Restore immediately when possible and retain one geometry-qualified
+    /// intent for the replacement view's first usable viewport. Hidden atlases
+    /// can stage this without I/O or borrowing another layout's coordinates.
+    @discardableResult
+    func restorePresentationAnchor(_ anchor: AtlasParcelCameraAnchor, relativeTo bounds: CGRect,
+        revision: UUID) -> Bool {
+        guard navigationRevision == revision, Self.anchorCenter(anchor, bounds: bounds) != nil else { return false }
+        return stagePresentationRestore(PresentationRestore(revision: revision, destination: .parcel(anchor, bounds)))
+    }
+
+    @discardableResult
+    func restorePresentationFit(revision: UUID) -> Bool {
+        guard navigationRevision == revision, Self.validPresentationBounds(contentBounds) else { return false }
+        return stagePresentationRestore(PresentationRestore(revision: revision, destination: .overview(contentBounds)))
+    }
+
+    private func stagePresentationRestore(_ restore: PresentationRestore) -> Bool {
+        if Self.validViewport(viewportSize) {
+            guard applyPresentationRestore(restore, viewport: viewportSize) else { return false }
+        } else {
+            stopMotion()
+            isDragging = false
+            lastTranslation = .zero
+            lastDragTime = nil
+        }
+        pendingPresentationRestore = restore
+        return true
+    }
+
+    private func applyPresentationRestore(_ restore: PresentationRestore, viewport: CGSize) -> Bool {
+        guard navigationRevision == restore.revision, Self.validViewport(viewport) else { return false }
+        switch restore.destination {
+        case let .overview(bounds):
+            return fit(bounds: bounds, viewport: viewport)
+        case let .parcel(anchor, bounds):
+            guard var center = Self.anchorCenter(anchor, bounds: bounds) else { return false }
+            let fitScale = min(viewport.width / bounds.width, viewport.height / bounds.height)
+            let requestedScale = fitScale * anchor.zoomFactor
+            guard fitScale.isFinite, fitScale > 0, requestedScale.isFinite, requestedScale > 0 else { return false }
+            let restoredScale = max(minimumScale(viewport: viewport), min(4096, requestedScale))
+            if fillsViewport {
+                guard Self.validPresentationBounds(contentBounds) else { return false }
+                let halfWidth = viewport.width / (2 * restoredScale), halfHeight = viewport.height / (2 * restoredScale)
+                center = CGPoint(
+                    x: min(contentBounds.maxX - halfWidth, max(contentBounds.minX + halfWidth, center.x)),
+                    y: min(contentBounds.maxY - halfHeight, max(contentBounds.minY + halfHeight, center.y)))
+            }
+            let x = viewport.width / 2 - center.x * restoredScale
+            let y = viewport.height / 2 - center.y * restoredScale
+            guard restoredScale.isFinite, center.x.isFinite, center.y.isFinite, x.isFinite, y.isFinite else { return false }
+            stopMotion()
+            isDragging = false
+            lastTranslation = .zero
+            lastDragTime = nil
+            viewportSize = viewport
+            scale = restoredScale; targetScale = restoredScale
+            offsetX = x; offsetY = y
+            presentationRevision = restore.revision
+            constrainToContent()
+            return true
+        }
+    }
+
+    private static func validViewport(_ viewport: CGSize) -> Bool {
+        viewport.width.isFinite && viewport.height.isFinite && viewport.width > 1 && viewport.height > 1
+    }
+
+    private static func validPresentationBounds(_ bounds: CGRect) -> Bool {
+        bounds.minX.isFinite && bounds.minY.isFinite && bounds.width.isFinite && bounds.height.isFinite
+            && bounds.maxX.isFinite && bounds.maxY.isFinite && bounds.midX.isFinite && bounds.midY.isFinite
+            && bounds.width > 0 && bounds.height > 0
+    }
+
+    private static func anchorCenter(_ anchor: AtlasParcelCameraAnchor, bounds: CGRect) -> CGPoint? {
+        guard validPresentationBounds(bounds) else { return nil }
+        let center = CGPoint(x: bounds.minX + anchor.relativeX * bounds.width,
+            y: bounds.minY + anchor.relativeY * bounds.height)
+        return center.x.isFinite && center.y.isFinite ? center : nil
     }
 
     /// Refresh preserves the coordinate frame. Show added files can focus the
@@ -161,10 +308,12 @@ final class AtlasPresentedFrame {
         navigationHistory.replaceCurrent(origin)
         guard let move = back ? navigationHistory.back() : navigationHistory.forward(),
               navigationHistory.commit(move, resolved: destination) else { return false }
+        pendingPresentationRestore = nil
         stopMotion()
         viewportSize = viewport
         targetScale = destination.scale
         focusCenter = destination.center
+        presentationRevision = revision
         if reducedMotion {
             scale = targetScale
             offsetX = viewport.width / 2 - destination.center.x * scale
@@ -196,6 +345,7 @@ final class AtlasPresentedFrame {
         let x = viewport.width / 2 - bounds.midX * fittedScale
         let y = viewport.height / 2 - bounds.midY * fittedScale
         guard fittedScale.isFinite, x.isFinite, y.isFinite else { return false }
+        pendingPresentationRestore = nil
         stopMotion()
         contentBounds = bounds
         viewportSize = viewport
@@ -203,6 +353,7 @@ final class AtlasPresentedFrame {
         targetScale = scale
         offsetX = x
         offsetY = y
+        presentationRevision = navigationRevision
         return true
     }
 
@@ -228,10 +379,12 @@ final class AtlasPresentedFrame {
         guard fittedScale.isFinite, destination.x.isFinite, destination.y.isFinite,
               (viewport.width / 2 - destination.x * fittedScale).isFinite,
               (viewport.height / 2 - destination.y * fittedScale).isFinite else { return false }
+        pendingPresentationRestore = nil
         stopMotion()
         viewportSize = viewport
         targetScale = fittedScale
         focusCenter = destination
+        presentationRevision = navigationRevision
         if reducedMotion {
             scale = targetScale
             offsetX = viewport.width / 2 - destination.x * scale
@@ -254,6 +407,10 @@ final class AtlasPresentedFrame {
     func updateViewport(_ size: CGSize) {
         guard size.width > 1, size.height > 1, size.width.isFinite, size.height.isFinite else { return }
         viewportSize = size
+        if let restore = pendingPresentationRestore {
+            pendingPresentationRestore = nil
+            _ = applyPresentationRestore(restore, viewport: size)
+        }
         guard fillsViewport else { return }
         targetScale = max(targetScale, minimumScale)
         if scale < minimumScale {
@@ -311,6 +468,7 @@ final class AtlasPresentedFrame {
 
     func steerZoom(by factor: Double, at point: CGPoint, immediate: Bool = false) {
         guard factor.isFinite, factor > 0, point.x.isFinite, point.y.isFinite else { return }
+        pendingPresentationRestore = nil
         if focusCenter != nil { stopMotion() }
         panVelocity = .zero
         anchorScreen = point
@@ -336,6 +494,7 @@ final class AtlasPresentedFrame {
     /// translation is cumulative from the gesture origin, never a location.
     func drag(translation: CGSize, now: Double) {
         guard translation.width.isFinite, translation.height.isFinite, now.isFinite else { return }
+        pendingPresentationRestore = nil
         // A keyboard history action can begin while a mouse button remains
         // down. Its next delta resumes that drag and cancels the flight.
         if focusCenter != nil || anchorActive { stopMotion() }
@@ -377,6 +536,7 @@ final class AtlasPresentedFrame {
     /// AppKit already supplies decaying momentum-phase deltas. Never add glide.
     func scroll(dx: Double, dy: Double) {
         guard dx.isFinite, dy.isFinite else { return }
+        pendingPresentationRestore = nil
         stopMotion()
         offsetX += dx
         offsetY += dy

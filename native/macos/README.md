@@ -87,6 +87,44 @@ with live/fork/retained-only capability checks in the existing reader fixtures.
 They are code-first additions pending strict-RCH execution. Actual application
 launching and sandboxed macOS handoff still require native qualification.
 
+## Returning to atlas folders
+
+The **Atlas folder** bar now has **Folder Back** and **Folder Forward**
+(**⇧⌘[** and **⇧⌘]**). These return through accepted folder and file-filter
+changes, including the camera position where you left each map. **Up one
+folder**, **Whole project**, and **Focus selected folder** enter the same
+history. The existing **Atlas Back/Forward** controls still navigate camera
+locations within one map.
+
+Use **Landmarks → Save current view…** to name a folder, its file filter and
+its map position. The menu can keep up to **32 landmarks in this window**;
+choose a name to return, or use **Remove landmark** to remove it. Landmarks
+and folder history last for this project session. Closing or replacing the
+project, replacing its access grant, or successfully changing its discovery
+policy clears them. A same-policy project refresh preserves them. They are
+not saved across application launches and do not grant access to a stored path.
+
+A return prepares its bounded folder catalog and layout under the original
+project root. The current map, Back/Forward routes and independent source
+readers stay available if preparation fails or is canceled. Filters are
+published with the accepted destination; editing a filter while a return is
+pending prevents the older request from overwriting that edit.
+
+Camera positions are relative to a raw-path file parcel and the viewport,
+so a return can resolve the parcel in a newly built layout. A missing parcel
+falls back to the folder overview with an explicit notice; it never opens a
+different source or treats a current pathname as an old exact capture. Project
+Files stays open if it owns a reader. Choose **Show text atlas** to see the
+accepted destination; deferred camera restoration waits for usable geometry.
+
+History retains at most 128 previous/forward destinations and no catalog or
+source payloads. This implements explicit semantic return navigation and
+session landmarks. Automatic precision-triggered focus islands and durable
+workspace restoration remain separate work. The production regression sources
+are in `AtlasFolderNavigationTests.swift` and `AtlasCameraTests.swift`, with
+`test_swiftui_folder_navigation.sh` and `test_swiftui_camera.sh` entry points.
+Independent executable and physical-Mac verification remain pending.
+
 ## City view
 
 After preparing a text atlas, choose **City** in the toolbar. The City uses the

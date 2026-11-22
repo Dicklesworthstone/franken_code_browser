@@ -7,7 +7,126 @@ import CoreGraphics
         precondition(abs(a - b) <= tolerance, "\(message): \(a) != \(b)")
         count += 1
     }
+    static func semanticFolderPlaces() {
+        let revision = UUID(), replacement = UUID()
+        let viewport = CGSize(width: 800, height: 600)
+        let parcel = CGRect(x: 100, y: 200, width: 100, height: 200)
+        let camera = AtlasCamera()
+        camera.bindNavigation(to: revision)
+        precondition(camera.presentationCenter(revision: revision) == nil,
+            "a replacement layout cannot snapshot the preceding layout's coordinates")
+        precondition(camera.fit(bounds: parcel, viewport: viewport))
+        camera.scale = 3
+        camera.offsetX = 400 - 125 * 3
+        camera.offsetY = 300 - 260 * 3
+        let saved = camera.presentationAnchor(relativeTo: parcel, revision: revision)!
+        precondition(camera.pendingPresentationAnchor(relativeTo: parcel, revision: revision) == nil,
+            "ordinary explored poses do not keep a stale preferred file anchor")
+        near(saved.relativeX, 0.25, "semantic parcel x")
+        near(saved.relativeY, 0.3, "semantic parcel y")
+        near(saved.zoomFactor, 1, "zoom relative to fitting original parcel")
+        precondition(camera.presentationAnchor(relativeTo: parcel, revision: replacement) == nil)
+        camera.bindNavigation(to: replacement)
+        precondition(camera.presentationCenter(revision: replacement) == nil)
+        let reflowed = CGRect(x: 1000, y: 1000, width: 200, height: 400)
+        precondition(camera.restorePresentationAnchor(saved, relativeTo: reflowed, revision: replacement))
+        let larger = CGSize(width: 1200, height: 800)
+        camera.updateViewport(larger)
+        near(camera.scale, 2, "restored zoom uses replacement parcel and current viewport")
+        near(camera.worldPoint(at: CGPoint(x: 600, y: 400)).x, 1050, "reflowed semantic center x")
+        near(camera.worldPoint(at: CGPoint(x: 600, y: 400)).y, 1120, "reflowed semantic center y")
+        let roundTrip = camera.presentationAnchor(relativeTo: reflowed, revision: replacement)!
+        near(roundTrip.relativeX, saved.relativeX, "reflow round-trip x")
+        near(roundTrip.relativeY, saved.relativeY, "reflow round-trip y")
+        near(roundTrip.zoomFactor, saved.zoomFactor, "reflow round-trip zoom")
+        precondition(camera.retainedNavigationCount == 0,
+            "cross-folder restoration does not manufacture camera history in an unrelated coordinate frame")
+
+        let hidden = AtlasCamera(), hiddenRevision = UUID(), refreshedRevision = UUID()
+        hidden.bindNavigation(to: hiddenRevision)
+        precondition(hidden.restorePresentationAnchor(saved, relativeTo: reflowed, revision: hiddenRevision),
+            "a hidden atlas can stage a validated semantic place")
+        near(hidden.scale, 0.2, "staging without geometry does not apply a fictitious viewport")
+        near(hidden.presentationCenter(revision: hiddenRevision)!.x, 1050, "pending place has a semantic center")
+        precondition(hidden.presentationAnchor(relativeTo: reflowed, revision: hiddenRevision) == saved)
+        precondition(hidden.pendingPresentationAnchor(relativeTo: reflowed, revision: hiddenRevision) == saved,
+            "hidden pending intent identifies its exact preferred parcel")
+        hidden.updateViewport(CGSize(width: Double.nan, height: 600))
+        near(hidden.scale, 0.2, "invalid geometry does not consume pending restoration")
+        hidden.bindNavigation(to: refreshedRevision, preservingHistory: true)
+        precondition(hidden.presentationCenter(revision: refreshedRevision) == nil,
+            "even a same-root refresh cannot silently reuse unverified pending parcel geometry")
+        hidden.updateViewport(larger)
+        near(hidden.scale, 0.2, "old revision cannot apply its pending place after rebinding")
+        precondition(!hidden.restorePresentationAnchor(saved, relativeTo: reflowed, revision: hiddenRevision))
+        precondition(hidden.restorePresentationAnchor(saved, relativeTo: reflowed, revision: refreshedRevision),
+            "the owner can resolve the raw path in the accepted refreshed layout and reissue its place")
+        hidden.updateViewport(larger)
+        near(hidden.scale, 2, "requalified hidden place restores")
+        near(hidden.worldPoint(at: CGPoint(x: 600, y: 400)).y, 1120, "requalified hidden center")
+
+        let deferred = AtlasCamera(), deferredRevision = UUID()
+        deferred.bindNavigation(to: deferredRevision)
+        precondition(deferred.restorePresentationAnchor(saved, relativeTo: reflowed, revision: deferredRevision))
+        deferred.updateViewport(viewport)
+        near(deferred.scale, 1.5, "first usable geometry applies deferred anchor")
+        precondition(deferred.pendingPresentationAnchor(relativeTo: reflowed, revision: deferredRevision) == nil,
+            "consumed restoration cannot override a later nearest-parcel snapshot")
+        near(deferred.worldPoint(at: CGPoint(x: 400, y: 300)).x, 1050, "deferred anchor center")
+        deferred.scroll(dx: 17, dy: 23)
+        let movedX = deferred.offsetX, movedY = deferred.offsetY
+        deferred.updateViewport(larger)
+        near(deferred.offsetX, movedX, "resizing cannot replay an already consumed place over a manual pan")
+        near(deferred.offsetY, movedY, "manual pan survives later geometry")
+
+        let interrupted = AtlasCamera(), interruptedRevision = UUID()
+        interrupted.bindNavigation(to: interruptedRevision)
+        precondition(interrupted.restorePresentationAnchor(saved, relativeTo: reflowed, revision: interruptedRevision))
+        interrupted.scroll(dx: 7, dy: 9)
+        interrupted.updateViewport(viewport)
+        near(interrupted.offsetX, 7, "direct input cancels a not-yet-presented anchor")
+        near(interrupted.offsetY, 9, "canceled pending anchor cannot take over later")
+
+        let overview = AtlasCamera(), overviewRevision = UUID()
+        overview.contentBounds = CGRect(x: 100, y: 200, width: 1600, height: 1200)
+        overview.bindNavigation(to: overviewRevision)
+        precondition(overview.restorePresentationFit(revision: overviewRevision))
+        near(overview.scale, 0.2, "hidden overview waits for geometry")
+        overview.updateViewport(viewport)
+        near(overview.scale, 0.48, "missing-file fallback fits the accepted directory")
+        near(overview.worldPoint(at: CGPoint(x: 400, y: 300)).x, 900, "overview center x")
+        near(overview.worldPoint(at: CGPoint(x: 400, y: 300)).y, 800, "overview center y")
+        precondition(!overview.restorePresentationFit(revision: UUID()), "stale overview is refused")
+        overview.contentBounds = .zero
+        precondition(!overview.restorePresentationFit(revision: overviewRevision), "empty geometry cannot stage a fit")
+
+        let dense = AtlasCamera(), denseRevision = UUID()
+        dense.fillsViewport = true
+        dense.contentBounds = CGRect(x: 0, y: 0, width: 1000, height: 1000)
+        dense.bindNavigation(to: denseRevision)
+        dense.updateViewport(viewport)
+        let distant = AtlasParcelCameraAnchor(relativeX: -2, relativeY: 3, zoomFactor: 0.000001)!
+        precondition(dense.restorePresentationAnchor(distant, relativeTo: parcel, revision: denseRevision))
+        near(dense.scale, 0.8, "restored dense view still covers the viewport")
+        precondition(dense.offsetX <= 0 && dense.offsetX + 1000 * dense.scale >= 800)
+        precondition(dense.offsetY <= 0 && dense.offsetY + 1000 * dense.scale >= 600)
+        let priorScale = dense.scale, priorX = dense.offsetX, priorY = dense.offsetY
+        precondition(!dense.restorePresentationAnchor(saved, relativeTo: .zero, revision: denseRevision))
+        precondition(!dense.restorePresentationAnchor(saved,
+            relativeTo: CGRect(x: Double.infinity, y: 0, width: 1, height: 1), revision: denseRevision))
+        near(dense.scale, priorScale, "invalid parcel does not change scale")
+        near(dense.offsetX, priorX, "invalid parcel does not change x")
+        near(dense.offsetY, priorY, "invalid parcel does not change y")
+        precondition(AtlasParcelCameraAnchor(relativeX: .nan, relativeY: 0, zoomFactor: 1) == nil)
+        precondition(AtlasParcelCameraAnchor(relativeX: 0, relativeY: .infinity, zoomFactor: 1) == nil)
+        precondition(AtlasParcelCameraAnchor(relativeX: 1_000_001, relativeY: 0, zoomFactor: 1) == nil)
+        precondition(AtlasParcelCameraAnchor(relativeX: 0, relativeY: 0, zoomFactor: 0) == nil)
+        precondition(AtlasParcelCameraAnchor(relativeX: 0, relativeY: 0, zoomFactor: .infinity) == nil)
+        precondition(AtlasParcelCameraAnchor(relativeX: 0, relativeY: 0, zoomFactor: 1_000_001) == nil)
+    }
+
     static func main() {
+        semanticFolderPlaces()
         let receipt = AtlasPresentedFrame()
         let revision = UUID(), replacement = UUID()
         let tap = CGPoint(x: 140, y: 260)

@@ -18,6 +18,7 @@ fn main() {
         "swiftui/AtlasCityMetalView.swift",
         "swiftui/AtlasCityView.swift",
         "swiftui/AtlasNavigationHistory.swift",
+        "swiftui/AtlasFolderNavigation.swift",
         "swiftui/AtlasSource.swift",
         "swiftui/AtlasSourceReader.swift",
         "swiftui/AtlasReader.swift",
