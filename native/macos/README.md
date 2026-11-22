@@ -1330,8 +1330,11 @@ document per worker step, parses at most 256 KiB per document and 32 MiB in
 aggregate, and retains at most 4,096 links. Progress reports missing captures,
 unsupported or oversized documents, parse limits, diagnostics and truncated
 link output. A partial inventory cannot establish that a file has no backlinks.
-Markdown extraction accepts UTF-8; UTF-16 Markdown is reported as unsupported
-and leaves coverage partial. Captured UTF-16 target files remain readable.
+Markdown link extraction accepts UTF-8 and BOM-marked UTF-16 in either byte
+order. The 256 KiB source bound applies separately to original bytes and decoded
+parser input. Each occurrence retains the whole original Markdown capture as
+evidence, including its BOM. Malformed or oversized documents leave coverage
+partial while other links remain available; captured UTF-16 targets stay readable.
 
 **Rebuild links** reuses the prepared source captures. **Refresh sources**
 captures the current project again so file edits can affect the inventory.

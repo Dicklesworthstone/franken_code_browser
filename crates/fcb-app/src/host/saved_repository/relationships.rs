@@ -184,6 +184,7 @@ impl SavedRepositorySession {
             let document = match CapturedDocumentLinks::build(capture.bytes(), request, qgen,
                 max_links - candidate.links.len(), &self.budget, document_id, &mut canceled) {
                 Ok(document) => document,
+                Err(DocumentLinkError::SourceLimit) => { candidate.source_limited += 1; continue; }
                 Err(DocumentLinkError::InvalidUtf8 | DocumentLinkError::InvalidEvidence
                     | DocumentLinkError::ComplexityLimit) => { candidate.unsupported += 1; continue; }
                 Err(error) => return Err(error.into()),

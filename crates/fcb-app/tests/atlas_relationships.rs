@@ -399,7 +399,7 @@ fn uncaptured_and_unavailable_markdown_have_distinct_coverage_counts() {
 }
 
 #[test]
-fn unsupported_utf16_malformed_names_and_oversized_docs_are_visible_partial_coverage() {
+fn utf16_links_coexist_with_malformed_names_and_oversized_docs_under_partial_coverage() {
     let utf16: Vec<u8> = "\u{feff}[code](b.rs)".encode_utf16().flat_map(u16::to_le_bytes).collect();
     let oversized = vec![b' '; MAX_DOCUMENT_LINK_SOURCE_BYTES + 1];
     let doc = b"[code](b.rs)";
@@ -409,11 +409,14 @@ fn unsupported_utf16_malformed_names_and_oversized_docs_are_visible_partial_cove
     let result = f.prepare(1, 1);
     assert!(!result.get("relationships_complete").flag());
     assert_eq!(result.get("markdown_files").number(), 6);
-    assert_eq!(result.get("scanned_markdown_files").number(), 2);
-    assert_eq!(result.get("unsupported_markdown_files").number(), 3);
+    assert_eq!(result.get("scanned_markdown_files").number(), 3);
+    assert_eq!(result.get("unsupported_markdown_files").number(), 2);
     assert_eq!(result.get("source_limited_markdown_files").number(), 1);
     assert_eq!(result.get("parsed_source_bytes").number(), (doc.len() + utf16.len() + 1) as u64);
-    assert_eq!(result.get("retained_links").number(), 1);
+    assert_eq!(result.get("retained_links").number(), 2);
+    let outgoing = f.page(1, Direction::Outgoing, Some(b"c.md"), 0, 64);
+    assert_eq!(outgoing.get("matching_links").number(), 1);
+    whole(outgoing.get("links").array()[0].get("evidence_range"), &utf16);
 }
 
 #[test]
@@ -576,4 +579,60 @@ fn an_empty_captured_document_universe_still_qualifies_missing_visible_membershi
     assert!(!incomplete.get("relationships_complete").flag());
     assert_eq!(incomplete.get("markdown_files").number(), 0);
     assert_eq!(incomplete.get("stop_reason").text(), "all-markdown-examined");
+}
+
+#[test]
+fn utf16_document_backlinks_open_exact_captures_after_live_files_change() {
+    let text = "# Guide 🦀\r\n\r\n[engine][code] and [again](src/lib.rs).\r\n\r\n[code]: src/lib.rs\r\n";
+    for (case, big_endian) in [false, true].into_iter().enumerate() {
+        let doc: Vec<u8> = std::iter::once(0xfeff).chain(text.encode_utf16()).flat_map(|unit|
+            if big_endian { unit.to_be_bytes() } else { unit.to_le_bytes() }).collect();
+        let code = b"fn captured_engine() {}\r\n";
+        let mut f = Fixture::new(&[("README.md", &doc), ("src/lib.rs", code)]);
+        f.build(1); let complete = f.prepare(1, 1);
+        assert!(complete.get("relationships_complete").flag());
+        assert_eq!(complete.get("scanned_markdown_files").number(), 1);
+        assert_eq!(complete.get("unsupported_markdown_files").number(), 0);
+        assert_eq!(complete.get("retained_links").number(), 2);
+        assert_eq!(complete.get("parsed_source_bytes").number(), doc.len() as u64);
+        let incoming = f.page(1, Direction::Incoming, Some(b"src/lib.rs"), 0, 64);
+        assert_eq!(incoming.get("matching_links").number(), 2);
+        for (ordinal, link) in incoming.get("links").array().iter().enumerate() {
+            assert_eq!(link.get("source_link_id").number(), ordinal as u64 + 1);
+            assert_eq!(link.get("source_sha256").text(), Sha256::digest(&doc).to_hex());
+            whole(link.get("evidence_range"), &doc);
+        }
+        fs::write(f.root.join("README.md"), b"replacement with no links").unwrap();
+        fs::write(f.root.join("src/lib.rs"), b"replacement source").unwrap();
+        let (mut evidence, response) = f.search.open_relationship_reader(&f.atlas,
+            owner(59940 + case as u64 * 2), 1, 1, Side::Evidence, || false).unwrap();
+        let response = json(&response);
+        assert_eq!(response.get("reader").get("encoding").text(),
+            if big_endian { "utf16be" } else { "utf16le" });
+        assert_eq!(response.get("reader").get("capture_sha256").text(), Sha256::digest(&doc).to_hex());
+        assert!(!response.get("source_reopened").flag());
+        let (mut target, _) = f.search.open_relationship_reader(&f.atlas,
+            owner(59941 + case as u64 * 2), 1, 1, Side::Target, || false).unwrap();
+        f.search.clear_index(&f.atlas, 2, || false).unwrap();
+        drop(f.search);
+        assert_eq!(json(&evidence.copy_range(0, doc.len() as u64, || false).unwrap()).get("original_hex").text(), hex(&doc));
+        assert_eq!(json(&target.copy_range(0, code.len() as u64, || false).unwrap()).get("original_hex").text(), hex(code));
+    }
+}
+
+#[test]
+fn decoded_document_limit_keeps_other_project_links_available_and_coverage_partial() {
+    let expanded: Vec<u8> = std::iter::once(0xfeff)
+        .chain("漢".repeat(MAX_DOCUMENT_LINK_SOURCE_BYTES / 3 + 1).encode_utf16())
+        .flat_map(u16::to_le_bytes).collect();
+    assert!(expanded.len() < MAX_DOCUMENT_LINK_SOURCE_BYTES);
+    let mut f = Fixture::new(&[("a.md", b"[valid](code.rs)"), ("b.md", &expanded), ("code.rs", b"code")]);
+    f.build(1); let result = f.prepare(1, 1);
+    assert!(!result.get("relationships_complete").flag());
+    assert_eq!(result.get("scanned_markdown_files").number(), 1);
+    assert_eq!(result.get("source_limited_markdown_files").number(), 1);
+    assert_eq!(result.get("unsupported_markdown_files").number(), 0);
+    assert_eq!(result.get("retained_links").number(), 1);
+    assert_eq!(result.get("pending_markdown_files").number(), 0);
+    assert_eq!(f.page(1, Direction::Incoming, Some(b"code.rs"), 0, 64).get("matching_links").number(), 1);
 }

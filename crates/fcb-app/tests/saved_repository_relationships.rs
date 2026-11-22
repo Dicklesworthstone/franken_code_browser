@@ -567,3 +567,70 @@ fn upstream_span_mismatches_and_missing_nested_heading_catalogs_keep_explicit_fi
     let start = link.get("target_range").get("start").number() as usize;
     assert_eq!(&guide[start..], b"# Target\n");
 }
+
+#[test]
+fn utf16_document_backlinks_keep_exact_archived_source_and_independent_readers() {
+    let text = "# Saved 🦀\r\n\r\n[engine][code] and [again](src/lib.rs).\r\n\r\n[code]: src/lib.rs\r\n";
+    for (case, big_endian) in [false, true].into_iter().enumerate() {
+        let doc: Vec<u8> = std::iter::once(0xfeff).chain(text.encode_utf16()).flat_map(|unit|
+            if big_endian { unit.to_be_bytes() } else { unit.to_le_bytes() }).collect();
+        let code = b"fn saved_engine() {}\r\n";
+        let f = Fixture::new(&[entry(b"README.md", &doc), entry(b"src/lib.rs", code)], true);
+        let mut saved = f.open(56900 + case as u64 * 3);
+        let response = saved.prepare_relationships(1, 64, 1024 * 1024, || false).unwrap();
+        assert_eq!(response.exit_code(), EXIT_OK);
+        let result = json(&response);
+        assert!(result.get("relationships_complete").flag());
+        assert_eq!(result.get("scanned_markdown_members").number(), 1);
+        assert_eq!(result.get("unsupported_markdown_members").number(), 0);
+        assert_eq!(result.get("retained_links").number(), 2);
+        assert_eq!(result.get("retained_source_payload_bytes").number(), 0);
+        let before = reads(&mut saved);
+        let incoming = json(&saved.relationship_page(1, Some(1), Direction::Incoming, 0, 64, || false).unwrap());
+        assert_eq!(incoming.get("matching_links").number(), 2);
+        assert_eq!(reads(&mut saved), before, "Backlink paging does not decode or load source again");
+        for (ordinal, row) in incoming.get("links").array().iter().enumerate() {
+            assert_eq!(row.get("source_link_id").number(), ordinal as u64 + 1);
+            assert_eq!(row.get("source_digest").text(), Sha256::digest(&doc).to_hex());
+            whole(row.get("evidence_range"), &doc);
+        }
+        let (mut evidence, receipt) = saved.open_relationship_reader(owner(56901 + case as u64 * 3),
+            1, 1, Side::Evidence, || false).unwrap();
+        let receipt = json(&receipt);
+        assert_eq!(receipt.get("reader").get("encoding").text(),
+            if big_endian { "utf16be" } else { "utf16le" });
+        whole(receipt.get("selection"), &doc);
+        let (mut target, _) = saved.open_relationship_reader(owner(56902 + case as u64 * 3),
+            1, 1, Side::Target, || false).unwrap();
+        saved.clear_relationships(2, || false).unwrap();
+        drop(saved);
+        fs::rename(&f.path, f.root.join("moved.fcbs")).unwrap();
+        assert_eq!(copy_all(&mut evidence).get("original_hex").text(), hex(&doc));
+        assert_eq!(copy_all(&mut target).get("original_hex").text(), hex(code));
+    }
+}
+
+#[test]
+fn malformed_and_expanded_utf16_do_not_hide_other_saved_document_links() {
+    let expanded: Vec<u8> = std::iter::once(0xfeff)
+        .chain("漢".repeat(MAX_DOCUMENT_LINK_SOURCE_BYTES / 3 + 1).encode_utf16())
+        .flat_map(u16::to_le_bytes).collect();
+    assert!(expanded.len() < MAX_DOCUMENT_LINK_SOURCE_BYTES);
+    let mut malformed: Vec<u8> = "\u{feff}[not-published](code.rs)".encode_utf16()
+        .flat_map(u16::to_be_bytes).collect();
+    malformed.extend_from_slice(&0xd800_u16.to_be_bytes());
+    let f = Fixture::new(&[entry(b"a.md", b"[valid](code.rs)"), entry(b"b.md", &expanded),
+        entry(b"c.md", &malformed), entry(b"code.rs", b"code")], true);
+    let mut saved = f.open(56920);
+    let response = saved.prepare_relationships(1, 64, 1024 * 1024, || false).unwrap();
+    assert_eq!(response.exit_code(), EXIT_PARTIAL);
+    let result = json(&response);
+    assert!(!result.get("relationships_complete").flag());
+    assert_eq!(result.get("scanned_markdown_members").number(), 1);
+    assert_eq!(result.get("source_limited_members").number(), 1);
+    assert_eq!(result.get("unsupported_markdown_members").number(), 1);
+    assert_eq!(result.get("retained_links").number(), 1);
+    assert_eq!(result.get("links_seen").number(), 1);
+    let incoming = json(&saved.relationship_page(1, Some(3), Direction::Incoming, 0, 64, || false).unwrap());
+    assert_eq!(incoming.get("matching_links").number(), 1);
+}

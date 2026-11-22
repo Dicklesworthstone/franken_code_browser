@@ -11,9 +11,10 @@
 use std::mem::size_of;
 use fcb_core::{ByteLength, ByteOffset, ByteRange, FileId, QueryGeneration,
     ResourceAllocationId, ResourceBudget, ResourceLease, SourceRevision};
-use fcb_source::CaptureRequest;
+use fcb_source::{CaptureRequest, encoding::{CaptureEncodingMap, SpanKind, detect_encoding}};
 use franken_markdown::{Block, Inline};
 
+/// Separate ceilings for original capture bytes and the parser's decoded UTF-8.
 pub const MAX_DOCUMENT_LINK_SOURCE_BYTES: usize = 256 * 1024;
 pub const MAX_DOCUMENT_LINKS: usize = 4096;
 pub const MAX_DOCUMENT_LINK_DESTINATION_BYTES: usize = 4096;
@@ -23,7 +24,9 @@ const MAX_PARSE_WORKSPACE_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DocumentLinkError {
-    InvalidLimits, SourceLimit, InvalidUtf8, InvalidEvidence, ComplexityLimit,
+    InvalidLimits, SourceLimit,
+    /// Legacy error code for invalid source text, including malformed UTF-16.
+    InvalidUtf8, InvalidEvidence, ComplexityLimit,
     OwnerMismatch, StaleSource, StaleGeneration, ResourceDenied, Canceled,
 }
 impl DocumentLinkError {
@@ -91,17 +94,52 @@ impl<'source> CapturedDocumentLinks<'source> {
         if max_links > MAX_DOCUMENT_LINKS { return Err(DocumentLinkError::InvalidLimits); }
         if source.len() > MAX_DOCUMENT_LINK_SOURCE_BYTES { return Err(DocumentLinkError::SourceLimit); }
         check(&mut canceled)?;
-        let parse_charge = parse_workspace(source)?;
-        let charge = Some(parse_charge)
-            .and_then(|n| max_links.checked_mul(size_of::<DocumentLink>() + MAX_DOCUMENT_LINK_DESTINATION_BYTES)
-                .and_then(|m| n.checked_add(m)))
+        let encoding = detect_encoding(source);
+        // UTF-8 stays borrowed. A BOM-marked UTF-16 capture uses the shared
+        // exact decoder; its original bytes and evidence identity never change.
+        // Reserve decoder Vec growth/overlap and its UTF-8 buffer BEFORE build.
+        let decode_charge = if encoding.is_utf16() {
+            source.len().checked_add(1).and_then(|n| n.checked_mul(256))
+                .and_then(|n| n.checked_add(size_of::<CaptureEncodingMap>() + 4096))
+                .ok_or(DocumentLinkError::ResourceDenied)?
+        } else { 0 };
+        let output_charge = max_links.checked_mul(size_of::<DocumentLink>() + MAX_DOCUMENT_LINK_DESTINATION_BYTES)
             .and_then(|n| n.checked_add(256 * 1024 + size_of::<Self>()))
+            .ok_or(DocumentLinkError::ResourceDenied)?;
+        // Preserve pre-allocation reference-amplification refusal for UTF-8.
+        // UTF-16 must be decoded before applying this same parser-input policy.
+        let initial_parse_charge = if encoding.is_utf16() { 0 } else { parse_workspace(source)? };
+        let charge = decode_charge.checked_add(output_charge)
+            .and_then(|n| n.checked_add(initial_parse_charge))
             .ok_or(DocumentLinkError::ResourceDenied)?;
         let lease = budget.try_reserve_managed(request.file().owner(), allocation,
             ByteLength::new(charge as u64)).map_err(|_| DocumentLinkError::ResourceDenied)?;
-        let original = std::str::from_utf8(source).map_err(|_| DocumentLinkError::InvalidUtf8)?;
-        let base = if source.starts_with(&[0xef, 0xbb, 0xbf]) { 3 } else { 0 };
-        let text = &original[base..];
+        let decoded = if encoding.is_utf16() {
+            let map = CaptureEncodingMap::build_with_encoding(source, encoding)
+                .map_err(|_| DocumentLinkError::InvalidUtf8)?;
+            check(&mut canceled)?;
+            if map.spans().iter().any(|span|
+                matches!(span.kind, SpanKind::ReplacementMalformed | SpanKind::EscapedByte)) {
+                return Err(DocumentLinkError::InvalidUtf8);
+            }
+            Some(map)
+        } else { None };
+        let text = if let Some(map) = &decoded {
+            map.decoded_text()
+        } else {
+            let original = std::str::from_utf8(source).map_err(|_| DocumentLinkError::InvalidUtf8)?;
+            &original[encoding.bom_bytes_len() as usize..]
+        };
+        if text.len() > MAX_DOCUMENT_LINK_SOURCE_BYTES { return Err(DocumentLinkError::SourceLimit); }
+        if decoded.is_some() {
+            // Reference definitions are recognized in DECODED bytes. Charging
+            // the UTF-16 byte stream would miss "]:", allowing parser expansion
+            // to evade the same limits that protect ordinary UTF-8 documents.
+            let parse_charge = parse_workspace(text.as_bytes())?;
+            let total = charge.checked_add(parse_charge).ok_or(DocumentLinkError::ResourceDenied)?;
+            lease.reconcile(ByteLength::new(total as u64)).map_err(|_| DocumentLinkError::ResourceDenied)?;
+        }
+        check(&mut canceled)?;
         let parsed = franken_markdown::parse::parse_document_spanned(text);
         check(&mut canceled)?;
         if parsed.source_len != text.len() { return Err(DocumentLinkError::InvalidEvidence); }

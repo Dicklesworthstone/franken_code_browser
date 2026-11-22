@@ -14,11 +14,12 @@ fn take(pointer: *mut c_char) -> String {
     let value = unsafe { CStr::from_ptr(pointer) }.to_str().unwrap().to_owned();
     unsafe { crate::fcb_free_string(pointer) }; value
 }
-fn workspace() -> (PathBuf, u64) {
+fn workspace() -> (PathBuf, u64) { workspace_with_document(DOC) }
+fn workspace_with_document(document: &[u8]) -> (PathBuf, u64) {
     let root = std::env::temp_dir().join(format!("fcb-atlas-links-c-{}-{}", std::process::id(),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
     fs::create_dir_all(root.join("src")).unwrap();
-    fs::write(root.join("README.md"), DOC).unwrap(); fs::write(root.join("src/lib.rs"), SOURCE).unwrap();
+    fs::write(root.join("README.md"), document).unwrap(); fs::write(root.join("src/lib.rs"), SOURCE).unwrap();
     let handle = fcb_atlas_create(); assert_ne!(handle, 0);
     let text = CString::new(root.to_str().unwrap()).unwrap();
     assert!(take(unsafe { fcb_atlas_open(handle, text.as_ptr(), 100) }).contains("\"status\":\"ok\""));
@@ -150,4 +151,33 @@ fn c_signatures_and_bounded_hex_marshaling_preserve_exact_native_path_bytes() {
     assert_eq!(unsafe { decode_path(maximum.as_ptr()) }.unwrap().unwrap().len(), MAX_SEARCH_SCOPE_PATH_BYTES);
     let unterminated = vec![b'0'; 2 * MAX_SEARCH_SCOPE_PATH_BYTES + 1];
     assert_eq!(unsafe { decode_path(unterminated.as_ptr().cast()) }.err(), Some(AccessError::InvalidArgument));
+}
+
+#[test]
+fn c_utf16_document_links_open_original_evidence_through_the_native_transport() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    for big_endian in [false, true] {
+        let doc: Vec<u8> = "\u{feff}# Guide 🦀\r\n\r\n[engine](src/lib.rs)\r\n".encode_utf16()
+            .flat_map(|unit| if big_endian { unit.to_be_bytes() } else { unit.to_le_bytes() }).collect();
+        let (root, handle) = workspace_with_document(&doc);
+        assert!(begin(handle, 1).contains("\"status\":\"ok\""));
+        let complete = finish(handle, 1);
+        assert!(complete.contains("\"relationships_complete\":true"), "{complete}");
+        assert!(complete.contains("\"retained_links\":\"1\""), "{complete}");
+        assert!(complete.contains("\"unsupported_markdown_files\":\"0\""), "{complete}");
+        let path = CString::new(hex(b"src/lib.rs")).unwrap();
+        let incoming = take(unsafe { fcb_atlas_links_page(handle, 1, 2, path.as_ptr(), 0, 128) });
+        assert!(incoming.contains("\"matching_links\":\"1\""), "{incoming}");
+        assert!(incoming.contains(&format!("\"evidence_range\":{{\"start\":\"0\",\"end\":\"{}\"}}", doc.len())));
+        fs::write(root.join("README.md"), b"replacement with no documentation links").unwrap();
+        let evidence = fcb_reader_create(); assert_ne!(evidence, 0);
+        let opened = take(fcb_atlas_links_open_reader(handle, evidence, 1, 1, 0));
+        assert!(opened.contains("\"status\":\"ok\""), "{opened}");
+        assert!(opened.contains(if big_endian { "\"encoding\":\"utf16be\"" } else { "\"encoding\":\"utf16le\"" }));
+        assert!(opened.contains("\"source_reopened\":false"));
+        assert_eq!(fcb_atlas_close(handle), 1);
+        let copy = take(fcb_reader_copy_range(evidence, 0, doc.len() as u64));
+        assert!(copy.contains(&hex(&doc)), "{copy}");
+        assert_eq!(fcb_reader_close(evidence), 1);
+    }
 }

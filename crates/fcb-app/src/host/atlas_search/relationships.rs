@@ -319,6 +319,10 @@ impl RetainedAtlasSearch {
             snapshot.max_links - snapshot.links.len(), &self.budget, work.document_id,
             || canceled() || atlas.validate_active().is_err()) {
             Ok(document) => document,
+            Err(DocumentLinkError::SourceLimit) => {
+                // A UTF-16 capture can fit while its decoded parser input does not.
+                snapshot.source_limited += 1; snapshot.examined += 1; return Ok(());
+            }
             Err(DocumentLinkError::InvalidUtf8 | DocumentLinkError::InvalidEvidence | DocumentLinkError::ComplexityLimit) => {
                 snapshot.unsupported += 1; snapshot.examined += 1; return Ok(());
             }

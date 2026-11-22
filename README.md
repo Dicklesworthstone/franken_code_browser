@@ -181,6 +181,12 @@ readers and exact selection handoff to the Reading Desk. A missing or canceled
 destination preserves the current source and forward history. See
 [project documentation navigation](native/macos/README.md#project-documentation-links-and-backlinks).
 
+**Documentation relationships include UTF-16 captures.** Outgoing links and
+backlinks now decode BOM-marked UTF-16 in either byte order through the shared
+source engine. Evidence readers retain the original bytes in live projects and
+saved archives, including after the live file changes. Malformed and oversized
+documents keep coverage explicit. Executable and native verification are pending.
+
 **Find in a Markdown preview searches the rendered document.** Literal phrases can
 cross emphasis or link markup, with a complete match count and Previous/Next navigation
 through bounded result pages. Each match opens its logical text context using the retained
