@@ -88,6 +88,7 @@ pub(super) enum Command<'a> {
     Hit { generation: u64, index: usize, context: usize },
     CopyRange { start: u64, end: u64 },
     ResolveSelection { window_start: u64, window_end: u64, utf8_start: u64, utf8_end: u64 },
+    MatchingDelimiter { start: u64, end: u64 },
     CopyHit { generation: u64, index: usize },
     Outline { generation: u64, options: ReaderOutlineOptions },
     Symbols { generation: u64, needle: &'a str, mode: SymbolNameMode, start: usize, limit: usize },
@@ -348,6 +349,7 @@ impl ReaderSessions {
             Command::CopyRange { start, end } => reader.copy_range(start, end, &mut stop),
             Command::ResolveSelection { window_start, window_end, utf8_start, utf8_end } =>
                 reader.resolve_selection(window_start, window_end, utf8_start, utf8_end, &mut stop),
+            Command::MatchingDelimiter { start, end } => reader.matching_delimiter(start, end, &mut stop),
             Command::CopyHit { generation, index } => reader.copy_hit(generation, index, &mut stop),
             Command::Outline { generation, options } => reader.prepare_outline(generation, options, &mut stop),
             Command::Symbols { generation, needle, mode, start, limit } => reader.symbol_page(generation, needle, mode, start, limit, &mut stop),
@@ -449,6 +451,10 @@ mod comparison_tests;
 #[cfg(all(test, unix))]
 #[path = "reader_selection_sessions_tests.rs"]
 mod selection_tests;
+
+#[cfg(all(test, unix))]
+#[path = "reader_delimiter_sessions_tests.rs"]
+mod delimiter_tests;
 
 #[cfg(all(test, unix))]
 #[path = "reader_export_sessions_tests.rs"]

@@ -185,6 +185,16 @@ pub extern "C" fn fcb_reader_resolve_selection(handle: u64, window_start: u64,
         Command::ResolveSelection { window_start, window_end, utf8_start, utf8_end }, || false)))
 }
 
+/// Find a selected bracket's lexical mate in the same complete source capture.
+/// Half-open coordinates name original bytes, never decoded or visual offsets.
+/// This bounded worker call does not read the live file or change search state.
+/// Cancellation uses the same handle epoch as other retained-reader operations.
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_reader_matching_delimiter(handle: u64, start: u64, end: u64) -> *mut c_char {
+    reply(|| answer(handle, |readers| readers.execute(handle,
+        Command::MatchingDelimiter { start, end }, || false)))
+}
+
 /// Original match bytes from the accepted query and this exact capture.
 #[unsafe(no_mangle)]
 pub extern "C" fn fcb_reader_copy_hit(handle: u64, generation: u64, index: u64) -> *mut c_char {
@@ -235,6 +245,10 @@ mod highlight_tests;
 #[cfg(test)]
 #[path = "reader_selection_ffi_tests.rs"]
 mod selection_tests;
+
+#[cfg(test)]
+#[path = "reader_delimiter_ffi_tests.rs"]
+mod delimiter_tests;
 
 #[cfg(test)]
 #[path = "reader_expression_ffi_tests.rs"]

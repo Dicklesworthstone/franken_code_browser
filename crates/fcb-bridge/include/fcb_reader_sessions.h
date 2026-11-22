@@ -14,6 +14,7 @@ extern "C" {
 #define FCB_READER_MAX_MATCHES UINT64_C(4096)
 #define FCB_READER_MAX_NEEDLE_BYTES UINT64_C(4096)
 #define FCB_READER_MAX_EXPRESSION_BYTES UINT64_C(1024)
+#define FCB_READER_MAX_DELIMITER_SOURCE_BYTES UINT64_C(524288)
 
 /*
  * Retained SINGLE-FILE reader sessions; no runtime or worker is created.
@@ -207,6 +208,28 @@ char *fcb_reader_export_original_cancelable(uint64_t handle, uint64_t start,
  * writes the clipboard, creates an annotation or exports a file. */
 char *fcb_reader_resolve_selection(uint64_t handle, uint64_t window_start,
     uint64_t window_end, uint64_t utf8_start, uint64_t utf8_end);
+
+/* Find the lexical mate of one selected ()[]{} scalar in a retained complete
+ * capture with at most MAX_DELIMITER_SOURCE_BYTES original and decoded bytes.
+ * start/end are half-open ORIGINAL-byte offsets; UTF-16 code units,
+ * decoded UTF-8 offsets and visual positions must not be substituted. The
+ * shared source decoder and upstream language lexer establish eligible code;
+ * brackets inside recognized comments/strings do not participate. This is
+ * lexical-delimiter-candidate evidence, never compiler or semantic resolution.
+ *
+ * Success uses command "matching-delimiter", selected_range, matching_range
+ * (null unless matched), delimiter_state, language, source_context
+ * "complete-capture", evidence_level "lexical-delimiter-candidate", and
+ * semantic_resolution=false. States: matched, unmatched, mismatched, not-code,
+ * not-delimiter. Invalid boundaries, unsupported language/encoding and bounded
+ * source/nesting/resource limits return explicit errors, not false no-matches.
+ * Validate the ordinary owner/file_id/source_revision/capture identity and the
+ * original requested selection before navigating to the returned range.
+ *
+ * Run on a host worker. No source I/O, clipboard effect or accepted-query
+ * mutation occurs. fcb_reader_cancel/close revoke in-flight delivery through
+ * the existing handle epoch; free every non-null JSON with fcb_free_string. */
+char *fcb_reader_matching_delimiter(uint64_t handle, uint64_t start, uint64_t end);
 
 /* cancel invalidates in-flight work, leaving the capture available afterward.
  * It is cooperative, not interruption of an OS syscall or rollback of already

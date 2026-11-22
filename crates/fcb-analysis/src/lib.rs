@@ -18,6 +18,8 @@ pub mod symbols;
 pub mod references;
 /// Lexical import evidence and explicit closed-catalog navigation candidates.
 pub mod imports;
+/// Lexical delimiter navigation over one complete, exactly mapped capture.
+pub mod delimiters;
 
 pub use comparison::{CaptureComparison, ComparisonError, ComparisonLimits, ComparisonQuality,
     ComparisonRelation, ComparisonStats, Correspondence, CorrespondenceKind};

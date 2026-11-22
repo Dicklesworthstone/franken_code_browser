@@ -18,6 +18,7 @@ mod comparison;
 mod highlight;
 mod position;
 mod selection;
+mod delimiter;
 mod export;
 mod search;
 pub(crate) mod document;
@@ -80,6 +81,7 @@ pub enum ReaderSessionError {
     DocumentImage(DocumentImageError),
     DocumentLinks(fcb::document::links::DocumentLinkError), MissingDocumentLinks, MissingDocumentLink,
     Comparison(fcb::analysis::comparison::ComparisonError),
+    Delimiter(fcb::analysis::delimiters::DelimiterError),
     Query(fcb::search::QueryError), ExpressionScopeUnsupported,
 }
 impl std::fmt::Display for ReaderSessionError {
@@ -94,6 +96,7 @@ impl std::fmt::Display for ReaderSessionError {
             Self::Reference(e) => write!(f, "{e}"),
             Self::DocumentLinks(e) => write!(f, "{e}"),
             Self::Comparison(e) => write!(f, "{e}"),
+            Self::Delimiter(e) => write!(f, "{e}"),
             Self::Query(e) => write!(f, "{e}"),
             Self::ExpressionScopeUnsupported => f.write_str("READER_SESSION_EXPRESSION_SCOPE_UNSUPPORTED"),
             Self::MissingDocument => f.write_str("READER_SESSION_NO_DOCUMENT"),
@@ -131,6 +134,11 @@ impl From<fcb::search::symbols::ReferenceError> for ReaderSessionError {
 }
 impl From<fcb::analysis::comparison::ComparisonError> for ReaderSessionError {
     fn from(e: fcb::analysis::comparison::ComparisonError) -> Self { Self::Comparison(e) }
+}
+impl From<fcb::analysis::delimiters::DelimiterError> for ReaderSessionError {
+    fn from(e: fcb::analysis::delimiters::DelimiterError) -> Self {
+        if e == fcb::analysis::delimiters::DelimiterError::Canceled { Self::Canceled } else { Self::Delimiter(e) }
+    }
 }
 impl From<OutputError> for ReaderSessionError { fn from(e: OutputError) -> Self { Self::App(e.into()) } }
 
