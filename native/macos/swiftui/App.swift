@@ -528,7 +528,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 ? (currentVisibleSearch?.snapshot.id.uuidString ?? "")
                 : (searchPathKind == .workspace ? "" : searchPathInput),
             mode: searchMode, nameMode: searchMode.effectiveNameMode(searchNameMode),
-            caseSensitive: effectiveSearchCaseSensitive, countAllMatches: effectiveSearchCountAllMatches)
+            caseSensitive: effectiveSearchCaseSensitive, countAllMatches: effectiveSearchCountAllMatches,
+            discoveryPolicy: projectBrowser.discoveryPolicy)
     }
 
     // Observe byte-distinct edits without duplicating an arbitrarily large
@@ -2799,7 +2800,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 fileScope: fileScope.searchScope(custom: customExtensions),
                 pathScope: pathScope,
                 mode: searchMode, nameMode: searchMode.effectiveNameMode(searchNameMode),
-                caseSensitive: effectiveSearchCaseSensitive, countAllMatches: effectiveSearchCountAllMatches)
+                caseSensitive: effectiveSearchCaseSensitive, countAllMatches: effectiveSearchCountAllMatches,
+                discoveryPolicy: requestedContext.discoveryPolicy)
             clearSearch()
             searchPending = true
             searchTitle = input.pathScope.isVisible ? "Searching frozen atlas files" : "Searching project"
@@ -2834,6 +2836,11 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 searchPending = false
                 switch result {
                 case .success(let report):
+                    guard report.discoveryPolicy == requestedContext.discoveryPolicy else {
+                        status = AtlasSearchError.invalidResponse.message
+                        searchSummary = status; searchTitle = "Search unavailable"
+                        return
+                    }
                     searchPending = report.isInProgress
                     prepareSearchOverlay(report, context: searchContext)
                     searchReport = report

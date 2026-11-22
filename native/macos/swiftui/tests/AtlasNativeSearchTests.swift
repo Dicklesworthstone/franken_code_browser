@@ -9,6 +9,7 @@ import Foundation
 @_silgen_name("fixture_expect_scope") private func expectScope(_ extensions: UnsafePointer<CChar>?, _ filenames: UnsafePointer<CChar>?)
 @_silgen_name("fixture_expect_path") private func expectPath(_ kind: UInt64, _ path: UnsafePointer<CChar>)
 @_silgen_name("fixture_expect_counted_case") private func expectCountedCase(_ caseSensitive: UInt64)
+@_silgen_name("fixture_expect_policy") private func expectPolicy(_ policy: UInt64)
 @_silgen_name("fixture_expect_structure") private func expectStructure(_ mode: UInt64, _ nameMode: UInt64)
 @_cdecl("fixture_mark_canceled") public func markCanceled(_ context: UnsafeMutableRawPointer?) {
     guard let context else { preconditionFailure("Missing callback lifetime") }
@@ -36,6 +37,7 @@ private final class Reports: @unchecked Sendable {
         return ["schema": "fcb.atlas-search/1", "status": "ok", "command": command,
             "owner": "11", "source_manifest": "1", "layout_revision": "1", "query_generation": "1",
             "needle": "x", "mode": "exact-decoded-literal", "search_strategy": "live-capture-scan",
+            "discovery_policy": "repository-rules-v1",
             "discovery_complete": true, "search_in_progress": running, "search_complete": complete,
             "count_all_matches": true, "match_count_complete": complete,
             "truncated": false, "stop_reason": running ? NSNull() : "all-files-examined",
@@ -74,9 +76,13 @@ private final class Reports: @unchecked Sendable {
         let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
         String(decoding: data, as: UTF8.self).withCString { setFixture(kind, index, $0) }
     }
+    private static func openReceipt(_ policy: String = "repository-rules-v1") -> [String: Any] {
+        ["schema": "fcb.atlas-session/1", "status": "ok", "command": "info",
+         "owner": "11", "discovery_policy": policy]
+    }
     private static func setup() throws {
         resetFixture()
-        try install(0, ["status": "ok"])
+        try install(0, openReceipt())
         try install(1, page("begin", step: 0))
         try install(2, page("step", step: 1, total: 70))
         try install(3, page("page", step: 1, total: 70, start: 64))
@@ -105,7 +111,7 @@ private final class Reports: @unchecked Sendable {
         resetFixture()
         scope.withCStrings { expectScope($0, $1) }
         if !pathScope.isWorkspace { pathScope.withCString { expectPath($0, $1!) } }
-        try install(0, ["status": "ok"])
+        try install(0, openReceipt())
         try install(1, scopedPage("begin", scope: scope, step: 0, eligible: eligible, pathScope: pathScope))
         try install(2, scopedPage("step", scope: scope, step: 1, eligible: eligible,
             total: eligible == 0 ? 0 : 1, running: false, pathScope: pathScope, hitPath: hitPath))
@@ -139,7 +145,7 @@ private final class Reports: @unchecked Sendable {
         resetFixture(); scope.withCStrings { expectScope($0, $1) }
         if !pathScope.isWorkspace { pathScope.withCString { expectPath($0, $1!) } }
         let extraStep = scope.isAll && pathScope.isWorkspace
-        try install(0, ["status": "ok"])
+        try install(0, openReceipt())
         try install(1, matchingPage("begin", step: 0, needle: needle, actualText: actualText,
             scope: scope, pathScope: pathScope))
         try install(2, matchingPage("step", step: 1, total: 1, running: extraStep,
@@ -188,7 +194,7 @@ private final class Reports: @unchecked Sendable {
     private static func setupStructure(_ mode: AtlasSearchMode = .symbols,
                                        nameMode: AtlasSearchNameMode = .contains) throws {
         resetFixture(); expectStructure(mode.code, nameMode.code)
-        try install(0, ["status": "ok"])
+        try install(0, openReceipt())
         try install(1, structurePage("begin-structure", mode: mode, nameMode: nameMode, step: 0))
         try install(2, structurePage("step", mode: mode, nameMode: nameMode, step: 1,
             total: 1, running: false, complete: true))
@@ -230,10 +236,69 @@ private final class Reports: @unchecked Sendable {
         check(fixtureCount(5) == 1, label + ": handle closed on rejection")
         check(fixtureCount(6) == fixtureCount(7), label + ": every C allocation released")
     }
+    @MainActor private static func discoveryPoliciesBindEveryReceipt() throws {
+        for policy in [AtlasDiscoveryPolicy.repositoryRules, .includeExcluded] {
+            resetFixture(); expectPolicy(policy.rawValue)
+            let receipt = policy == .repositoryRules
+                ? policy.wireName + ":" + String(repeating: "a", count: 64) : policy.wireName
+            try install(0, openReceipt(receipt))
+            var began = page("begin", step: 0, catalogued: 1)
+            var finished = page("step", step: 1, total: 1, running: false, complete: true, catalogued: 1)
+            began["discovery_policy"] = receipt; finished["discovery_policy"] = receipt
+            try install(1, began); try install(2, finished)
+            let progress = Reports()
+            var report: AtlasSearchReport? = try AtlasNativeSearch.runScoped(
+                input: AtlasSearchInput(root: "/project", query: "x", discoveryPolicy: policy),
+                cancellation: AtlasSearchCancellation(), access: AtlasSearchAccessLease(nil), progress: progress.append)
+            check(report!.complete && report!.discoveryPolicy == policy
+                && progress.values.allSatisfy { $0.discoveryPolicy == policy },
+                "Selected discovery policy reaches the ABI, provisional reports and terminal result")
+            check(!policy.includesExcluded || report!.summary.contains("Ignored and generated files included"),
+                "An expanded search universe is disclosed")
+            report = nil; progress.clear(); retired()
+            check(fixtureCount(6) == fixtureCount(7), "Policy-scoped responses and retained owner retire")
+        }
+        for policy in ["all-regular-files/no-rule-files-v1", "repository-rules-v1:", "repository-rules-v1:bad"] {
+            try rejected("mismatched or malformed opened discovery policy") { try install(0, openReceipt(policy)) }
+            check(fixtureCount(2) == 0, "Wrong-policy open is rejected before source-search admission")
+        }
+        for openedOwner in ["0", "01", "invalid", "18446744073709551616", "12"] {
+            try rejected("opened owner must match the allocated native owner") {
+                var opened = openReceipt(); opened["owner"] = openedOwner
+                var began = page("begin", step: 0); began["owner"] = openedOwner
+                try install(0, opened); try install(1, began)
+            }
+            check(fixtureCount(2) == 0 && fixtureCount(3) == 0,
+                "Malformed or consistently forged positive owner is refused before search admission or source steps")
+        }
+        for phase in [UInt32(1), 2, 3] {
+            try rejected("policy changed during search phase \(phase)") {
+                var changed = phase == 1 ? page("begin", step: 0)
+                    : page(phase == 2 ? "step" : "page", step: 1, total: 70, start: phase == 3 ? 64 : 0)
+                changed["discovery_policy"] = "all-regular-files/no-rule-files-v1"
+                try install(phase, changed)
+            }
+        }
+        try rejected("frozen rule fingerprint changed between open and query") {
+            try install(0, openReceipt("repository-rules-v1:" + String(repeating: "a", count: 64)))
+        }
+        try setup(); expectPolicy(1)
+        do {
+            _ = try AtlasNativeSearch.runScoped(
+                input: AtlasSearchInput(root: "/project", query: "x", discoveryPolicy: .includeExcluded),
+                cancellation: AtlasSearchCancellation(), access: AtlasSearchAccessLease(nil), progress: { _ in })
+            preconditionFailure("Include-excluded query accepted narrower rules receipt")
+        } catch AtlasSearchError.invalidResponse { checks += 1 }
+        retired()
+        check(fixtureCount(2) == 0 && fixtureCount(6) == fixtureCount(7),
+            "Expanded requests never silently fall back to repository rules")
+    }
+
     @MainActor static func main() throws {
+        try discoveryPoliciesBindEveryReceipt()
         for caseSensitive in [true, false] {
             resetFixture(); expectCountedCase(caseSensitive ? 1 : 0)
-            try install(0, ["status": "ok"])
+            try install(0, openReceipt())
             try install(1, countedPage("begin", step: 0, caseSensitive: caseSensitive))
             try install(2, countedPage("step", step: 1, caseSensitive: caseSensitive))
             for (index, start) in stride(from: 64, to: 1000, by: 128).enumerated() {
@@ -256,7 +321,7 @@ private final class Reports: @unchecked Sendable {
         }
         do {
             resetFixture()
-            try install(0, ["status": "ok"])
+            try install(0, openReceipt())
             var began = page("begin", step: 0); began["count_all_matches"] = false
             var finished = page("step", step: 1, total: 1, running: false, complete: true, catalogued: 1)
             finished["count_all_matches"] = false; began["catalogued_files"] = "1"; began["pending_files"] = "1"

@@ -2,9 +2,9 @@ import Foundation
 
 private typealias SearchPoll = @convention(c) (UnsafeMutableRawPointer?) -> Int32
 @_silgen_name("fcb_atlas_create") private func createSearchAtlas() -> UInt64
-@_silgen_name("fcb_atlas_open_cancelable")
+@_silgen_name("fcb_atlas_open_with_policy_cancelable")
 private func openSearchAtlas(_ handle: UInt64, _ root: UnsafePointer<CChar>?, _ maxFiles: UInt64,
-    _ poll: SearchPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
+    _ discoveryPolicy: UInt64, _ poll: SearchPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_search_begin")
 private func beginSearch(_ handle: UInt64, _ generation: UInt64, _ query: UnsafePointer<CChar>?,
     _ maxMatches: UInt64, _ maxFiles: UInt64, _ maxFileBytes: UInt64, _ maxSourceBytes: UInt64) -> UnsafeMutablePointer<CChar>?
@@ -87,6 +87,7 @@ enum AtlasNativeSearch {
             close: { closeSearchAtlas($0) != 0 }, retirementFailed: {
                 FileHandle.standardError.write(Data("ATLAS_SEARCH_RETIREMENT_FAILED\n".utf8))
             })
+        let handle = owner.call { $0 }
         owner.retainAccess(access)
         let poll: SearchPoll = { context in
             guard let context else { return 1 }
@@ -96,9 +97,15 @@ enum AtlasNativeSearch {
             let context = Unmanaged.passUnretained(cancellation).toOpaque()
             let metadataLimit: UInt64 = pathScope.isVisible ? UInt64(AtlasSearchPathScope.maximumVisibleFiles) : 4096
             let opened: SearchOpen = try read(root.withCString {
-                rootPointer in owner.call { openSearchAtlas($0, rootPointer, metadataLimit, poll, context) }
+                rootPointer in owner.call { openSearchAtlas($0, rootPointer, metadataLimit,
+                    input.discoveryPolicy.rawValue, poll, context) }
             }, cancellation)
             guard opened.status == "ok" else { throw AtlasSearchError.unavailable }
+            guard opened.schema == "fcb.atlas-session/1", opened.command == "info",
+                  let openedOwner = opened.owner, let ownerID = UInt64(openedOwner),
+                  ownerID > 0, ownerID == handle, String(ownerID) == openedOwner,
+                  let policyReceipt = opened.discovery_policy,
+                  input.discoveryPolicy.admitsAtlasReceipt(policyReceipt) else { throw AtlasSearchError.invalidResponse }
             var page: SearchPage = try read(query.withCString {
                 queryPointer in scope.withCStrings { extensions, filenames in
                     pathScope.withCString { kind, path in
@@ -139,7 +146,8 @@ enum AtlasNativeSearch {
             }, cancellation)
             var stream = SearchStream(query: query, scope: scope, pathScope: pathScope,
                 mode: input.mode, nameMode: input.nameMode, caseSensitive: input.caseSensitive,
-                countAllMatches: input.countsLiveMatches)
+                countAllMatches: input.countsLiveMatches, ownerIdentity: openedOwner,
+                discoveryPolicy: input.discoveryPolicy, policyReceipt: policyReceipt)
             var lastPublished: TimeInterval? = nil
             var publishedHits = 0
             while true {
@@ -201,9 +209,13 @@ enum AtlasNativeSearch {
     }
 }
 
-private struct SearchOpen: Decodable { let status: String }
+private struct SearchOpen: Decodable {
+    let status: String
+    let schema, command, owner, discovery_policy: String?
+}
 private struct SearchPage: Decodable {
     let schema, status, command, owner, source_manifest, layout_revision, query_generation: String
+    let discovery_policy: String
     let needle, mode, search_strategy: String
     let case_sensitive: Bool?
     let requested_mode, realized_mode, name_mode, name_case, evidence_level, completeness_basis: String?
@@ -274,6 +286,9 @@ private struct SearchStream {
     let nameMode: AtlasSearchNameMode
     let caseSensitive: Bool
     let countAllMatches: Bool
+    let ownerIdentity: String
+    let discoveryPolicy: AtlasDiscoveryPolicy
+    let policyReceipt: String
     let id = UUID()
     private var identity: [String]?
     private var state: SearchState?
@@ -284,11 +299,13 @@ private struct SearchStream {
     private var retainedExcerptBytes = 0
     init(query: String, scope: AtlasSearchFileScope, pathScope: AtlasSearchPathScope,
          mode: AtlasSearchMode, nameMode: AtlasSearchNameMode, caseSensitive: Bool = true,
-         countAllMatches: Bool) {
+         countAllMatches: Bool, ownerIdentity: String,
+         discoveryPolicy: AtlasDiscoveryPolicy, policyReceipt: String) {
         self.query = query; self.scope = scope; self.pathScope = pathScope
         self.mode = mode; self.nameMode = nameMode
         self.caseSensitive = caseSensitive
         self.countAllMatches = countAllMatches
+        self.ownerIdentity = ownerIdentity; self.discoveryPolicy = discoveryPolicy; self.policyReceipt = policyReceipt
     }
     var count: Int { hits.count }
     var retained: Int { state?.retained ?? 0 }
@@ -393,11 +410,13 @@ private struct SearchStream {
                 cataloguedFiles: state.eligible), streamID: id, capture: capture,
             fileScope: scope, excludedFiles: state.catalogued - state.eligible, pathScope: pathScope,
             mode: mode, nameMode: nameMode, structureCoverage: state.structureCoverage,
-            caseSensitive: caseSensitive, visibleMissingFiles: state.visibleMissing, expression: state.expression)
+            caseSensitive: caseSensitive, visibleMissingFiles: state.visibleMissing, expression: state.expression,
+            discoveryPolicy: discoveryPolicy)
     }
 
     private func validated(_ page: SearchPage) throws -> SearchState {
         guard page.schema == "fcb.atlas-search/1", page.status == "ok",
+              page.owner == ownerIdentity, page.discovery_policy.utf8.elementsEqual(policyReceipt.utf8),
               [beginCommand, "step", "page"].contains(page.command),
               page.mode == (mode == .text ? AtlasSearchText.wireMode(caseSensitive: caseSensitive) : mode.wireMode),
               (page.case_sensitive ?? true) == caseSensitive,

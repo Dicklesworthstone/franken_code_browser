@@ -3,6 +3,7 @@ import Foundation
 @_silgen_name("indexed_fixture_mode") private func mode(_ value: Int32)
 @_silgen_name("indexed_fixture_calls") private func calls() -> UInt32
 @_silgen_name("indexed_fixture_live") private func live() -> UInt32
+@_silgen_name("indexed_fixture_policy") private func selectedPolicy() -> UInt64
 @_cdecl("indexed_fixture_cancel") func cancelIndexedFixture(_ context: UnsafeMutableRawPointer?) {
     guard let context else { preconditionFailure("Missing cancellation context") }
     Unmanaged<AtlasSearchCancellation>.fromOpaque(context).takeUnretainedValue().cancel()
@@ -48,6 +49,12 @@ import Foundation
         check(try t.scopedIndexBegin!(h, 6, .all, AtlasSearchPathScope(visiblePaths: [])) != nil)
         check(live() == 0 && calls() == 20)
         #endif
+        let beforePolicy = calls()
+        for policy in [AtlasDiscoveryPolicy.repositoryRules, .includeExcluded] {
+            check(try t.openWithPolicy!(h, "/repo", policy, flag) == "{\"owned\":true}")
+            check(selectedPolicy() == policy.rawValue && live() == 0)
+        }
+        check(calls() == beforePolicy + 2)
         let beforeExpressions = calls()
         let expression = "\"exact text\" required -excluded lang:rs"
         check(try t.expressionQueryBegin!(h, 52, 1, expression, .all, .workspace, true) != nil)

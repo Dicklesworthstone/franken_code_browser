@@ -35,6 +35,7 @@ private enum ExpressionFixture {
         let end = min(total, start + (command == "page" ? 128 : 64))
         var out: [String: Any] = ["schema": "fcb.atlas-search/1", "status": "ok", "command": command,
             "owner": "11", "source_manifest": "1", "layout_revision": "1", "query_generation": "1",
+            "discovery_policy": "repository-rules-v1",
             "needle": "x", "mode": "decoded-text-expression", "case_sensitive": true, "search_strategy": "live-capture-scan",
             "discovery_complete": true, "search_in_progress": !complete, "search_complete": complete,
             "truncated": false, "stop_reason": complete ? "all-files-examined" : NSNull(),
@@ -59,7 +60,8 @@ private enum ExpressionFixture {
     }
     static func setupCounted(caseSensitive: Bool) {
         resetExpressionFixture(); query.withCString { expectExpression($0, caseSensitive ? 1 : 0) }
-        install(0, ["status": "ok"])
+        install(0, ["schema": "fcb.atlas-session/1", "status": "ok", "command": "info",
+            "owner": "11", "discovery_policy": "repository-rules-v1"])
         install(1, countedPage("begin-expression", step: 0, caseSensitive: caseSensitive))
         install(2, countedPage("step", step: 1, caseSensitive: caseSensitive))
         for (index, start) in stride(from: 64, to: 1000, by: 128).enumerated() {
@@ -72,7 +74,8 @@ private enum ExpressionFixture {
     }
     static func setup() {
         resetExpressionFixture(); query.withCString { expectExpression($0, 1) }
-        install(0, ["status": "ok"])
+        install(0, ["schema": "fcb.atlas-session/1", "status": "ok", "command": "info",
+            "owner": "11", "discovery_policy": "repository-rules-v1"])
         install(1, page("begin-expression", step: 0))
         install(2, page("step", step: 1, total: 70))
         install(3, page("page", step: 1, total: 70, start: 64))
@@ -80,6 +83,7 @@ private enum ExpressionFixture {
         var imported = hit(1)
         imported.merge(["schema": "fcb.atlas-search/1", "status": "ok", "command": "open-reader",
             "owner": "11", "source_manifest": "1", "layout_revision": "1", "query_generation": "1",
+            "discovery_policy": "repository-rules-v1",
             "reader_owner": "100", "source_reopened": false, "source_observation": "retained-search-capture",
             "reader": ["schema": "fcb.reader-session/1", "status": "ok", "command": "info", "owner": "100",
                 "file_id": "1", "source_revision": "1", "captured_bytes": "1000", "encoding": "utf8",

@@ -246,6 +246,22 @@ import Foundation
         check(pathReport.summary.contains("selected file") && pathReport.summary.contains("src/core/lib.rs"),
             "A file-scoped negative describes only that file")
         let legacyPolicy = try AtlasSearchInput(root: "/project", query: "x")
+        check(legacyPolicy.discoveryPolicy == .repositoryRules, "Standalone requests keep repository-rules discovery")
+        let expanded = try AtlasSearchInput(root: "/project", query: "x", discoveryPolicy: .includeExcluded)
+        do { try expanded.requireLegacyScope(); preconditionFailure("Legacy search discarded expanded discovery") }
+        catch AtlasSearchError.unsupportedDiscoveryPolicy { checks += 1 }
+        let rules = AtlasDiscoveryPolicy.repositoryRules
+        let fingerprint = String(repeating: "a", count: 64)
+        check(rules.admitsAtlasReceipt(rules.wireName) && rules.admitsAtlasReceipt(rules.wireName + ":" + fingerprint),
+            "Retained rule-aware discovery permits its exact snapshot fingerprint")
+        for receipt in [rules.wireName + ":", rules.wireName + ":" + fingerprint + "0",
+                        rules.wireName + ":" + String(repeating: "A", count: 64),
+                        "all-regular-files/no-rule-files-v1", "product-defaults/no-rule-files-v1"] {
+            check(!rules.admitsAtlasReceipt(receipt), "Retained catalog refuses malformed or different policy")
+        }
+        check(!AtlasDiscoveryPolicy.includeExcluded.admitsAtlasReceipt(rules.wireName)
+            && !AtlasDiscoveryPolicy.includeExcluded.admitsAtlasReceipt(AtlasDiscoveryPolicy.includeExcluded.wireName + ":" + fingerprint),
+            "Expanded discovery cannot borrow rule scope or its observation hash")
         check(legacyPolicy.countsLiveMatches && !legacyPolicy.countsIndexedMatches(supportsCounting: false)
             && legacyPolicy.countsIndexedMatches(supportsCounting: true),
             "Omitted count choice preserves exact counting for capable routes and bounded legacy transports")
@@ -267,6 +283,8 @@ import Foundation
             atlasRevision: UUID(), scope: "all", customExtensions: "", countAllMatches: true)
         var boundedContext = countedContext; boundedContext.countAllMatches = false
         check(!countedContext.matches(boundedContext), "Changing count policy revokes stale row and frame authority")
+        var expandedContext = countedContext; expandedContext.discoveryPolicy = .includeExcluded
+        check(!countedContext.matches(expandedContext), "Discovery policy changes revoke stale row and frame authority")
         let insensitive = try AtlasSearchInput(root: "/project", query: "İ", caseSensitive: false)
         check(!insensitive.caseSensitive && insensitive.query.utf8.elementsEqual("İ".utf8),
             "Match Case changes matching policy without transforming query bytes")

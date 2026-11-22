@@ -13,6 +13,18 @@ enum AtlasDiscoveryPolicy: UInt64, Sendable {
         self == .repositoryRules ? "repository-rules-v1" : "all-regular-files/no-rule-files-v1"
     }
     var includesExcluded: Bool { self == .includeExcluded }
+    /// Retained atlas receipts can include the frozen rule-observation hash.
+    /// A policy switch needs a new owner; that hash stays exact for its pages.
+    func admitsAtlasReceipt(_ name: String) -> Bool {
+        if name == wireName { return true }
+        guard self == .repositoryRules else { return false }
+        let prefix = wireName + ":"
+        guard name.hasPrefix(prefix) else { return false }
+        let fingerprint = name.utf8.dropFirst(prefix.utf8.count)
+        return fingerprint.count == 64 && fingerprint.allSatisfy {
+            (48...57).contains($0) || (97...102).contains($0)
+        }
+    }
     func admits(_ name: String, legacyDefault: Bool = false) -> Bool {
         name == wireName || (legacyDefault && self == .repositoryRules
             && name == "product-defaults/no-rule-files-v1")
@@ -312,7 +324,7 @@ struct AtlasSearchStructureCoverage: Equatable, Sendable {
 }
 
 enum AtlasSearchError: Error, Sendable {
-    case unavailable, invalidResponse, canceled, invalidRequest, invalidScope, invalidPathScope, invalidVisibleScope, identityExhausted, unsupportedMatching, unsupportedCounting
+    case unavailable, invalidResponse, canceled, invalidRequest, invalidScope, invalidPathScope, invalidVisibleScope, identityExhausted, unsupportedMatching, unsupportedCounting, unsupportedDiscoveryPolicy
     case query(String)
     var message: String {
         switch self {
@@ -324,6 +336,7 @@ enum AtlasSearchError: Error, Sendable {
         case .identityExhausted: return "This search session exhausted its request identities. Reopen the window before searching again."
         case .unsupportedMatching: return "This search connection does not support case-insensitive text. Turn on Match case to search."
         case .unsupportedCounting: return "This search connection cannot honor the requested count policy. Reconnect to search."
+        case .unsupportedDiscoveryPolicy: return "This search connection cannot include ignored and generated files. Reconnect to search the selected discovery scope."
         case .unavailable: return "Search unavailable. The project could not be read or the search exceeded its limits."
         case .invalidResponse: return "Search response could not be read. Results are unavailable, not an empty match set."
         case .query(let code):
@@ -374,6 +387,7 @@ struct AtlasSearchReport: Sendable {
     /// catalog. These are not excluded files or proof of an empty region.
     var visibleMissingFiles: Int = 0
     var expression: AtlasSearchExpression? = nil
+    var discoveryPolicy: AtlasDiscoveryPolicy = .repositoryRules
     var isInProgress: Bool { progress?.isRunning == true }
     var isWorkspaceScope: Bool { fileScope.isAll && pathScope.isWorkspace }
     var resultLabel: String { mode == .text && !caseSensitive ? "case-insensitive matches" : mode.resultLabel }
@@ -383,11 +397,13 @@ struct AtlasSearchReport: Sendable {
             return "Preparing captured index for \(indexStatus.captureScopeDescription): \(progress.examinedFiles) of \(progress.cataloguedFiles) eligible files examined."
                 + (indexStatus.captureMissingVisibleFiles == 0 ? "" : " \(indexStatus.captureMissingVisibleFiles) requested visible files are outside this search catalog.")
                 + " Query results are not ready yet."
+                + (discoveryPolicy.includesExcluded ? " Ignored and generated files included." : "")
         }
         return resultSummary
             + (isWorkspaceScope ? "" : " \(excludedFiles) catalogued files outside this scope.")
             + (visibleMissingFiles == 0 ? "" : " \(visibleMissingFiles) requested visible files are outside this search catalog.")
             + ((expression?.excludedFiles ?? 0) == 0 ? "" : " \(expression?.excludedFiles ?? 0) files excluded by expression path/language filters.")
+            + (discoveryPolicy.includesExcluded ? " Ignored and generated files included." : "")
             + (indexStatus == nil ? "" : " Captured index; Refresh to include file edits.")
             + ((indexStatus?.uncapturedFiles ?? 0) == 0 ? "" : " \(indexStatus?.uncapturedFiles ?? 0) eligible files were not captured. Refresh to capture the current scope within its limits.")
     }
@@ -540,6 +556,7 @@ struct AtlasSearchInput: Sendable {
     /// exact text counts when its route supports counting; legacy transports
     /// and other modes stay bounded. Explicit choices are never substituted.
     let countAllMatches: Bool?
+    let discoveryPolicy: AtlasDiscoveryPolicy
     var countsLiveMatches: Bool { countAllMatches ?? (mode == .text && caseSensitive) }
     func countsIndexedMatches(supportsCounting: Bool) -> Bool {
         countAllMatches ?? (mode == .text && caseSensitive && supportsCounting)
@@ -549,7 +566,8 @@ struct AtlasSearchInput: Sendable {
     init(root: String, query: String, fileScope: AtlasSearchFileScope = .all,
          pathScope: AtlasSearchPathScope = .workspace,
          mode: AtlasSearchMode = .text, nameMode: AtlasSearchNameMode = .contains,
-         caseSensitive: Bool = true, countAllMatches: Bool? = nil) throws {
+         caseSensitive: Bool = true, countAllMatches: Bool? = nil,
+         discoveryPolicy: AtlasDiscoveryPolicy = .repositoryRules) throws {
         guard !root.isEmpty, root.utf8.count <= 16_384, !root.utf8.contains(0),
               !query.isEmpty, query.utf8.count <= 1_024, !query.utf8.contains(0) else {
             throw AtlasSearchError.invalidRequest
@@ -562,8 +580,10 @@ struct AtlasSearchInput: Sendable {
         self.nameMode = mode.effectiveNameMode(nameMode)
         self.caseSensitive = mode.isTextual ? caseSensitive : true
         self.countAllMatches = mode.isTextual ? countAllMatches : false
+        self.discoveryPolicy = discoveryPolicy
     }
     func requireLegacyScope() throws {
+        guard discoveryPolicy == .repositoryRules else { throw AtlasSearchError.unsupportedDiscoveryPolicy }
         guard mode == .text else { throw AtlasSearchError.invalidRequest }
         guard caseSensitive else { throw AtlasSearchError.unsupportedMatching }
         guard countAllMatches == nil else { throw AtlasSearchError.unsupportedCounting }
@@ -815,11 +835,12 @@ struct AtlasSearchContext: Sendable {
     var nameMode: AtlasSearchNameMode = .contains
     var caseSensitive: Bool = true
     var countAllMatches: Bool? = nil
+    var discoveryPolicy: AtlasDiscoveryPolicy = .repositoryRules
 
     func matches(_ other: Self) -> Bool {
         loadGeneration == other.loadGeneration && atlasRevision == other.atlasRevision
             && mode == other.mode && nameMode == other.nameMode && caseSensitive == other.caseSensitive
-            && countAllMatches == other.countAllMatches
+            && countAllMatches == other.countAllMatches && discoveryPolicy == other.discoveryPolicy
             && root.utf8.elementsEqual(other.root.utf8)
             && query.utf8.elementsEqual(other.query.utf8)
             && scope.utf8.elementsEqual(other.scope.utf8)

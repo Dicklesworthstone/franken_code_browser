@@ -7,6 +7,7 @@ final class IndexedFixture: @unchecked Sendable {
         var unavailable = 0
         var pending = 0
         var discovery = true
+        var ruleFingerprint: String?
         var fallback = false
         var hitCount = 2
         var countedMatches: UInt64? = nil
@@ -45,6 +46,7 @@ final class IndexedFixture: @unchecked Sendable {
         var expression: String?
         var structureMode: AtlasSearchMode?
         var nameMode: AtlasSearchNameMode = .contains
+        var discoveryPolicyReceipt: String?
     }
     private let lock = NSLock()
     private var config = Configuration()
@@ -102,6 +104,14 @@ final class IndexedFixture: @unchecked Sendable {
         })
     }
 
+    var policyAwareTransport: AtlasIndexedSearchTransport {
+        var transport = self.transport
+        transport.openWithPolicy = { h, _, policy, flag in
+            try self.response("open", h, discoveryPolicy: policy, cancellation: flag)
+        }
+        return transport
+    }
+
     /// Opt-in count receipts; the default fixture keeps legacy bounded pages.
     var countedTransport: AtlasIndexedSearchTransport {
         var transport = self.transport
@@ -137,6 +147,7 @@ final class IndexedFixture: @unchecked Sendable {
                           expression: String? = nil,
                           structureMode: AtlasSearchMode? = nil,
                           nameMode: AtlasSearchNameMode = .contains,
+                          discoveryPolicy: AtlasDiscoveryPolicy? = nil,
                           cancellation: AtlasSearchCancellation? = nil) throws -> String? {
         lock.lock(); let block = blocked; lock.unlock()
         block?(phase)
@@ -144,6 +155,13 @@ final class IndexedFixture: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard var s = sessions[h] else { preconditionFailure("Use after close") }
         events.append("\(phase):\(h):\(generation)")
+        if phase == "open", let discoveryPolicy {
+            s.discoveryPolicyReceipt = discoveryPolicy.wireName
+            if discoveryPolicy == .repositoryRules, let fingerprint = s.config.ruleFingerprint {
+                s.discoveryPolicyReceipt! += ":" + fingerprint
+            }
+            events.append("discovery-policy:\(discoveryPolicy.rawValue)")
+        }
         if phase == "build-begin" {
             s.captureFileScope = scope; s.capturePathScope = pathScope
             events.append("capture-scope:\(scope.wireKind):\(scope.extensions ?? ""):\(scope.filenames ?? "")")
@@ -183,6 +201,7 @@ final class IndexedFixture: @unchecked Sendable {
         var value: [String: Any] = ["schema": "fcb.atlas-search/1", "status": "ok", "owner": String(h),
             "source_manifest": "1", "layout_revision": "3", "scope": "all", "workspace_files": String(c.files),
             "catalogued_files": String(c.files), "index_generation": "1"]
+        if let receipt = s.discoveryPolicyReceipt { value["discovery_policy"] = receipt }
         if phase != "open" {
             value["capture_search_scope"] = s.captureFileScope.wireKind
             value["capture_scope_extensions"] = s.captureFileScope.extensions ?? ""

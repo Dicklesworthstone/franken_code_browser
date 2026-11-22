@@ -6,8 +6,10 @@
 static const uint64_t handle = UINT64_C(18446744073709551500);
 static unsigned calls, allocated, freed;
 static int mode;
+static uint64_t policy = UINT64_MAX;
 extern void indexed_fixture_cancel(void *);
-void indexed_fixture_reset(void) { calls = allocated = freed = 0; mode = 0; }
+void indexed_fixture_reset(void) { calls = allocated = freed = 0; mode = 0; policy = UINT64_MAX; }
+uint64_t indexed_fixture_policy(void) { return policy; }
 void indexed_fixture_mode(int next) { mode = next; }
 unsigned indexed_fixture_calls(void) { return calls; }
 unsigned indexed_fixture_live(void) { return allocated - freed; }
@@ -26,6 +28,11 @@ static void poll_now(int32_t (*poll)(void *), void *ctx) {
 uint64_t fcb_atlas_create(void) { ++calls; return handle; }
 char *fcb_atlas_open_cancelable(uint64_t h, const char *root, uint64_t files, int32_t (*poll)(void *), void *ctx) {
     assert(h == handle && !strcmp(root, "/repo") && files == 20000); ++calls; poll_now(poll, ctx); return result();
+}
+char *fcb_atlas_open_with_policy_cancelable(uint64_t h, const char *root, uint64_t files,
+        uint64_t selected_policy, int32_t (*poll)(void *), void *ctx) {
+    assert(selected_policy <= 1); policy = selected_policy;
+    return fcb_atlas_open_cancelable(h, root, files, poll, ctx);
 }
 char *fcb_atlas_index_begin(uint64_t h, uint64_t g, uint64_t files, uint64_t per_file, uint64_t bytes, uint64_t grams) {
     assert(h == handle && g == 1 && files == 4096 && per_file == 1024 * 1024 && bytes == 32 * 1024 * 1024 && grams == 2 * 1024 * 1024);

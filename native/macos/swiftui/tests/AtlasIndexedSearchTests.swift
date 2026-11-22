@@ -11,9 +11,10 @@ import Dispatch
     @MainActor private static func run(_ worker: AtlasIndexedSearch, query: String = "x", root: String = "/repo",
                                       access: AnyObject? = nil, flag: AtlasSearchCancellation = AtlasSearchCancellation(),
                                       reports: IndexReports = IndexReports(), caseSensitive: Bool = true,
-                                      countAllMatches: Bool? = nil) throws -> AtlasSearchReport {
+                                      countAllMatches: Bool? = nil,
+                                      discoveryPolicy: AtlasDiscoveryPolicy = .repositoryRules) throws -> AtlasSearchReport {
         try worker.runScoped(input: AtlasSearchInput(root: root, query: query, caseSensitive: caseSensitive,
-            countAllMatches: countAllMatches),
+            countAllMatches: countAllMatches, discoveryPolicy: discoveryPolicy),
             cancellation: flag, access: AtlasSearchAccessLease(access), progress: reports.offer)
     }
     @MainActor private static func scoped(_ worker: AtlasIndexedSearch, scope: AtlasSearchFileScope,
@@ -393,7 +394,99 @@ import Dispatch
         }
         #endif
     }
+    @MainActor private static func discoveryPolicyOwnership() throws {
+        do {
+            let fixture = IndexedFixture(), reports = IndexReports()
+            fixture.configure { $0.ruleFingerprint = String(repeating: "a", count: 64) }
+            let worker = AtlasIndexedSearch(transport: fixture.policyAwareTransport)
+            let rules = try run(worker, reports: reports)
+            let selected = rules.capture!.target(rules.hits[0])!
+            check(rules.discoveryPolicy == .repositoryRules && fixture.count("discovery-policy:0") == 1,
+                "Default index pins the requested rule-aware universe and fingerprint")
+            let expanded = try run(worker, reports: reports, discoveryPolicy: .includeExcluded)
+            check(expanded.discoveryPolicy == .includeExcluded && expanded.indexStatus?.reused == false
+                && fixture.count("create:") == 2 && fixture.count("discovery-policy:1") == 1,
+                "Discovery policy replacement creates a new index despite identical root and grant")
+            let again = try run(worker, query: "new query", discoveryPolicy: .includeExcluded)
+            check(again.indexStatus?.reused == true && fixture.count("create:") == 2,
+                "Repeated queries reuse the accepted expanded universe")
+            _ = try selected.openReader(100)
+            check(fixture.count("source:") == 1, "A policy switch preserves an independently retained old capture")
+            let prepared = try worker.prepare(root: "/repo", discoveryPolicy: .repositoryRules,
+                cancellation: AtlasSearchCancellation(), access: AtlasSearchAccessLease(nil), progress: { _ in })
+            check(prepared.basis.discoveryPolicyReceipt == "repository-rules-v1:" + String(repeating: "a", count: 64)
+                && fixture.count("create:") == 3, "Explicit preparation cannot reuse an index from another policy")
+            check(reports.values.contains { $0.indexStatus?.building == true && $0.discoveryPolicy == .includeExcluded },
+                "Provisional build reports retain the selected discovery scope")
+        }
+        do {
+            let fixture = IndexedFixture(), worker = AtlasIndexedSearch(transport: fixture.transport)
+            do { _ = try run(worker, discoveryPolicy: .includeExcluded); preconditionFailure("Legacy discovery silently narrowed") }
+            catch AtlasSearchError.unsupportedDiscoveryPolicy { checks += 1 }
+            do {
+                _ = try worker.prepare(root: "/repo", discoveryPolicy: .includeExcluded,
+                    cancellation: AtlasSearchCancellation(), access: AtlasSearchAccessLease(nil), progress: { _ in })
+                preconditionFailure("Legacy preparation silently narrowed")
+            } catch AtlasSearchError.unsupportedDiscoveryPolicy { checks += 1 }
+            check(fixture.count("create:") == 0, "Unsupported expanded discovery is refused before owner allocation or I/O")
+            _ = try run(worker)
+            check(fixture.count("create:") == 1, "Legacy default callers keep working")
+        }
+        for phase in ["build-begin", "build-step", "query-begin", "query-step", "page", "source"] {
+            for receipt in ["all-regular-files/no-rule-files-v1", "repository-rules-v1"] {
+                let fixture = IndexedFixture(), worker = AtlasIndexedSearch(transport: fixture.transport)
+                fixture.configure { $0.hitCount = 200 }
+                fixture.patch { actual, original in
+                    var value = original
+                    if phase == actual { value["discovery_policy"] = receipt }
+                    return value
+                }
+                do {
+                    let report = try run(worker)
+                    if phase == "source" { _ = try report.capture!.target(report.hits[0])!.openReader(100) }
+                    preconditionFailure("Legacy owner introduced an unpinned policy at \(phase)")
+                } catch AtlasSearchError.invalidResponse { checks += 1 }
+            }
+        }
+        for phase in ["open", "build-begin", "build-step", "query-begin", "query-step", "page"] {
+            let fixture = IndexedFixture(), worker = AtlasIndexedSearch(transport: fixture.policyAwareTransport)
+            fixture.configure { $0.hitCount = 200 }
+            fixture.patch { actual, original in
+                var value = original
+                if phase == actual { value["discovery_policy"] = "all-regular-files/no-rule-files-v1" }
+                return value
+            }
+            do { _ = try run(worker); preconditionFailure("Accepted changed index discovery policy at \(phase)") }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
+            if phase == "open" {
+                check(fixture.count("build-begin:") == 0, "Wrong-policy metadata cannot start source capture")
+            }
+        }
+        for phase in ["open", "build-begin", "query-step"] {
+            let fixture = IndexedFixture(), worker = AtlasIndexedSearch(transport: fixture.policyAwareTransport)
+            fixture.patch { actual, original in
+                var value = original
+                if phase == actual { value.removeValue(forKey: "discovery_policy") }
+                return value
+            }
+            do { _ = try run(worker); preconditionFailure("Accepted missing policy at \(phase)") }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
+        }
+        do {
+            let fixture = IndexedFixture(), worker = AtlasIndexedSearch(transport: fixture.policyAwareTransport)
+            fixture.configure { $0.ruleFingerprint = String(repeating: "a", count: 64) }
+            fixture.patch { phase, original in
+                var value = original
+                if phase == "build-step" { value["discovery_policy"] = "repository-rules-v1:" + String(repeating: "b", count: 64) }
+                return value
+            }
+            do { _ = try run(worker); preconditionFailure("Frozen rules changed beneath index preparation") }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
+        }
+    }
+
     @MainActor static func main() throws {
+        try discoveryPolicyOwnership()
         try structuralSearch()
         try countedSearch()
         for caseSensitive in [true, false] {

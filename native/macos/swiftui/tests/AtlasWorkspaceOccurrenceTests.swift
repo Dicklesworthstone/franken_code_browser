@@ -49,6 +49,7 @@ private final class OccurrenceReports: @unchecked Sendable {
         let rows = start < end ? ((start + 1)...end).map { hit($0, name: name, utf16: utf16, path: path) } : []
         return ["schema": "fcb.atlas-search/1", "status": "ok", "command": command,
             "owner": "11", "source_manifest": "1", "layout_revision": "1", "query_generation": "1",
+            "discovery_policy": "repository-rules-v1",
             "needle": name, "mode": "identifier-occurrence", "search_strategy": "live-structure-scan",
             "requested_mode": "occurrences", "realized_mode": "whole-token-text-candidate",
             "evidence_level": "whole-token-text-candidate", "name_mode": "exact", "name_case": "sensitive",
@@ -74,7 +75,8 @@ private final class OccurrenceReports: @unchecked Sendable {
     private static func setup(name: String = "run", utf16: Bool = false, total: Int = 1,
                               catalogued: Int = 1) throws {
         resetFixture(); expectStructure(4, 0)
-        try install(0, ["status": "ok"])
+        try install(0, ["schema": "fcb.atlas-session/1", "status": "ok", "command": "info",
+            "owner": "11", "discovery_policy": "repository-rules-v1"])
         try install(1, page("begin-structure", step: 0, catalogued: catalogued, name: name))
         try install(2, page("step", step: 1, total: total, running: catalogued > 1,
             complete: catalogued == 1, catalogued: catalogued, name: name, utf16: utf16))
@@ -159,6 +161,7 @@ private final class OccurrenceReports: @unchecked Sendable {
         var imported = hit(1)
         imported.merge(["schema": "fcb.atlas-search/1", "status": "ok", "command": "open-reader",
             "owner": "11", "source_manifest": "1", "layout_revision": "1", "query_generation": "1",
+            "discovery_policy": "repository-rules-v1",
             "reader_owner": "100", "source_reopened": false, "source_observation": "retained-search-capture",
             "reader": ["schema": "fcb.reader-session/1", "status": "ok", "command": "info",
                 "owner": "100", "file_id": "1", "source_revision": "1", "captured_bytes": "32768",
@@ -282,7 +285,8 @@ private final class OccurrenceReports: @unchecked Sendable {
         for mode in [AtlasSearchMode.text, .symbols, .headings] {
             resetFixture()
             if mode.supportsNameMatching { expectStructure(mode.code, 0) }
-            try install(0, ["status": "ok"])
+            try install(0, ["schema": "fcb.atlas-session/1", "status": "ok", "command": "info",
+            "owner": "11", "discovery_policy": "repository-rules-v1"])
             var foreign = page(mode.isTextual ? "begin" : "begin-structure", step: 0)
             foreign["mode"] = mode.wireMode
             foreign["search_strategy"] = mode.isTextual ? "live-capture-scan" : "live-structure-scan"

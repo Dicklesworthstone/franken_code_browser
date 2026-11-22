@@ -262,6 +262,9 @@ import Foundation
             check(old.matchesSourceRequest(new), "An in-flight source search survives optional preview publication")
             check(!old.matches(new), "Old overlay/frame authority still rejected after layout change")
             check(old.matchesSourceRequest(old) && old.matches(old), "Unchanged source and display remain compatible")
+            var expanded = new; expanded.discoveryPolicy = .includeExcluded
+            check(!old.matchesSourceRequest(expanded) && !old.matches(expanded),
+                "Preview publication cannot rebind a result from another discovery policy")
             var insensitive = new; insensitive.caseSensitive = false
             check(!old.matchesSourceRequest(insensitive) && !old.matches(insensitive),
                 "Preview publication cannot rebind a result after Match Case changes")

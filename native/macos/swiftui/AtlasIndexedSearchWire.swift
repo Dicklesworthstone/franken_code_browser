@@ -48,6 +48,15 @@ struct AtlasIndexWire: Decodable {
         }
         return true
     }
+    /// Once opening omits a legacy policy, later operations cannot introduce
+    /// a different discovery claim under that already accepted source owner.
+    func validateDiscoveryPolicyReceipt(_ expected: String?) throws {
+        if let expected {
+            guard try text("discovery_policy").utf8.elementsEqual(expected.utf8) else { throw Self.invalid() }
+        } else {
+            guard try absent(["discovery_policy"]) else { throw Self.invalid() }
+        }
+    }
     func rows<T: Decodable>(_ key: String, limit: Int) throws -> [T] {
         var rows = try fields.nestedUnkeyedContainer(forKey: Key(key))
         if let count = rows.count, count > limit { throw Self.invalid() }
@@ -119,6 +128,7 @@ struct AtlasIndexedBasis: Sendable, Equatable {
     let sourceBytes: UInt64
     let discoveryComplete: Bool
     let captureScope: AtlasIndexedCaptureScope
+    var discoveryPolicyReceipt: String? = nil
 
     func validate(_ wire: AtlasIndexWire, command: String) throws {
         try wire.header(schema: "fcb.atlas-search/1", command: command, owner: owner)
@@ -128,6 +138,7 @@ struct AtlasIndexedBasis: Sendable, Equatable {
             throw AtlasIndexWire.invalid()
         }
         try captureScope.validate(wire, files: files)
+        try wire.validateDiscoveryPolicyReceipt(discoveryPolicyReceipt)
     }
 }
 

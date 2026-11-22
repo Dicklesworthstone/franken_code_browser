@@ -18,7 +18,8 @@ private final class StepControl: @unchecked Sendable {
                 if action == .invalidReceipt { return "{\"status\":\"ok\"}" }
                 return result
             }, queryBegin: base.queryBegin, queryStep: base.queryStep, page: base.page,
-            sourceReader: base.sourceReader, close: base.close, retirementFailed: base.retirementFailed)
+            sourceReader: base.sourceReader, close: base.close, retirementFailed: base.retirementFailed,
+            openWithPolicy: base.openWithPolicy)
     }
 }
 private final class Grant {}
@@ -39,6 +40,22 @@ private final class Grant {}
         try worker.run(root: root, query: query, cancellation: AtlasSearchCancellation(), access: access, progress: progress)
     }
     @MainActor static func main() throws {
+        do {
+            let fixture = IndexedFixture(), control = StepControl()
+            let worker = AtlasIndexedSearch(transport: control.transport(fixture.policyAwareTransport))
+            control.set(.cancelAfterReceipt)
+            canceled { try run(worker) }
+            check(fixture.count("create:") == 1 && fixture.count("build-step:") == 1,
+                "Rules preparation retains its last acknowledged source step")
+            control.set(.normal)
+            let report = try worker.runScoped(
+                input: AtlasSearchInput(root: "/repo", query: "x", discoveryPolicy: .includeExcluded),
+                cancellation: AtlasSearchCancellation(), access: AtlasSearchAccessLease(nil), progress: { _ in })
+            check(report.discoveryPolicy == .includeExcluded && report.complete
+                && fixture.count("create:") == 2 && fixture.count("build-begin:") == 2
+                && fixture.count("discovery-policy:1") == 1,
+                "A policy change cannot resume a narrower paused source universe")
+        }
         do {
             let f = IndexedFixture(), control = StepControl()
             f.configure { $0.files = 4 }

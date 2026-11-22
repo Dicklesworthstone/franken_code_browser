@@ -172,7 +172,7 @@ extension AtlasSearchContext {
         loadGeneration == other.loadGeneration
             && (pathKind != "visible" || atlasRevision == other.atlasRevision)
             && mode == other.mode && nameMode == other.nameMode && caseSensitive == other.caseSensitive
-            && countAllMatches == other.countAllMatches
+            && countAllMatches == other.countAllMatches && discoveryPolicy == other.discoveryPolicy
             && root.utf8.elementsEqual(other.root.utf8)
             && query.utf8.elementsEqual(other.query.utf8)
             && scope.utf8.elementsEqual(other.scope.utf8)

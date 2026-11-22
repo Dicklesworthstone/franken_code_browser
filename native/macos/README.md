@@ -223,9 +223,15 @@ where applicable; the receipt's partial coverage is not deletion evidence.
 **Quick Open → Include ignored files** restarts filename discovery for the current query. **Search large
 project files… → Include ignored files** applies to the next **Search** and
 survives **Reset search**. Superseded rows cannot authorize new actions; retained
-source evidence remains readable. These controls are local to each tool:
-ordinary sidebar search retains its own default scope, and visible-atlas
-search keeps its frozen membership. The override reports
+source evidence remains readable.
+
+Project Files' accepted discovery policy also governs ordinary sidebar search
+and captured-index preparation. Switching policy invalidates stale search
+actions and prevents reuse of an index prepared under the other policy.
+Visible-atlas search keeps its frozen path membership within the selected
+discovery policy. Quick Open and Search large project files retain their own
+independent controls. Search and index replies must match their opened catalog's
+policy, including the exact rule-observation fingerprint when present. The override reports
 `all-regular-files/no-rule-files-v1`, with no repository-rule configuration reads.
 Root confinement, symlink and special-object refusal, resource limits and
 independent exclusions for FCB's own artifacts still apply.
@@ -1221,8 +1227,10 @@ the live query's file or capture budget.
 Leave **Captured index** off to capture matching-scope sources during each
 query. Turn it on to prepare the current file/location scope once and run both
 Text and Expression queries against those retained bytes. Editing the
-expression or changing **Match case** reuses the prepared captures. **Refresh**
-captures current sources again. Expression filters narrow a query over the
+expression or changing **Match case** reuses the prepared captures. Changing
+the accepted discovery policy starts a new catalog and capture preparation;
+a paused build or completed index under the other policy is never reused.
+**Refresh** captures current sources again. Expression filters narrow a query over the
 prepared index; they do not change which sources the index originally captured.
 Widening a query beyond that captured scope can therefore leave files
 uncaptured until Refresh. Indexed queries and result activation do no live
