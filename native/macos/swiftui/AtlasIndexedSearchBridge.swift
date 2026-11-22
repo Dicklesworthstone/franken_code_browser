@@ -11,6 +11,10 @@ private typealias IndexPoll = @convention(c) (UnsafeMutableRawPointer?) -> Int32
 private func indexedOpenDirectory(_ h: UInt64, _ root: UnsafePointer<CChar>?,
     _ directory: UnsafePointer<UInt8>?, _ directoryLength: UInt64, _ files: UInt64, _ policy: UInt64,
     _ poll: IndexPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_atlas_open_file_with_policy_cancelable")
+private func indexedOpenFile(_ h: UInt64, _ root: UnsafePointer<CChar>?,
+    _ file: UnsafePointer<UInt8>?, _ fileLength: UInt64, _ files: UInt64, _ policy: UInt64,
+    _ poll: IndexPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_index_begin") private func indexedBuildBegin(_ h: UInt64, _ g: UInt64,
     _ files: UInt64, _ fileBytes: UInt64, _ sourceBytes: UInt64, _ grams: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_index_begin_scoped") private func indexedScopedBuildBegin(_ h: UInt64, _ g: UInt64,
@@ -163,12 +167,22 @@ extension AtlasIndexedSearchTransport {
                 policy.rawValue, poll, context) }
         }
     }, openDirectoryWithPolicy: { h, root, catalog, policy, flag in
-        guard !catalog.isWorkspace else { throw AtlasSearchError.invalidCatalogScope }
+        guard catalog.kind == .directory else { throw AtlasSearchError.invalidCatalogScope }
         return try polling(flag) { poll, context in
             root.withCString { rootPointer in
                 catalog.directory.withUnsafeBufferPointer { directory in
                     indexedOpenDirectory(h, rootPointer, directory.baseAddress, UInt64(directory.count),
                         UInt64(AtlasSearchPathScope.maximumVisibleFiles), policy.rawValue, poll, context)
+                }
+            }
+        }
+    }, openFileWithPolicy: { h, root, catalog, policy, flag in
+        guard catalog.kind == .file else { throw AtlasSearchError.invalidCatalogScope }
+        return try polling(flag) { poll, context in
+            root.withCString { rootPointer in
+                catalog.file.withUnsafeBufferPointer { file in
+                    indexedOpenFile(h, rootPointer, file.baseAddress, UInt64(file.count),
+                        1, policy.rawValue, poll, context)
                 }
             }
         }

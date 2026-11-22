@@ -20,7 +20,8 @@ private final class StepControl: @unchecked Sendable {
             }, queryBegin: base.queryBegin, queryStep: base.queryStep, page: base.page,
             sourceReader: base.sourceReader, close: base.close, retirementFailed: base.retirementFailed,
             pathScopedQueryBegin: base.pathScopedQueryBegin, scopedIndexBegin: base.scopedIndexBegin,
-            openWithPolicy: base.openWithPolicy, openDirectoryWithPolicy: base.openDirectoryWithPolicy)
+            openWithPolicy: base.openWithPolicy, openDirectoryWithPolicy: base.openDirectoryWithPolicy,
+            openFileWithPolicy: base.openFileWithPolicy)
     }
 }
 private final class Grant {}
@@ -40,7 +41,50 @@ private final class Grant {}
                             progress: @Sendable (AtlasSearchReport) -> Void = { _ in }) throws -> AtlasSearchReport {
         try worker.run(root: root, query: query, cancellation: AtlasSearchCancellation(), access: access, progress: progress)
     }
+    @MainActor private static func exactFilePreparation() throws {
+        for replacement in ["same-file", "sibling-file", "parent-directory"] {
+            let fixture = IndexedFixture(), control = StepControl()
+            let firstPath = "zz-late/a.rs"
+            let firstCatalog = try AtlasSearchCatalogScope(file: Array(firstPath.utf8))
+            fixture.configure { $0.files = 1; $0.pathHex = firstCatalog.pathHex }
+            let worker = AtlasIndexedSearch(transport: control.transport(fixture.catalogAwareTransport))
+            let input = try AtlasSearchInput(root: "/repo", query: "x",
+                pathScope: AtlasSearchPathScope(kind: .file, path: firstPath), catalogScope: firstCatalog)
+            control.set(.cancelAfterReceipt)
+            canceled {
+                try worker.runScoped(input: input, cancellation: AtlasSearchCancellation(),
+                    access: AtlasSearchAccessLease(nil), progress: { _ in })
+            }
+            check(fixture.count("create:") == 1 && fixture.count("build-step:") == 1
+                && fixture.count("query-begin:") == 0,
+                "An acknowledged one-file capture survives cancellation without starting source verification")
+            control.set(.normal)
+            let next: AtlasSearchInput
+            if replacement == "same-file" { next = input }
+            else if replacement == "sibling-file" {
+                let file = try AtlasSearchCatalogScope(file: Array("zz-late/b.rs".utf8))
+                fixture.configure { $0.pathHex = file.pathHex }
+                next = try AtlasSearchInput(root: "/repo", query: "x",
+                    pathScope: AtlasSearchPathScope(kind: .file, path: "zz-late/b.rs"), catalogScope: file)
+            } else {
+                next = try AtlasSearchInput(root: "/repo", query: "x",
+                    pathScope: AtlasSearchPathScope(kind: .directory, path: "zz-late"),
+                    catalogScope: AtlasSearchCatalogScope(directory: Array("zz-late".utf8)))
+            }
+            let result = try worker.runScoped(input: next, cancellation: AtlasSearchCancellation(),
+                access: AtlasSearchAccessLease(nil), progress: { _ in })
+            check(result.complete && result.catalogScope == next.catalogScope
+                && result.indexStatus?.reused == (replacement == "same-file"),
+                "Only the same typed exact-file catalog can reuse its canceled delivery's accepted capture")
+            let expected = replacement == "same-file" ? 1 : 2
+            check(fixture.count("create:") == expected && fixture.count("build-begin:") == expected
+                && fixture.count("build-step:") == expected,
+                "Changing selected file or broadening to its parent starts a new discovery universe")
+        }
+    }
+
     @MainActor static func main() throws {
+        try exactFilePreparation()
         for sameDirectory in [true, false] {
             let fixture = IndexedFixture(), control = StepControl()
             fixture.configure { $0.pathHex = "7a7a2d6c6174652f612e7273" }

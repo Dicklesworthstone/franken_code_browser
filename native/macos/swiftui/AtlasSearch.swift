@@ -337,8 +337,8 @@ enum AtlasSearchError: Error, Sendable {
         case .unsupportedMatching: return "This search connection does not support case-insensitive text. Turn on Match case to search."
         case .unsupportedCounting: return "This search connection cannot honor the requested count policy. Reconnect to search."
         case .unsupportedDiscoveryPolicy: return "This search connection cannot include ignored and generated files. Reconnect to search the selected discovery scope."
-        case .invalidCatalogScope: return "Choose a project-relative search folder of at most 2,048 original path bytes, with no empty or dot components."
-        case .unsupportedCatalogScope: return "This search connection cannot discover the selected folder independently. Reconnect before searching this scope."
+        case .invalidCatalogScope: return "Choose a project-relative file or folder of at most 2,048 original path bytes, with no empty or dot components and at most 32 file or 31 folder components."
+        case .unsupportedCatalogScope: return "This search connection cannot discover the selected file or folder independently. Reconnect before searching this scope."
         case .unavailable: return "Search unavailable. The project could not be read or the search exceeded its limits."
         case .invalidResponse: return "Search response could not be read. Results are unavailable, not an empty match set."
         case .query(let code):
@@ -391,6 +391,7 @@ struct AtlasSearchReport: Sendable {
     var expression: AtlasSearchExpression? = nil
     var discoveryPolicy: AtlasDiscoveryPolicy = .repositoryRules
     var catalogScope: AtlasSearchCatalogScope = .workspace
+    var discoveryCoverage: AtlasSearchDiscoveryCoverage? = nil
     /// One bounded result window over the same explicitly retained index.
     var resultWindow: AtlasSearchResultWindow? = nil
     var isInProgress: Bool { progress?.isRunning == true }
@@ -400,19 +401,22 @@ struct AtlasSearchReport: Sendable {
     var summary: String {
         if let indexStatus, indexStatus.building, let progress {
             return "Preparing captured index for \(indexStatus.captureScopeDescription): \(progress.examinedFiles) of \(progress.cataloguedFiles) eligible files examined."
-                + (indexStatus.captureMissingVisibleFiles == 0 ? "" : " \(indexStatus.captureMissingVisibleFiles) requested visible files are outside this search catalog.")
+                + (indexStatus.captureMissingVisibleFiles == 0 ? "" : " \(indexStatus.captureMissingVisibleFiles) requested files are outside this search catalog.")
                 + " Query results are not ready yet."
                 + (discoveryPolicy.includesExcluded ? " Ignored and generated files included." : "")
         }
         return resultSummary
             + (isWorkspaceScope ? "" : " \(excludedFiles) catalogued files outside this scope.")
-            + (visibleMissingFiles == 0 ? "" : " \(visibleMissingFiles) requested visible files are outside this search catalog.")
+            + (visibleMissingFiles == 0 ? "" : " \(visibleMissingFiles) requested files are outside this search catalog.")
             + ((expression?.excludedFiles ?? 0) == 0 ? "" : " \(expression?.excludedFiles ?? 0) files excluded by expression path/language filters.")
             + (discoveryPolicy.includesExcluded ? " Ignored and generated files included." : "")
             + (indexStatus == nil ? "" : " Captured index; Refresh to include file edits.")
             + ((indexStatus?.uncapturedFiles ?? 0) == 0 ? "" : " \(indexStatus?.uncapturedFiles ?? 0) eligible files were not captured. Refresh to capture the current scope within its limits.")
     }
     private var resultSummary: String {
+        if catalogScope.kind == .file, hits.isEmpty, let explanation = discoveryCoverage?.fileExplanation(policy: discoveryPolicy) {
+            return explanation
+        }
         let count = hits.count
         let nounCount = countAllMatches || resultWindow != nil ? matchesSeen : UInt64(count)
         let noun: String
@@ -563,89 +567,184 @@ struct AtlasSearchReport: Sendable {
     private struct FileRecord: Decodable { let file_id: String }
 }
 
-/// Metadata discovery is bounded independently inside this exact directory.
+/// Metadata discovery is bounded independently inside this exact scope.
 /// It never changes the granted project root or the root-relative result paths.
 struct AtlasSearchCatalogScope: Equatable, Sendable {
+    enum Kind: String, Sendable { case workspace, directory, file }
     static let maximumDirectoryBytes = 2048
     static let maximumDirectoryComponents = 31
-    static let workspace = Self(validatedDirectory: [])
-    let directory: [UInt8]
+    static let maximumFileBytes = 2048
+    static let maximumFileComponents = 32
+    static let workspace = Self(validatedKind: .workspace, rawPath: [])
+    let kind: Kind
+    let rawPath: [UInt8]
 
     init(directory: [UInt8]) throws {
-        guard directory.count <= Self.maximumDirectoryBytes,
-              directory.split(separator: 47, omittingEmptySubsequences: false).count <= Self.maximumDirectoryComponents,
-              directory.isEmpty || (!directory.contains(0)
-                && !directory.split(separator: 47, omittingEmptySubsequences: false).contains(where: {
+        try self.init(kind: directory.isEmpty ? .workspace : .directory, rawPath: directory)
+    }
+    init(file: [UInt8]) throws { try self.init(kind: .file, rawPath: file) }
+    init(kind: Kind, rawPath: [UInt8]) throws {
+        let byteLimit = kind == .file ? Self.maximumFileBytes : Self.maximumDirectoryBytes
+        let componentLimit = kind == .file ? Self.maximumFileComponents : Self.maximumDirectoryComponents
+        guard rawPath.count <= byteLimit,
+              (kind == .workspace ? rawPath.isEmpty : !rawPath.isEmpty),
+              rawPath.split(separator: 47, omittingEmptySubsequences: false).count <= componentLimit,
+              rawPath.isEmpty || (!rawPath.contains(0)
+                && !rawPath.split(separator: 47, omittingEmptySubsequences: false).contains(where: {
                     $0.isEmpty || $0.elementsEqual([46]) || $0.elementsEqual([46, 46])
                 })) else { throw AtlasSearchError.invalidCatalogScope }
-        self.directory = directory
+        self.kind = kind; self.rawPath = rawPath
     }
-    private init(validatedDirectory: [UInt8]) { directory = validatedDirectory }
-    var isWorkspace: Bool { directory.isEmpty }
-    var directoryHex: String {
+    private init(validatedKind: Kind, rawPath: [UInt8]) { kind = validatedKind; self.rawPath = rawPath }
+    var isWorkspace: Bool { kind == .workspace }
+    var directory: [UInt8] { kind == .directory ? rawPath : [] }
+    var file: [UInt8] { kind == .file ? rawPath : [] }
+    var pathHex: String {
         let digits = Array("0123456789abcdef".utf8)
-        return String(decoding: directory.flatMap { [digits[Int($0 >> 4)], digits[Int($0 & 15)]] }, as: UTF8.self)
+        return String(decoding: rawPath.flatMap { [digits[Int($0 >> 4)], digits[Int($0 & 15)]] }, as: UTF8.self)
     }
+    var directoryHex: String { kind == .directory ? pathHex : "" }
     func containsFile(_ raw: [UInt8]) -> Bool {
-        isWorkspace || (raw.count > directory.count + 1 && raw.starts(with: directory)
-            && raw[directory.count] == 47)
+        switch kind {
+        case .workspace: return true
+        case .file: return raw == rawPath
+        case .directory:
+            return raw.count > rawPath.count + 1 && raw.starts(with: rawPath) && raw[rawPath.count] == 47
+        }
+    }
+}
+
+/// These immutable discovery counters are distinct from query/type exclusions
+/// and source-capture failures. A skipped selected file is never a zero-match proof.
+struct AtlasSearchDiscoveryCoverage: Equatable, Sendable {
+    let excludedEntries, unavailableEntries, symlinksNotFollowed, specialObjects: UInt64
+
+    init(excluded: String, unavailable: String, symlinks: String, special: String) throws {
+        func number(_ text: String) throws -> UInt64 {
+            guard let value = UInt64(text), String(value) == text else { throw AtlasSearchError.invalidResponse }
+            return value
+        }
+        excludedEntries = try number(excluded); unavailableEntries = try number(unavailable)
+        symlinksNotFollowed = try number(symlinks); specialObjects = try number(special)
+    }
+    func fileExplanation(policy: AtlasDiscoveryPolicy) -> String? {
+        var messages: [String] = []
+        if excludedEntries > 0 {
+            messages.append("The selected file was excluded from discovery; its source was not searched.")
+            if policy == .repositoryRules {
+                messages.append("If a repository ignore rule or generated-file policy excluded it, try Include excluded files.")
+            }
+        }
+        if unavailableEntries > 0 {
+            messages.append("Some entries needed to discover the selected file were unavailable. Search coverage is incomplete.")
+        }
+        if symlinksNotFollowed > 0 {
+            messages.append("A symlink in the selected path was not followed; the file was not searched.")
+        }
+        if specialObjects > 0 {
+            messages.append("The selected path is a special filesystem object and was not searched.")
+        }
+        return messages.isEmpty ? nil : messages.joined(separator: " ")
     }
 }
 
 /// Opening fixes this discovery identity for every later retained response.
-/// A legacy workspace owner may omit the whole additive receipt; later phases
-/// must then remain absent instead of introducing an unpinned scope.
+/// Legacy receipts may omit the entire scope or the additive file field only
+/// for workspace/directory discovery; subsequent phases preserve that shape.
 struct AtlasSearchCatalogReceipt: Equatable, Sendable {
     struct Path: Decodable, Sendable { let encoding, hex, display: String }
-    static let legacyWorkspace = Self(scope: .workspace, hasEcho: false)
+    static let legacyWorkspace = Self(scope: .workspace, hasEcho: false, hasFileEcho: false, discoveryCoverage: nil)
     let scope: AtlasSearchCatalogScope
     let hasEcho: Bool
+    let hasFileEcho: Bool
+    let discoveryCoverage: AtlasSearchDiscoveryCoverage?
 
-    /// Decodable optionals alone cannot distinguish missing keys from JSON
-    /// null. Preserve the all-absent legacy contract before typed admission.
-    static func validateFieldPresence(in data: Data) throws {
-        _ = try JSONDecoder().decode(FieldPresence.self, from: data)
+    /// Decodable optionals cannot distinguish missing keys from JSON null.
+    /// Preserve key presence independently from the validated path payload.
+    @discardableResult
+    static func validateFieldPresence(in data: Data) throws -> Fields {
+        try JSONDecoder().decode(Fields.self, from: data)
     }
-    private struct FieldPresence: Decodable {
-        enum Key: String, CodingKey, CaseIterable { case discovery_scope, discovery_directory, path_basis }
+    struct Fields: Decodable, Sendable {
+        enum Key: String, CodingKey {
+            case discovery_scope, discovery_directory, discovery_file, path_basis
+            case discovery_excluded_entries, discovery_unavailable_entries
+            case discovery_symlinks_not_followed, discovery_special_objects
+        }
+        let hasEcho, hasFileEcho: Bool
+        let discoveryCoverage: AtlasSearchDiscoveryCoverage?
         init(from decoder: Decoder) throws {
             let fields = try decoder.container(keyedBy: Key.self)
-            let count = Key.allCases.filter { fields.contains($0) }.count
-            guard count == 0 || count == 3 else { throw AtlasSearchError.invalidResponse }
-            if count == 3 {
-                _ = try fields.decode(String.self, forKey: .discovery_scope)
-                _ = try fields.decode(String.self, forKey: .path_basis)
-                _ = try fields.decodeIfPresent(Path.self, forKey: .discovery_directory)
-            }
-        }
-    }
-    private init(scope: AtlasSearchCatalogScope, hasEcho: Bool) {
-        self.scope = scope; self.hasEcho = hasEcho
-    }
-    init(scope: AtlasSearchCatalogScope, kind: String?, directory: Path?, pathBasis: String?,
-         requiresEcho: Bool = false) throws {
-        if kind == nil && directory == nil && pathBasis == nil {
-            guard scope.isWorkspace, !requiresEcho else { throw AtlasSearchError.invalidResponse }
-            self.init(scope: scope, hasEcho: false)
-            return
-        }
-        guard pathBasis == "project-root", kind == (scope.isWorkspace ? "workspace" : "directory") else {
-            throw AtlasSearchError.invalidResponse
-        }
-        if scope.isWorkspace {
-            guard directory == nil else { throw AtlasSearchError.invalidResponse }
-        } else {
-            guard let directory, directory.encoding == "unix-bytes",
-                  directory.hex.utf8.elementsEqual(scope.directoryHex.utf8),
-                  !directory.display.isEmpty, directory.display.utf8.count <= 16_384 else {
+            let base: [Key] = [.discovery_scope, .discovery_directory, .path_basis]
+            let count = base.filter { fields.contains($0) }.count
+            hasEcho = count == base.count
+            hasFileEcho = fields.contains(.discovery_file)
+            guard count == 0 || hasEcho, hasEcho || !hasFileEcho else {
                 throw AtlasSearchError.invalidResponse
             }
+            let coverageKeys: [Key] = [.discovery_excluded_entries, .discovery_unavailable_entries,
+                .discovery_symlinks_not_followed, .discovery_special_objects]
+            let coverageCount = coverageKeys.filter { fields.contains($0) }.count
+            guard coverageCount == 0 || (hasEcho && coverageCount == coverageKeys.count) else {
+                throw AtlasSearchError.invalidResponse
+            }
+            if coverageCount == 0 {
+                discoveryCoverage = nil
+            } else {
+                discoveryCoverage = try AtlasSearchDiscoveryCoverage(
+                    excluded: fields.decode(String.self, forKey: .discovery_excluded_entries),
+                    unavailable: fields.decode(String.self, forKey: .discovery_unavailable_entries),
+                    symlinks: fields.decode(String.self, forKey: .discovery_symlinks_not_followed),
+                    special: fields.decode(String.self, forKey: .discovery_special_objects))
+            }
+            if hasEcho {
+                let kind = try fields.decode(String.self, forKey: .discovery_scope)
+                _ = try fields.decode(String.self, forKey: .path_basis)
+                _ = try fields.decodeIfPresent(Path.self, forKey: .discovery_directory)
+                _ = try fields.decodeIfPresent(Path.self, forKey: .discovery_file)
+                guard kind != "file" || (hasFileEcho && discoveryCoverage != nil) else { throw AtlasSearchError.invalidResponse }
+            }
         }
-        self.init(scope: scope, hasEcho: true)
     }
-    func validate(kind: String?, directory: Path?, pathBasis: String?) throws {
-        guard try Self(scope: scope, kind: kind, directory: directory,
-            pathBasis: pathBasis, requiresEcho: hasEcho) == self else { throw AtlasSearchError.invalidResponse }
+    private init(scope: AtlasSearchCatalogScope, hasEcho: Bool, hasFileEcho: Bool,
+                 discoveryCoverage: AtlasSearchDiscoveryCoverage?) {
+        self.scope = scope; self.hasEcho = hasEcho; self.hasFileEcho = hasFileEcho
+        self.discoveryCoverage = discoveryCoverage
+    }
+    init(scope: AtlasSearchCatalogScope, kind: String?, directory: Path?, file: Path? = nil,
+         pathBasis: String?, hasFileEcho: Bool = false,
+         discoveryCoverage: AtlasSearchDiscoveryCoverage? = nil, requiresEcho: Bool = false) throws {
+        if kind == nil && directory == nil && file == nil && pathBasis == nil && !hasFileEcho {
+            guard scope.isWorkspace, !requiresEcho, discoveryCoverage == nil else { throw AtlasSearchError.invalidResponse }
+            self.init(scope: scope, hasEcho: false, hasFileEcho: false, discoveryCoverage: nil)
+            return
+        }
+        guard pathBasis == "project-root", kind == scope.kind.rawValue else {
+            throw AtlasSearchError.invalidResponse
+        }
+        func matches(_ path: Path?) -> Bool {
+            guard let path else { return false }
+            return path.encoding == "unix-bytes" && path.hex.utf8.elementsEqual(scope.pathHex.utf8)
+                && !path.display.isEmpty && path.display.utf8.count <= 16_384
+        }
+        switch scope.kind {
+        case .workspace:
+            guard directory == nil, file == nil else { throw AtlasSearchError.invalidResponse }
+        case .directory:
+            guard file == nil, matches(directory) else { throw AtlasSearchError.invalidResponse }
+        case .file:
+            guard hasFileEcho, discoveryCoverage != nil, directory == nil, matches(file) else { throw AtlasSearchError.invalidResponse }
+        }
+        self.init(scope: scope, hasEcho: true, hasFileEcho: hasFileEcho, discoveryCoverage: discoveryCoverage)
+    }
+    func validate(kind: String?, directory: Path?, file: Path? = nil,
+                  pathBasis: String?, hasFileEcho: Bool = false,
+                  discoveryCoverage: AtlasSearchDiscoveryCoverage? = nil) throws {
+        guard try Self(scope: scope, kind: kind, directory: directory, file: file,
+            pathBasis: pathBasis, hasFileEcho: hasFileEcho,
+            discoveryCoverage: discoveryCoverage, requiresEcho: hasEcho) == self else {
+            throw AtlasSearchError.invalidResponse
+        }
     }
 }
 
@@ -892,6 +991,7 @@ struct AtlasSearchPathScope: Equatable, Sendable {
         if let visiblePaths { return visiblePaths.allSatisfy(catalog.containsFile) }
         if kind == .file { return catalog.containsFile(Array(path.utf8)) }
         if kind == .directory {
+            guard catalog.kind == .directory else { return false }
             let raw = Array(path.utf8)
             return raw == catalog.directory || catalog.containsFile(raw)
         }
@@ -1027,13 +1127,14 @@ struct AtlasSearchContext: Sendable {
     var caseSensitive: Bool = true
     var countAllMatches: Bool? = nil
     var discoveryPolicy: AtlasDiscoveryPolicy = .repositoryRules
-    var catalogDirectory: [UInt8] = []
+    var catalogKind: AtlasSearchCatalogScope.Kind = .workspace
+    var catalogPath: [UInt8] = []
 
     func matches(_ other: Self) -> Bool {
         loadGeneration == other.loadGeneration && atlasRevision == other.atlasRevision
             && mode == other.mode && nameMode == other.nameMode && caseSensitive == other.caseSensitive
             && countAllMatches == other.countAllMatches && discoveryPolicy == other.discoveryPolicy
-            && catalogDirectory == other.catalogDirectory
+            && catalogKind == other.catalogKind && catalogPath == other.catalogPath
             && root.utf8.elementsEqual(other.root.utf8)
             && query.utf8.elementsEqual(other.query.utf8)
             && scope.utf8.elementsEqual(other.scope.utf8)

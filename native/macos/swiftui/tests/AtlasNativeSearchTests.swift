@@ -11,6 +11,7 @@ import Foundation
 @_silgen_name("fixture_expect_counted_case") private func expectCountedCase(_ caseSensitive: UInt64)
 @_silgen_name("fixture_expect_policy") private func expectPolicy(_ policy: UInt64)
 @_silgen_name("fixture_expect_directory") private func expectDirectory(_ bytes: UnsafePointer<UInt8>?, _ length: UInt64)
+@_silgen_name("fixture_expect_file") private func expectFile(_ bytes: UnsafePointer<UInt8>?, _ length: UInt64)
 @_silgen_name("fixture_expect_structure") private func expectStructure(_ mode: UInt64, _ nameMode: UInt64)
 @_cdecl("fixture_mark_canceled") public func markCanceled(_ context: UnsafeMutableRawPointer?) {
     guard let context else { preconditionFailure("Missing callback lifetime") }
@@ -297,10 +298,14 @@ private final class Reports: @unchecked Sendable {
 
     private static func catalogEcho(_ original: [String: Any], scope: AtlasSearchCatalogScope) -> [String: Any] {
         var value = original
-        value["discovery_scope"] = scope.isWorkspace ? "workspace" : "directory"
-        value["discovery_directory"] = scope.isWorkspace ? NSNull()
-            : ["encoding": "unix-bytes", "hex": scope.directoryHex, "display": "selected folder"] as Any
+        value["discovery_scope"] = scope.kind.rawValue
+        value["discovery_directory"] = scope.kind == .directory
+            ? ["encoding": "unix-bytes", "hex": scope.pathHex, "display": "selected folder"] as Any : NSNull()
+        value["discovery_file"] = scope.kind == .file
+            ? ["encoding": "unix-bytes", "hex": scope.pathHex, "display": "selected file"] as Any : NSNull()
         value["path_basis"] = "project-root"
+        value["discovery_excluded_entries"] = "0"; value["discovery_unavailable_entries"] = "0"
+        value["discovery_symlinks_not_followed"] = "0"; value["discovery_special_objects"] = "0"
         return value
     }
     private static func directoryPage(_ command: String, step: Int, total: Int, running: Bool,
@@ -439,6 +444,132 @@ private final class Reports: @unchecked Sendable {
         #endif
     }
 
+    private static func exactFilePage(_ command: String, step: Int, total: Int = 0, start: Int = 0,
+                                      scope: AtlasSearchCatalogScope, path: AtlasSearchPathScope,
+                                      policy: AtlasDiscoveryPolicy = .repositoryRules, excluded: Bool = false) -> [String: Any] {
+        let files = excluded ? 0 : 1
+        var value = page(command, step: step, total: total, start: start,
+            running: step == 0, complete: step > 0 && !excluded, catalogued: files)
+        value["search_scope"] = "all"; value["scope_extensions"] = ""; value["scope_filenames"] = ""
+        value["eligible_files"] = String(files); value["excluded_files"] = "0"
+        value["scope_path_kind"] = path.kind.rawValue
+        value["scope_path"] = path.isVisible ? "" : path.path; value["scope_path_hex"] = path.pathHex
+        if path.isVisible {
+            value["scope_region_sha256"] = path.visibleIdentity
+            value["scope_region_files"] = "1"; value["scope_region_path_bytes"] = String(scope.file.count)
+            value["scope_region_catalogued_files"] = String(files)
+            value["scope_region_missing_files"] = String(1 - files)
+        }
+        let rows = value["hits"] as! [[String: Any]]
+        value["hits"] = rows.map { row in hit(Int(row["hit_id"] as! String)!, path: scope.pathHex) }
+        value["discovery_policy"] = policy.wireName
+        value["discovery_complete"] = !excluded
+        value = catalogEcho(value, scope: scope)
+        value["discovery_excluded_entries"] = excluded ? "1" : "0"
+        return value
+    }
+    private static func exactFileImport(_ scope: AtlasSearchCatalogScope) -> [String: Any] {
+        let path: [String: Any] = ["encoding": "unix-bytes", "hex": scope.pathHex, "display": "selected file"]
+        var imported = importReply(), reader = imported["reader"] as! [String: Any]
+        imported["path"] = path; reader["path"] = path; imported["reader"] = reader
+        return catalogEcho(imported, scope: scope)
+    }
+    private static func setupExactFile(_ scope: AtlasSearchCatalogScope, path: AtlasSearchPathScope,
+                                      policy: AtlasDiscoveryPolicy = .repositoryRules, rows: Int = 70,
+                                      excluded: Bool = false) throws {
+        resetFixture(); expectPolicy(policy.rawValue)
+        scope.file.withUnsafeBufferPointer { expectFile($0.baseAddress, UInt64($0.count)) }
+        path.withCString { expectPath($0, $1!) }
+        var opened = catalogEcho(openReceipt(policy.wireName), scope: scope)
+        opened["discovery_excluded_entries"] = excluded ? "1" : "0"
+        try install(0, opened)
+        try install(1, exactFilePage("begin", step: 0, scope: scope, path: path, policy: policy, excluded: excluded))
+        try install(2, exactFilePage("step", step: 1, total: excluded ? 0 : rows,
+            scope: scope, path: path, policy: policy, excluded: excluded))
+        if rows > 64 && !excluded {
+            try install(3, exactFilePage("page", step: 1, total: rows, start: 64, scope: scope, path: path, policy: policy))
+        }
+        try install(4, exactFileImport(scope))
+    }
+    @MainActor private static func exactFileCatalogsBindEveryPhase() throws {
+        let file = try AtlasSearchCatalogScope(file: Array("zz-late/chosen.rs".utf8))
+        let path = try AtlasSearchPathScope(kind: .file, path: "zz-late/chosen.rs")
+        func run(_ catalog: AtlasSearchCatalogScope? = nil, path selection: AtlasSearchPathScope? = nil,
+                 policy: AtlasDiscoveryPolicy = .repositoryRules) throws -> AtlasSearchReport {
+            try AtlasNativeSearch.runScoped(input: AtlasSearchInput(root: "/project", query: "x", pathScope: selection ?? path,
+                discoveryPolicy: policy, catalogScope: catalog ?? file), cancellation: AtlasSearchCancellation(),
+                access: AtlasSearchAccessLease(nil), progress: { _ in })
+        }
+        for policy in [AtlasDiscoveryPolicy.repositoryRules, .includeExcluded] {
+            try setupExactFile(file, path: path, policy: policy)
+            var report: AtlasSearchReport? = try run(policy: policy)
+            check(report!.complete && report!.catalogScope == file && report!.hits.count == 70
+                && report!.progress?.cataloguedFiles == 1 && report!.discoveryCoverage?.excludedEntries == 0,
+                "Live exact-file search uses its independently discovered one-member catalog")
+            var target = report!.capture!.target(report!.hits[0])
+            report = nil
+            check(target!.root == "/project" && target!.path == "zz-late/chosen.rs",
+                "File discovery retains the original project grant and full relative source path")
+            _ = try target!.openReader(100)
+            check(fixtureCount(17) == 1 && fixtureCount(16) == 0 && fixtureCount(1) == 1
+                && fixtureCount(4) == 1 && fixtureCount(8) == 1,
+                "File open, paging and source activation never substitute a parent-directory opener")
+            target = nil; retired()
+            check(fixtureCount(6) == fixtureCount(7), "Exact-file search balances response allocations")
+        }
+        for phase in [UInt32(0), 1, 2, 3, 4] {
+            try setupExactFile(file, path: path)
+            var wrong: [String: Any]
+            if phase == 0 { wrong = catalogEcho(openReceipt(), scope: file) }
+            else if phase == 4 { wrong = exactFileImport(file) }
+            else {
+                wrong = exactFilePage(phase == 1 ? "begin" : phase == 2 ? "step" : "page",
+                    step: phase == 1 ? 0 : 1, total: phase == 1 ? 0 : 70, start: phase == 3 ? 64 : 0,
+                    scope: file, path: path)
+            }
+            wrong["discovery_file"] = ["encoding": "unix-bytes", "hex": "6f746865722e7273", "display": "chosen.rs"]
+            try install(phase, wrong)
+            do {
+                let result = try run()
+                if phase == 4 { _ = try result.capture!.target(result.hits[0])!.openReader(100) }
+                preconditionFailure("A changed file receipt entered a live source phase")
+            } catch AtlasSearchError.invalidResponse { checks += 1 }
+            retired()
+            if phase == 0 { check(fixtureCount(2) == 0, "A wrong selected file cannot begin source reads") }
+            check(fixtureCount(6) == fixtureCount(7), "Rejected file receipts release every response")
+        }
+        for missing in ["discovery_file", "discovery_directory", "discovery_excluded_entries"] {
+            try setupExactFile(file, path: path)
+            var opened = catalogEcho(openReceipt(), scope: file); opened.removeValue(forKey: missing)
+            try install(0, opened)
+            do { _ = try run(); preconditionFailure("Incomplete file discovery was accepted") }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
+            retired()
+            check(fixtureCount(2) == 0, "File discovery refuses absent identity or coverage before query admission")
+        }
+        try setupExactFile(file, path: path, excluded: true)
+        var excluded: AtlasSearchReport? = try run()
+        check(!excluded!.complete && excluded!.hits.isEmpty && excluded!.excludedFiles == 0
+            && excluded!.discoveryCoverage?.excludedEntries == 1
+            && excluded!.summary.contains("excluded from discovery"),
+            "Excluded selected files are explained separately from type filters and complete no-match results")
+        excluded = nil; retired()
+        try setupExactFile(file, path: path); cancelStep()
+        do { _ = try run(); preconditionFailure("Exact-file capture ignored cooperative cancellation") }
+        catch AtlasSearchError.canceled { checks += 1 }
+        retired()
+        check(fixtureCount(6) == fixtureCount(7), "Canceled exact-file capture releases allocations")
+        #if canImport(CryptoKit)
+        let raw = try AtlasSearchCatalogScope(file: [122, 255, 92, 45, 47, 97, 46, 114, 115])
+        let visible = try AtlasSearchPathScope(visiblePaths: [raw.file])
+        try setupExactFile(raw, path: visible, rows: 1)
+        var opaque: AtlasSearchReport? = try run(raw, path: visible)
+        check(opaque!.complete && opaque!.catalogScope == raw && opaque!.hits[0].sourcePath == nil
+            && fixtureCount(17) == 1, "Exact-file C marshaling preserves raw names without requiring UTF8")
+        opaque = nil; retired()
+        #endif
+    }
+
     @MainActor static func main() throws {
         resetFixture()
         let windowInput = try AtlasSearchInput(root: "/project", query: "x")
@@ -453,6 +584,7 @@ private final class Reports: @unchecked Sendable {
         check(fixtureCount(0) == 0 && fixtureCount(1) == 0 && fixtureCount(2) == 0,
             "Live search refuses retained-index window requests before allocation, discovery or query admission")
         try directoryCatalogsBindEveryPhase()
+        try exactFileCatalogsBindEveryPhase()
         try discoveryPoliciesBindEveryReceipt()
         for caseSensitive in [true, false] {
             resetFixture(); expectCountedCase(caseSensitive ? 1 : 0)

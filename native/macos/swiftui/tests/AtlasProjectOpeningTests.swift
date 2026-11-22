@@ -262,9 +262,16 @@ import Foundation
             check(old.matchesSourceRequest(new), "An in-flight source search survives optional preview publication")
             check(!old.matches(new), "Old overlay/frame authority still rejected after layout change")
             check(old.matchesSourceRequest(old) && old.matches(old), "Unchanged source and display remain compatible")
-            var directoryChanged = new; directoryChanged.catalogDirectory = Array("zz-late".utf8)
+            var directoryChanged = new; directoryChanged.catalogKind = .directory
+            directoryChanged.catalogPath = Array("zz-late".utf8)
             check(!old.matchesSourceRequest(directoryChanged) && !old.matches(directoryChanged),
                 "A same-root catalog-directory change rejects source results across optional preview publication")
+            var exactFile = directoryChanged; exactFile.catalogKind = .file
+            check(!directoryChanged.matchesSourceRequest(exactFile) && !directoryChanged.matches(exactFile),
+                "Equal path bytes under a file catalog cannot borrow a directory's source or display authority")
+            var anotherFile = exactFile; anotherFile.catalogPath = Array("other-file".utf8)
+            check(!exactFile.matchesSourceRequest(anotherFile) && !exactFile.matches(anotherFile),
+                "Changing the selected file invalidates a result before a newer preview is accepted")
             var expanded = new; expanded.discoveryPolicy = .includeExcluded
             check(!old.matchesSourceRequest(expanded) && !old.matches(expanded),
                 "Preview publication cannot rebind a result from another discovery policy")

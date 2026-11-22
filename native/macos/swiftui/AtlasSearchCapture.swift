@@ -206,10 +206,12 @@ enum AtlasSearchCaptureFactory {
             throw AtlasSearchError.invalidResponse
         }
         do {
-            try AtlasSearchCatalogReceipt.validateFieldPresence(in: data)
+            let catalogFields = try AtlasSearchCatalogReceipt.validateFieldPresence(in: data)
             let wire = try JSONDecoder().decode(ImportWire.self, from: data)
             try identity.catalogReceipt.validate(kind: wire.discovery_scope,
-                directory: wire.discovery_directory, pathBasis: wire.path_basis)
+                directory: wire.discovery_directory, file: wire.discovery_file,
+                pathBasis: wire.path_basis, hasFileEcho: catalogFields.hasFileEcho,
+                discoveryCoverage: catalogFields.discoveryCoverage)
             guard wire.schema == "fcb.atlas-search/1", wire.status == "ok", wire.command == "open-reader",
                   number(wire.owner) == identity.owner, number(wire.source_manifest) == identity.manifest,
                   number(wire.layout_revision) == identity.layout, number(wire.query_generation) == identity.generation,
@@ -251,7 +253,7 @@ enum AtlasSearchCaptureFactory {
         let schema, status, command, owner, source_manifest, layout_revision, query_generation: String
         let hit_id, file_id, source_revision, capture_sha256, capture_byte_length: String
         let discovery_scope, path_basis: String?
-        let discovery_directory: AtlasSearchCatalogReceipt.Path?
+        let discovery_directory, discovery_file: AtlasSearchCatalogReceipt.Path?
         let original_range: Range
         let path: Path
         let source_observation, reader_owner: String

@@ -42,6 +42,17 @@ struct AtlasIndexedSearchTransport: Sendable {
     /// Independently bounded directory discovery under the unchanged root grant.
     var openDirectoryWithPolicy: (@Sendable (UInt64, String, AtlasSearchCatalogScope,
         AtlasDiscoveryPolicy, AtlasSearchCancellation) throws -> String?)? = nil
+    /// Direct exact-file discovery never enumerates its siblings or changes grants.
+    var openFileWithPolicy: (@Sendable (UInt64, String, AtlasSearchCatalogScope,
+        AtlasDiscoveryPolicy, AtlasSearchCancellation) throws -> String?)? = nil
+
+    func hasPolicyOpener(for scope: AtlasSearchCatalogScope) -> Bool {
+        switch scope.kind {
+        case .workspace: return openWithPolicy != nil
+        case .directory: return openDirectoryWithPolicy != nil
+        case .file: return openFileWithPolicy != nil
+        }
+    }
 }
 
 /// A completed retained source index, without an admitted text query. A links
@@ -115,12 +126,11 @@ final class AtlasIndexedSearch: @unchecked Sendable {
         try check(cancellation)
         guard serial.try() else { throw AtlasSearchError.unavailable }
         defer { serial.unlock() }
-        guard catalogScope.isWorkspace || transport.openDirectoryWithPolicy != nil else {
+        guard catalogScope.isWorkspace || transport.hasPolicyOpener(for: catalogScope) else {
             throw AtlasSearchError.unsupportedCatalogScope
         }
         guard pathScope.isContained(in: catalogScope) else { throw AtlasSearchError.invalidCatalogScope }
-        guard discoveryPolicy == .repositoryRules || (catalogScope.isWorkspace
-            ? transport.openWithPolicy != nil : transport.openDirectoryWithPolicy != nil) else {
+        guard discoveryPolicy == .repositoryRules || transport.hasPolicyOpener(for: catalogScope) else {
             throw AtlasSearchError.unsupportedDiscoveryPolicy
         }
         let grant = access.reference.map(ObjectIdentifier.init)
@@ -146,11 +156,10 @@ final class AtlasIndexedSearch: @unchecked Sendable {
     func runScoped(input: AtlasSearchInput, cancellation: AtlasSearchCancellation,
                    access: AtlasSearchAccessLease, progress: @Sendable (AtlasSearchReport) -> Void) throws -> AtlasSearchReport {
         let root = input.root, query = input.query, scope = input.fileScope, pathScope = input.pathScope
-        guard input.catalogScope.isWorkspace || transport.openDirectoryWithPolicy != nil else {
+        guard input.catalogScope.isWorkspace || transport.hasPolicyOpener(for: input.catalogScope) else {
             throw AtlasSearchError.unsupportedCatalogScope
         }
-        guard input.discoveryPolicy == .repositoryRules || (input.catalogScope.isWorkspace
-            ? transport.openWithPolicy != nil : transport.openDirectoryWithPolicy != nil) else {
+        guard input.discoveryPolicy == .repositoryRules || transport.hasPolicyOpener(for: input.catalogScope) else {
             throw AtlasSearchError.unsupportedDiscoveryPolicy
         }
         let usesWindows = input.mode.isTextual && transport.windowQueryBegin != nil
@@ -287,7 +296,8 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                     mode: input.mode, nameMode: input.nameMode, structureCoverage: state.structureCoverage,
                     caseSensitive: input.caseSensitive, visibleMissingFiles: state.visibleMissing,
                     expression: state.expression, discoveryPolicy: input.discoveryPolicy,
-                    catalogScope: basis.catalogReceipt.scope, resultWindow: window)
+                    catalogScope: basis.catalogReceipt.scope, discoveryCoverage: basis.catalogReceipt.discoveryCoverage,
+                    resultWindow: window)
                 try check(cancellation)
                 if !state.running { return report }
                 let now = ProcessInfo.processInfo.systemUptime
@@ -321,12 +331,17 @@ final class AtlasIndexedSearch: @unchecked Sendable {
         owner.retainAccess(access)
         try check(cancellation)
         let opened = try AtlasIndexWire.decode(owner.call { handle in
-            if !catalogScope.isWorkspace {
+            switch catalogScope.kind {
+            case .file:
+                guard let open = transport.openFileWithPolicy else { throw AtlasSearchError.unsupportedCatalogScope }
+                return try open(handle, root, catalogScope, discoveryPolicy, cancellation)
+            case .directory:
                 guard let open = transport.openDirectoryWithPolicy else { throw AtlasSearchError.unsupportedCatalogScope }
                 return try open(handle, root, catalogScope, discoveryPolicy, cancellation)
+            case .workspace:
+                if let open = transport.openWithPolicy { return try open(handle, root, discoveryPolicy, cancellation) }
+                return try transport.open(handle, root, cancellation)
             }
-            if let open = transport.openWithPolicy { return try open(handle, root, discoveryPolicy, cancellation) }
-            return try transport.open(handle, root, cancellation)
         })
         try opened.header(schema: "fcb.atlas-session/1", command: "info", owner: handle)
         let policyReceipt = try opened.optionalText("discovery_policy")
@@ -334,7 +349,7 @@ final class AtlasIndexedSearch: @unchecked Sendable {
             guard discoveryPolicy.admitsAtlasReceipt(policyReceipt) else { throw AtlasIndexWire.invalid() }
         } else if !catalogScope.isWorkspace || transport.openWithPolicy != nil { throw AtlasIndexWire.invalid() }
         let catalogReceipt = try opened.catalogReceipt(scope: catalogScope)
-        let files = try opened.count("catalogued_files", upTo: AtlasSearchPathScope.maximumVisibleFiles)
+        let files = try opened.count("catalogued_files", upTo: catalogScope.kind == .file ? 1 : AtlasSearchPathScope.maximumVisibleFiles)
         let discovery = try opened.flag("discovery_complete"), layout = try opened.number("layout_revision")
         guard layout > 0, try opened.text("scope") == "all", try opened.number("workspace_files") == UInt64(files),
               try opened.text("retention") == "frozen-catalog-and-spatial-index" else { throw AtlasIndexWire.invalid() }
@@ -383,7 +398,8 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                         captureEligibleFiles: page.captureScope.eligibleFiles,
                         captureMissingVisibleFiles: page.captureScope.visibleMissingFiles),
                     fileScope: scope, pathScope: pathScope, mode: mode, nameMode: nameMode,
-                    caseSensitive: caseSensitive, discoveryPolicy: discoveryPolicy, catalogScope: preparation.catalogReceipt.scope))
+                    caseSensitive: caseSensitive, discoveryPolicy: discoveryPolicy, catalogScope: preparation.catalogReceipt.scope,
+                    discoveryCoverage: preparation.catalogReceipt.discoveryCoverage))
                 lastPublished = now
             }
             // Cancellation here leaves the last acknowledged Rust step intact.

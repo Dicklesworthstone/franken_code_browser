@@ -552,9 +552,11 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             mode: searchMode, nameMode: searchMode.effectiveNameMode(searchNameMode),
             caseSensitive: effectiveSearchCaseSensitive, countAllMatches: effectiveSearchCountAllMatches,
             discoveryPolicy: projectBrowser.discoveryPolicy,
-            catalogDirectory: searchPathKind == .visible ? (currentVisibleSearch?.catalogScope.directory ?? [])
-                : (searchPathKind == .directory
-                    ? Array(searchPathInput.utf8.prefix(AtlasSearchCatalogScope.maximumDirectoryBytes + 1)) : []))
+            catalogKind: searchPathKind == .visible ? (currentVisibleSearch?.catalogScope.kind ?? .workspace)
+                : (searchPathKind == .file ? .file : (searchPathKind == .directory ? .directory : .workspace)),
+            catalogPath: searchPathKind == .visible ? (currentVisibleSearch?.catalogScope.rawPath ?? [])
+                : (searchPathKind == .directory || searchPathKind == .file
+                    ? Array(searchPathInput.utf8.prefix(AtlasSearchCatalogScope.maximumFileBytes + 1)) : []))
     }
 
     // Observe byte-distinct edits without duplicating an arbitrarily large
@@ -3300,7 +3302,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 mode: searchMode, nameMode: searchMode.effectiveNameMode(searchNameMode),
                 caseSensitive: effectiveSearchCaseSensitive, countAllMatches: effectiveSearchCountAllMatches,
                 discoveryPolicy: requestedContext.discoveryPolicy,
-                catalogScope: AtlasSearchCatalogScope(directory: requestedContext.catalogDirectory), resultWindow: window)
+                catalogScope: AtlasSearchCatalogScope(kind: requestedContext.catalogKind,
+                    rawPath: requestedContext.catalogPath), resultWindow: window)
             if window == nil { clearSearch() }
             searchPending = true; searchWindowPending = window != nil
             searchTitle = input.pathScope.isVisible ? "Searching frozen atlas files" : "Searching project"
@@ -3357,7 +3360,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                     }
                     searchWindowPending = false
                     guard report.discoveryPolicy == requestedContext.discoveryPolicy,
-                          report.catalogScope.directory == requestedContext.catalogDirectory else {
+                          report.catalogScope == input.catalogScope else {
                         status = AtlasSearchError.invalidResponse.message
                         searchSummary = status; searchTitle = "Search unavailable"
                         return

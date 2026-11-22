@@ -5,6 +5,7 @@ import Foundation
 @_silgen_name("indexed_fixture_live") private func live() -> UInt32
 @_silgen_name("indexed_fixture_policy") private func selectedPolicy() -> UInt64
 @_silgen_name("indexed_fixture_directory_length") private func directoryLength() -> UInt64
+@_silgen_name("indexed_fixture_file_length") private func fileLength() -> UInt64
 @_cdecl("indexed_fixture_cancel") func cancelIndexedFixture(_ context: UnsafeMutableRawPointer?) {
     guard let context else { preconditionFailure("Missing cancellation context") }
     Unmanaged<AtlasSearchCancellation>.fromOpaque(context).takeUnretainedValue().cancel()
@@ -86,6 +87,42 @@ import Foundation
             preconditionFailure("A canceled directory request reached C")
         } catch AtlasSearchError.canceled { checks += 1 }
         check(calls() == beforeCanceledDirectory && live() == 0)
+        mode(0)
+        let exactFile = try AtlasSearchCatalogScope(file: [122, 255, 92, 45, 47, 97, 46, 114, 115])
+        let beforeFile = calls()
+        for policy in [AtlasDiscoveryPolicy.repositoryRules, .includeExcluded] {
+            check(try t.openFileWithPolicy!(h, "/repo", exactFile, policy, flag) == "{\"owned\":true}")
+            check(selectedPolicy() == policy.rawValue && fileLength() == 9 && live() == 0)
+        }
+        check(calls() == beforeFile + 2)
+        for invalid in [AtlasSearchCatalogScope.workspace, directory] {
+            do {
+                _ = try t.openFileWithPolicy!(h, "/repo", invalid, .repositoryRules, flag)
+                preconditionFailure("A non-file scope entered the exact-file ABI")
+            } catch AtlasSearchError.invalidCatalogScope { checks += 1 }
+        }
+        do {
+            _ = try t.openDirectoryWithPolicy!(h, "/repo", exactFile, .repositoryRules, flag)
+            preconditionFailure("A file scope entered the directory ABI")
+        } catch AtlasSearchError.invalidCatalogScope { checks += 1 }
+        check(calls() == beforeFile + 2)
+        for bad: Int32 in [1, 2, 3, 4] {
+            mode(bad)
+            let fileFlag = AtlasSearchCancellation()
+            do {
+                let result = try t.openFileWithPolicy!(h, "/repo", exactFile, .includeExcluded, fileFlag)
+                check(bad == 1 && result == nil)
+            } catch AtlasSearchError.invalidResponse { check(bad == 2 || bad == 3) }
+            catch AtlasSearchError.canceled { check(bad == 4 && fileFlag.isCanceled) }
+            check(live() == 0)
+        }
+        let canceledFile = AtlasSearchCancellation(); canceledFile.cancel()
+        let beforeCanceledFile = calls()
+        do {
+            _ = try t.openFileWithPolicy!(h, "/repo", exactFile, .repositoryRules, canceledFile)
+            preconditionFailure("A canceled exact-file request reached C")
+        } catch AtlasSearchError.canceled { checks += 1 }
+        check(calls() == beforeCanceledFile && live() == 0)
         mode(0)
         let beforeExpressions = calls()
         let expression = "\"exact text\" required -excluded lang:rs"

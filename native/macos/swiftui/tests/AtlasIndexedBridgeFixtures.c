@@ -7,11 +7,12 @@ static const uint64_t handle = UINT64_C(18446744073709551500);
 static unsigned calls, allocated, freed;
 static int mode;
 static uint64_t policy = UINT64_MAX;
-static uint64_t directory_length;
+static uint64_t directory_length, file_length;
 extern void indexed_fixture_cancel(void *);
-void indexed_fixture_reset(void) { calls = allocated = freed = 0; mode = 0; policy = UINT64_MAX; directory_length = 0; }
+void indexed_fixture_reset(void) { calls = allocated = freed = 0; mode = 0; policy = UINT64_MAX; directory_length = file_length = 0; }
 uint64_t indexed_fixture_policy(void) { return policy; }
 uint64_t indexed_fixture_directory_length(void) { return directory_length; }
+uint64_t indexed_fixture_file_length(void) { return file_length; }
 void indexed_fixture_mode(int next) { mode = next; }
 unsigned indexed_fixture_calls(void) { return calls; }
 unsigned indexed_fixture_live(void) { return allocated - freed; }
@@ -43,6 +44,14 @@ char *fcb_atlas_open_directory_with_policy_cancelable(uint64_t h, const char *ro
     assert(directory && length == sizeof(expected) && !memcmp(directory, expected, sizeof(expected)));
     directory_length = length;
     return fcb_atlas_open_with_policy_cancelable(h, root, files, selected_policy, poll, ctx);
+}
+char *fcb_atlas_open_file_with_policy_cancelable(uint64_t h, const char *root,
+        const uint8_t *file, uint64_t length, uint64_t files,
+        uint64_t selected_policy, int32_t (*poll)(void *), void *ctx) {
+    const uint8_t expected[] = {122, 255, 92, 45, 47, 97, 46, 114, 115};
+    assert(h == handle && root && !strcmp(root, "/repo") && files == 1 && selected_policy <= 1);
+    assert(file && length == sizeof(expected) && !memcmp(file, expected, sizeof(expected)));
+    file_length = length; policy = selected_policy; ++calls; poll_now(poll, ctx); return result();
 }
 char *fcb_atlas_index_begin(uint64_t h, uint64_t g, uint64_t files, uint64_t per_file, uint64_t bytes, uint64_t grams) {
     assert(h == handle && g == 1 && files == 4096 && per_file == 1024 * 1024 && bytes == 32 * 1024 * 1024 && grams == 2 * 1024 * 1024);

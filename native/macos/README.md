@@ -1193,6 +1193,13 @@ allowance before the selected folder is reached. Live queries and **Captured
 index** use this same discovery scope, so a folder atlas beyond the whole-project
 file limit can also be searched.
 
+Choosing **File** admits the exact project-relative file directly before the
+metadata limit. It does not enumerate the file's siblings or depend on that
+file appearing in the root or parent-folder catalog. Both live and captured-index
+queries can therefore search a selected file beyond those catalogs' bounds.
+File discovery admits at most one regular file, with up to 2,048 raw path bytes
+and 32 components; folder discovery retains its 31-component bound.
+
 The project root remains the access boundary and the basis for every returned
 path. Repository rules inherited from the root and ancestor directories still
 apply, together with the selected **Include excluded files** policy. Choosing a
@@ -1207,19 +1214,29 @@ identity behind displayed labels, including non-UTF-8 names. A stale atlas,
 different directory or changed grant cannot silently broaden the request.
 
 Completed indexes and paused index builds are reusable only under the same
-project root, access grant, discovery policy and actual discovery directory.
-Moving between folders, or from a folder to **Workspace**, prepares the newly
-requested catalog and captures. Within the same catalog, file/type changes keep
+project root, access grant, discovery policy and typed discovery scope, including
+its exact raw path. Changing files, moving between folders, or broadening to a
+parent folder or **Workspace** prepares the newly requested catalog and captures. Within the same catalog, file/type changes keep
 the existing frozen-capture behavior: broadening beyond captured membership
 reports uncaptured files until **Refresh**. Editing text, expressions, case or
 counting options can reuse compatible captures without rereading live source.
 
 Retained open, search, index and source replies identify the discovery universe
-with `discovery_scope`, `discovery_directory` and `path_basis=project-root`.
-The native search host checks this identity through paging, resumption and source
-activation. A completed folder search therefore remains distinguishable from a
-completed workspace search. **File** requests still use the bounded root
-catalog; independently discovering an exact file is a separate capability.
+with `discovery_scope`, `discovery_directory`, `discovery_file` and
+`path_basis=project-root`. The native host checks the typed scope through opening,
+index preparation, query steps, result pages and captured-reader activation.
+Later result windows retain that same scope and capture instead of reopening a
+changed live path. A completed file or folder search remains distinguishable
+from a completed workspace search.
+
+Discovery exclusion, unavailability, skipped-symlink and special-object counters
+remain separate from query/type exclusions and source-capture failures. When the
+chosen file is excluded, the search summary explains why its source was not
+searched. **Include excluded files** admits ignored and generated source where
+that policy applies; independent artifact exclusions and source confinement remain
+in force. Missing or unobservable sources never become a successful no-match
+claim. Older workspace/folder hosts may consistently omit additive fields;
+exact-file hosts must supply the complete scope and coverage receipt.
 
 Focused host, registry, C ABI and native transport regression sources accompany
 this integration. Independent executable verification and physical-Mac

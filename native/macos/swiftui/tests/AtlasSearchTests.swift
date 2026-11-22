@@ -75,12 +75,117 @@ import Foundation
         var context = AtlasSearchContext(root: "/repo", query: "needle", loadGeneration: UUID(),
             atlasRevision: UUID(), scope: "All files", customExtensions: "")
         let wholeProject = context
-        context.catalogDirectory = folder.directory
+        context.catalogKind = .directory; context.catalogPath = folder.directory
         check(!context.matches(wholeProject), "Stale actions cannot borrow another catalog's root-identical query")
+    }
+
+    static func exactFileCatalogScopes() throws {
+        let raw = Array("zz-late/chosen.rs".utf8)
+        let catalog = try AtlasSearchCatalogScope(file: raw)
+        let sameNamedDirectory = try AtlasSearchCatalogScope(directory: raw)
+        let path = try AtlasSearchPathScope(kind: .file, path: "zz-late/chosen.rs")
+        let input = try AtlasSearchInput(root: "/repo", query: "needle", pathScope: path, catalogScope: catalog)
+        check(catalog.kind == .file && catalog.file == raw && catalog.directory.isEmpty
+            && catalog != sameNamedDirectory && !catalog.isWorkspace,
+            "A file catalog cannot alias a workspace or directory with equal raw path bytes")
+        check(catalog.containsFile(raw) && !catalog.containsFile(raw + Array("/child.rs".utf8))
+            && !catalog.containsFile(Array("zz-late/chosen.rs2".utf8)),
+            "Exact-file discovery admits precisely one member, never descendants or prefixes")
+        for wider in [AtlasSearchPathScope.workspace,
+                      try AtlasSearchPathScope(kind: .directory, path: "zz-late"),
+                      try AtlasSearchPathScope(kind: .directory, path: "zz-late/chosen.rs"),
+                      try AtlasSearchPathScope(kind: .file, path: "zz-late/other.rs")] {
+            do {
+                _ = try AtlasSearchInput(root: "/repo", query: "needle", pathScope: wider, catalogScope: catalog)
+                preconditionFailure("A one-file catalog admitted another source universe")
+            } catch AtlasSearchError.invalidCatalogScope { checks += 1 }
+        }
+        let opaque = try AtlasSearchCatalogScope(file: [122, 255, 92, 45, 47, 97])
+        check(opaque.pathHex == "7aff5c2d2f61" && opaque.file == [122, 255, 92, 45, 47, 97],
+            "Exact-file catalog identity preserves undecodable names and Unix backslashes")
+        let longest = try AtlasSearchCatalogScope(file: Array(repeating: UInt8(97), count: 2048))
+        let deepest = try AtlasSearchCatalogScope(file: Array(Array(repeating: "a", count: 32).joined(separator: "/").utf8))
+        check(longest.file.count == 2048 && deepest.file.filter { $0 == 47 }.count == 31,
+            "The admitted file boundary includes the filename below 31 parent components")
+        for invalid in [[], [0], Array("/a".utf8), Array("a/".utf8), Array("a//b".utf8),
+                        Array("a/../b".utf8), Array("./a".utf8), Array(repeating: UInt8(97), count: 2049),
+                        Array(Array(repeating: "a", count: 33).joined(separator: "/").utf8)] {
+            do { _ = try AtlasSearchCatalogScope(file: invalid); preconditionFailure("Invalid file discovery path accepted") }
+            catch AtlasSearchError.invalidCatalogScope { checks += 1 }
+        }
+        let coverage = try AtlasSearchDiscoveryCoverage(excluded: "0", unavailable: "0", symlinks: "0", special: "0")
+        let payload = AtlasSearchCatalogReceipt.Path(encoding: "unix-bytes", hex: catalog.pathHex, display: "chosen.rs")
+        let receipt = try AtlasSearchCatalogReceipt(scope: catalog, kind: "file", directory: nil, file: payload,
+            pathBasis: "project-root", hasFileEcho: true, discoveryCoverage: coverage)
+        try receipt.validate(kind: "file", directory: nil, file: payload, pathBasis: "project-root",
+            hasFileEcho: true, discoveryCoverage: coverage)
+        for missing in ["file-presence", "coverage", "file-payload", "directory-null", "path-basis"] {
+            do {
+                _ = try AtlasSearchCatalogReceipt(scope: catalog, kind: "file",
+                    directory: missing == "directory-null" ? payload : nil,
+                    file: missing == "file-payload" ? nil : payload,
+                    pathBasis: missing == "path-basis" ? "file-root" : "project-root",
+                    hasFileEcho: missing != "file-presence",
+                    discoveryCoverage: missing == "coverage" ? nil : coverage)
+                preconditionFailure("Incomplete exact-file receipt accepted")
+            } catch AtlasSearchError.invalidResponse { checks += 1 }
+        }
+        let keys = ["discovery_excluded_entries", "discovery_unavailable_entries",
+                    "discovery_symlinks_not_followed", "discovery_special_objects"]
+        var modern: [String: Any] = ["discovery_scope": "file", "discovery_directory": NSNull(),
+            "discovery_file": ["encoding": "unix-bytes", "hex": catalog.pathHex, "display": "chosen.rs"],
+            "path_basis": "project-root"]
+        for key in keys { modern[key] = "0" }
+        let present = try AtlasSearchCatalogReceipt.validateFieldPresence(in: JSONSerialization.data(withJSONObject: modern))
+        check(present.hasEcho && present.hasFileEcho && present.discoveryCoverage == coverage,
+            "The exact-file wire pins both full field presence and discovery accounting")
+        for missing in ["discovery_scope", "discovery_directory", "discovery_file", "path_basis"] + keys {
+            var value = modern; value.removeValue(forKey: missing)
+            do {
+                _ = try AtlasSearchCatalogReceipt.validateFieldPresence(in: JSONSerialization.data(withJSONObject: value))
+                preconditionFailure("A partial exact-file envelope was accepted")
+            } catch { checks += 1 }
+        }
+        for bad in ["-1", "00", "+1", "18446744073709551616"] {
+            do {
+                _ = try AtlasSearchDiscoveryCoverage(excluded: bad, unavailable: "0", symlinks: "0", special: "0")
+                preconditionFailure("Noncanonical discovery counter accepted")
+            } catch AtlasSearchError.invalidResponse { checks += 1 }
+        }
+        let excluded = try AtlasSearchDiscoveryCoverage(excluded: "1", unavailable: "0", symlinks: "0", special: "0")
+        let skipped = AtlasSearchReport(hits: [], complete: true, truncated: false, unavailableFiles: 0,
+            unsupportedFiles: 0, matchesSeen: 0, pathScope: path, catalogScope: catalog, discoveryCoverage: excluded)
+        check(skipped.summary.contains("excluded from discovery") && !skipped.summary.hasPrefix("No ")
+            && skipped.summary.contains("If a repository ignore rule"),
+            "An ignored selected file is explained as excluded, with a conditional policy hint")
+        var stillExcluded = skipped
+        stillExcluded.discoveryPolicy = .includeExcluded
+        check(stillExcluded.summary.contains("excluded from discovery")
+            && !stillExcluded.summary.contains("try Include excluded files"),
+            "Independent artifact exclusions never promise that an already enabled inclusion policy can bypass them")
+        stillExcluded.visibleMissingFiles = 1
+        check(!stillExcluded.summary.contains("requested visible"),
+            "A missing exact file is not mislabeled as a visible-atlas request")
+        let source = AtlasSearchResultWindowSource(index: UUID(), input: input, countAllMatches: true)
+        let request = AtlasSearchResultWindowRequest(source: source, offset: 1000)
+        let continuation = try AtlasSearchInput(root: "/repo", query: "needle", pathScope: path,
+            catalogScope: catalog, resultWindow: request)
+        check(source.matches(continuation, countAllMatches: true), "An exact-file window keeps its source catalog")
+        do {
+            _ = try AtlasSearchInput(root: "/repo", query: "needle", pathScope: path,
+                catalogScope: AtlasSearchCatalogScope(directory: Array("zz-late".utf8)), resultWindow: request)
+            preconditionFailure("A file result window borrowed a parent directory's captures")
+        } catch AtlasSearchError.invalidRequest { checks += 1 }
+        var context = AtlasSearchContext(root: "/repo", query: "needle", loadGeneration: UUID(),
+            atlasRevision: UUID(), scope: "All files", customExtensions: "", catalogKind: .file, catalogPath: raw)
+        let exact = context
+        context.catalogKind = .directory
+        check(!context.matches(exact), "Equal bytes under a different discovery kind cannot activate stale source")
     }
 
     static func main() throws {
         try catalogScopes()
+        try exactFileCatalogScopes()
         func envelope(_ hits: [[String: Any]] = []) -> [String: Any] {
             ["schema": "fcb.cli/1", "status": "ok", "command": "search", "scope": "workspace",
              "mode": "decoded-text-literal", "workspace_complete": true, "discovery_complete": true,

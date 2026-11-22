@@ -6,12 +6,30 @@ private func legacySearch(_ root: UnsafePointer<CChar>?, _ query: UnsafePointer<
 @_silgen_name("fcb_free_string")
 private func freeLegacySearch(_ text: UnsafeMutablePointer<CChar>?)
 
+@_silgen_name("fcb_atlas_create")
+private func createDiscoveryControl() -> UInt64
+@_silgen_name("fcb_atlas_open")
+private func openDiscoveryControl(_ handle: UInt64, _ root: UnsafePointer<CChar>?, _ files: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_atlas_children")
+private func discoveryControlChildren(_ handle: UInt64, _ parent: UInt64, _ start: UInt64, _ limit: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_atlas_close")
+private func closeDiscoveryControl(_ handle: UInt64) -> UInt8
+
 @_silgen_name("fcb_reader_create")
 private func createRetainedReader() -> UInt64
 @_silgen_name("fcb_reader_copy_range")
 private func copyRetainedRange(_ handle: UInt64, _ start: UInt64, _ end: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_reader_close")
 private func closeRetainedReader(_ handle: UInt64) -> UInt8
+
+/// One bounded worker prepass returns the selected raw-relative UTF8 path to
+/// the test's main actor before that immutable file request enters the coordinator.
+private final class ExactFileDiscoverySelection: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Result<String, AtlasSearchError>?
+    func offer(_ value: Result<String, AtlasSearchError>) { lock.lock(); stored = value; lock.unlock() }
+    var value: Result<String, AtlasSearchError>? { lock.lock(); defer { lock.unlock() }; return stored }
+}
 
 /// Link AtlasSearch.swift, AtlasSearchCoordinator.swift, AtlasSearchWorker.swift
 /// and the real fcb-bridge static library. These tests use actual temporary
@@ -25,8 +43,119 @@ private func closeRetainedReader(_ handle: UInt64) -> UInt8
         }
         precondition(condition(), "native bridge worker timed out")
     }
+    /// Choose an actually omitted member from a real bounded root catalog.
+    /// Filesystem enumeration order is not assumed to follow filename order.
+    nonisolated private static func omittedFile(root: String, candidates: [String]) throws -> String {
+        precondition(!Thread.isMainThread)
+        func object(_ pointer: UnsafeMutablePointer<CChar>?) throws -> [String: Any] {
+            defer { freeLegacySearch(pointer) }
+            guard let pointer else { throw AtlasSearchError.unavailable }
+            let count = strnlen(pointer, 16 * 1024 * 1024 + 1)
+            guard count <= 16 * 1024 * 1024,
+                  let value = try JSONSerialization.jsonObject(with: Data(bytes: pointer, count: count)) as? [String: Any],
+                  value["status"] as? String == "ok" else { throw AtlasSearchError.invalidResponse }
+            return value
+        }
+        let handle = createDiscoveryControl(); precondition(handle > 0)
+        defer { precondition(closeDiscoveryControl(handle) == 1) }
+        let info = try object(root.withCString { openDiscoveryControl(handle, $0, 4096) })
+        precondition(info["catalogued_files"] as? String == "4096" && info["discovery_complete"] as? Bool == false,
+            "The control corpus must exceed the real sidebar's root metadata allowance")
+        let focus = info["focus"] as! [String: Any]
+        let parent = UInt64(focus["ordinal"] as! String)!
+        var members = Set<String>(), offset: UInt64 = 0
+        for _ in 0..<5 {
+            let page = try object(discoveryControlChildren(handle, parent, offset, 1024))
+            let rows = page["rows"] as! [[String: Any]]
+            for row in rows where row["kind"] as? String == "file" {
+                members.insert((row["path"] as! [String: Any])["hex"] as! String)
+            }
+            guard let next = page["next_offset"] as? String else { break }
+            let value = UInt64(next)!; precondition(value > offset && value <= 4096); offset = value
+        }
+        precondition(members.count == 4096)
+        guard let omitted = candidates.first(where: { name in
+            !members.contains(name.utf8.map { String(format: "%02x", $0) }.joined())
+        }) else { preconditionFailure("The control did not expose an omitted source") }
+        return omitted
+    }
+
+    private static func independentExactFileDiscovery() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("fcb-native-exact-file-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        let names = (0..<4100).map { String(format: "member-%04d.rs", $0) }
+        for name in names { try Data("needle\n".utf8).write(to: root.appendingPathComponent(name)) }
+        let selection = ExactFileDiscoverySelection()
+        let discoveryWorker = DispatchQueue(label: "fcb-exact-file-discovery-test")
+        discoveryWorker.async {
+            do { selection.offer(.success(try omittedFile(root: root.path, candidates: names))) }
+            catch { selection.offer(.failure(error as? AtlasSearchError ?? .invalidResponse)) }
+        }
+        pump { selection.value != nil }
+        let selected = try selection.value!.get()
+        let path = try AtlasSearchPathScope(kind: .file, path: selected)
+        let catalog = try AtlasSearchCatalogScope(file: Array(selected.utf8))
+        let coordinator = AtlasSearchCoordinator(scopedWork: { input, flag, access, publish in
+            precondition(!Thread.isMainThread)
+            let result = try AtlasNativeSearch.runScoped(input: input, cancellation: flag, access: access, progress: publish)
+            precondition(result.complete && result.hits.count == 1 && result.matchesSeen == 1
+                && result.progress?.cataloguedFiles == 1 && result.catalogScope == catalog
+                && result.hits[0].sourcePath == selected,
+                "Independent file discovery must reach the chosen source beyond the root catalog cap")
+            guard let target = result.capture?.target(result.hits[0]) else {
+                preconditionFailure("The independently discovered file lost its exact source capability")
+            }
+            try Data("replacement\n".utf8).write(to: root.appendingPathComponent(selected))
+            let reader = createRetainedReader(); precondition(reader != 0)
+            defer { precondition(closeRetainedReader(reader) == 1) }
+            let receipt = try target.openReader(reader)
+            precondition(target.root == input.root && receipt.contains("\"capture_origin\":\"host-supplied\""))
+            guard let copied = copyRetainedRange(reader, target.start, target.end) else {
+                preconditionFailure("The selected file's captured match disappeared")
+            }
+            defer { freeLegacySearch(copied) }
+            let copiedObject = try JSONSerialization.jsonObject(with: Data(String(cString: copied).utf8)) as! [String: Any]
+            precondition(copiedObject["original_hex"] as? String == "6e6565646c65",
+                "Opening an old exact-file hit must not read replacement live bytes")
+            return result
+        })
+        var result: AtlasSearchReport?
+        try coordinator.submitScoped(input: AtlasSearchInput(root: root.path, query: "needle",
+            pathScope: path, catalogScope: catalog)) { completion in
+            do { let next = try completion.get(); if !next.isInProgress { result = next } }
+            catch { preconditionFailure("Independent file discovery failed: \(error)") }
+        }
+        pump { result != nil }
+        result = nil
+
+        try Data("ignored.rs\n".utf8).write(to: root.appendingPathComponent(".gitignore"))
+        try Data("needle\n".utf8).write(to: root.appendingPathComponent("ignored.rs"))
+        let ignoredPath = try AtlasSearchPathScope(kind: .file, path: "ignored.rs")
+        let ignoredCatalog = try AtlasSearchCatalogScope(file: Array("ignored.rs".utf8))
+        for policy in [AtlasDiscoveryPolicy.repositoryRules, .includeExcluded] {
+            var answer: AtlasSearchReport?
+            try coordinator.submitScoped(input: AtlasSearchInput(root: root.path, query: "needle",
+                pathScope: ignoredPath, discoveryPolicy: policy, catalogScope: ignoredCatalog),
+                using: AtlasNativeSearch.runScoped) { completion in
+                do { let next = try completion.get(); if !next.isInProgress { answer = next } }
+                catch { preconditionFailure("Exact-file rule policy failed: \(error)") }
+            }
+            pump { answer != nil }
+            if policy == .repositoryRules {
+                precondition(answer!.hits.isEmpty && answer!.discoveryCoverage?.excludedEntries == 1
+                    && answer!.summary.contains("excluded from discovery"),
+                    "Choosing an ignored file must disclose the rule exclusion")
+            } else {
+                precondition(answer!.complete && answer!.hits.count == 1
+                    && answer!.discoveryCoverage?.excludedEntries == 0,
+                    "Explicit inclusion searches the same file without weakening source confinement")
+            }
+        }
+    }
+
     static func main() throws {
         precondition(Thread.isMainThread)
+        try independentExactFileDiscovery()
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("fcb-native-search-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
         try Data("needle first\nneedle second\n".utf8).write(to: root.appendingPathComponent("source.rs"))

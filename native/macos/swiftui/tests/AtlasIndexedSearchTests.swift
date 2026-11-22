@@ -647,8 +647,149 @@ import Dispatch
         #endif
     }
 
+    @MainActor private static func exactFileCatalogs() throws {
+        let catalog = try AtlasSearchCatalogScope(file: Array("zz-late/chosen.rs".utf8))
+        let path = try AtlasSearchPathScope(kind: .file, path: "zz-late/chosen.rs")
+        func fixture() -> IndexedFixture {
+            let f = IndexedFixture()
+            f.configure { $0.files = 1; $0.pathHex = catalog.pathHex }
+            return f
+        }
+        func selected(_ worker: AtlasIndexedSearch, reports: IndexReports = IndexReports()) throws -> AtlasSearchReport {
+            try worker.runScoped(input: AtlasSearchInput(root: "/repo", query: "x", pathScope: path, catalogScope: catalog),
+                cancellation: AtlasSearchCancellation(), access: AtlasSearchAccessLease(nil), progress: reports.offer)
+        }
+        do {
+            let f = fixture(), worker = AtlasIndexedSearch(transport: f.catalogAwareTransport), reports = IndexReports()
+            let first = try selected(worker, reports: reports)
+            let retained = first.capture!.target(first.hits[0])!
+            check(first.complete && first.catalogScope == catalog
+                && first.hits[0].sourcePath == "zz-late/chosen.rs" && retained.root == "/repo",
+                "Exact-file discovery preserves the project grant and original relative source path")
+            check(f.count("discovery-file:" + catalog.pathHex) == 1 && f.count("discovery-directory:") == 0
+                && reports.values.allSatisfy { $0.catalogScope == catalog && $0.discoveryCoverage?.excludedEntries == 0 },
+                "File discovery is explicit before capture and remains frozen in progressive coverage")
+            let repeated = try selected(worker)
+            check(repeated.indexStatus?.reused == true && f.count("create:") == 1,
+                "Repeated exact-file queries reuse their immutable capture")
+            let parent = try worker.runScoped(input: AtlasSearchInput(root: "/repo", query: "x",
+                pathScope: AtlasSearchPathScope(kind: .directory, path: "zz-late"),
+                catalogScope: AtlasSearchCatalogScope(directory: Array("zz-late".utf8))),
+                cancellation: AtlasSearchCancellation(), access: AtlasSearchAccessLease(nil), progress: { _ in })
+            check(parent.catalogScope.kind == .directory && parent.indexStatus?.reused == false
+                && f.count("create:") == 2 && f.count("build-begin:") == 2,
+                "A parent directory never borrows a one-file catalog as complete membership")
+            _ = try retained.openReader(100)
+            check(f.count("source:") == 1, "The old file capture stays readable after parent discovery replaces the cache")
+            let prepared = try worker.prepare(root: "/repo", pathScope: path, catalogScope: catalog,
+                cancellation: AtlasSearchCancellation(), access: AtlasSearchAccessLease(nil), progress: { _ in })
+            check(prepared.basis.catalogReceipt.scope == catalog && f.count("create:") == 3,
+                "Explicit source preparation keys reuse by typed exact-file scope")
+        }
+        do {
+            let f = fixture()
+            var transport = f.catalogAwareTransport; transport.openFileWithPolicy = nil
+            let worker = AtlasIndexedSearch(transport: transport)
+            do { _ = try selected(worker); preconditionFailure("Missing file opener used a parent or root catalog") }
+            catch AtlasSearchError.unsupportedCatalogScope { checks += 1 }
+            check(f.count("create:") == 0 && f.count("open:") == 0,
+                "Missing exact-file capability refuses before creating an owner or reading metadata")
+        }
+        do {
+            let f = fixture(); f.configure { $0.countedMatches = 1201 }
+            var transport = f.windowTransport
+            let catalogTransport = f.catalogAwareTransport
+            transport.openWithPolicy = catalogTransport.openWithPolicy
+            transport.openDirectoryWithPolicy = catalogTransport.openDirectoryWithPolicy
+            transport.openFileWithPolicy = catalogTransport.openFileWithPolicy
+            let worker = AtlasIndexedSearch(transport: transport), first = try selected(worker)
+            let next = try worker.runScoped(input: AtlasSearchInput(root: "/repo", query: "x",
+                pathScope: path, catalogScope: catalog, resultWindow: first.resultWindow!.next!),
+                cancellation: AtlasSearchCancellation(), access: AtlasSearchAccessLease(nil), progress: { _ in })
+            check(first.hits.count == 1000 && next.hits.count == 201 && next.indexStatus?.reused == true
+                && next.resultWindow?.source.catalogScope == catalog && next.resultWindow?.source.index == first.resultWindow?.source.index,
+                "Later matches retain the same independently selected file and captured bytes")
+            check(f.count("create:") == 1 && f.count("build-begin:") == 1 && f.count("query-window:1000") == 1,
+                "Result-window navigation cannot reopen a live file")
+        }
+        for phase in ["open", "build-begin", "build-step", "query-begin", "query-step", "page", "source"] {
+            let f = fixture(), worker = AtlasIndexedSearch(transport: f.catalogAwareTransport)
+            if phase == "page" { f.configure { $0.hitCount = 70 } }
+            f.patch { current, original in
+                var value = original
+                if current == phase {
+                    value["discovery_file"] = ["encoding": "unix-bytes", "hex": "6f746865722e7273", "display": "chosen.rs"]
+                }
+                return value
+            }
+            do {
+                let result = try selected(worker)
+                if phase == "source" { _ = try result.capture!.target(result.hits[0])!.openReader(100) }
+                preconditionFailure("Changed exact-file receipt accepted at " + phase)
+            } catch AtlasSearchError.invalidResponse { checks += 1 }
+            if phase == "open" { check(f.count("build-begin:") == 0, "Wrong file scope cannot begin source capture") }
+        }
+        for key in ["discovery_file", "discovery_directory", "discovery_excluded_entries",
+                    "discovery_unavailable_entries", "discovery_symlinks_not_followed", "discovery_special_objects"] {
+            let f = fixture(), worker = AtlasIndexedSearch(transport: f.catalogAwareTransport)
+            f.patch { phase, original in
+                var value = original; if phase == "open" { value.removeValue(forKey: key) }; return value
+            }
+            do { _ = try selected(worker); preconditionFailure("File discovery accepted an incomplete receipt") }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
+            check(f.count("build-begin:") == 0, "Exact-file discovery requires bounded exclusion/unavailability accounting")
+        }
+        for phase in ["build-step", "query-step", "source"] {
+            let f = fixture(), worker = AtlasIndexedSearch(transport: f.catalogAwareTransport)
+            f.patch { current, original in
+                var value = original; if current == phase { value["discovery_excluded_entries"] = "1" }; return value
+            }
+            do {
+                let result = try selected(worker)
+                if phase == "source" { _ = try result.capture!.target(result.hits[0])!.openReader(100) }
+                preconditionFailure("Frozen discovery accounting changed under a retained catalog")
+            } catch AtlasSearchError.invalidResponse { checks += 1 }
+        }
+        do {
+            let f = fixture(), worker = AtlasIndexedSearch(transport: f.catalogAwareTransport)
+            f.configure { $0.files = 2 }
+            do { _ = try selected(worker); preconditionFailure("A file catalog claimed multiple members") }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
+            check(f.count("build-begin:") == 0, "An exact-file catalog cannot spend a sibling's capture allowance")
+        }
+        do {
+            let f = fixture(), worker = AtlasIndexedSearch(transport: f.catalogAwareTransport)
+            f.configure { $0.files = 0; $0.hitCount = 0; $0.discovery = false }
+            f.patch { _, original in
+                var value = original; value["discovery_excluded_entries"] = "1"; return value
+            }
+            let report = try selected(worker)
+            check(!report.complete && report.hits.isEmpty && report.discoveryCoverage?.excludedEntries == 1
+                && report.excludedFiles == 0 && report.summary.contains("excluded from discovery"),
+                "An excluded selected file remains distinct from query/type exclusions and a no-match proof")
+        }
+        // Older non-file owners may consistently omit only the additive file
+        // field and coverage group; accepting them must not weaken file admission.
+        do {
+            let f = fixture(), worker = AtlasIndexedSearch(transport: f.catalogAwareTransport)
+            f.patch { _, original in
+                var value = original
+                for key in ["discovery_file", "discovery_excluded_entries", "discovery_unavailable_entries",
+                            "discovery_symlinks_not_followed", "discovery_special_objects"] { value.removeValue(forKey: key) }
+                return value
+            }
+            let report = try worker.runScoped(input: AtlasSearchInput(root: "/repo", query: "x",
+                pathScope: AtlasSearchPathScope(kind: .directory, path: "zz-late"),
+                catalogScope: AtlasSearchCatalogScope(directory: Array("zz-late".utf8))),
+                cancellation: AtlasSearchCancellation(), access: AtlasSearchAccessLease(nil), progress: { _ in })
+            check(report.complete && report.discoveryCoverage == nil && report.catalogScope.kind == .directory,
+                "Consistent three-field legacy directory receipts remain supported")
+        }
+    }
+
     @MainActor static func main() throws {
         try directoryCatalogs()
+        try exactFileCatalogs()
         try discoveryPolicyOwnership()
         try structuralSearch()
         try countedSearch()

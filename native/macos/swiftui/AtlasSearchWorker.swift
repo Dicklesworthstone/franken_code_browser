@@ -9,6 +9,10 @@ private func openSearchAtlas(_ handle: UInt64, _ root: UnsafePointer<CChar>?, _ 
 private func openSearchDirectory(_ handle: UInt64, _ root: UnsafePointer<CChar>?,
     _ directory: UnsafePointer<UInt8>?, _ directoryLength: UInt64, _ maxFiles: UInt64,
     _ discoveryPolicy: UInt64, _ poll: SearchPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_atlas_open_file_with_policy_cancelable")
+private func openSearchFile(_ handle: UInt64, _ root: UnsafePointer<CChar>?,
+    _ file: UnsafePointer<UInt8>?, _ fileLength: UInt64, _ maxFiles: UInt64,
+    _ discoveryPolicy: UInt64, _ poll: SearchPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_search_begin")
 private func beginSearch(_ handle: UInt64, _ generation: UInt64, _ query: UnsafePointer<CChar>?,
     _ maxMatches: UInt64, _ maxFiles: UInt64, _ maxFileBytes: UInt64, _ maxSourceBytes: UInt64) -> UnsafeMutablePointer<CChar>?
@@ -100,15 +104,20 @@ enum AtlasNativeSearch {
         }
         return try withExtendedLifetime(cancellation) {
             let context = Unmanaged.passUnretained(cancellation).toOpaque()
-            let metadataLimit: UInt64 = pathScope.isVisible ? UInt64(AtlasSearchPathScope.maximumVisibleFiles) : 4096
+            let metadataLimit: UInt64 = input.catalogScope.kind == .file ? 1
+                : (pathScope.isVisible ? UInt64(AtlasSearchPathScope.maximumVisibleFiles) : 4096)
             let opened: SearchOpen = try read(root.withCString { rootPointer in
                 owner.call { handle in
                     if input.catalogScope.isWorkspace {
                         return openSearchAtlas(handle, rootPointer, metadataLimit,
                             input.discoveryPolicy.rawValue, poll, context)
                     }
-                    return input.catalogScope.directory.withUnsafeBufferPointer { directory in
-                        openSearchDirectory(handle, rootPointer, directory.baseAddress, UInt64(directory.count),
+                    return input.catalogScope.rawPath.withUnsafeBufferPointer { path in
+                        if input.catalogScope.kind == .file {
+                            return openSearchFile(handle, rootPointer, path.baseAddress, UInt64(path.count),
+                                metadataLimit, input.discoveryPolicy.rawValue, poll, context)
+                        }
+                        return openSearchDirectory(handle, rootPointer, path.baseAddress, UInt64(path.count),
                             metadataLimit, input.discoveryPolicy.rawValue, poll, context)
                     }
                 }
@@ -120,7 +129,9 @@ enum AtlasNativeSearch {
                   let policyReceipt = opened.discovery_policy,
                   input.discoveryPolicy.admitsAtlasReceipt(policyReceipt) else { throw AtlasSearchError.invalidResponse }
             let catalogReceipt = try AtlasSearchCatalogReceipt(scope: input.catalogScope,
-                kind: opened.discovery_scope, directory: opened.discovery_directory, pathBasis: opened.path_basis)
+                kind: opened.discovery_scope, directory: opened.discovery_directory, file: opened.discovery_file,
+                pathBasis: opened.path_basis, hasFileEcho: opened.catalogFields.hasFileEcho,
+                discoveryCoverage: opened.catalogFields.discoveryCoverage)
             var page: SearchPage = try read(query.withCString {
                 queryPointer in scope.withCStrings { extensions, filenames in
                     pathScope.withCString { kind, path in
@@ -225,17 +236,32 @@ enum AtlasNativeSearch {
     }
 }
 
-private struct SearchOpen: Decodable {
+/// Decode scope-field presence beside each typed body without duplicating the
+/// search envelope's decoder or mistaking an absent field for JSON null.
+@dynamicMemberLookup
+private struct SearchEnvelope<Body: Decodable>: Decodable {
+    let body: Body
+    let catalogFields: AtlasSearchCatalogReceipt.Fields
+    init(from decoder: Decoder) throws {
+        body = try Body(from: decoder)
+        catalogFields = try AtlasSearchCatalogReceipt.Fields(from: decoder)
+    }
+    subscript<Value>(dynamicMember keyPath: KeyPath<Body, Value>) -> Value { body[keyPath: keyPath] }
+}
+private typealias SearchOpen = SearchEnvelope<SearchOpenBody>
+private typealias SearchPage = SearchEnvelope<SearchPageBody>
+
+private struct SearchOpenBody: Decodable {
     let status: String
     let schema, command, owner, discovery_policy: String?
     let discovery_scope, path_basis: String?
-    let discovery_directory: AtlasSearchCatalogReceipt.Path?
+    let discovery_directory, discovery_file: AtlasSearchCatalogReceipt.Path?
 }
-private struct SearchPage: Decodable {
+private struct SearchPageBody: Decodable {
     let schema, status, command, owner, source_manifest, layout_revision, query_generation: String
     let discovery_policy: String
     let discovery_scope, path_basis: String?
-    let discovery_directory: AtlasSearchCatalogReceipt.Path?
+    let discovery_directory, discovery_file: AtlasSearchCatalogReceipt.Path?
     let needle, mode, search_strategy: String
     let case_sensitive: Bool?
     let requested_mode, realized_mode, name_mode, name_case, evidence_level, completeness_basis: String?
@@ -433,11 +459,14 @@ private struct SearchStream {
             fileScope: scope, excludedFiles: state.catalogued - state.eligible, pathScope: pathScope,
             mode: mode, nameMode: nameMode, structureCoverage: state.structureCoverage,
             caseSensitive: caseSensitive, visibleMissingFiles: state.visibleMissing, expression: state.expression,
-            discoveryPolicy: discoveryPolicy, catalogScope: catalogReceipt.scope)
+            discoveryPolicy: discoveryPolicy, catalogScope: catalogReceipt.scope,
+            discoveryCoverage: catalogReceipt.discoveryCoverage)
     }
 
     private func validated(_ page: SearchPage) throws -> SearchState {
-        try catalogReceipt.validate(kind: page.discovery_scope, directory: page.discovery_directory, pathBasis: page.path_basis)
+        try catalogReceipt.validate(kind: page.discovery_scope, directory: page.discovery_directory, file: page.discovery_file,
+            pathBasis: page.path_basis, hasFileEcho: page.catalogFields.hasFileEcho,
+            discoveryCoverage: page.catalogFields.discoveryCoverage)
         guard page.schema == "fcb.atlas-search/1", page.status == "ok",
               page.owner == ownerIdentity, page.discovery_policy.utf8.elementsEqual(policyReceipt.utf8),
               [beginCommand, "step", "page"].contains(page.command),
@@ -453,8 +482,8 @@ private struct SearchStream {
         if let identity {
             guard identity == [page.owner, page.source_manifest, page.layout_revision, page.query_generation] else { throw invalid() }
         }
-        let catalogued = try count(page.catalogued_files,
-            max: pathScope.isVisible ? AtlasSearchPathScope.maximumVisibleFiles : 4096)
+        let catalogued = try count(page.catalogued_files, max: catalogReceipt.scope.kind == .file ? 1
+            : (pathScope.isVisible ? AtlasSearchPathScope.maximumVisibleFiles : 4096))
         try pathScope.validateEcho(kind: page.scope_path_kind, path: page.scope_path, hex: page.scope_path_hex,
             regionSHA256: page.scope_region_sha256, regionFiles: page.scope_region_files,
             regionPathBytes: page.scope_region_path_bytes)

@@ -121,7 +121,11 @@ final class IndexedFixture: @unchecked Sendable {
             try self.response("open", h, discoveryPolicy: policy, catalogScope: .workspace, cancellation: flag)
         }
         transport.openDirectoryWithPolicy = { h, _, catalog, policy, flag in
-            precondition(!catalog.isWorkspace)
+            precondition(catalog.kind == .directory)
+            return try self.response("open", h, discoveryPolicy: policy, catalogScope: catalog, cancellation: flag)
+        }
+        transport.openFileWithPolicy = { h, _, catalog, policy, flag in
+            precondition(catalog.kind == .file)
             return try self.response("open", h, discoveryPolicy: policy, catalogScope: catalog, cancellation: flag)
         }
         return transport
@@ -192,7 +196,8 @@ final class IndexedFixture: @unchecked Sendable {
         }
         if phase == "open", let catalogScope {
             s.catalogScope = catalogScope
-            events.append("discovery-directory:\(catalogScope.isWorkspace ? "workspace" : catalogScope.directoryHex)")
+            if catalogScope.kind == .file { events.append("discovery-file:\(catalogScope.pathHex)") }
+            else { events.append("discovery-directory:\(catalogScope.isWorkspace ? "workspace" : catalogScope.directoryHex)") }
         }
         if phase == "build-begin" {
             s.captureFileScope = scope; s.capturePathScope = pathScope
@@ -237,10 +242,14 @@ final class IndexedFixture: @unchecked Sendable {
             "catalogued_files": String(c.files), "index_generation": "1"]
         if let receipt = s.discoveryPolicyReceipt { value["discovery_policy"] = receipt }
         if let catalog = s.catalogScope {
-            value["discovery_scope"] = catalog.isWorkspace ? "workspace" : "directory"
-            value["discovery_directory"] = catalog.isWorkspace ? NSNull() : ["encoding": "unix-bytes",
-                "hex": catalog.directoryHex, "display": "selected folder"] as Any
+            value["discovery_scope"] = catalog.kind.rawValue
+            value["discovery_directory"] = catalog.kind == .directory ? ["encoding": "unix-bytes",
+                "hex": catalog.pathHex, "display": "selected folder"] as Any : NSNull()
+            value["discovery_file"] = catalog.kind == .file ? ["encoding": "unix-bytes",
+                "hex": catalog.pathHex, "display": "selected file"] as Any : NSNull()
             value["path_basis"] = "project-root"
+            value["discovery_excluded_entries"] = "0"; value["discovery_unavailable_entries"] = "0"
+            value["discovery_symlinks_not_followed"] = "0"; value["discovery_special_objects"] = "0"
         }
         if phase != "open" {
             value["capture_search_scope"] = s.captureFileScope.wireKind

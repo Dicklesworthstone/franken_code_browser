@@ -11,7 +11,11 @@ struct AtlasIndexWire: Decodable {
         init?(intValue: Int) { return nil }
     }
     let fields: KeyedDecodingContainer<Key>
-    init(from decoder: Decoder) throws { fields = try decoder.container(keyedBy: Key.self) }
+    let catalogFields: AtlasSearchCatalogReceipt.Fields
+    init(from decoder: Decoder) throws {
+        fields = try decoder.container(keyedBy: Key.self)
+        catalogFields = try AtlasSearchCatalogReceipt.Fields(from: decoder)
+    }
     static func decode(_ json: String?) throws -> Self {
         guard let json else { throw AtlasSearchError.unavailable }
         guard json.utf8.count <= 8 * 1024 * 1024, let data = json.data(using: .utf8) else { throw invalid() }
@@ -59,12 +63,11 @@ struct AtlasIndexWire: Decodable {
     }
     func catalogReceipt(scope: AtlasSearchCatalogScope) throws -> AtlasSearchCatalogReceipt {
         do {
-            let keys = ["discovery_scope", "discovery_directory", "path_basis"]
-            let count = keys.filter { fields.contains(Key($0)) }.count
-            guard count == 0 || count == keys.count else { throw Self.invalid() }
-            return try AtlasSearchCatalogReceipt(scope: scope, kind: count == 0 ? nil : text("discovery_scope"),
+            return try AtlasSearchCatalogReceipt(scope: scope, kind: catalogFields.hasEcho ? text("discovery_scope") : nil,
                 directory: fields.decodeIfPresent(AtlasSearchCatalogReceipt.Path.self, forKey: Key("discovery_directory")),
-                pathBasis: count == 0 ? nil : text("path_basis"))
+                file: fields.decodeIfPresent(AtlasSearchCatalogReceipt.Path.self, forKey: Key("discovery_file")),
+                pathBasis: catalogFields.hasEcho ? text("path_basis") : nil,
+                hasFileEcho: catalogFields.hasFileEcho, discoveryCoverage: catalogFields.discoveryCoverage)
         } catch { throw Self.invalid() }
     }
     func validateCatalogReceipt(_ expected: AtlasSearchCatalogReceipt) throws {
