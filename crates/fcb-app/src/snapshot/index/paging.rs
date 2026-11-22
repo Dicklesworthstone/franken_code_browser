@@ -62,14 +62,10 @@ pub(super) fn execute(options: &Options, out: &mut Output, budget: &ResourceBudg
             EXIT_PARTIAL
         } else { EXIT_OK });
     }
-    let report = if options.ignore_case {
-        matching::direct(&mut archive, options.text.as_deref(), None, true, options.count_all_matches,
-            options.limit, options.skip_matches, budget,
-            [allocation(157), allocation(158), allocation(159), allocation(160)], canceled)?
-    } else {
+    let report = {
         let needle = match (&options.text, &options.raw) {
-            (Some(text), None) => IndexedNeedle::text(owner(), text, budget, allocation(157)),
-            (None, Some(bytes)) => IndexedNeedle::raw(owner(), bytes, budget, allocation(157)),
+            (Some(text), None) => IndexedNeedle::text_matching(owner(), text, !options.ignore_case, budget, allocation(157)),
+            (None, Some(bytes)) if !options.ignore_case => IndexedNeedle::raw(owner(), bytes, budget, allocation(157)),
             _ => return Err(Failure::new("CLI_INVALID_NEEDLE")),
         }.map_err(|error| Failure::new(&error.to_string()))?;
         let opts = PagedQueryOptions { generation: generation(), first_file: file_id(), first_revision: revision(), max_matches: options.limit };
@@ -95,8 +91,7 @@ pub(super) fn execute(options: &Options, out: &mut Output, budget: &ResourceBudg
         out.literal(",\"scanned_bytes\":")?; out.integer(report.stats().scanned_bytes)?;
     } else {
         out.literal(if report.is_complete() { "Complete saved-scope search.\n" } else { "PARTIAL saved-scope search.\n" })?;
-        out.literal(if options.ignore_case { "The index manifest was validated; its posting pages were not consulted.\n" }
-            else { "Index pages and source members were verified on demand; unread backing integrity remains unchecked.\n" })?;
+        out.literal("Index pages and source members were verified on demand; unread backing integrity remains unchecked.\n")?;
         matching::human(out, &report, options.ignore_case, true)?;
     }
     matching::hits(&mut archive, &report, options.raw.is_some(), options.json, out, budget, canceled)?;
@@ -106,7 +101,7 @@ pub(super) fn execute(options: &Options, out: &mut Output, budget: &ResourceBudg
 fn fields(out: &mut Output) -> Result<(), Failure> { search_fields(out, false) }
 fn search_fields(out: &mut Output, ignore_case: bool) -> Result<(), Failure> {
     out.literal(",\"index_layout\":\"demand-paged-postings-v1\",\"candidate_strategy\":")?;
-    out.quoted(if ignore_case { "direct-verified-member-scan" } else { "rarest-posting-intersection" })?;
+    out.quoted(if ignore_case { "ascii-case-variant-posting-intersection" } else { "rarest-posting-intersection" })?;
     out.literal(",\"index_pin_scope\":\"page-manifest-envelope-sha256\",\"index_body_verified_on_open\":false,\"index_page_verification\":\"sha256-before-use\"")?;
     out.literal(",\"index_page_bytes\":")?; out.integer(POSTING_PAGE_BYTES as u64)?; Ok(())
 }

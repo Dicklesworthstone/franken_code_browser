@@ -126,7 +126,7 @@ pub struct PagedPostings<R: Read + Seek> {
     pin: Sha256Digest,
     rows: Vec<Row>,
     pages: Vec<PageMeta>,
-    captured: Vec<u32>, raw_fallback: Vec<u32>, text_fallback: Vec<u32>,
+    captured: Vec<u32>, raw_fallback: Vec<u32>, text_fallback: Vec<u32>, lowercase_fallback: Vec<u32>,
     total: usize, body_offset: u64, file_bytes: u64,
     cache: Vec<u8>, slots: Vec<Option<usize>>, replacement: usize,
     stats: SavedIndexStats, io: PostingPageIo,
@@ -168,7 +168,8 @@ impl<R: Read + Seek> PagedPostings<R> {
         let mut reader = EnvelopeReader::open(&manifest, PAGED_MANIFEST_SCHEMA, limits, UnknownPolicy::Strict)?;
         let archive = get_digest(&mut reader)?;
         if archive != directory.digest() { return Err(SnapshotIndexError::SourceMismatch.into()); }
-        if reader.get_u32()? != SEMANTICS || reader.get_u32()? != POSTING_PAGE_PAIRS as u32 {
+        let semantics = validate_semantics(reader.get_u32()?)?;
+        if reader.get_u32()? != POSTING_PAGE_PAIRS as u32 {
             return Err(SnapshotIndexError::Version.into());
         }
         let count = usize::try_from(reader.get_u64()?).map_err(|_| SnapshotIndexError::Limits)?;
@@ -182,7 +183,7 @@ impl<R: Read + Seek> PagedPostings<R> {
         let mut sum = 0usize;
         for ordinal in 0..count {
             if canceled() { return Err(SnapshotIndexError::Canceled.into()); }
-            let coverage = Coverage::parse(reader.get_u8()?)?;
+            let coverage = Coverage::parse(reader.get_u8()?, semantics)?;
             let length = reader.get_u64()?;
             let digest = get_digest(&mut reader)?;
             let n = usize::try_from(reader.get_u64()?).map_err(|_| SnapshotIndexError::Limits)?;
@@ -219,11 +220,11 @@ impl<R: Read + Seek> PagedPostings<R> {
         if input.seek(SeekFrom::End(0)).map_err(|_| PagedPostingError::Io)? != file_bytes {
             return Err(SnapshotIndexError::Format.into());
         }
-        let (captured, raw_fallback, text_fallback) = fallbacks(&rows, &mut canceled)?;
+        let (captured, raw_fallback, text_fallback, lowercase_fallback) = fallbacks(&rows, &mut canceled)?;
         let mut cache = reserve(cache_pages * POSTING_PAGE_BYTES)?; cache.resize(cache_pages * POSTING_PAGE_BYTES, 0);
         let mut slots = reserve(cache_pages)?; slots.resize(cache_pages, None);
         if canceled() { return Err(SnapshotIndexError::Canceled.into()); }
-        Ok(Self { input, owner: directory.owner(), archive, pin, rows, pages, captured, raw_fallback, text_fallback,
+        Ok(Self { input, owner: directory.owner(), archive, pin, rows, pages, captured, raw_fallback, text_fallback, lowercase_fallback,
             total, body_offset: (HEADER_BYTES + manifest_len) as u64, file_bytes, cache, slots, replacement: 0,
             stats, io, failed: None, _lease: lease })
     }
@@ -242,8 +243,15 @@ impl<R: Read + Seek> PagedPostings<R> {
     }
     pub fn raw_candidates(&mut self, needle: &[u8]) -> PagedPostingCandidates<'_> { self.candidates(needle, false) }
     pub fn text_candidates(&mut self, needle: &str) -> PagedPostingCandidates<'_> { self.candidates(needle.as_bytes(), true) }
+    pub fn text_candidates_matching(&mut self, needle: &str, case_sensitive: bool) -> PagedPostingCandidates<'_> {
+        self.candidates_matching(needle.as_bytes(), true, case_sensitive)
+    }
     pub(crate) fn candidates(&mut self, needle: &[u8], text: bool) -> PagedPostingCandidates<'_> {
-        PagedPostingCandidates::new(self, needle, text)
+        self.candidates_matching(needle, text, true)
+    }
+    pub(crate) fn candidates_matching(&mut self, needle: &[u8], text: bool, case_sensitive: bool) -> PagedPostingCandidates<'_> {
+        let policy = if text { MatchPolicy::text(case_sensitive) } else { MatchPolicy::Bytes };
+        PagedPostingCandidates::new(self, needle, policy)
     }
     fn load_page(&mut self, page: usize, slot: usize, canceled: &mut dyn FnMut() -> bool) -> Result<(), PagedPostingError> {
         let meta = self.pages[page];
@@ -276,7 +284,7 @@ trait PairSource {
     fn pair(&mut self, index: usize, loads: &mut usize, canceled: &mut dyn FnMut() -> bool)
         -> Result<Option<u64>, PagedPostingError>;
     fn coverage(&self, ordinal: usize) -> Coverage;
-    fn fallback(&self, text: bool, short: bool) -> &[u32];
+    fn fallback(&self, policy: MatchPolicy, all: bool) -> &[u32];
     fn captured_count(&self) -> usize;
 }
 impl<R: Read + Seek> PairSource for PagedPostings<R> {
@@ -311,13 +319,18 @@ impl<R: Read + Seek> PairSource for PagedPostings<R> {
         Ok(Some(u64::from_le_bytes(self.cache[start..start + 8].try_into().unwrap())))
     }
     fn coverage(&self, ordinal: usize) -> Coverage { self.rows[ordinal].coverage }
-    fn fallback(&self, text: bool, short: bool) -> &[u32] {
-        if short { &self.captured } else if text { &self.text_fallback } else { &self.raw_fallback }
+    fn fallback(&self, policy: MatchPolicy, all: bool) -> &[u32] {
+        if all { &self.captured } else { match policy {
+            MatchPolicy::Bytes => &self.raw_fallback,
+            MatchPolicy::ExactText => &self.text_fallback,
+            MatchPolicy::AsciiLowercase => &self.lowercase_fallback,
+        } }
     }
     fn captured_count(&self) -> usize { self.captured.len() }
 }
 fn valid_pair(pair: u64, rows: &[Row]) -> bool {
-    pair >> 32 <= 0x00ff_ffff && rows.get(ordinal(pair)).is_some_and(|row| row.coverage.indexed() && row.count > 0)
+    pair >> 32 <= 0x00ff_ffff && rows.get(ordinal(pair)).is_some_and(|row| row.coverage.indexed()
+        && row.coverage.accepts_gram((pair >> 32) as u32) && row.count > 0)
 }
 fn manifest_length(rows: usize, pages: usize) -> Result<usize, SnapshotIndexError> {
     let length = rows.checked_mul(ROW_BYTES).and_then(|n| pages.checked_mul(PAGE_META_BYTES).and_then(|p| n.checked_add(p)))

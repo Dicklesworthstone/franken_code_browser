@@ -280,14 +280,10 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget, effect:
         return Ok(if index.stats().uncovered_files > 0 || index.stats().unavailable_files > 0
             || !archive.directory().discovery_complete() { EXIT_PARTIAL } else { EXIT_OK });
     }
-    let report = if options.ignore_case {
-        matching::direct(&mut archive, options.text.as_deref(), None, true, options.count_all_matches,
-            options.limit, options.skip_matches, budget,
-            [allocation(157), allocation(158), allocation(159), allocation(160)], canceled)?
-    } else {
+    let report = {
         let needle = match (&options.text, &options.raw) {
-            (Some(text), None) => IndexedNeedle::text(owner(), text, budget, allocation(157)),
-            (None, Some(bytes)) => IndexedNeedle::raw(owner(), bytes, budget, allocation(157)),
+            (Some(text), None) => IndexedNeedle::text_matching(owner(), text, !options.ignore_case, budget, allocation(157)),
+            (None, Some(bytes)) if !options.ignore_case => IndexedNeedle::raw(owner(), bytes, budget, allocation(157)),
             _ => return Err(Failure::new("CLI_INVALID_NEEDLE")),
         }.map_err(|error| Failure::new(&error.to_string()))?;
         let opts = PagedQueryOptions { generation: generation(), first_file: file_id(), first_revision: revision(), max_matches: options.limit };

@@ -53,11 +53,11 @@ pub(super) fn fields(out: &mut Output, report: &PagedReport, raw: bool,
     out.literal(",\"normalization\":")?;
     out.quoted(if ignore_case { "unicode-scalar-lowercase" } else { "none" })?;
     out.literal(",\"full_case_folding\":false,\"canonical_normalization\":false,\"index_used\":")?;
-    out.boolean(index_available && !ignore_case)?;
+    out.boolean(index_available)?;
     out.literal(",\"index_policy\":")?;
-    out.quoted(if index_available && !ignore_case { "exact-compatible-index" } else { "direct-verified-member-scan" })?;
-    out.literal(",\"index_bypass_reason\":")?;
-    if index_available && ignore_case { out.quoted("incompatible-normalization")?; } else { out.literal("null")?; }
+    out.quoted(if !index_available { "direct-verified-member-scan" }
+        else if ignore_case { "ascii-case-variants-with-source-fallback" } else { "exact-compatible-index" })?;
+    out.literal(",\"index_bypass_reason\":null")?;
     out.literal(",\"workspace_complete\":")?; out.boolean(report.is_complete())?;
     out.literal(",\"truncated\":")?; out.boolean(report.truncated())?;
     out.literal(",\"count_all_matches\":")?; out.boolean(report.count_all_matches())?;
@@ -79,7 +79,7 @@ pub(super) fn human(out: &mut Output, report: &PagedReport, ignore_case: bool,
     index_available: bool) -> Result<(), Failure> {
     if ignore_case {
         out.literal("Unicode scalar-lowercase literal matching; no full case folding or canonical normalization.\n")?;
-        if index_available { out.literal("The exact index is incompatible with this mode; all saved members are verified and scanned directly.\n")?; }
+        if index_available { out.literal("ASCII-qualified index rows prune case variants; Unicode, legacy and uncovered sources retain direct verification.\n")?; }
     }
     window_human(out, report.skip_matches(), report.skipped_matches(), report.hits().len(),
         report.has_more_matches(), report.next_match_offset())?;

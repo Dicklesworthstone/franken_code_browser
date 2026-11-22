@@ -146,10 +146,12 @@ fn lowercase_index_fallback_keeps_offset_and_original_utf16_ranges() {
         assert_eq!(range(hit), (4, 10));
         assert_eq!(hit.get("matched_text").text(), "ANA");
         assert_eq!(hit.get("original_hex").text(), "0041004e0041");
-        assert!(!page.get("index_used").flag());
-        if let Some(index) = index {
-            assert_eq!(page.get("index_bypass_reason").text(), "incompatible-normalization");
-            if index.paged { assert_eq!(page.get("index_page_loads").number(), 0); }
+        assert_eq!(page.get("index_used").flag(), index.is_some());
+        if index.is_some() {
+            assert_eq!(page.get("index_policy").text(), "ascii-case-variants-with-source-fallback");
+            assert_eq!(page.get("index_bypass_reason"), &Json::Null);
+            assert_eq!(page.get("index_eliminated_files").number(), 0);
+            assert_eq!(page.get("index_fallback_files").number(), 2);
         }
     }
 }

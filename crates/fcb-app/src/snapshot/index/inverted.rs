@@ -52,7 +52,8 @@ pub(super) fn search_fields(out: &mut Output, inverted: bool, ignore_case: bool)
     out.literal(",\"index_layout\":")?;
     out.quoted(if inverted { "global-postings-v1" } else { "per-member-grams-v1" })?;
     out.literal(",\"candidate_strategy\":")?;
-    out.quoted(if ignore_case { "direct-verified-member-scan" }
+    out.quoted(if ignore_case && inverted { "ascii-case-variant-posting-intersection" }
+        else if ignore_case { "per-member-ascii-case-variant-probes" }
         else if inverted { "rarest-posting-intersection" } else { "per-member-probes" })?;
     Ok(())
 }

@@ -10,7 +10,7 @@ use fcb::{ArenaOwnerId, ByteLength};
 use fcb::search::{IndexLimits, ResourceAllocationId, ResourceBudget};
 use fcb::search::snapshot::{SnapshotBytes, SnapshotData, SnapshotEntry, SnapshotLimits, Sha256Digest};
 use fcb::search::paged_snapshot::PagedSnapshot;
-use fcb::search::snapshot_index::{SnapshotIndex, SnapshotPostings, SnapshotIndexError, PostingStep};
+use fcb::search::snapshot_index::{IndexDecision, SnapshotIndex, SnapshotPostings, SnapshotIndexError, PostingStep};
 use fcb_store::Sha256;
 
 const ARCHIVE: &str = "46434253314352530100000000000000b400000000000000010104000000000000001200000000000000706f7374696e67732d766563746f722d7631010000000000000061060000000000000001060000000000000061626361626301000000000000006206000000000000000106000000000000006263646263640500000000000000656d707479000000000000000001000000000000000007000000000000006d697373696e67ffffffffffffffff001200000000000000534f555243455f554e415641494c41424c4581fd9946fbdd6f572270da6ddebb83b295c09680b889679d18000c1a3b0e5540";
@@ -47,12 +47,21 @@ fn exact_global_wire_image_matches_independent_struct_and_sha256_vector() {
     let global = segments.invert(&budget, id(7), || false).unwrap();
     let encoded = global.encode(&budget, id(8), || false).unwrap();
     assert_eq!(encoded.bytes().len(), 352);
-    assert_eq!(encoded.bytes(), bytes(POSTINGS));
-    assert_eq!(encoded.digest(), pin());
+    let mut qualified = bytes(POSTINGS);
+    qualified[56..60].copy_from_slice(&2u32.to_le_bytes());
+    for tag in [76, 125, 174] { qualified[tag] = 4; }
+    let qualified_pin = resign(&mut qualified);
+    assert_eq!(encoded.bytes(), qualified);
+    assert_eq!(encoded.digest(), qualified_pin);
     let reopened = SnapshotPostings::decode_pinned(&bytes(POSTINGS), pin(), archive.directory(), &budget, id(9), || false).unwrap();
     assert_eq!(reopened.stats().indexed_files, 3);
     assert_eq!(reopened.stats().unavailable_files, 1);
     assert_eq!(reopened.posting_count(), 6);
+    let mut fallback = reopened.text_candidates_matching("absent", false);
+    for ordinal in 0..3 {
+        assert_eq!(fallback.step(), PostingStep::Candidate { ordinal, decision: IndexDecision::Fallback });
+    }
+    assert_eq!(fallback.step(), PostingStep::Finished); assert_eq!(fallback.excluded_files(), Some(0));
 }
 
 #[test]
@@ -76,13 +85,13 @@ fn a_valid_checksum_and_matching_pin_do_not_admit_invalid_posting_structure() {
     let budget = budget(); let archive = archive(&budget); let original = bytes(POSTINGS);
     let baseline = budget.accounting().reserved().get();
     let mut mutants = Vec::new();
-    for (offset, value) in [(4usize, 0u64), (56, 2), (60, 65537), (68, 0), (77, 999), (117, 0)] {
+    for (offset, value) in [(4usize, 0u64), (56, 3), (60, 65537), (68, 0), (77, 999), (117, 0)] {
         let mut mutant = original.clone();
         let width = if offset == 4 || offset == 56 { 4 } else { 8 };
         mutant[offset..offset + width].copy_from_slice(&value.to_le_bytes()[..width]);
         mutants.push(mutant);
     }
-    for (offset, value) in [(8, 2), (10, 1), (12, 1), (24, 0), (76, 1), (85, 0)] {
+    for (offset, value) in [(8, 2), (10, 1), (12, 1), (24, 0), (76, 1), (76, 4), (85, 0)] {
         let mut mutant = original.clone(); mutant[offset] = value; mutants.push(mutant);
     }
     let first = 76 + 4 * 49;

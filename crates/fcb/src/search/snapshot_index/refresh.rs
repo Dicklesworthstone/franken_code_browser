@@ -162,7 +162,8 @@ pub(super) fn construct<R: Read + Seek>(archive: &mut PagedSnapshot<R>, limits: 
             stats.build_source_bytes += index.statistics().source_bytes_examined;
             let image = index.segment_image(0).ok_or(SnapshotIndexError::Format)?;
             if image.coverage() == SegmentCoverage::Indexed {
-                row.coverage = if image.source_is_utf8() { Coverage::Utf8 } else { Coverage::Bytes };
+                row.coverage = if image.source_is_utf8() && verified.bytes().is_ascii() { Coverage::Ascii }
+                    else if image.source_is_utf8() { Coverage::Utf8 } else { Coverage::Bytes };
                 row.count = image.grams().len();
                 grams.extend_from_slice(image.grams());
                 refreshed.rebuilt_files += 1;

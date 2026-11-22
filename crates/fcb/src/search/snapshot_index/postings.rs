@@ -2,7 +2,7 @@
 
 //! A global inverse of the existing trusted per-member trigram segments.
 //! Construction transposes keys, never reparses source or invents coverage.
-//! Query preparation performs three binary range lookups and allocates nothing;
+//! Query preparation performs at most 24 binary range lookups and allocates nothing;
 //! each step inspects at most one posting and one fallback member. Results stay
 //! in original member order so result limits and source identities are stable.
 //!
@@ -31,6 +31,7 @@ pub struct SnapshotPostings {
     captured: Vec<u32>,
     raw_fallback: Vec<u32>,
     text_fallback: Vec<u32>,
+    lowercase_fallback: Vec<u32>,
     stats: SavedIndexStats,
     _lease: ResourceLease,
 }
@@ -53,10 +54,10 @@ impl SnapshotIndex {
             }
         }
         pairs.sort_unstable(); // Bounded worker operation; no UI callback claim.
-        let (captured, raw_fallback, text_fallback) = fallbacks(&rows, &mut canceled)?;
+        let (captured, raw_fallback, text_fallback, lowercase_fallback) = fallbacks(&rows, &mut canceled)?;
         if canceled() { return Err(SnapshotIndexError::Canceled); }
         Ok(SnapshotPostings { owner: self.owner, archive: self.archive, rows, pairs,
-            captured, raw_fallback, text_fallback, stats: self.stats, _lease: lease })
+            captured, raw_fallback, text_fallback, lowercase_fallback, stats: self.stats, _lease: lease })
     }
 }
 
@@ -76,18 +77,28 @@ impl SnapshotPostings {
     }
     pub fn raw_candidates(&self, needle: &[u8]) -> PostingCandidates<'_> { self.candidates(needle, false) }
     pub fn text_candidates(&self, needle: &str) -> PostingCandidates<'_> { self.candidates(needle.as_bytes(), true) }
+    /// Compatible ASCII case variants intersect without dropping non-ASCII,
+    /// legacy, short-query or otherwise uncovered source members.
+    pub fn text_candidates_matching(&self, needle: &str, case_sensitive: bool) -> PostingCandidates<'_> {
+        self.candidates_matching(needle.as_bytes(), true, case_sensitive)
+    }
     pub(crate) fn candidates(&self, needle: &[u8], text: bool) -> PostingCandidates<'_> {
-        let short = needle.len() < 3;
-        let keys = if short { [0; 3] } else {
-            let last = needle.len() - 3;
-            [0, last / 2, last].map(|i| u32::from_be_bytes([0, needle[i], needle[i + 1], needle[i + 2]]))
-        };
-        let lists = keys.map(|key| if short { 0..0 } else { self.gram_range(key) });
-        let rarest = (0..3).min_by_key(|&i| lists[i].len()).unwrap_or(0);
-        let driver = lists[rarest].clone();
-        let fallback = if short { &self.captured } else if text { &self.text_fallback } else { &self.raw_fallback };
-        PostingCandidates { index: self, keys, lists, driver, fallback, fallback_next: 0,
-            text, short, stats: PostingProbeStats { list_lookups: if short { 0 } else { 3 }, ..Default::default() } }
+        self.candidates_matching(needle, text, true)
+    }
+    pub(crate) fn candidates_matching(&self, needle: &[u8], text: bool, case_sensitive: bool) -> PostingCandidates<'_> {
+        let policy = if text { MatchPolicy::text(case_sensitive) } else { MatchPolicy::Bytes };
+        let probes = GramProbes::new(needle, policy);
+        let lists = std::array::from_fn(|i| if i < probes.count { self.gram_range(probes.keys[i]) } else { 0..0 });
+        let rarest = probes.rarest(&lists);
+        let driver_count = rarest.len();
+        let drivers = std::array::from_fn(|i| if i < driver_count { lists[rarest.start + i].clone() } else { 0..0 });
+        let fallback = if probes.fallback_all() { &self.captured } else { match policy {
+            MatchPolicy::Bytes => &self.raw_fallback, MatchPolicy::ExactText => &self.text_fallback,
+            MatchPolicy::AsciiLowercase => &self.lowercase_fallback,
+        } };
+        let stats = PostingProbeStats { list_lookups: probes.count, ..Default::default() };
+        PostingCandidates { index: self, probes, lists, drivers, driver_count, fallback, fallback_next: 0,
+            policy, last_examined: None, stats }
     }
     fn gram_range(&self, gram: u32) -> Range<usize> {
         let start = self.pairs.partition_point(|pair| *pair < pack(gram, 0));
@@ -147,7 +158,7 @@ impl SnapshotPostings {
         let mut reader = EnvelopeReader::open(bytes, POSTINGS_SCHEMA, limits, UnknownPolicy::Strict)?;
         let archive = get_digest(&mut reader)?;
         if archive != directory.digest() { return Err(SnapshotIndexError::SourceMismatch); }
-        if reader.get_u32()? != SEMANTICS { return Err(SnapshotIndexError::Version); }
+        let semantics = validate_semantics(reader.get_u32()?)?;
         let count = usize::try_from(reader.get_u64()?).map_err(|_| SnapshotIndexError::Limits)?;
         let total = usize::try_from(reader.get_u64()?).map_err(|_| SnapshotIndexError::Limits)?;
         if count != directory.len() || count > MAX_INDEX_MEMBERS || total > MAX_INDEX_GRAMS
@@ -159,7 +170,7 @@ impl SnapshotPostings {
         let mut expected_total = 0usize;
         for ordinal in 0..count {
             if canceled() { return Err(SnapshotIndexError::Canceled); }
-            let coverage = Coverage::parse(reader.get_u8()?)?;
+            let coverage = Coverage::parse(reader.get_u8()?, semantics)?;
             let length = reader.get_u64()?;
             let digest = get_digest(&mut reader)?;
             let n = usize::try_from(reader.get_u64()?).map_err(|_| SnapshotIndexError::Limits)?;
@@ -191,15 +202,17 @@ impl SnapshotPostings {
                 return Err(SnapshotIndexError::Format);
             }
             let row = &mut rows[ordinal];
-            if !row.coverage.indexed() || row.start == row.count { return Err(SnapshotIndexError::Format); }
+            if !row.coverage.indexed() || !row.coverage.accepts_gram((pair >> 32) as u32)
+                || row.start == row.count { return Err(SnapshotIndexError::Format); }
             row.start += 1;
             previous = Some(pair); pairs.push(pair);
         }
         if rows.iter().any(|row| row.start != row.count) { return Err(SnapshotIndexError::Format); }
         reader.finish()?;
-        let (captured, raw_fallback, text_fallback) = fallbacks(&rows, &mut canceled)?;
+        let (captured, raw_fallback, text_fallback, lowercase_fallback) = fallbacks(&rows, &mut canceled)?;
         if canceled() { return Err(SnapshotIndexError::Canceled); }
-        Ok(Self { owner: directory.owner(), archive, rows, pairs, captured, raw_fallback, text_fallback, stats, _lease: lease })
+        Ok(Self { owner: directory.owner(), archive, rows, pairs, captured, raw_fallback, text_fallback,
+            lowercase_fallback, stats, _lease: lease })
     }
 
     /// Compatibility for the existing refresh engine. Decodes a pinned inverse
@@ -241,46 +254,60 @@ pub enum PostingStep {
     Finished,
 }
 
-/// Allocation-free intersection of three complete gram lists, ordered by source
-/// member. The smallest list is the driver; other lists use binary membership
-/// checks, not scans across skipped ordinals. Fallback membership merges into
-/// the same ordering. Empty/short needles do not claim index exclusions.
+/// Allocation-free intersection of three complete gram groups, ordered by
+/// source member. Each group contains one exact gram or at most eight ASCII
+/// case variants. The smallest group's union drives candidate verification;
+/// duplicate posting/fallback members emit once and consume one posting per
+/// step. Unsupported queries never claim index exclusions.
 pub struct PostingCandidates<'index> {
     index: &'index SnapshotPostings,
-    keys: [u32; 3],
-    lists: [Range<usize>; 3],
-    driver: Range<usize>,
+    probes: GramProbes,
+    lists: [Range<usize>; MAX_PROBE_KEYS],
+    drivers: [Range<usize>; 8],
+    driver_count: usize,
     fallback: &'index [u32],
     fallback_next: usize,
-    text: bool,
-    short: bool,
+    policy: MatchPolicy,
+    last_examined: Option<usize>,
     stats: PostingProbeStats,
 }
 impl PostingCandidates<'_> {
     pub const fn stats(&self) -> PostingProbeStats { self.stats }
-    pub fn is_finished(&self) -> bool { self.driver.is_empty() && self.fallback_next == self.fallback.len() }
+    pub fn is_finished(&self) -> bool {
+        self.drivers[..self.driver_count].iter().all(Range::is_empty) && self.fallback_next == self.fallback.len()
+    }
     /// Proven total only after the cursor finishes. A truncated query must not
     /// report unvisited candidates as index-excluded source members.
     pub fn excluded_files(&self) -> Option<usize> {
         self.is_finished().then(|| self.index.captured.len() - self.stats.candidates_emitted - self.stats.fallback_emitted)
     }
     pub fn step(&mut self) -> PostingStep {
-        let posting = (!self.driver.is_empty()).then(|| ordinal(self.index.pairs[self.driver.start]));
+        let driver = self.drivers[..self.driver_count].iter().enumerate().filter(|(_, list)| !list.is_empty())
+            .min_by_key(|(_, list)| ordinal(self.index.pairs[list.start])).map(|(i, _)| i);
+        let posting = driver.map(|i| ordinal(self.index.pairs[self.drivers[i].start]));
         let fallback = self.fallback.get(self.fallback_next).map(|&n| n as usize);
         if let Some(file) = fallback.filter(|file| posting.is_none_or(|p| *file <= p)) {
             self.fallback_next += 1;
-            if posting == Some(file) { self.driver.start += 1; self.stats.posting_entries_visited += 1; }
+            if posting == Some(file) { self.drivers[driver.unwrap()].start += 1; self.stats.posting_entries_visited += 1; }
+            self.last_examined = Some(file);
             self.stats.fallback_emitted += 1;
             return PostingStep::Candidate { ordinal: file, decision: IndexDecision::Fallback };
         }
         let Some(file) = posting else { return PostingStep::Finished; };
-        self.driver.start += 1;
+        self.drivers[driver.unwrap()].start += 1;
         self.stats.posting_entries_visited += 1;
-        if self.text && self.index.rows[file].coverage != Coverage::Utf8 { return PostingStep::Pending; }
-        debug_assert!(!self.short);
-        for (key, list) in self.keys.iter().zip(&self.lists) {
-            self.stats.membership_lookups += 1;
-            if self.index.pairs[list.clone()].binary_search(&pack(*key, file)).is_err() { return PostingStep::Pending; }
+        if self.last_examined == Some(file) { return PostingStep::Pending; }
+        self.last_examined = Some(file);
+        if !self.policy.compatible(self.index.rows[file].coverage) { return PostingStep::Pending; }
+        for group in &self.probes.groups {
+            let mut present = false;
+            for key in group.clone() {
+                self.stats.membership_lookups += 1;
+                if self.index.pairs[self.lists[key].clone()].binary_search(&pack(self.probes.keys[key], file)).is_ok() {
+                    present = true; break;
+                }
+            }
+            if !present { return PostingStep::Pending; }
         }
         self.stats.candidates_emitted += 1;
         PostingStep::Candidate { ordinal: file, decision: IndexDecision::Verify }
@@ -298,22 +325,24 @@ fn encoded_length(count: usize, postings: usize) -> Result<usize, SnapshotIndexE
 fn charge(owner: ArenaOwnerId, count: usize, postings: usize, conversion: bool,
     budget: &ResourceBudget, allocation: ResourceAllocationId) -> Result<ResourceLease, SnapshotIndexError> {
     encoded_length(count, postings)?;
-    let bytes = count.checked_mul(size_of::<Row>() + 3 * size_of::<u32>())
+    let bytes = count.checked_mul(size_of::<Row>() + 4 * size_of::<u32>())
         .and_then(|n| postings.checked_mul(if conversion { 12 } else { 8 }).and_then(|p| n.checked_add(p)))
         .and_then(|n| n.checked_add(size_of::<SnapshotPostings>() + size_of::<SnapshotIndex>()))
         .ok_or(SnapshotIndexError::Limits)?;
     budget.try_reserve_managed(owner, allocation, ByteLength::new(bytes as u64)).map_err(|_| SnapshotIndexError::ResourceDenied)
 }
 fn fallbacks(rows: &[Row], canceled: &mut impl FnMut() -> bool)
-    -> Result<(Vec<u32>, Vec<u32>, Vec<u32>), SnapshotIndexError> {
+    -> Result<(Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>), SnapshotIndexError> {
     let mut captured = reserve(rows.len())?;
     let mut raw = reserve(rows.len())?;
     let mut text = reserve(rows.len())?;
+    let mut lowercase = reserve(rows.len())?;
     for (ordinal, row) in rows.iter().enumerate() {
         if canceled() { return Err(SnapshotIndexError::Canceled); }
         if row.coverage != Coverage::Unavailable { captured.push(ordinal as u32); }
         if row.coverage == Coverage::Uncovered { raw.push(ordinal as u32); }
         if matches!(row.coverage, Coverage::Uncovered | Coverage::Bytes) { text.push(ordinal as u32); }
+        if row.coverage != Coverage::Unavailable && row.coverage != Coverage::Ascii { lowercase.push(ordinal as u32); }
     }
-    Ok((captured, raw, text))
+    Ok((captured, raw, text, lowercase))
 }

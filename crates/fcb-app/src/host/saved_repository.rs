@@ -267,9 +267,9 @@ impl SavedRepositorySession {
     }
 
     /// Search with the shared exact or Unicode scalar-lowercase literal engine.
-    /// Lowercasing is not full case folding or canonical normalization. Exact
-    /// posting pages cannot prove negatives for this mode, so lowercase queries
-    /// verify the entire admitted member manifest without consulting the index.
+    /// Lowercasing is not full case folding or canonical normalization. Qualified
+    /// ASCII rows can prune case variants; Unicode, legacy and uncovered rows
+    /// keep the ordinary source verification route.
     /// The selected policy is frozen with counts, pages and activation receipts.
     pub fn search_matching(&mut self, generation: u64, needle: &str, max_matches: usize,
         case_sensitive: bool, count_all_matches: bool,
@@ -301,9 +301,9 @@ impl SavedRepositorySession {
             first_revision: SourceRevision::new(owner, 1).map_err(|_| SavedRepositoryError::IdentityExhausted)?, max_matches };
         let before = self.archive.load_stats();
         let ids = [result_id, member_id, scan_id];
-        let used_index = case_sensitive && self.index.is_some();
-        let report = if let Some(index) = self.index.as_mut().filter(|_| case_sensitive) {
-            let pattern = IndexedNeedle::text(owner, needle, &self.budget, pattern_id)
+        let used_index = self.index.is_some();
+        let report = if let Some(index) = self.index.as_mut() {
+            let pattern = IndexedNeedle::text_matching(owner, needle, case_sensitive, &self.budget, pattern_id)
                 .map_err(PagedSearchError::from)?;
             let query = PagedQuery::new_paged_page(&mut self.archive, &pattern, &mut index.pages,
                 opts, skip_matches, count_all_matches, &self.budget, ids)?;
@@ -443,8 +443,9 @@ impl SavedRepositorySession {
         encode_matching(out, query.case_sensitive)?;
         out.literal(",\"index_used\":")?; out.boolean(query.index_generation.is_some())?;
         out.literal(",\"index_policy\":")?;
-        out.quoted(if query.index_generation.is_some() { "exact-compatible-postings" }
-            else { "direct-verified-member-scan" })?;
+        out.quoted(if query.index_generation.is_none() { "direct-verified-member-scan" }
+            else if query.case_sensitive { "exact-compatible-postings" }
+            else { "ascii-case-variants-with-source-fallback" })?;
         out.literal(",\"search_complete\":")?; out.boolean(report.is_complete())?;
         out.literal(",\"count_all_matches\":")?; out.boolean(report.count_all_matches())?;
         out.literal(",\"matches_seen_exact\":")?; out.boolean(report.is_complete())?;

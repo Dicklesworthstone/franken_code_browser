@@ -70,7 +70,15 @@ pub struct IndexedNeedle<'pattern> {
 impl<'pattern> IndexedNeedle<'pattern> {
     pub fn text(owner: ArenaOwnerId, text: &'pattern str, budget: &ResourceBudget,
         allocation: ResourceAllocationId) -> Result<Self, StreamReadError> {
-        Ok(Self { owner, pattern: text.as_bytes(), inner: StreamingNeedle::text(owner, text, budget, allocation)? })
+        Self::text_matching(owner, text, true, budget, allocation)
+    }
+    /// Bind the original literal to the production scalar-lowercase verifier.
+    /// ASCII-qualified segments can prune case variants; every incompatible
+    /// source and query keeps the ordinary digest-verified fallback route.
+    pub fn text_matching(owner: ArenaOwnerId, text: &'pattern str, case_sensitive: bool,
+        budget: &ResourceBudget, allocation: ResourceAllocationId) -> Result<Self, StreamReadError> {
+        Ok(Self { owner, pattern: text.as_bytes(),
+            inner: StreamingNeedle::text_matching(owner, text, case_sensitive, budget, allocation)? })
     }
     pub fn raw(owner: ArenaOwnerId, bytes: &'pattern [u8], budget: &ResourceBudget,
         allocation: ResourceAllocationId) -> Result<Self, StreamReadError> {
@@ -217,10 +225,11 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
         index.validate_directory(archive.directory())?;
         if needle.owner != archive.directory().owner() { return Err(PagedSearchError::OwnerMismatch); }
         let mut query = Self::new(archive, &needle.inner, options, budget, allocations)?;
-        if needle.inner.mode() != StreamingMode::OriginalBytes && needle.inner.mode() != StreamingMode::ExactText {
-            return Ok(query); // A different normalization requires its own compatible postings.
+        if !matches!(needle.inner.mode(), StreamingMode::OriginalBytes | StreamingMode::ExactText | StreamingMode::LowercaseText) {
+            return Ok(query);
         }
-        let candidates = index.candidates(needle.pattern, matches!(needle.inner.mode(), StreamingMode::ExactText));
+        let candidates = index.candidates_matching(needle.pattern, needle.inner.mode() != StreamingMode::OriginalBytes,
+            needle.inner.mode() != StreamingMode::LowercaseText);
         query.stats.posting_list_lookups = candidates.stats().list_lookups;
         query.postings = Some(candidates);
         Ok(query)
@@ -240,10 +249,11 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
         index.validate_directory(archive.directory())?;
         if needle.owner != archive.directory().owner() { return Err(PagedSearchError::OwnerMismatch); }
         let mut query = Self::new(archive, &needle.inner, options, budget, allocations)?;
-        if needle.inner.mode() != StreamingMode::OriginalBytes && needle.inner.mode() != StreamingMode::ExactText {
+        if !matches!(needle.inner.mode(), StreamingMode::OriginalBytes | StreamingMode::ExactText | StreamingMode::LowercaseText) {
             return Ok(query);
         }
-        let candidates = index.candidates(needle.pattern, matches!(needle.inner.mode(), StreamingMode::ExactText));
+        let candidates = index.candidates_matching(needle.pattern, needle.inner.mode() != StreamingMode::OriginalBytes,
+            needle.inner.mode() != StreamingMode::LowercaseText);
         query.stats.posting_list_lookups = candidates.stats().list_lookups;
         query.paged_postings = Some(candidates);
         Ok(query)
@@ -335,6 +345,8 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
                     index.raw_decision(ordinal, pattern)
                 } else if self.needle.mode() == StreamingMode::ExactText {
                     index.text_decision(ordinal, std::str::from_utf8(pattern).ok())
+                } else if self.needle.mode() == StreamingMode::LowercaseText {
+                    index.text_decision_matching(ordinal, std::str::from_utf8(pattern).ok(), false)
                 } else { IndexDecision::Fallback }),
                 _ => None,
             };

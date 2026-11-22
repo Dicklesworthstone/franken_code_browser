@@ -18,7 +18,8 @@ fn policy(page: &Json, case_sensitive: bool, indexed: bool) {
     assert_eq!(page.get("case_sensitive").flag(), case_sensitive);
     assert_eq!(page.get("mode").text(), if case_sensitive { "exact-decoded-literal" } else { "unicode-lowercase-literal" });
     assert_eq!(page.get("index_used").flag(), indexed);
-    assert_eq!(page.get("index_policy").text(), if indexed { "exact-compatible-postings" } else { "direct-verified-member-scan" });
+    assert_eq!(page.get("index_policy").text(), if !indexed { "direct-verified-member-scan" }
+        else if case_sensitive { "exact-compatible-postings" } else { "ascii-case-variants-with-source-fallback" });
     if !indexed {
         assert_eq!(page.get("index_generation"), &Json::Null);
         assert_eq!(page.get("index_pin"), &Json::Null);
@@ -28,7 +29,7 @@ fn policy(page: &Json, case_sensitive: bool, indexed: bool) {
 }
 
 #[test]
-fn lowercase_bypasses_exact_postings_without_losing_utf8_or_utf16_matches() {
+fn lowercase_prunes_ascii_negatives_without_losing_utf8_or_utf16_matches() {
     let le: Vec<_> = "\u{feff}BANANA".encode_utf16().flat_map(u16::to_le_bytes).collect();
     let be: Vec<_> = "\u{feff}BANANA".encode_utf16().flat_map(u16::to_be_bytes).collect();
     let f = Fixture::new(&[entry(b"a.rs", b"BANANA"), entry(b"b.rs", &le),
@@ -42,16 +43,18 @@ fn lowercase_bypasses_exact_postings_without_losing_utf8_or_utf16_matches() {
     session.attach_index(1, &index, pin, || false).unwrap();
     let exact = json(&session.search_counted(2, "ana", 6, || false).unwrap());
     policy(&exact, true, true); assert_eq!(exact.get("matches_seen").number(), 0);
-    let index_reads = field(&mut session, "index_page_bytes_read");
     let matched = session.search_matching(3, "ana", 6, false, true, || false).unwrap();
     assert_eq!(matched.exit_code(), EXIT_OK);
-    let matched = json(&matched); policy(&matched, false, false);
+    let matched = json(&matched); policy(&matched, false, true);
     assert_eq!(matched.get("hits"), direct.get("hits"));
-    assert_eq!(field(&mut session, "index_page_bytes_read"), index_reads);
+    assert_eq!(matched.get("member_bytes_read").number(), 34);
+    assert!(matched.get("member_bytes_read").number() < direct.get("member_bytes_read").number());
+    assert_eq!(matched.get("index_eliminated_files").number(), 1);
+    assert_eq!(matched.get("fallback_files").number(), 2);
     assert_eq!(field(&mut session, "index_generation").number(), 1);
     let reads = field(&mut session, "member_bytes_read");
     let page = json(&session.results(3, 4, 1, || false).unwrap());
-    policy(&page, false, false);
+    policy(&page, false, true);
     assert_eq!(page.get("matches_seen").number(), 6);
     assert_eq!(page.get("hits").array()[0].get("hit_id").number(), 5);
     assert_eq!(field(&mut session, "member_bytes_read"), reads);
@@ -142,15 +145,16 @@ fn matching_policy_is_frozen_across_counts_paging_failed_replacement_and_activat
 }
 
 #[test]
-fn incompatible_postings_cannot_turn_unknown_saved_members_into_exact_absence() {
+fn compatible_pruning_cannot_turn_unknown_saved_members_into_exact_absence() {
     let f = Fixture::new(&[entry(b"a.rs", b"BANANA"),
         SnapshotEntry { path: b"b.rs", observed_bytes: 20, data: SnapshotData::Unavailable("NOT_CAPTURED") }], true);
     let (index, pin) = f.index(); let mut session = f.open(88831);
     session.attach_index(1, &index, pin, || false).unwrap();
     let response = session.search_matching(1, "missing", 0, false, true, || false).unwrap();
     assert_eq!(response.exit_code(), EXIT_PARTIAL);
-    let page = json(&response); policy(&page, false, false);
+    let page = json(&response); policy(&page, false, true);
     assert_eq!(page.get("matches_seen").number(), 0);
+    assert_eq!(page.get("index_eliminated_files").number(), 1);
     assert_eq!(page.get("unavailable_files").number(), 1);
     assert!(!page.get("search_complete").flag()); assert!(!page.get("matches_seen_exact").flag());
 }

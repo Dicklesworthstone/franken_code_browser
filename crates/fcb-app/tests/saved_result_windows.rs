@@ -99,7 +99,9 @@ fn indexed_and_lowercase_windows_keep_counts_original_utf16_ranges_and_large_off
     assert!(indexed.get("index_used").flag()); assert_eq!(indexed.get("hits"), direct.get("hits"));
     let index_reads = json(&session.info(|| false).unwrap()).get("index_page_bytes_read").clone();
     let lowercase = json(&session.search_matching_page(3, "ana", 2, false, true, 3, || false).unwrap());
-    window(&lowercase, 3, 3, Some(5)); assert!(!lowercase.get("index_used").flag());
+    window(&lowercase, 3, 3, Some(5)); assert!(lowercase.get("index_used").flag());
+    assert_eq!(lowercase.get("index_eliminated_files").number(), 1);
+    assert_eq!(lowercase.get("fallback_files").number(), 2);
     assert_eq!(lowercase.get("hits"), direct.get("hits"));
     assert_eq!(json(&session.info(|| false).unwrap()).get("index_page_bytes_read"), &index_reads);
     let (reader, receipt) = session.open_hit_reader(owner(88912), 3, 1, || false).unwrap();

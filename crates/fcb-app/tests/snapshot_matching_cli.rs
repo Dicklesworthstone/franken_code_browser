@@ -155,7 +155,7 @@ fn exact_counts_are_independent_of_retention_and_count_only_positive_and_zero_ex
 }
 
 #[test]
-fn every_index_layout_bypasses_incompatible_case_sensitive_candidates_without_false_negatives() {
+fn every_index_layout_prunes_ascii_case_variants_without_losing_original_spellings() {
     let f = Fixture::new();
     for (path, body) in [("a", "BEACON"), ("b", "beacon"), ("c", "BeAcOn"), ("d", "unrelated")] {
         fs::write(f.root().join(path), body).unwrap();
@@ -167,17 +167,21 @@ fn every_index_layout_bypasses_incompatible_case_sensitive_candidates_without_fa
         assert!(exact.get("index_used").flag()); assert_eq!(exact.get("index_eliminated_files").number(), 3);
         let (exit, folded) = f.search(Some(&index), &["--text", "beacon", "--ignore-case", "--count-all"]);
         assert_eq!(exit, EXIT_OK); assert_eq!(folded.get("matches_seen").number(), 3);
-        assert!(!folded.get("index_used").flag());
-        assert_eq!(folded.get("candidate_strategy").text(), "direct-verified-member-scan");
-        assert_eq!(folded.get("index_policy").text(), "direct-verified-member-scan");
-        assert_eq!(folded.get("index_bypass_reason").text(), "incompatible-normalization");
-        assert_eq!(folded.get("index_eliminated_files").number(), 0);
-        assert_eq!(folded.get("posting_entries_visited").number(), 0);
-        assert_eq!(folded.get("loaded_members").number(), 4);
-        assert_eq!(folded.get("member_payload_bytes_loaded").number(), 27);
+        assert!(folded.get("index_used").flag());
+        assert_eq!(folded.get("candidate_strategy").text(), match index.layout {
+            Layout::Segments => "per-member-ascii-case-variant-probes",
+            Layout::Postings | Layout::Paged => "ascii-case-variant-posting-intersection",
+        });
+        assert_eq!(folded.get("index_policy").text(), "ascii-case-variants-with-source-fallback");
+        assert_eq!(folded.get("index_bypass_reason"), &Json::Null);
+        assert_eq!(folded.get("index_eliminated_files").number(), 1);
+        assert_eq!(folded.get("index_candidates").number(), 3);
+        assert_eq!(folded.get("index_fallback_files").number(), 0);
+        assert_eq!(folded.get("loaded_members").number(), 3);
+        assert_eq!(folded.get("member_payload_bytes_loaded").number(), 18);
         if matches!(index.layout, Layout::Paged) {
-            assert_eq!(folded.get("index_page_bytes_read").number(), 0);
-            assert_eq!(folded.get("index_page_loads").number(), 0);
+            assert!(folded.get("index_page_bytes_read").number() > 0);
+            assert!(folded.get("index_page_loads").number() > 0);
         }
         assert_eq!(rows(&folded, "a")[0].get("matched_text").text(), "BEACON");
         assert_eq!(rows(&folded, "c")[0].get("matched_text").text(), "BeAcOn");
@@ -278,7 +282,7 @@ fn unsupported_flag_combinations_fail_before_io_and_literal_flag_values_stay_lit
 }
 
 #[test]
-fn ignore_case_keeps_pin_checks_and_reports_unread_posting_pages_truthfully() {
+fn ignore_case_keeps_pin_checks_and_rejects_changed_consulted_posting_pages() {
     let f = Fixture::new(); fs::write(f.root().join("a"), b"BEACON").unwrap(); assert_eq!(f.save(&[]).0, EXIT_OK);
     let indexes = f.indexes();
     for index in &indexes {
@@ -292,10 +296,14 @@ fn ignore_case_keeps_pin_checks_and_reports_unread_posting_pages_truthfully() {
     let mut bytes = fs::read(f.index(paged.layout)).unwrap();
     let body = 32 + u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
     bytes[body] ^= 1; fs::write(f.index(paged.layout), bytes).unwrap();
-    let (exit, direct) = f.search(Some(paged), &["--text", "beacon", "--ignore-case", "--count-all"]);
-    assert_eq!(exit, EXIT_OK); assert_eq!(direct.get("matches_seen").number(), 1);
-    assert_eq!(direct.get("index_page_bytes_read").number(), 0); assert!(!direct.get("index_used").flag());
-    assert!(!direct.get("index_body_verified_on_open").flag());
+    // A short query cannot use grams and must not touch even a corrupt page.
+    let (exit, short) = f.search(Some(paged), &["--text", "be", "--ignore-case", "--count-all"]);
+    assert_eq!(exit, EXIT_OK); assert_eq!(short.get("matches_seen").number(), 1);
+    assert_eq!(short.get("index_page_bytes_read").number(), 0);
+    assert_eq!(short.get("index_fallback_files").number(), 1);
+    assert!(!short.get("index_body_verified_on_open").flag());
+    let (exit, folded) = f.search(Some(paged), &["--text", "beacon", "--ignore-case", "--count-all"]);
+    assert_eq!(exit, EXIT_ERROR); assert_eq!(folded.get("error").get("code").text(), "PAGED_INDEX_CHANGED_PAGE");
     let (exit, exact) = f.search(Some(paged), &["--text", "BEACON", "--count-all"]);
     assert_eq!(exit, EXIT_ERROR); assert_eq!(exact.get("error").get("code").text(), "PAGED_INDEX_CHANGED_PAGE");
 }

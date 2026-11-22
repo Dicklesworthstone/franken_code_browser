@@ -33,9 +33,14 @@ pub const INDEX_SCHEMA: EnvelopeSchema = EnvelopeSchema::with_magic(*b"FCBI", 0x
 pub const MAX_INDEX_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_INDEX_GRAMS: usize = 2 * 1024 * 1024;
 pub const MAX_INDEX_MEMBERS: usize = 65_536;
-const SEMANTICS: u32 = 1; // Raw contiguous byte trigrams, sorted unique u24 in u32.
+// v2 retains the raw gram representation and adds an ASCII source certificate.
+// v1 remains readable; its UTF-8 rows cannot exclude lowercase candidates.
+const SEMANTICS: u32 = 2;
 const ROW_BYTES: usize = 1 + 8 + 32 + 8;
 const PREFIX_BYTES: usize = 32 + 4 + 8 + 8;
+
+mod case_probe;
+use case_probe::{GramProbes, MatchPolicy, MAX_PROBE_KEYS};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SnapshotIndexError {
@@ -82,14 +87,19 @@ pub struct SavedIndexStats {
     pub build_source_bytes: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Coverage { Unavailable, Uncovered, Utf8, Bytes }
+enum Coverage { Unavailable, Uncovered, Utf8, Bytes, Ascii }
 impl Coverage {
-    fn tag(self) -> u8 { match self { Self::Unavailable => 0, Self::Uncovered => 1, Self::Utf8 => 2, Self::Bytes => 3 } }
-    fn parse(tag: u8) -> Result<Self, SnapshotIndexError> {
+    fn tag(self) -> u8 { match self { Self::Unavailable => 0, Self::Uncovered => 1, Self::Utf8 => 2, Self::Bytes => 3, Self::Ascii => 4 } }
+    fn parse(tag: u8, semantics: u32) -> Result<Self, SnapshotIndexError> {
         match tag { 0 => Ok(Self::Unavailable), 1 => Ok(Self::Uncovered), 2 => Ok(Self::Utf8),
-            3 => Ok(Self::Bytes), _ => Err(SnapshotIndexError::Format) }
+            3 => Ok(Self::Bytes), 4 if semantics >= 2 => Ok(Self::Ascii), _ => Err(SnapshotIndexError::Format) }
     }
-    fn indexed(self) -> bool { matches!(self, Self::Utf8 | Self::Bytes) }
+    fn indexed(self) -> bool { matches!(self, Self::Utf8 | Self::Bytes | Self::Ascii) }
+    fn utf8(self) -> bool { matches!(self, Self::Utf8 | Self::Ascii) }
+    fn accepts_gram(self, gram: u32) -> bool { self != Self::Ascii || gram & 0x0080_8080 == 0 }
+}
+fn validate_semantics(value: u32) -> Result<u32, SnapshotIndexError> {
+    if matches!(value, 1 | SEMANTICS) { Ok(value) } else { Err(SnapshotIndexError::Version) }
 }
 #[derive(Clone, Debug)]
 struct Row { coverage: Coverage, length: u64, digest: Sha256Digest, start: usize, count: usize }
@@ -126,25 +136,30 @@ impl SnapshotIndex {
     /// Exact UTF-8 only. UTF-16, malformed encodings and absent text declarations
     /// must use the ordinary decoder/scanner, even when their raw grams differ.
     pub fn text_decision(&self, ordinal: usize, text: Option<&str>) -> IndexDecision {
+        self.text_decision_matching(ordinal, text, true)
+    }
+    /// Lowercase text can exclude only ASCII-qualified rows and ASCII needles
+    /// at least three bytes long. Every other captured member retains fallback.
+    pub fn text_decision_matching(&self, ordinal: usize, text: Option<&str>, case_sensitive: bool) -> IndexDecision {
         let Some(row) = self.rows.get(ordinal) else { return IndexDecision::Fallback; };
         let Some(text) = text else { return IndexDecision::Fallback; };
-        if row.coverage != Coverage::Utf8 { return IndexDecision::Fallback; }
-        self.probe(row, text.as_bytes())
+        let policy = MatchPolicy::text(case_sensitive);
+        if !policy.compatible(row.coverage) { return IndexDecision::Fallback; }
+        self.probe(row, text.as_bytes(), policy)
     }
     /// Original-byte hosts may use this with the SAME raw needle they verify.
     /// IndexedNeedle in the paged adapter binds this pattern to its exact matcher.
     pub fn raw_decision(&self, ordinal: usize, bytes: &[u8]) -> IndexDecision {
         let Some(row) = self.rows.get(ordinal) else { return IndexDecision::Fallback; };
         if !row.coverage.indexed() { return IndexDecision::Fallback; }
-        self.probe(row, bytes)
+        self.probe(row, bytes, MatchPolicy::Bytes)
     }
-    fn probe(&self, row: &Row, bytes: &[u8]) -> IndexDecision {
-        if bytes.len() < 3 { return IndexDecision::Fallback; }
-        let last = bytes.len() - 3;
+    fn probe(&self, row: &Row, bytes: &[u8], policy: MatchPolicy) -> IndexDecision {
+        let probes = GramProbes::new(bytes, policy);
+        if probes.fallback_all() { return IndexDecision::Fallback; }
         let grams = &self.grams[row.start..row.start + row.count];
-        for offset in [0, last / 2, last] {
-            let key = u32::from_be_bytes([0, bytes[offset], bytes[offset + 1], bytes[offset + 2]]);
-            if grams.binary_search(&key).is_err() { return IndexDecision::Excluded; }
+        for group in &probes.groups {
+            if !group.clone().any(|i| grams.binary_search(&probes.keys[i]).is_ok()) { return IndexDecision::Excluded; }
         }
         IndexDecision::Verify
     }
@@ -201,7 +216,7 @@ impl SnapshotIndex {
         let mut reader = EnvelopeReader::open(bytes, INDEX_SCHEMA, limits, UnknownPolicy::Strict)?;
         let archive = get_digest(&mut reader)?;
         if archive != directory.digest() { return Err(SnapshotIndexError::SourceMismatch); }
-        if reader.get_u32()? != SEMANTICS { return Err(SnapshotIndexError::Version); }
+        let semantics = validate_semantics(reader.get_u32()?)?;
         let count = usize::try_from(reader.get_u64()?).map_err(|_| SnapshotIndexError::Limits)?;
         let total = usize::try_from(reader.get_u64()?).map_err(|_| SnapshotIndexError::Limits)?;
         if count != directory.len() || count > MAX_INDEX_MEMBERS || total > MAX_INDEX_GRAMS
@@ -212,7 +227,7 @@ impl SnapshotIndex {
         let mut stats = SavedIndexStats { members: count, unique_grams: total, ..SavedIndexStats::default() };
         for ordinal in 0..count {
             if canceled() { return Err(SnapshotIndexError::Canceled); }
-            let coverage = Coverage::parse(reader.get_u8()?)?;
+            let coverage = Coverage::parse(reader.get_u8()?, semantics)?;
             let length = reader.get_u64()?;
             let digest = get_digest(&mut reader)?;
             let n = usize::try_from(reader.get_u64()?).map_err(|_| SnapshotIndexError::Limits)?;
@@ -230,7 +245,8 @@ impl SnapshotIndex {
             for i in 0..n {
                 if i % 4096 == 0 && canceled() { return Err(SnapshotIndexError::Canceled); }
                 let gram = reader.get_u32()?;
-                if gram > 0x00ff_ffff || previous.is_some_and(|last| last >= gram) { return Err(SnapshotIndexError::Format); }
+                if gram > 0x00ff_ffff || !coverage.accepts_gram(gram)
+                    || previous.is_some_and(|last| last >= gram) { return Err(SnapshotIndexError::Format); }
                 previous = Some(gram); grams.push(gram);
             }
             match coverage { Coverage::Unavailable => stats.unavailable_files += 1,

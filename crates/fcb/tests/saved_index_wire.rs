@@ -42,12 +42,18 @@ fn production_builder_and_decoder_match_the_independent_fcbi1_vector() {
     let built = SnapshotIndex::build(&mut archive, IndexLimits::default(), &budget,
         [allocation(3), allocation(4), allocation(5), allocation(6)], || false).unwrap();
     let encoded = built.encode(&budget, allocation(7), || false).unwrap();
-    assert_eq!(encoded.bytes(), expected);
-    assert_eq!(encoded.digest().to_hex(), PIN);
+    let mut qualified = expected.clone();
+    qualified[56..60].copy_from_slice(&2u32.to_le_bytes()); qualified[76] = 4;
+    rechecksum(&mut qualified);
+    assert_eq!(encoded.bytes(), qualified);
+    assert_eq!(encoded.digest(), Sha256::digest(&qualified));
+    assert_eq!(built.text_decision_matching(0, Some("ABSENT"), false), IndexDecision::Excluded);
     drop(built);
-    let restored = SnapshotIndex::decode_pinned(&expected, encoded.digest(), archive.directory(), &budget, allocation(3), || false).unwrap();
+    let restored = SnapshotIndex::decode_pinned(&expected, Sha256::digest(&expected), archive.directory(), &budget, allocation(3), || false).unwrap();
     assert_eq!(restored.raw_decision(0, b"ana"), IndexDecision::Verify);
     assert_eq!(restored.text_decision(0, Some("absent")), IndexDecision::Excluded);
+    assert_eq!(restored.text_decision_matching(0, Some("ANA"), false), IndexDecision::Fallback);
+    assert_eq!(restored.text_decision_matching(0, Some("absent"), false), IndexDecision::Fallback);
 }
 
 #[test]
@@ -79,7 +85,7 @@ fn a_forged_complete_segment_with_a_valid_internal_checksum_cannot_use_the_old_p
 fn trusted_bytes_still_need_valid_schema_counts_order_lengths_and_source_bindings() {
     let budget = budget(); let archive = archive(&budget); let original = unhex(GOLDEN);
     for (offset, value) in [(0, 0), (4, 0), (8, 2), (10, 1), (12, 1), (14, 1), (16, 1),
-        (24, 0), (56, 2), (60, 2), (68, 255), (76, 7), (77, 255), (85, 0), (117, 255), (128, 255)] {
+        (24, 0), (56, 3), (60, 2), (68, 255), (76, 4), (76, 7), (77, 255), (85, 0), (117, 255), (128, 255)] {
         let mut changed = original.clone(); changed[offset] = value; rechecksum(&mut changed);
         // Supplying newly computed pins is limited to this adversarial decoder
         // test, to exercise checks BEHIND the trusted-digest boundary itself.
@@ -92,4 +98,14 @@ fn trusted_bytes_still_need_valid_schema_counts_order_lengths_and_source_binding
     assert!(SnapshotIndex::decode_pinned(&duplicate, Sha256::digest(&duplicate), archive.directory(), &budget, allocation(3), || false).is_err());
     assert!(matches!(SnapshotIndex::decode_pinned(&original, Sha256Digest::new([0; 32]), archive.directory(), &budget, allocation(3), || false),
         Err(SnapshotIndexError::PinMismatch)));
+}
+
+#[test]
+fn ascii_qualification_rejects_non_ascii_grams_behind_the_pin_boundary() {
+    let budget = budget(); let archive = archive(&budget); let mut qualified = unhex(GOLDEN);
+    qualified[56..60].copy_from_slice(&2u32.to_le_bytes()); qualified[76] = 4;
+    // Preserve u24 width, ordering and row counts while contradicting ASCII.
+    qualified[133] |= 0x80; rechecksum(&mut qualified);
+    assert!(matches!(SnapshotIndex::decode_pinned(&qualified, Sha256::digest(&qualified),
+        archive.directory(), &budget, allocation(3), || false), Err(SnapshotIndexError::Format)));
 }
