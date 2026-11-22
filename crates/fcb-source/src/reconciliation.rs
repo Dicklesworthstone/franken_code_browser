@@ -24,7 +24,7 @@ use std::ops::Bound;
 use fcb_core::{ArenaOwnerId, FileId, SourceRevision};
 
 use crate::discovery::{
-    BoundedDiscovery, DiscoveryEntry, DiscoveryKind, IncompleteReason, ScanEpoch, ScanStatus,
+    BoundedDiscovery, DiscoveryEntry, DiscoveryKind, DiscoveryScope, IncompleteReason, ScanEpoch, ScanStatus,
 };
 use crate::old_anchor::{fnv1a, OldAnchor};
 use crate::path::NormalizedPath;
@@ -283,26 +283,34 @@ pub struct ReconciliationReport {
     pub epoch: ScanEpoch,
     pub status: ReconciliationStatus,
     pub directory: Option<NormalizedPath>,
+    /// Exact member scope, mutually exclusive with directory. None for both
+    /// means the whole root; a file scope never covers same-named descendants.
+    pub file: Option<NormalizedPath>,
     pub added: Vec<NormalizedPath>,
     pub modified: Vec<NormalizedPath>,
     pub retained: Vec<NormalizedPath>,
     pub tombstoned: Vec<NormalizedPath>,
     /// Unobserved known entries kept because absence was not established,
-    /// including entries outside this pass's directory scope.
+    /// including entries outside this pass's directory or exact-file scope.
     pub preserved_unseen: Vec<NormalizedPath>,
     pub intervening_hints_detected: bool,
 }
 
 impl ReconciliationReport {
     /// Invariant assertion: An incomplete scan or a scan with intervening dirty hints
-    /// must NEVER tombstone any unseen entries. A directory-scoped scan cannot
-    /// tombstone entries outside that directory or the directory itself.
+    /// must NEVER tombstone any unseen entries. A directory scope covers only
+    /// its descendants; an exact-file scope covers only that member's path.
     pub fn is_honest_and_complete(&self) -> bool {
         if !self.status.is_completed() || self.intervening_hints_detected {
             self.tombstoned.is_empty()
         } else {
             self.tombstoned.iter().all(|path| {
-                self.directory.as_ref().is_none_or(|directory| is_descendant(path, directory))
+                match (&self.directory, &self.file) {
+                    (None, Some(file)) => path == file,
+                    (Some(directory), None) => is_descendant(path, directory),
+                    (None, None) => true,
+                    (Some(_), Some(_)) => false,
+                }
             })
         }
     }
@@ -323,9 +331,9 @@ struct ReconciliationObservation {
     excluded_subtree: bool,
 }
 
-/// Manages a reconciliation pass over a directory.
+/// Manages a reconciliation pass over an explicitly admitted namespace.
 pub struct ReconciliationPass {
-    directory: Option<NormalizedPath>,
+    scope: DiscoveryScope,
     epoch: ScanEpoch,
     start_hint_sequence: u64,
     known_entries: BTreeMap<NormalizedPath, KnownEntry>,
@@ -346,8 +354,32 @@ impl ReconciliationPass {
         dirty_tracker: &DirtyHintTracker,
         known_entries: BTreeMap<NormalizedPath, KnownEntry>,
     ) -> Self {
+        Self::with_scope(match directory {
+            Some(directory) => DiscoveryScope::Directory(directory),
+            None => DiscoveryScope::Workspace,
+        }, epoch, dirty_tracker, known_entries)
+    }
+
+    /// Reconcile one exact member while preserving all siblings and descendants.
+    /// A caller that supplies completion must possess observation/absence
+    /// evidence for that member; a missing path alone is not successful discovery.
+    pub fn for_file(
+        file: NormalizedPath,
+        epoch: ScanEpoch,
+        dirty_tracker: &DirtyHintTracker,
+        known_entries: BTreeMap<NormalizedPath, KnownEntry>,
+    ) -> Self {
+        Self::with_scope(DiscoveryScope::File(file), epoch, dirty_tracker, known_entries)
+    }
+
+    fn with_scope(
+        scope: DiscoveryScope,
+        epoch: ScanEpoch,
+        dirty_tracker: &DirtyHintTracker,
+        known_entries: BTreeMap<NormalizedPath, KnownEntry>,
+    ) -> Self {
         Self {
-            directory,
+            scope,
             epoch,
             start_hint_sequence: dirty_tracker.current_sequence(),
             known_entries,
@@ -358,7 +390,15 @@ impl ReconciliationPass {
     }
 
     pub fn directory(&self) -> Option<&NormalizedPath> {
-        self.directory.as_ref()
+        self.scope.directory()
+    }
+
+    pub fn file(&self) -> Option<&NormalizedPath> {
+        self.scope.file()
+    }
+
+    pub fn scope(&self) -> &DiscoveryScope {
+        &self.scope
     }
 
     pub fn epoch(&self) -> ScanEpoch {
@@ -379,7 +419,7 @@ impl ReconciliationPass {
         inode: Option<u64>,
         digest: Option<ObservationDigest>,
     ) {
-        if !is_within_scope(&path, self.directory.as_ref()) {
+        if !self.scope.contains_entry(&path) {
             return;
         }
         self.observed_entries.insert(
@@ -393,7 +433,7 @@ impl ReconciliationPass {
 
     /// Record observations from a `DiscoveryEntry` within this pass's scope.
     pub fn record_discovery_entry(&mut self, entry: &DiscoveryEntry) {
-        if !is_within_scope(entry.path(), self.directory.as_ref()) {
+        if !self.scope.contains_entry(entry.path()) {
             return;
         }
         self.observed_entries.insert(
@@ -446,7 +486,8 @@ impl ReconciliationPass {
         let mut report = ReconciliationReport {
             epoch: self.epoch,
             status,
-            directory: self.directory.clone(),
+            directory: self.directory().cloned(),
+            file: self.file().cloned(),
             added: Vec::new(),
             modified: Vec::new(),
             retained: Vec::new(),
@@ -481,8 +522,9 @@ impl ReconciliationPass {
 
         // Categorize known entries not observed in this pass
         let completed = matches!(status, ReconciliationStatus::Completed { .. });
+        let affected_path = self.directory().or_else(|| self.file());
         let intervening_hints = dirty_tracker
-            .has_hints_since(self.start_hint_sequence, self.directory.as_ref());
+            .has_hints_since(self.start_hint_sequence, affected_path);
 
         if intervening_hints {
             report.intervening_hints_detected = true;
@@ -494,8 +536,7 @@ impl ReconciliationPass {
                 // successfully and NO intervening dirty hints arrived.
                 // Explicit exclusions can make a policy-scoped scan complete,
                 // but never establish absence inside the excluded subtree.
-                let enumerated = self.directory.as_ref()
-                    .is_none_or(|directory| is_descendant(path, directory));
+                let enumerated = self.scope.covers_absence(path);
                 if completed && !intervening_hints && enumerated
                     && !self.is_excluded_by_observation(path.as_bytes())
                 {
@@ -511,7 +552,7 @@ impl ReconciliationPass {
         if completed && !intervening_hints {
             dirty_tracker.hints.retain(|hint| {
                 hint.sequence > self.start_hint_sequence
-                    || !is_within_scope(&hint.path, self.directory.as_ref())
+                    || !self.scope.contains_entry(&hint.path)
                     || self.exclusion_affects_hint(hint)
             });
         }
@@ -520,15 +561,15 @@ impl ReconciliationPass {
     }
 
     /// Reconcile directly using a `BoundedDiscovery` session's admitted scope.
-    /// A focused directory walk cannot establish absence in the rest of a
-    /// supplied whole-root catalog, even when that walk completes successfully.
+    /// A focused directory or file cannot establish absence in the rest of a
+    /// supplied whole-root catalog, even when that observation completes.
     pub fn reconcile_from_discovery(
         discovery: &mut BoundedDiscovery,
         cancel: &CancelFlag,
         dirty_tracker: &mut DirtyHintTracker,
         known_entries: BTreeMap<NormalizedPath, KnownEntry>,
     ) -> Result<ReconciliationReport, SourceError> {
-        let mut pass = Self::new(discovery.directory().cloned(), discovery.scan_epoch(),
+        let mut pass = Self::with_scope(discovery.scope().clone(), discovery.scan_epoch(),
             dirty_tracker, known_entries);
 
         loop {

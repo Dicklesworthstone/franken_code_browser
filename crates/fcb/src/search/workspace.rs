@@ -14,6 +14,7 @@ use fcb_core::{ByteLength, FileId, ResourceAllocationId, ResourceBudget, Resourc
 use fcb_source::{CancelFlag, CaptureRequest, CompleteCapture, SourceError};
 use fcb_source::confined::SymlinkPolicy;
 use fcb_source::discovery::{BoundedDiscovery, DiscoveryAggregate, DiscoveryKind, DiscoveryLimits};
+pub use fcb_source::discovery::DiscoveryScope;
 use fcb_source::ignore::IgnoreMatcher;
 pub use fcb_source::ignore::repository::{RepositoryRules, RuleLimits, RuleError, RuleStats, RuleDiagnostic, RuleObservation};
 use fcb_source::path::NormalizedPath;
@@ -98,7 +99,7 @@ impl WorkspaceEntry {
 
 pub struct WorkspaceCatalog {
     grant: RootGrant,
-    directory: Option<NormalizedPath>,
+    scope: DiscoveryScope,
     id: SearchManifestId,
     first_file: FileId,
     limits: WorkspaceLimits,
@@ -142,7 +143,7 @@ impl WorkspaceCatalog {
         let discovery_limits = DiscoveryLimits::new(1, 32, MAX_WORKSPACE_PATH_BYTES as u32, 64, 16 * 1024, 4096)?;
         let ignore = if include_excluded { IgnoreMatcher::include_all() } else { IgnoreMatcher::product_defaults() };
         let discovery = BoundedDiscovery::open_metadata_only(grant.clone(), SymlinkPolicy::DisallowAll, discovery_limits, ignore)?;
-        Ok(Self { grant, directory: None, id, first_file, limits, include_excluded, discovery: Some(discovery),
+        Ok(Self { grant, scope: DiscoveryScope::Workspace, id, first_file, limits, include_excluded, discovery: Some(discovery),
             repository_rules: None, policy_key: None, entries,
             stage: WorkspaceStage::Discovering, aggregate: DiscoveryAggregate::default(), pages: 0,
             path_bytes: 0, discovery_complete: false, limit: None, discovery_error: None, _lease: lease })
@@ -178,7 +179,7 @@ impl WorkspaceCatalog {
         let ignore = if include_excluded { IgnoreMatcher::include_all() } else { IgnoreMatcher::product_defaults() };
         catalog.discovery = Some(BoundedDiscovery::open_metadata_only_in_directory(
             catalog.grant.clone(), directory.clone(), traversal, ignore)?);
-        catalog.directory = Some(directory);
+        catalog.scope = DiscoveryScope::Directory(directory);
         Ok(catalog)
     }
     /// Rule-aware directory scope. Ancestor rules are loaded in order on step,
@@ -197,22 +198,68 @@ impl WorkspaceCatalog {
         }
         catalog.discovery = Some(BoundedDiscovery::open_rule_aware_in_directory(
             catalog.grant.clone(), directory.clone(), traversal, rules, budget, allocations[1])?);
-        catalog.directory = Some(directory);
+        catalog.scope = DiscoveryScope::Directory(directory);
+        catalog.policy_key = Some(fcb_source::ignore::repository::RULE_POLICY_NAME.to_owned());
+        Ok(catalog)
+    }
+    /// Observe one explicitly selected regular file independently of the
+    /// whole-project and parent-directory budgets. No sibling is enumerated.
+    /// Source capture remains separate; the grant and raw paths keep their
+    /// original project-root identity.
+    pub fn open_for_file(grant: RootGrant, file: NormalizedPath,
+        id: SearchManifestId, first_file: FileId, limits: WorkspaceLimits,
+        include_excluded: bool, budget: &ResourceBudget, allocation: ResourceAllocationId)
+        -> Result<Self, WorkspaceError> {
+        let mut catalog = Self::open(grant, id, first_file, limits, include_excluded, budget, allocation)?;
+        let traversal = catalog.discovery.as_ref().ok_or(WorkspaceError::Pending)?.limits();
+        if file.as_bytes().len() > traversal.max_path_bytes() as usize
+            || file.segments().len() > traversal.max_depth() as usize {
+            return Err(WorkspaceError::InvalidLimits);
+        }
+        let ignore = if include_excluded { IgnoreMatcher::include_all() } else { IgnoreMatcher::product_defaults() };
+        catalog.discovery = Some(BoundedDiscovery::open_metadata_only_for_file(
+            catalog.grant.clone(), file.clone(), traversal, ignore)?);
+        catalog.scope = DiscoveryScope::File(file);
+        Ok(catalog)
+    }
+    /// Rule-aware exact member. Root/ancestor rules are loaded on step without
+    /// opening a directory iterator. A deliberately excluded member is counted
+    /// separately from missing policy or interrupted observation.
+    pub fn open_rule_aware_for_file(grant: RootGrant, file: NormalizedPath,
+        id: SearchManifestId, first_file: FileId, limits: WorkspaceLimits, rules: RuleLimits,
+        budget: &ResourceBudget, allocations: [ResourceAllocationId; 2])
+        -> Result<Self, WorkspaceError> {
+        if allocations[0] == allocations[1] { return Err(WorkspaceError::InvalidLimits); }
+        let mut catalog = Self::open(grant, id, first_file, limits, false, budget, allocations[0])?;
+        let traversal = catalog.discovery.as_ref().ok_or(WorkspaceError::Pending)?.limits();
+        if file.as_bytes().len() > traversal.max_path_bytes() as usize
+            || file.segments().len() > traversal.max_depth() as usize {
+            return Err(WorkspaceError::InvalidLimits);
+        }
+        catalog.discovery = Some(BoundedDiscovery::open_rule_aware_for_file(
+            catalog.grant.clone(), file.clone(), traversal, rules, budget, allocations[1])?);
+        catalog.scope = DiscoveryScope::File(file);
         catalog.policy_key = Some(fcb_source::ignore::repository::RULE_POLICY_NAME.to_owned());
         Ok(catalog)
     }
     pub const fn id(&self) -> SearchManifestId { self.id }
     pub fn grant(&self) -> &RootGrant { &self.grant }
-    /// None means whole-root discovery. A directory uses original-root-relative
-    /// raw bytes; a complete scoped catalog says nothing about its siblings.
-    pub fn directory(&self) -> Option<&NormalizedPath> { self.directory.as_ref() }
+    /// Immutable discovery namespace, retained when the catalog is frozen.
+    pub fn discovery_scope(&self) -> &DiscoveryScope { &self.scope }
+    /// True only for whole-root discovery; absence of a directory alone also
+    /// occurs for an exact-file catalog and is not whole-root evidence.
+    pub fn is_workspace(&self) -> bool { self.scope.is_workspace() }
+    /// Original-root-relative directory, or None for workspace/exact-file scope.
+    pub fn directory(&self) -> Option<&NormalizedPath> { self.scope.directory() }
+    /// Original-root-relative exact member, or None for workspace/directory scope.
+    pub fn file(&self) -> Option<&NormalizedPath> { self.scope.file() }
     pub const fn stage(&self) -> WorkspaceStage { self.stage }
     pub const fn limits(&self) -> WorkspaceLimits { self.limits }
     pub fn entries(&self) -> &[WorkspaceEntry] { &self.entries }
     pub const fn aggregate(&self) -> DiscoveryAggregate { self.aggregate }
     pub const fn discovery_pages(&self) -> usize { self.pages }
-    /// Completeness within directory(), or the whole root when None. Search
-    /// manifests built from this catalog close only that declared universe.
+    /// Completeness within discovery_scope(). Search manifests built from
+    /// this catalog close only that declared universe, never its siblings.
     pub const fn discovery_complete(&self) -> bool { self.discovery_complete }
     pub const fn stopped_by_limit(&self) -> Option<WorkspaceLimit> { self.limit }
     pub const fn discovery_error(&self) -> Option<SourceError> { self.discovery_error }

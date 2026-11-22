@@ -99,6 +99,42 @@ impl ChildOrderGeneration { pub const fn get(self) -> u64 { self.0 } }
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DiscoveryKind { File, Directory, Symlink, Special, Unavailable, Cycle }
 
+/// The namespace admitted by a discovery session. Ancestor policy reads never
+/// widen a directory or exact-file scope. Paths retain the original root basis.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DiscoveryScope {
+    Workspace,
+    Directory(NormalizedPath),
+    File(NormalizedPath),
+}
+impl DiscoveryScope {
+    pub fn directory(&self) -> Option<&NormalizedPath> {
+        match self { Self::Directory(path) => Some(path), _ => None }
+    }
+    pub fn file(&self) -> Option<&NormalizedPath> {
+        match self { Self::File(path) => Some(path), _ => None }
+    }
+    pub fn is_workspace(&self) -> bool { matches!(self, Self::Workspace) }
+    fn target(&self) -> Option<&NormalizedPath> {
+        match self { Self::Workspace => None, Self::Directory(path) | Self::File(path) => Some(path) }
+    }
+    pub(crate) fn contains_entry(&self, path: &NormalizedPath) -> bool {
+        match self {
+            Self::Workspace => true,
+            Self::File(file) => file == path,
+            Self::Directory(directory) => directory == path || self.covers_absence(path),
+        }
+    }
+    pub(crate) fn covers_absence(&self, path: &NormalizedPath) -> bool {
+        match self {
+            Self::Workspace => true,
+            Self::File(file) => file == path,
+            Self::Directory(directory) => path.as_bytes().starts_with(directory.as_bytes())
+                && path.as_bytes().get(directory.as_bytes().len()) == Some(&b'/'),
+        }
+    }
+}
+
 /// An observation is not a capture, deletion or persistent file identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveryEntry {
@@ -176,7 +212,7 @@ pub struct BoundedDiscovery {
     repository_rules: Option<RepositoryRules>,
     // Keep the original grant/path basis. Ancestors contribute policy but are
     // not enumerated, so unrelated siblings cannot consume the subtree budget.
-    directory: Option<NormalizedPath>,
+    scope: DiscoveryScope,
     pending: VecDeque<PendingDir>,
     open: VecDeque<OpenDir>,
     epoch: ScanEpoch,
@@ -233,6 +269,37 @@ impl BoundedDiscovery {
         Ok(Self::open_rule_aware(grant, limits, rules, budget, allocation)?
             .with_directory(directory)?)
     }
+    /// Observe one regular file under the original grant. No sibling directory
+    /// entries or source payloads are read. The file must exist at admission;
+    /// later disappearance/replacement remains incomplete discovery evidence.
+    pub fn open_metadata_only_for_file(grant: RootGrant, file: NormalizedPath,
+        limits: DiscoveryLimits, ignore: IgnoreMatcher) -> Result<Self, SourceError> {
+        Self::open_metadata_only(grant, SymlinkPolicy::DisallowAll, limits, ignore)?
+            .with_file(file)
+    }
+    /// Load only the root and ancestor rules before directly observing one
+    /// member. Rules are deferred to batches under the ordinary policy budget.
+    pub fn open_rule_aware_for_file(grant: RootGrant, file: NormalizedPath,
+        limits: DiscoveryLimits, rules: RuleLimits, budget: &ResourceBudget,
+        allocation: ResourceAllocationId) -> Result<Self, RuleError> {
+        Ok(Self::open_rule_aware(grant, limits, rules, budget, allocation)?
+            .with_file(file)?)
+    }
+    fn with_file(mut self, file: NormalizedPath) -> Result<Self, SourceError> {
+        if file.as_bytes().len() > self.limits.max_path_bytes as usize
+            || file.as_bytes().len() as u64 > self.limits.max_batch_bytes
+            || file.segments().len() > self.limits.max_depth as usize {
+            return Err(SourceError::PayloadTooLarge);
+        }
+        let root = self.reader.canonical_root_path()?;
+        let resolved = self.reader.resolve_confined_path(&root, &file)?;
+        let metadata = fs::symlink_metadata(resolved).map_err(|_| SourceError::CaptureUnavailable)?;
+        validate_not_special(&metadata)?;
+        if !metadata.is_file() { return Err(SourceError::InvalidRange); }
+        self.grant.validate_active()?;
+        self.scope = DiscoveryScope::File(file);
+        Ok(self)
+    }
     fn with_directory(mut self, directory: NormalizedPath) -> Result<Self, SourceError> {
         if directory.as_bytes().len() > self.limits.max_path_bytes as usize
             || directory.segments().len() >= self.limits.max_depth as usize {
@@ -244,7 +311,7 @@ impl BoundedDiscovery {
         validate_not_special(&metadata)?;
         if !metadata.is_dir() { return Err(SourceError::InvalidRange); }
         self.grant.validate_active()?;
-        self.directory = Some(directory);
+        self.scope = DiscoveryScope::Directory(directory);
         Ok(self)
     }
     pub fn reads_rule_files(&self) -> bool { self.read_rule_files || self.repository_rules.is_some() }
@@ -263,7 +330,7 @@ impl BoundedDiscovery {
         reader.canonical_root_path()?;
         let mut session = Self { reader, grant, limits, ignore,
             own_exclusions: OwnArtifactExclusion::default_product(), read_rule_files: true,
-            repository_rules: None, directory: None, pending: VecDeque::new(), open: VecDeque::new(), epoch: ScanEpoch(1),
+            repository_rules: None, scope: DiscoveryScope::Workspace, pending: VecDeque::new(), open: VecDeque::new(), epoch: ScanEpoch(1),
             next_stable_generation: 1, aggregate: DiscoveryAggregate::default(), peaks: DiscoveryPeaks::default(),
             status: ScanStatus::InProgress, queue_saturated: false, root_excluded: false };
         session.pending.push_back(PendingDir { rel: None, kind: DiscoveryKind::Directory,
@@ -274,10 +341,12 @@ impl BoundedDiscovery {
     pub fn own_exclusions(&self) -> &OwnArtifactExclusion { &self.own_exclusions }
     pub fn own_exclusions_mut(&mut self) -> &mut OwnArtifactExclusion { &mut self.own_exclusions }
     pub fn register_own_artifact_path(&mut self, path: &Path) -> Result<(), SourceError> { self.own_exclusions.register_path(path) }
-    /// The immutable root-relative enumeration scope, or `None` for the whole
-    /// granted root. Reading ancestor rules does not widen this scope. Consumers
-    /// reconciling prior catalogs must retain it even after traversal stops.
-    pub fn directory(&self) -> Option<&NormalizedPath> { self.directory.as_ref() }
+    /// Immutable namespace identity, retained even after traversal stops.
+    pub fn scope(&self) -> &DiscoveryScope { &self.scope }
+    /// The selected directory, or None for workspace/exact-file discovery.
+    pub fn directory(&self) -> Option<&NormalizedPath> { self.scope.directory() }
+    /// The selected exact member, or None for workspace/directory discovery.
+    pub fn file(&self) -> Option<&NormalizedPath> { self.scope.file() }
     pub fn limits(&self) -> DiscoveryLimits { self.limits }
     pub fn scan_epoch(&self) -> ScanEpoch { self.epoch }
     pub fn status(&self) -> ScanStatus { self.status }
@@ -480,12 +549,33 @@ impl BoundedDiscovery {
                 return OpenResult::SkippedUnavailable;
             }
         } else if self.read_rule_files { self.load_rule_files(pending.rel.as_ref(), &resolved, cancel); }
-        if let Some(directory) = self.directory.as_ref()
-            && pending.depth < directory.segments().len() as u32 {
+        if let Some(target) = self.scope.target()
+            && pending.depth < target.segments().len() as u32 {
+            if self.scope.file().is_some() && pending.depth as usize + 1 == target.segments().len() {
+                // The parent has supplied policy. Observe exactly this name:
+                // opening its parent iterator would let siblings spend the
+                // selected file's discovery allowance before it is reached.
+                let name = target.segments()[pending.depth as usize].to_path_buf();
+                let child_fs = resolved.join(&name);
+                let snapshot = OpenSnapshot { rel: pending.rel, depth: pending.depth,
+                    alias_hops: pending.alias_hops, ancestry: pending.ancestry, resolved };
+                let entry = self.observe_dirent(&snapshot, name.as_os_str(), &child_fs, false);
+                if entry.as_ref().is_some_and(|entry| !matches!(entry.kind(),
+                    DiscoveryKind::File | DiscoveryKind::Unavailable)) {
+                    // The admitted file changed kind. That is not a completed
+                    // regular-file observation and must not silently close an
+                    // empty search universe or expand into its new descendants.
+                    self.aggregate.unavailable = self.aggregate.unavailable.saturating_add(1);
+                }
+                return match entry {
+                    Some(entry) => OpenResult::SkippedEntry(entry),
+                    None => OpenResult::SkippedUnavailable,
+                };
+            }
             // Visit the next ancestor directly after its parent's rules have
             // been loaded. Each visit uses an ordinary bounded transition and
             // the same root/depth/path/cycle checks as normal discovery.
-            let name = directory.segments()[pending.depth as usize].as_bytes();
+            let name = target.segments()[pending.depth as usize].as_bytes();
             let child = match child_relative(pending.rel.as_ref(), name) {
                 Ok(path) => path,
                 Err(_) => {
@@ -515,7 +605,7 @@ impl BoundedDiscovery {
         self.note_descriptor_peak(); self.note_queue_peak(); OpenResult::Opened
     }
     fn is_directory_ancestor(&self, path: Option<&NormalizedPath>) -> bool {
-        self.directory.as_ref().is_some_and(|directory| {
+        self.scope.target().is_some_and(|directory| {
             path.is_none_or(|path| directory == path
                 || directory.as_bytes().starts_with(path.as_bytes())
                     && directory.as_bytes().get(path.as_bytes().len()) == Some(&b'/'))
@@ -540,7 +630,7 @@ impl BoundedDiscovery {
                         ancestry: open.ancestry.clone(), resolved: open.resolved.clone() }
                 };
                 let child_fs = snapshot.resolved.join(dirent.file_name());
-                if let Some(entry) = self.observe_dirent(&snapshot, dirent.file_name().as_os_str(), &child_fs) {
+                if let Some(entry) = self.observe_dirent(&snapshot, dirent.file_name().as_os_str(), &child_fs, true) {
                     *batch_bytes = batch_bytes.saturating_add(entry.path.as_bytes().len() as u64);
                     entries.push(entry);
                     if let Some(open) = self.open.front_mut() {
@@ -555,7 +645,8 @@ impl BoundedDiscovery {
             }
         }
     }
-    fn observe_dirent(&mut self, open: &OpenSnapshot, name: &OsStr, child_fs_path: &Path) -> Option<DiscoveryEntry> {
+    fn observe_dirent(&mut self, open: &OpenSnapshot, name: &OsStr, child_fs_path: &Path,
+        descend: bool) -> Option<DiscoveryEntry> {
         if name == OsStr::new(".") || name == OsStr::new("..") { return None; }
         let child_path = match child_relative(open.rel.as_ref(), os_name_bytes(name)) {
             Ok(path) => path,
@@ -579,12 +670,12 @@ impl BoundedDiscovery {
             let excluded = self.classify_exclusion(&child_path, false)
                 || self.own_exclusions.is_excluded(child_fs_path, None)
                 || self.reader.symlink_policy() == SymlinkPolicy::DisallowAll;
-            if !excluded { self.maybe_follow_symlink_dir(open, &child_path, depth, child_fs_path); }
+            if !excluded && descend { self.maybe_follow_symlink_dir(open, &child_path, depth, child_fs_path); }
             return Some(self.push_kind(child_path, DiscoveryKind::Symlink, depth, None, excluded));
         }
         if file_type.is_dir() {
             let excluded = self.classify_exclusion(&child_path, true) || self.own_exclusions.is_excluded(child_fs_path, None);
-            if !excluded { self.maybe_enqueue_dir(open, child_path.clone(), depth); }
+            if !excluded && descend { self.maybe_enqueue_dir(open, child_path.clone(), depth); }
             return Some(self.push_kind(child_path, DiscoveryKind::Directory, depth, None, excluded));
         }
         if file_type.is_file() {

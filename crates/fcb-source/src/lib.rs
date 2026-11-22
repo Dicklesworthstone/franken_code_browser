@@ -48,7 +48,7 @@ pub use encoding::{
 pub use confined::{ConfinedSourceReader, DirectoryId, SymlinkPolicy, safe_open_regular_file};
 pub use discovery::{
     BoundedDiscovery, ChildOrderGeneration, DiscoveryAggregate, DiscoveryBatch, DiscoveryEntry,
-    DiscoveryKind, DiscoveryLimits, DiscoveryPeaks, IncompleteReason, OwnArtifactExclusion,
+    DiscoveryKind, DiscoveryLimits, DiscoveryPeaks, DiscoveryScope, IncompleteReason, OwnArtifactExclusion,
     PublicationState, ScanEpoch, ScanStatus,
 };
 pub use ignore::{
