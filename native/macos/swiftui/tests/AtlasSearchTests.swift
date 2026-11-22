@@ -6,7 +6,81 @@ import Foundation
         precondition(condition(), message)
         checks += 1
     }
+    static func catalogScopes() throws {
+        let folder = try AtlasSearchCatalogScope(directory: Array("zz-late".utf8))
+        let query = try AtlasSearchPathScope(kind: .directory, path: "zz-late")
+        let input = try AtlasSearchInput(root: "/repo", query: "needle", pathScope: query, catalogScope: folder)
+        check(input.root == "/repo" && input.catalogScope == folder && input.pathScope == query,
+            "Independent discovery preserves the original root and root-relative query")
+        let legacy = try AtlasSearchInput(root: "/repo", query: "needle", pathScope: query)
+        check(legacy.catalogScope.isWorkspace, "Standalone path-filter callers preserve their workspace catalog default")
+        check(!folder.containsFile(Array("zz-later/a.rs".utf8)) && folder.containsFile(Array("zz-late/a.rs".utf8)),
+            "Directory discovery contains only paths below the exact slash-delimited boundary")
+        let raw = try AtlasSearchCatalogScope(directory: [122, 255, 92, 45])
+        check(raw.directoryHex == "7aff5c2d" && raw.directory == [122, 255, 92, 45],
+            "Non-UTF8 names and Unix backslashes survive discovery identity without normalization")
+        let composed = try AtlasSearchCatalogScope(directory: Array("café".utf8))
+        let decomposed = try AtlasSearchCatalogScope(directory: Array("cafe\u{301}".utf8))
+        check(composed != decomposed, "Canonically equivalent display names remain distinct directories")
+        for path in [Array("/a".utf8), Array("a/".utf8), Array("a//b".utf8), Array("a/../b".utf8),
+                     Array("./a".utf8), [97, 0], Array(repeating: UInt8(97), count: 2049),
+                     Array(Array(repeating: "a", count: 32).joined(separator: "/").utf8)] {
+            do { _ = try AtlasSearchCatalogScope(directory: path); preconditionFailure("Invalid discovery directory accepted") }
+            catch AtlasSearchError.invalidCatalogScope { checks += 1 }
+        }
+        let deepestDirectory = try AtlasSearchCatalogScope(directory: Array(Array(repeating: "a", count: 31).joined(separator: "/").utf8))
+        check(deepestDirectory.directory.filter { $0 == 47 }.count == 30, "The full admitted directory depth remains available")
+        let longestDirectory = try AtlasSearchCatalogScope(directory: Array(repeating: UInt8(97), count: 2048))
+        check(longestDirectory.directory.count == 2048,
+            "The exact directory ABI limit remains available")
+        for scope in [AtlasSearchPathScope.workspace,
+                      try AtlasSearchPathScope(kind: .directory, path: "other"),
+                      try AtlasSearchPathScope(kind: .file, path: "zz-later/a.rs")] {
+            do {
+                _ = try AtlasSearchInput(root: "/repo", query: "needle", pathScope: scope, catalogScope: folder)
+                preconditionFailure("A narrow discovery catalog admitted a wider query")
+            } catch AtlasSearchError.invalidCatalogScope { checks += 1 }
+        }
+        let receipt = try AtlasSearchCatalogReceipt(scope: folder, kind: "directory",
+            directory: .init(encoding: "unix-bytes", hex: folder.directoryHex, display: "zz-late"), pathBasis: "project-root")
+        try receipt.validate(kind: "directory",
+            directory: .init(encoding: "unix-bytes", hex: folder.directoryHex, display: "another display label"), pathBasis: "project-root")
+        for (kind, hex, basis) in [("workspace", folder.directoryHex, "project-root"),
+                                   ("directory", composed.directoryHex, "project-root"),
+                                   ("directory", folder.directoryHex.uppercased(), "directory-root"),
+                                   ("directory", folder.directoryHex, "directory-root")] {
+            do {
+                try receipt.validate(kind: kind, directory: .init(encoding: "unix-bytes", hex: hex, display: "zz-late"), pathBasis: basis)
+                preconditionFailure("Changed discovery receipt accepted")
+            } catch AtlasSearchError.invalidResponse { checks += 1 }
+        }
+        do {
+            _ = try AtlasSearchCatalogReceipt(scope: folder, kind: nil, directory: nil, pathBasis: nil)
+            preconditionFailure("A directory request borrowed an unlabeled legacy workspace")
+        } catch AtlasSearchError.invalidResponse { checks += 1 }
+        do {
+            try AtlasSearchCatalogReceipt.legacyWorkspace.validate(kind: "workspace", directory: nil, pathBasis: "project-root")
+            preconditionFailure("A legacy owner introduced an unpinned discovery claim")
+        } catch AtlasSearchError.invalidResponse { checks += 1 }
+        let windowSource = AtlasSearchResultWindowSource(index: UUID(), input: input, countAllMatches: true)
+        let request = AtlasSearchResultWindowRequest(source: windowSource, offset: 1000)
+        let nextWindow = try AtlasSearchInput(root: "/repo", query: "needle", pathScope: query,
+            catalogScope: folder, resultWindow: request)
+        check(nextWindow.catalogScope == folder && windowSource.matches(nextWindow, countAllMatches: true),
+            "A result-window capability retains its original discovery directory")
+        do {
+            _ = try AtlasSearchInput(root: "/repo", query: "needle", pathScope: query, resultWindow: request)
+            preconditionFailure("A result window borrowed the same path filter under a different discovery catalog")
+        } catch AtlasSearchError.invalidRequest { checks += 1 }
+        var context = AtlasSearchContext(root: "/repo", query: "needle", loadGeneration: UUID(),
+            atlasRevision: UUID(), scope: "All files", customExtensions: "")
+        let wholeProject = context
+        context.catalogDirectory = folder.directory
+        check(!context.matches(wholeProject), "Stale actions cannot borrow another catalog's root-identical query")
+    }
+
     static func main() throws {
+        try catalogScopes()
         func envelope(_ hits: [[String: Any]] = []) -> [String: Any] {
             ["schema": "fcb.cli/1", "status": "ok", "command": "search", "scope": "workspace",
              "mode": "decoded-text-literal", "workspace_complete": true, "discovery_complete": true,

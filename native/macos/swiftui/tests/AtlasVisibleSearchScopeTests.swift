@@ -21,11 +21,36 @@ import Foundation
     }
 
     static func main() throws {
+        try directoryIdentityFollowsTheAcceptedView()
         try geometryUsesAllParcelsAndExactIntersections()
         try rawMembershipIsFrozenAndNotAPathLabel()
         try boundsRefuseWholeScopeAndEmptyRemainsEmpty()
         try invalidGeometryAndCancellationCannotPublishMembership()
         print("Accepted atlas-view membership, exact raw paths, frozen scope identity, bounded refusal and cancellation checks passed.")
+    }
+
+    private static func directoryIdentityFollowsTheAcceptedView() throws {
+        let project = UUID(), layout = UUID()
+        let directory = try AtlasDirectoryFocus(rawPath: [122, 255, 92, 45])
+        let viewport = try AtlasVisibleSearchScope.Viewport(x: 0, y: 0, width: 100, height: 100)
+        let accepted = try AtlasVisibleSearchScope.View(root: "/repo", project: project, layout: layout,
+            viewport: viewport, directory: directory)
+        let member = directory.rawPath + Array("/late.rs".utf8)
+        let frozen = try capture([entry(1, member, x: 0)], in: accepted)
+        precondition(frozen.paths == [member] && frozen.view.directory == directory)
+        precondition(frozen.view.belongs(to: "/repo", project: project, layout: layout, directory: directory))
+        precondition(!frozen.view.belongs(to: "/repo", project: project, layout: layout))
+        precondition(!frozen.view.represents(root: "/repo", project: project, layout: layout, viewport: viewport))
+        reject("a focused atlas borrowed an unrelated visible parcel") {
+            _ = try capture([entry(1, Array("other/late.rs".utf8), x: 0)], in: accepted)
+        }
+        let composed = try AtlasDirectoryFocus(rawPath: Array("café".utf8))
+        let decomposed = try AtlasDirectoryFocus(rawPath: Array("cafe\u{301}".utf8))
+        let unicode = try AtlasVisibleSearchScope.View(root: "/repo", project: project, layout: layout,
+            viewport: viewport, directory: composed)
+        precondition(!unicode.belongs(to: "/repo", project: project, layout: layout, directory: decomposed))
+        let empty = try capture([], in: accepted)
+        precondition(empty.paths.isEmpty && empty.view.directory == directory)
     }
 
     private static func geometryUsesAllParcelsAndExactIntersections() throws {

@@ -10,6 +10,7 @@ import Foundation
 @_silgen_name("fixture_expect_path") private func expectPath(_ kind: UInt64, _ path: UnsafePointer<CChar>)
 @_silgen_name("fixture_expect_counted_case") private func expectCountedCase(_ caseSensitive: UInt64)
 @_silgen_name("fixture_expect_policy") private func expectPolicy(_ policy: UInt64)
+@_silgen_name("fixture_expect_directory") private func expectDirectory(_ bytes: UnsafePointer<UInt8>?, _ length: UInt64)
 @_silgen_name("fixture_expect_structure") private func expectStructure(_ mode: UInt64, _ nameMode: UInt64)
 @_cdecl("fixture_mark_canceled") public func markCanceled(_ context: UnsafeMutableRawPointer?) {
     guard let context else { preconditionFailure("Missing callback lifetime") }
@@ -294,7 +295,164 @@ private final class Reports: @unchecked Sendable {
             "Expanded requests never silently fall back to repository rules")
     }
 
+    private static func catalogEcho(_ original: [String: Any], scope: AtlasSearchCatalogScope) -> [String: Any] {
+        var value = original
+        value["discovery_scope"] = scope.isWorkspace ? "workspace" : "directory"
+        value["discovery_directory"] = scope.isWorkspace ? NSNull()
+            : ["encoding": "unix-bytes", "hex": scope.directoryHex, "display": "selected folder"] as Any
+        value["path_basis"] = "project-root"
+        return value
+    }
+    private static func directoryPage(_ command: String, step: Int, total: Int, running: Bool,
+                                     scope: AtlasSearchCatalogScope, path: AtlasSearchPathScope,
+                                     policy: AtlasDiscoveryPolicy) -> [String: Any] {
+        let eligible = path.isVisible ? 1 : 2
+        let member = scope.directory + Array("/a.rs".utf8)
+        let memberHex = member.map { String(format: "%02x", $0) }.joined()
+        var value = scopedPage(command, scope: .all, step: step, eligible: eligible, total: total,
+            running: running, pathScope: path, hitPath: memberHex)
+        if command == "page" {
+            value["hits"] = (65...total).map { hit($0, path: memberHex) }
+            value["next_offset"] = NSNull()
+        }
+        if path.isVisible {
+            value["scope_path"] = ""; value["scope_path_hex"] = ""
+            value["scope_region_sha256"] = path.visibleIdentity
+            value["scope_region_files"] = String(path.visibleCount ?? 0)
+            value["scope_region_path_bytes"] = String(member.count)
+            value["scope_region_catalogued_files"] = "1"; value["scope_region_missing_files"] = "0"
+        }
+        value["discovery_policy"] = policy.wireName
+        return catalogEcho(value, scope: scope)
+    }
+    private static func directoryImport(_ scope: AtlasSearchCatalogScope) -> [String: Any] {
+        let member = scope.directory + Array("/a.rs".utf8)
+        let rawPath: [String: Any] = ["encoding": "unix-bytes",
+            "hex": member.map { String(format: "%02x", $0) }.joined(), "display": "a.rs"]
+        var imported = importReply(), reader = imported["reader"] as! [String: Any]
+        imported["path"] = rawPath; reader["path"] = rawPath; imported["reader"] = reader
+        return catalogEcho(imported, scope: scope)
+    }
+    private static func setupDirectory(_ scope: AtlasSearchCatalogScope, path: AtlasSearchPathScope,
+                                       policy: AtlasDiscoveryPolicy = .repositoryRules, rows: Int = 1) throws {
+        resetFixture(); expectPolicy(policy.rawValue)
+        scope.directory.withUnsafeBufferPointer { expectDirectory($0.baseAddress, UInt64($0.count)) }
+        path.withCString { expectPath($0, $1!) }
+        try install(0, catalogEcho(openReceipt(policy.wireName), scope: scope))
+        try install(1, directoryPage("begin", step: 0, total: 0, running: true, scope: scope, path: path, policy: policy))
+        try install(2, directoryPage("step", step: 1, total: rows, running: !path.isVisible, scope: scope, path: path, policy: policy))
+        if rows > 64 {
+            try install(3, directoryPage("page", step: 1, total: rows, running: !path.isVisible, scope: scope, path: path, policy: policy))
+        }
+        if !path.isVisible {
+            try install(2, directoryPage("step", step: 2, total: rows, running: false,
+                scope: scope, path: path, policy: policy), index: 1)
+        }
+        try install(4, directoryImport(scope))
+    }
+    @MainActor private static func directoryCatalogsBindEveryPhase() throws {
+        let folder = try AtlasSearchCatalogScope(directory: Array("zz-late".utf8))
+        let path = try AtlasSearchPathScope(kind: .directory, path: "zz-late")
+        func run(_ catalog: AtlasSearchCatalogScope, path: AtlasSearchPathScope,
+                 policy: AtlasDiscoveryPolicy = .repositoryRules) throws -> AtlasSearchReport {
+            try AtlasNativeSearch.runScoped(input: AtlasSearchInput(root: "/project", query: "x", pathScope: path,
+                discoveryPolicy: policy, catalogScope: catalog), cancellation: AtlasSearchCancellation(),
+                access: AtlasSearchAccessLease(nil), progress: { _ in })
+        }
+        for policy in [AtlasDiscoveryPolicy.repositoryRules, .includeExcluded] {
+            try setupDirectory(folder, path: path, policy: policy, rows: 70)
+            var report: AtlasSearchReport? = try run(folder, path: path, policy: policy)
+            check(report!.complete && report!.catalogScope == folder && report!.discoveryPolicy == policy
+                && report!.hits.count == 70 && report!.hits[0].sourcePath == "zz-late/a.rs",
+                "Live folder search keeps independently bounded discovery and root-relative results through every page")
+            var target = report!.capture!.target(report!.hits[0])
+            report = nil
+            check(target!.root == "/project" && target!.path == "zz-late/a.rs",
+                "The original project grant and full relative path survive directory-scoped search")
+            _ = try target!.openReader(100)
+            check(fixtureCount(16) == 1 && fixtureCount(1) == 1 && fixtureCount(4) == 1 && fixtureCount(8) == 1,
+                "Folder open, paged query and capture import use one retained directory owner")
+            target = nil; retired()
+            check(fixtureCount(6) == fixtureCount(7), "Directory search drains every response allocation")
+        }
+        try setup()
+        try install(0, catalogEcho(openReceipt(), scope: .workspace))
+        try install(1, catalogEcho(page("begin", step: 0), scope: .workspace))
+        try install(2, catalogEcho(page("step", step: 1, total: 70), scope: .workspace))
+        try install(3, catalogEcho(page("page", step: 1, total: 70, start: 64), scope: .workspace))
+        try install(2, catalogEcho(page("step", step: 2, total: 70, running: false, complete: true), scope: .workspace), index: 1)
+        try install(4, catalogEcho(importReply(), scope: .workspace))
+        var workspace: AtlasSearchReport? = try AtlasNativeSearch.run(root: "/project", query: "x", cancellation: AtlasSearchCancellation())
+        _ = try workspace!.capture!.target(workspace!.hits[0])!.openReader(100)
+        check(workspace!.complete && workspace!.catalogScope.isWorkspace && fixtureCount(16) == 0,
+            "Modern workspace receipts preserve default opening, pagination and retained activation")
+        workspace = nil; retired()
+        for phase in [UInt32(0), 1, 2, 3, 4] {
+            try setupDirectory(folder, path: path, rows: 70)
+            var corrupt: [String: Any]
+            if phase == 0 { corrupt = catalogEcho(openReceipt(), scope: folder) }
+            else if phase == 4 { corrupt = directoryImport(folder) }
+            else {
+                corrupt = directoryPage(phase == 1 ? "begin" : phase == 2 ? "step" : "page",
+                    step: phase == 1 ? 0 : 1, total: phase == 1 ? 0 : 70, running: true,
+                    scope: folder, path: path, policy: .repositoryRules)
+            }
+            corrupt["discovery_directory"] = ["encoding": "unix-bytes", "hex": "6f74686572", "display": "zz-late"]
+            try install(phase, corrupt)
+            do {
+                let result = try run(folder, path: path)
+                if phase == 4 { _ = try result.capture!.target(result.hits[0])!.openReader(100) }
+                preconditionFailure("Live receipt changed catalog directory at phase " + String(phase))
+            } catch AtlasSearchError.invalidResponse { checks += 1 }
+            retired()
+            if phase == 0 { check(fixtureCount(2) == 0, "A mismatched directory open cannot admit source search") }
+            check(fixtureCount(6) == fixtureCount(7), "Rejected directory receipts preserve allocation balance")
+        }
+        for phase in [UInt32(0), 1, 2, 3, 4] {
+            for defect in ["partial", "all-null"] {
+                try setup()
+                var changed = phase == 0 ? openReceipt() : phase == 4 ? importReply()
+                    : page(phase == 1 ? "begin" : phase == 2 ? "step" : "page",
+                        step: phase == 1 ? 0 : 1, total: phase == 1 ? 0 : 70, start: phase == 3 ? 64 : 0)
+                changed["discovery_directory"] = NSNull()
+                if defect == "all-null" {
+                    changed["discovery_scope"] = NSNull(); changed["path_basis"] = NSNull()
+                }
+                try install(phase, changed)
+                do {
+                    let result = try AtlasNativeSearch.run(root: "/project", query: "x", cancellation: AtlasSearchCancellation())
+                    if phase == 4 { _ = try result.capture!.target(result.hits[0])!.openReader(100) }
+                    preconditionFailure("Legacy workspace accepted a partial or null-only discovery receipt")
+                } catch AtlasSearchError.invalidResponse { checks += 1 }
+                retired()
+            }
+        }
+        #if canImport(CryptoKit)
+        let raw = try AtlasSearchCatalogScope(directory: [122, 255, 92, 45])
+        let visible = try AtlasSearchPathScope(visiblePaths: [raw.directory + Array("/a.rs".utf8)])
+        try setupDirectory(raw, path: visible)
+        var visibleReport: AtlasSearchReport? = try run(raw, path: visible)
+        check(visibleReport!.complete && visibleReport!.catalogScope == raw
+            && visibleReport!.pathScope == visible && visibleReport!.hits[0].sourcePath == nil
+            && fixtureCount(16) == 1, "Visible search uses its accepted raw directory without a lossy path or root-prefix catalog")
+        visibleReport = nil; retired()
+        #endif
+    }
+
     @MainActor static func main() throws {
+        resetFixture()
+        let windowInput = try AtlasSearchInput(root: "/project", query: "x")
+        let windowSource = AtlasSearchResultWindowSource(index: UUID(), input: windowInput, countAllMatches: true)
+        let windowRequest = try AtlasSearchInput(root: "/project", query: "x",
+            resultWindow: .init(source: windowSource, offset: 1000))
+        do {
+            _ = try AtlasNativeSearch.runScoped(input: windowRequest, cancellation: AtlasSearchCancellation(),
+                access: AtlasSearchAccessLease(nil), progress: { _ in })
+            preconditionFailure("A captured result window became a fresh live first-page query")
+        } catch AtlasSearchError.unavailable { checks += 1 }
+        check(fixtureCount(0) == 0 && fixtureCount(1) == 0 && fixtureCount(2) == 0,
+            "Live search refuses retained-index window requests before allocation, discovery or query admission")
+        try directoryCatalogsBindEveryPhase()
         try discoveryPoliciesBindEveryReceipt()
         for caseSensitive in [true, false] {
             resetFixture(); expectCountedCase(caseSensitive ? 1 : 0)

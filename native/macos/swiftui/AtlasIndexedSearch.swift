@@ -39,6 +39,9 @@ struct AtlasIndexedSearchTransport: Sendable {
     /// Legacy openers retain repository-rules defaults; explicit opt-in must
     /// never silently reuse their narrower discovery universe.
     var openWithPolicy: (@Sendable (UInt64, String, AtlasDiscoveryPolicy, AtlasSearchCancellation) throws -> String?)? = nil
+    /// Independently bounded directory discovery under the unchanged root grant.
+    var openDirectoryWithPolicy: (@Sendable (UInt64, String, AtlasSearchCatalogScope,
+        AtlasDiscoveryPolicy, AtlasSearchCancellation) throws -> String?)? = nil
 }
 
 /// A completed retained source index, without an admitted text query. A links
@@ -83,13 +86,15 @@ final class AtlasIndexedSearch: @unchecked Sendable {
         let discovery: Bool
         let discoveryPolicy: AtlasDiscoveryPolicy
         let policyReceipt: String?
+        let catalogReceipt: AtlasSearchCatalogReceipt
         var page: AtlasIndexBuildPage
         init(owner: AtlasSearchCaptureOwner, root: String, grant: ObjectIdentifier?, handle: UInt64,
              layout: UInt64, files: Int, discovery: Bool, page: AtlasIndexBuildPage,
-             discoveryPolicy: AtlasDiscoveryPolicy, policyReceipt: String?) {
+             discoveryPolicy: AtlasDiscoveryPolicy, policyReceipt: String?, catalogReceipt: AtlasSearchCatalogReceipt) {
             self.owner = owner; self.root = root; self.grant = grant; self.handle = handle
             self.layout = layout; self.files = files; self.discovery = discovery; self.page = page
             self.discoveryPolicy = discoveryPolicy; self.policyReceipt = policyReceipt
+            self.catalogReceipt = catalogReceipt
         }
     }
     private let transport: AtlasIndexedSearchTransport
@@ -101,6 +106,7 @@ final class AtlasIndexedSearch: @unchecked Sendable {
     func prepare(root: String, scope: AtlasSearchFileScope = .all,
                  pathScope: AtlasSearchPathScope = .workspace,
                  discoveryPolicy: AtlasDiscoveryPolicy = .repositoryRules,
+                 catalogScope: AtlasSearchCatalogScope = .workspace,
                  cancellation: AtlasSearchCancellation, access: AtlasSearchAccessLease,
                  progress: @Sendable (AtlasSearchReport) -> Void) throws -> AtlasPreparedIndex {
         guard !root.isEmpty, root.utf8.count <= 16_384, !root.utf8.contains(0) else {
@@ -109,14 +115,20 @@ final class AtlasIndexedSearch: @unchecked Sendable {
         try check(cancellation)
         guard serial.try() else { throw AtlasSearchError.unavailable }
         defer { serial.unlock() }
-        guard discoveryPolicy == .repositoryRules || transport.openWithPolicy != nil else {
+        guard catalogScope.isWorkspace || transport.openDirectoryWithPolicy != nil else {
+            throw AtlasSearchError.unsupportedCatalogScope
+        }
+        guard pathScope.isContained(in: catalogScope) else { throw AtlasSearchError.invalidCatalogScope }
+        guard discoveryPolicy == .repositoryRules || (catalogScope.isWorkspace
+            ? transport.openWithPolicy != nil : transport.openDirectoryWithPolicy != nil) else {
             throw AtlasSearchError.unsupportedDiscoveryPolicy
         }
         let grant = access.reference.map(ObjectIdentifier.init)
         if cached.map({ $0.root.utf8.elementsEqual(root.utf8) && $0.grant == grant
-            && $0.discoveryPolicy == discoveryPolicy }) != true {
+            && $0.discoveryPolicy == discoveryPolicy && $0.basis.catalogReceipt.scope == catalogScope }) != true {
             cached = nil
             cached = try build(root: root, scope: scope, pathScope: pathScope, discoveryPolicy: discoveryPolicy,
+                catalogScope: catalogScope,
                 mode: .text, nameMode: .contains,
                 caseSensitive: true, access: access, cancellation: cancellation, progress: progress)
         }
@@ -134,7 +146,11 @@ final class AtlasIndexedSearch: @unchecked Sendable {
     func runScoped(input: AtlasSearchInput, cancellation: AtlasSearchCancellation,
                    access: AtlasSearchAccessLease, progress: @Sendable (AtlasSearchReport) -> Void) throws -> AtlasSearchReport {
         let root = input.root, query = input.query, scope = input.fileScope, pathScope = input.pathScope
-        guard input.discoveryPolicy == .repositoryRules || transport.openWithPolicy != nil else {
+        guard input.catalogScope.isWorkspace || transport.openDirectoryWithPolicy != nil else {
+            throw AtlasSearchError.unsupportedCatalogScope
+        }
+        guard input.discoveryPolicy == .repositoryRules || (input.catalogScope.isWorkspace
+            ? transport.openWithPolicy != nil : transport.openDirectoryWithPolicy != nil) else {
             throw AtlasSearchError.unsupportedDiscoveryPolicy
         }
         let usesWindows = input.mode.isTextual && transport.windowQueryBegin != nil
@@ -168,7 +184,7 @@ final class AtlasIndexedSearch: @unchecked Sendable {
         do {
             let grant = access.reference.map(ObjectIdentifier.init)
             let reused = cached.map { $0.root.utf8.elementsEqual(root.utf8) && $0.grant == grant
-                && $0.discoveryPolicy == input.discoveryPolicy } == true
+                && $0.discoveryPolicy == input.discoveryPolicy && $0.basis.catalogReceipt.scope == input.catalogScope } == true
             if let requested = input.resultWindow {
                 // A page request may never recapture an edited live tree or
                 // borrow another root/grant's equally numbered index.
@@ -180,7 +196,8 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                 // gate. Cancellation can suppress query delivery, not make an
                 // acknowledged complete source universe need another capture.
                 cached = try build(root: root, scope: scope, pathScope: pathScope,
-                    discoveryPolicy: input.discoveryPolicy, mode: input.mode, nameMode: input.nameMode, caseSensitive: input.caseSensitive,
+                    discoveryPolicy: input.discoveryPolicy, catalogScope: input.catalogScope,
+                    mode: input.mode, nameMode: input.nameMode, caseSensitive: input.caseSensitive,
                     access: access, cancellation: cancellation, progress: progress)
             }
             guard let session = cached else { throw AtlasSearchError.unavailable }
@@ -269,7 +286,8 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                     fileScope: scope, excludedFiles: basis.files - state.eligible, pathScope: pathScope,
                     mode: input.mode, nameMode: input.nameMode, structureCoverage: state.structureCoverage,
                     caseSensitive: input.caseSensitive, visibleMissingFiles: state.visibleMissing,
-                    expression: state.expression, discoveryPolicy: input.discoveryPolicy, resultWindow: window)
+                    expression: state.expression, discoveryPolicy: input.discoveryPolicy,
+                    catalogScope: basis.catalogReceipt.scope, resultWindow: window)
                 try check(cancellation)
                 if !state.running { return report }
                 let now = ProcessInfo.processInfo.systemUptime
@@ -290,7 +308,8 @@ final class AtlasIndexedSearch: @unchecked Sendable {
     }
 
     private func beginBuild(root: String, scope: AtlasSearchFileScope, pathScope: AtlasSearchPathScope,
-                            discoveryPolicy: AtlasDiscoveryPolicy, access: AtlasSearchAccessLease,
+                            discoveryPolicy: AtlasDiscoveryPolicy, catalogScope: AtlasSearchCatalogScope,
+                            access: AtlasSearchAccessLease,
                             cancellation: AtlasSearchCancellation) throws -> Preparation {
         if transport.scopedIndexBegin == nil {
             guard pathScope.isWorkspace else { throw AtlasSearchError.invalidPathScope }
@@ -302,6 +321,10 @@ final class AtlasIndexedSearch: @unchecked Sendable {
         owner.retainAccess(access)
         try check(cancellation)
         let opened = try AtlasIndexWire.decode(owner.call { handle in
+            if !catalogScope.isWorkspace {
+                guard let open = transport.openDirectoryWithPolicy else { throw AtlasSearchError.unsupportedCatalogScope }
+                return try open(handle, root, catalogScope, discoveryPolicy, cancellation)
+            }
             if let open = transport.openWithPolicy { return try open(handle, root, discoveryPolicy, cancellation) }
             return try transport.open(handle, root, cancellation)
         })
@@ -309,7 +332,8 @@ final class AtlasIndexedSearch: @unchecked Sendable {
         let policyReceipt = try opened.optionalText("discovery_policy")
         if let policyReceipt {
             guard discoveryPolicy.admitsAtlasReceipt(policyReceipt) else { throw AtlasIndexWire.invalid() }
-        } else if transport.openWithPolicy != nil { throw AtlasIndexWire.invalid() }
+        } else if !catalogScope.isWorkspace || transport.openWithPolicy != nil { throw AtlasIndexWire.invalid() }
+        let catalogReceipt = try opened.catalogReceipt(scope: catalogScope)
         let files = try opened.count("catalogued_files", upTo: AtlasSearchPathScope.maximumVisibleFiles)
         let discovery = try opened.flag("discovery_complete"), layout = try opened.number("layout_revision")
         guard layout > 0, try opened.text("scope") == "all", try opened.number("workspace_files") == UInt64(files),
@@ -320,23 +344,24 @@ final class AtlasIndexedSearch: @unchecked Sendable {
             return try transport.indexBegin(handle, 1)
         }, owner: handle, layout: layout, files: files, discovery: discovery,
             scope: scope, pathScope: pathScope, requiresCaptureEcho: transport.scopedIndexBegin != nil,
-            policyReceipt: policyReceipt, command: "index-begin")
+            policyReceipt: policyReceipt, catalogReceipt: catalogReceipt, command: "index-begin")
         guard page.steps == 0, page.examined == 0, page.bytes == 0, page.readBytes == 0, page.running else { throw AtlasIndexWire.invalid() }
         return Preparation(owner: owner, root: root, grant: access.reference.map(ObjectIdentifier.init),
             handle: handle, layout: layout, files: files, discovery: discovery, page: page,
-            discoveryPolicy: discoveryPolicy, policyReceipt: policyReceipt)
+            discoveryPolicy: discoveryPolicy, policyReceipt: policyReceipt, catalogReceipt: catalogReceipt)
     }
 
     private func build(root: String, scope: AtlasSearchFileScope, pathScope: AtlasSearchPathScope,
-                       discoveryPolicy: AtlasDiscoveryPolicy, mode: AtlasSearchMode, nameMode: AtlasSearchNameMode, caseSensitive: Bool,
+                       discoveryPolicy: AtlasDiscoveryPolicy, catalogScope: AtlasSearchCatalogScope,
+                       mode: AtlasSearchMode, nameMode: AtlasSearchNameMode, caseSensitive: Bool,
                        access: AtlasSearchAccessLease, cancellation: AtlasSearchCancellation,
                        progress: @Sendable (AtlasSearchReport) -> Void) throws -> Session {
         let grant = access.reference.map(ObjectIdentifier.init)
         if preparing.map({ $0.root.utf8.elementsEqual(root.utf8) && $0.grant == grant
-            && $0.discoveryPolicy == discoveryPolicy }) != true {
+            && $0.discoveryPolicy == discoveryPolicy && $0.catalogReceipt.scope == catalogScope }) != true {
             preparing = nil
             preparing = try beginBuild(root: root, scope: scope, pathScope: pathScope,
-                discoveryPolicy: discoveryPolicy, access: access, cancellation: cancellation)
+                discoveryPolicy: discoveryPolicy, catalogScope: catalogScope, access: access, cancellation: cancellation)
         }
         guard let preparation = preparing else { throw AtlasSearchError.unavailable }
         // A replacement request gets a new report stream, even when it resumes
@@ -358,7 +383,7 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                         captureEligibleFiles: page.captureScope.eligibleFiles,
                         captureMissingVisibleFiles: page.captureScope.visibleMissingFiles),
                     fileScope: scope, pathScope: pathScope, mode: mode, nameMode: nameMode,
-                    caseSensitive: caseSensitive, discoveryPolicy: discoveryPolicy))
+                    caseSensitive: caseSensitive, discoveryPolicy: discoveryPolicy, catalogScope: preparation.catalogReceipt.scope))
                 lastPublished = now
             }
             // Cancellation here leaves the last acknowledged Rust step intact.
@@ -369,7 +394,7 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                     owner: preparation.handle, layout: preparation.layout, files: preparation.files,
                     discovery: preparation.discovery, scope: page.captureScope.fileScope,
                     pathScope: page.captureScope.pathScope, requiresCaptureEcho: page.captureScope.hasEcho,
-                    policyReceipt: preparation.policyReceipt, command: "index-step")
+                    policyReceipt: preparation.policyReceipt, catalogReceipt: preparation.catalogReceipt, command: "index-step")
                 guard next.captureScope == page.captureScope,
                       next.manifest == page.manifest, next.steps == page.steps + 1,
                       next.examined >= page.examined, next.examined <= page.examined + 1,
@@ -392,7 +417,7 @@ final class AtlasIndexedSearch: @unchecked Sendable {
             captureManifest: captureManifest, files: preparation.files, capturedFiles: page.captured,
             unavailable: page.unavailable, pending: page.pending, sourceBytes: page.bytes,
             discoveryComplete: preparation.discovery, captureScope: page.captureScope,
-            discoveryPolicyReceipt: preparation.policyReceipt)
+            discoveryPolicyReceipt: preparation.policyReceipt, catalogReceipt: preparation.catalogReceipt)
         let session = Session(owner: preparation.owner, root: root, grant: grant, basis: basis,
             discoveryPolicy: discoveryPolicy)
         preparing = nil
@@ -410,10 +435,11 @@ private struct AtlasIndexBuildPage {
     let captureScope: AtlasIndexedCaptureScope
     init(_ json: String?, owner: UInt64, layout: UInt64, files: Int, discovery: Bool,
          scope: AtlasSearchFileScope, pathScope: AtlasSearchPathScope, requiresCaptureEcho: Bool,
-         policyReceipt: String?, command: String) throws {
+         policyReceipt: String?, catalogReceipt: AtlasSearchCatalogReceipt, command: String) throws {
         let w = try AtlasIndexWire.decode(json)
         try w.header(schema: "fcb.atlas-search/1", command: command, owner: owner)
         try w.validateDiscoveryPolicyReceipt(policyReceipt)
+        try w.validateCatalogReceipt(catalogReceipt)
         manifest = try w.number("source_manifest")
         captureManifest = try w.optionalNumber("capture_manifest")
         captureScope = try AtlasIndexedCaptureScope(w, fileScope: scope, pathScope: pathScope,

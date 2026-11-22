@@ -7,6 +7,10 @@ private typealias IndexPoll = @convention(c) (UnsafeMutableRawPointer?) -> Int32
 @_silgen_name("fcb_atlas_open_with_policy_cancelable") private func indexedOpenWithPolicy(
     _ h: UInt64, _ root: UnsafePointer<CChar>?, _ files: UInt64, _ policy: UInt64,
     _ poll: IndexPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_atlas_open_directory_with_policy_cancelable")
+private func indexedOpenDirectory(_ h: UInt64, _ root: UnsafePointer<CChar>?,
+    _ directory: UnsafePointer<UInt8>?, _ directoryLength: UInt64, _ files: UInt64, _ policy: UInt64,
+    _ poll: IndexPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_index_begin") private func indexedBuildBegin(_ h: UInt64, _ g: UInt64,
     _ files: UInt64, _ fileBytes: UInt64, _ sourceBytes: UInt64, _ grams: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_index_begin_scoped") private func indexedScopedBuildBegin(_ h: UInt64, _ g: UInt64,
@@ -157,6 +161,16 @@ extension AtlasIndexedSearchTransport {
         try polling(flag) { poll, context in
             root.withCString { indexedOpenWithPolicy(h, $0, UInt64(AtlasSearchPathScope.maximumVisibleFiles),
                 policy.rawValue, poll, context) }
+        }
+    }, openDirectoryWithPolicy: { h, root, catalog, policy, flag in
+        guard !catalog.isWorkspace else { throw AtlasSearchError.invalidCatalogScope }
+        return try polling(flag) { poll, context in
+            root.withCString { rootPointer in
+                catalog.directory.withUnsafeBufferPointer { directory in
+                    indexedOpenDirectory(h, rootPointer, directory.baseAddress, UInt64(directory.count),
+                        UInt64(AtlasSearchPathScope.maximumVisibleFiles), policy.rawValue, poll, context)
+                }
+            }
         }
     })
 

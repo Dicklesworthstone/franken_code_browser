@@ -51,21 +51,26 @@ struct AtlasVisibleSearchScope: Sendable {
         let id: UUID
         let root: String
         let project, layout: UUID
+        let directory: AtlasDirectoryFocus
         let viewport: Viewport
 
-        init(root: String, project: UUID, layout: UUID, viewport: Viewport, id: UUID = UUID()) throws {
+        init(root: String, project: UUID, layout: UUID, viewport: Viewport,
+             directory: AtlasDirectoryFocus = .project, id: UUID = UUID()) throws {
             guard root.hasPrefix("/"), root.utf8.count <= 16_384, !root.utf8.contains(0) else {
                 throw Failure.invalidView
             }
             self.id = id; self.root = root; self.project = project; self.layout = layout; self.viewport = viewport
+            self.directory = directory
         }
 
-        func belongs(to root: String, project: UUID, layout: UUID) -> Bool {
-            self.project == project && self.layout == layout && self.root.utf8.elementsEqual(root.utf8)
+        func belongs(to root: String, project: UUID, layout: UUID, directory: AtlasDirectoryFocus = .project) -> Bool {
+            self.project == project && self.layout == layout && self.directory == directory
+                && self.root.utf8.elementsEqual(root.utf8)
         }
 
-        func represents(root: String, project: UUID, layout: UUID, viewport: Viewport) -> Bool {
-            belongs(to: root, project: project, layout: layout) && self.viewport == viewport
+        func represents(root: String, project: UUID, layout: UUID, viewport: Viewport,
+                        directory: AtlasDirectoryFocus = .project) -> Bool {
+            belongs(to: root, project: project, layout: layout, directory: directory) && self.viewport == viewport
         }
     }
 
@@ -100,7 +105,7 @@ struct AtlasVisibleSearchScope: Sendable {
             guard view.viewport.intersects(entry) else { continue }
             let raw = entry.rawPath
             guard raw.count <= maximumPathBytes else { throw Failure.pathTooLong }
-            guard !raw.isEmpty, !raw.contains(0),
+            guard view.directory.containsFile(raw), !raw.isEmpty, !raw.contains(0),
                   !raw.split(separator: 47, omittingEmptySubsequences: false).contains(where: {
                       $0.isEmpty || $0.elementsEqual([46]) || $0.elementsEqual([46, 46])
                   }) else { throw Failure.invalidMetadata }

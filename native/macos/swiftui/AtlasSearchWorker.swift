@@ -5,6 +5,10 @@ private typealias SearchPoll = @convention(c) (UnsafeMutableRawPointer?) -> Int3
 @_silgen_name("fcb_atlas_open_with_policy_cancelable")
 private func openSearchAtlas(_ handle: UInt64, _ root: UnsafePointer<CChar>?, _ maxFiles: UInt64,
     _ discoveryPolicy: UInt64, _ poll: SearchPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_atlas_open_directory_with_policy_cancelable")
+private func openSearchDirectory(_ handle: UInt64, _ root: UnsafePointer<CChar>?,
+    _ directory: UnsafePointer<UInt8>?, _ directoryLength: UInt64, _ maxFiles: UInt64,
+    _ discoveryPolicy: UInt64, _ poll: SearchPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_search_begin")
 private func beginSearch(_ handle: UInt64, _ generation: UInt64, _ query: UnsafePointer<CChar>?,
     _ maxMatches: UInt64, _ maxFiles: UInt64, _ maxFileBytes: UInt64, _ maxSourceBytes: UInt64) -> UnsafeMutablePointer<CChar>?
@@ -83,6 +87,7 @@ enum AtlasNativeSearch {
         access: AtlasSearchAccessLease, progress: @Sendable (AtlasSearchReport) -> Void) throws -> AtlasSearchReport {
         let root = input.root, query = input.query, scope = input.fileScope, pathScope = input.pathScope
         if cancellation.isCanceled { throw AtlasSearchError.canceled }
+        guard input.resultWindow == nil else { throw AtlasSearchError.unavailable }
         let owner = try AtlasSearchCaptureOwner(create: { createSearchAtlas() },
             close: { closeSearchAtlas($0) != 0 }, retirementFailed: {
                 FileHandle.standardError.write(Data("ATLAS_SEARCH_RETIREMENT_FAILED\n".utf8))
@@ -96,9 +101,17 @@ enum AtlasNativeSearch {
         return try withExtendedLifetime(cancellation) {
             let context = Unmanaged.passUnretained(cancellation).toOpaque()
             let metadataLimit: UInt64 = pathScope.isVisible ? UInt64(AtlasSearchPathScope.maximumVisibleFiles) : 4096
-            let opened: SearchOpen = try read(root.withCString {
-                rootPointer in owner.call { openSearchAtlas($0, rootPointer, metadataLimit,
-                    input.discoveryPolicy.rawValue, poll, context) }
+            let opened: SearchOpen = try read(root.withCString { rootPointer in
+                owner.call { handle in
+                    if input.catalogScope.isWorkspace {
+                        return openSearchAtlas(handle, rootPointer, metadataLimit,
+                            input.discoveryPolicy.rawValue, poll, context)
+                    }
+                    return input.catalogScope.directory.withUnsafeBufferPointer { directory in
+                        openSearchDirectory(handle, rootPointer, directory.baseAddress, UInt64(directory.count),
+                            metadataLimit, input.discoveryPolicy.rawValue, poll, context)
+                    }
+                }
             }, cancellation)
             guard opened.status == "ok" else { throw AtlasSearchError.unavailable }
             guard opened.schema == "fcb.atlas-session/1", opened.command == "info",
@@ -106,6 +119,8 @@ enum AtlasNativeSearch {
                   ownerID > 0, ownerID == handle, String(ownerID) == openedOwner,
                   let policyReceipt = opened.discovery_policy,
                   input.discoveryPolicy.admitsAtlasReceipt(policyReceipt) else { throw AtlasSearchError.invalidResponse }
+            let catalogReceipt = try AtlasSearchCatalogReceipt(scope: input.catalogScope,
+                kind: opened.discovery_scope, directory: opened.discovery_directory, pathBasis: opened.path_basis)
             var page: SearchPage = try read(query.withCString {
                 queryPointer in scope.withCStrings { extensions, filenames in
                     pathScope.withCString { kind, path in
@@ -147,7 +162,7 @@ enum AtlasNativeSearch {
             var stream = SearchStream(query: query, scope: scope, pathScope: pathScope,
                 mode: input.mode, nameMode: input.nameMode, caseSensitive: input.caseSensitive,
                 countAllMatches: input.countsLiveMatches, ownerIdentity: openedOwner,
-                discoveryPolicy: input.discoveryPolicy, policyReceipt: policyReceipt)
+                discoveryPolicy: input.discoveryPolicy, policyReceipt: policyReceipt, catalogReceipt: catalogReceipt)
             var lastPublished: TimeInterval? = nil
             var publishedHits = 0
             while true {
@@ -201,6 +216,7 @@ enum AtlasNativeSearch {
             let data = Data(bytes: pointer, count: length)
             if let failure = AtlasSearchExpression.queryFailure(in: data)
                 ?? AtlasSearchOccurrencePolicy.queryFailure(in: data) { throw failure }
+            try AtlasSearchCatalogReceipt.validateFieldPresence(in: data)
             let result = try JSONDecoder().decode(T.self, from: data)
             if cancellation.isCanceled { throw AtlasSearchError.canceled }
             return result
@@ -212,10 +228,14 @@ enum AtlasNativeSearch {
 private struct SearchOpen: Decodable {
     let status: String
     let schema, command, owner, discovery_policy: String?
+    let discovery_scope, path_basis: String?
+    let discovery_directory: AtlasSearchCatalogReceipt.Path?
 }
 private struct SearchPage: Decodable {
     let schema, status, command, owner, source_manifest, layout_revision, query_generation: String
     let discovery_policy: String
+    let discovery_scope, path_basis: String?
+    let discovery_directory: AtlasSearchCatalogReceipt.Path?
     let needle, mode, search_strategy: String
     let case_sensitive: Bool?
     let requested_mode, realized_mode, name_mode, name_case, evidence_level, completeness_basis: String?
@@ -289,6 +309,7 @@ private struct SearchStream {
     let ownerIdentity: String
     let discoveryPolicy: AtlasDiscoveryPolicy
     let policyReceipt: String
+    let catalogReceipt: AtlasSearchCatalogReceipt
     let id = UUID()
     private var identity: [String]?
     private var state: SearchState?
@@ -300,12 +321,13 @@ private struct SearchStream {
     init(query: String, scope: AtlasSearchFileScope, pathScope: AtlasSearchPathScope,
          mode: AtlasSearchMode, nameMode: AtlasSearchNameMode, caseSensitive: Bool = true,
          countAllMatches: Bool, ownerIdentity: String,
-         discoveryPolicy: AtlasDiscoveryPolicy, policyReceipt: String) {
+         discoveryPolicy: AtlasDiscoveryPolicy, policyReceipt: String, catalogReceipt: AtlasSearchCatalogReceipt) {
         self.query = query; self.scope = scope; self.pathScope = pathScope
         self.mode = mode; self.nameMode = nameMode
         self.caseSensitive = caseSensitive
         self.countAllMatches = countAllMatches
         self.ownerIdentity = ownerIdentity; self.discoveryPolicy = discoveryPolicy; self.policyReceipt = policyReceipt
+        self.catalogReceipt = catalogReceipt
     }
     var count: Int { hits.count }
     var retained: Int { state?.retained ?? 0 }
@@ -394,7 +416,7 @@ private struct SearchStream {
     func report(owner: AtlasSearchCaptureOwner, root: String) throws -> AtlasSearchReport {
         guard let state, let identity, hits.count == state.retained, hits.count == wireHits.count else { throw invalid() }
         let source = try AtlasSearchCaptureIdentity(owner: number(identity[0]), manifest: number(identity[1]),
-            layout: number(identity[2]), generation: number(identity[3]))
+            layout: number(identity[2]), generation: number(identity[3]), catalogReceipt: catalogReceipt)
         let witnesses = try zip(hits, wireHits).map { hit, wire in
             AtlasSearchCaptureWitness(hit: hit, file: try number(wire.file_id),
                 revision: try number(wire.source_revision), pathHex: wire.path.hex)
@@ -411,10 +433,11 @@ private struct SearchStream {
             fileScope: scope, excludedFiles: state.catalogued - state.eligible, pathScope: pathScope,
             mode: mode, nameMode: nameMode, structureCoverage: state.structureCoverage,
             caseSensitive: caseSensitive, visibleMissingFiles: state.visibleMissing, expression: state.expression,
-            discoveryPolicy: discoveryPolicy)
+            discoveryPolicy: discoveryPolicy, catalogScope: catalogReceipt.scope)
     }
 
     private func validated(_ page: SearchPage) throws -> SearchState {
+        try catalogReceipt.validate(kind: page.discovery_scope, directory: page.discovery_directory, pathBasis: page.path_basis)
         guard page.schema == "fcb.atlas-search/1", page.status == "ok",
               page.owner == ownerIdentity, page.discovery_policy.utf8.elementsEqual(policyReceipt.utf8),
               [beginCommand, "step", "page"].contains(page.command),
@@ -553,7 +576,8 @@ private struct SearchStream {
         guard !raw.contains(0), raw.first != 47,
               !raw.split(separator: 47, omittingEmptySubsequences: false).contains(where: {
                   $0.isEmpty || $0.elementsEqual([46]) || $0.elementsEqual([46, 46])
-              }), scope.admitsRawPath(raw), pathScope.admitsRawPath(raw) else { throw invalid() }
+              }), scope.admitsRawPath(raw), pathScope.admitsRawPath(raw),
+              catalogReceipt.scope.containsFile(raw) else { throw invalid() }
         let structure: AtlasSearchStructure?
         if mode.isTextual {
             guard wire.structure == nil, mode != .expression || wire.matched_text != nil,

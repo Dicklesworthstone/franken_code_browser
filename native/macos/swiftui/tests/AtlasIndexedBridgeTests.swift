@@ -4,6 +4,7 @@ import Foundation
 @_silgen_name("indexed_fixture_calls") private func calls() -> UInt32
 @_silgen_name("indexed_fixture_live") private func live() -> UInt32
 @_silgen_name("indexed_fixture_policy") private func selectedPolicy() -> UInt64
+@_silgen_name("indexed_fixture_directory_length") private func directoryLength() -> UInt64
 @_cdecl("indexed_fixture_cancel") func cancelIndexedFixture(_ context: UnsafeMutableRawPointer?) {
     guard let context else { preconditionFailure("Missing cancellation context") }
     Unmanaged<AtlasSearchCancellation>.fromOpaque(context).takeUnretainedValue().cancel()
@@ -55,6 +56,37 @@ import Foundation
             check(selectedPolicy() == policy.rawValue && live() == 0)
         }
         check(calls() == beforePolicy + 2)
+        let directory = try AtlasSearchCatalogScope(directory: [122, 255, 92, 45])
+        let beforeDirectory = calls()
+        for policy in [AtlasDiscoveryPolicy.repositoryRules, .includeExcluded] {
+            check(try t.openDirectoryWithPolicy!(h, "/repo", directory, policy, flag) == "{\"owned\":true}")
+            check(selectedPolicy() == policy.rawValue && directoryLength() == 4 && live() == 0)
+        }
+        check(calls() == beforeDirectory + 2)
+        do {
+            _ = try t.openDirectoryWithPolicy!(h, "/repo", .workspace, .repositoryRules, flag)
+            preconditionFailure("A workspace request entered the directory ABI")
+        } catch AtlasSearchError.invalidCatalogScope { checks += 1 }
+        check(calls() == beforeDirectory + 2)
+        for bad: Int32 in [1, 2, 3, 4] {
+            mode(bad)
+            let directoryFlag = AtlasSearchCancellation()
+            do {
+                let result = try t.openDirectoryWithPolicy!(h, "/repo", directory, .repositoryRules, directoryFlag)
+                check(bad == 1 && result == nil)
+            } catch AtlasSearchError.invalidResponse { check(bad == 2 || bad == 3) }
+            catch AtlasSearchError.canceled { check(bad == 4 && directoryFlag.isCanceled) }
+            check(live() == 0)
+        }
+        let canceledDirectory = AtlasSearchCancellation()
+        canceledDirectory.cancel()
+        let beforeCanceledDirectory = calls()
+        do {
+            _ = try t.openDirectoryWithPolicy!(h, "/repo", directory, .repositoryRules, canceledDirectory)
+            preconditionFailure("A canceled directory request reached C")
+        } catch AtlasSearchError.canceled { checks += 1 }
+        check(calls() == beforeCanceledDirectory && live() == 0)
+        mode(0)
         let beforeExpressions = calls()
         let expression = "\"exact text\" required -excluded lang:rs"
         check(try t.expressionQueryBegin!(h, 52, 1, expression, .all, .workspace, true) != nil)

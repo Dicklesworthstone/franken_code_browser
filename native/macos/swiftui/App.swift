@@ -217,6 +217,7 @@ extension AtlasCamera {
 private struct AtlasFrozenViewportSearch: Sendable {
     let snapshot: AtlasVisibleSearchScope
     let pathScope: AtlasSearchPathScope
+    let catalogScope: AtlasSearchCatalogScope
 }
 
 /// A complete atlas replacement is staged on the bounded worker before any
@@ -532,7 +533,10 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 : (searchPathKind == .workspace ? "" : searchPathInput),
             mode: searchMode, nameMode: searchMode.effectiveNameMode(searchNameMode),
             caseSensitive: effectiveSearchCaseSensitive, countAllMatches: effectiveSearchCountAllMatches,
-            discoveryPolicy: projectBrowser.discoveryPolicy)
+            discoveryPolicy: projectBrowser.discoveryPolicy,
+            catalogDirectory: searchPathKind == .visible ? (currentVisibleSearch?.catalogScope.directory ?? [])
+                : (searchPathKind == .directory
+                    ? Array(searchPathInput.utf8.prefix(AtlasSearchCatalogScope.maximumDirectoryBytes + 1)) : []))
     }
 
     // Observe byte-distinct edits without duplicating an arbitrarily large
@@ -541,14 +545,16 @@ private struct AtlasPreparedProjectRefresh: Sendable {
 
     private var currentVisibleSearch: AtlasFrozenViewportSearch? {
         guard !atlasLayoutPending, hasMetadataAtlas, !hasRetainedAtlas, let frozenVisibleSearch,
-              frozenVisibleSearch.snapshot.view.belongs(to: root, project: loadGeneration, layout: atlasRevision) else { return nil }
+              frozenVisibleSearch.snapshot.view.belongs(to: root, project: loadGeneration,
+                layout: atlasRevision, directory: atlasDirectory) else { return nil }
         return frozenVisibleSearch
     }
 
     private var canFreezeVisibleSearch: Bool {
         !loadingProject && !showsCatalog && !showsCity && !atlasLayoutPending && hasMetadataAtlas
             && !hasRetainedAtlas && visibleSearchTask == nil
-            && visibleSearchView?.belongs(to: root, project: loadGeneration, layout: atlasRevision) == true
+            && visibleSearchView?.belongs(to: root, project: loadGeneration,
+                layout: atlasRevision, directory: atlasDirectory) == true
     }
 
     private var openFileSearchPath: String? {
@@ -1040,7 +1046,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                         .accessibilityLabel("\(frozen.snapshot.count) files in the frozen atlas search scope")
                     if let visibleSearchView,
                        !frozen.snapshot.view.represents(root: root, project: loadGeneration,
-                            layout: atlasRevision, viewport: visibleSearchView.viewport) {
+                            layout: atlasRevision, viewport: visibleSearchView.viewport, directory: atlasDirectory) {
                         Text("The atlas view has moved. Search still uses these frozen files; use the current view to change the scope.")
                             .font(.caption2).foregroundStyle(.secondary)
                     }
@@ -2690,9 +2696,9 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         if let viewport = try? AtlasVisibleSearchScope.Viewport(x: Double(world.minX), y: Double(world.minY),
             width: Double(world.width), height: Double(world.height)),
            visibleSearchView?.represents(root: root, project: loadGeneration,
-                layout: atlasRevision, viewport: viewport) != true {
+                layout: atlasRevision, viewport: viewport, directory: atlasDirectory) != true {
             visibleSearchView = try? AtlasVisibleSearchScope.View(root: root,
-                project: loadGeneration, layout: atlasRevision, viewport: viewport)
+                project: loadGeneration, layout: atlasRevision, viewport: viewport, directory: atlasDirectory)
         }
         atlasResidency.updateViewport(world, scale: scale, selectedPath: selectedPath)
     }
@@ -2749,11 +2755,13 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                         id: request, canceled: { cancellation.isCanceled })
                     let pathScope = try AtlasSearchPathScope(visiblePaths: snapshot.paths)
                     guard !cancellation.isCanceled else { throw AtlasVisibleSearchScope.Failure.canceled }
-                    return AtlasFrozenViewportSearch(snapshot: snapshot, pathScope: pathScope)
+                    let catalogScope = try AtlasSearchCatalogScope(directory: snapshot.view.directory.rawPath)
+                    return AtlasFrozenViewportSearch(snapshot: snapshot, pathScope: pathScope, catalogScope: catalogScope)
                 }
                 guard !Task.isCancelled, !cancellation.isCanceled, visibleSearchRequest == request,
                       searchPathKind == .visible, !atlasLayoutPending, hasMetadataAtlas,
-                      acceptedView.belongs(to: root, project: loadGeneration, layout: atlasRevision) else { return }
+                      acceptedView.belongs(to: root, project: loadGeneration,
+                        layout: atlasRevision, directory: atlasDirectory) else { return }
                 frozenVisibleSearch = frozen
                 visibleSearchNotice = ""
                 if query.isEmpty {
@@ -3004,7 +3012,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 pathScope: pathScope,
                 mode: searchMode, nameMode: searchMode.effectiveNameMode(searchNameMode),
                 caseSensitive: effectiveSearchCaseSensitive, countAllMatches: effectiveSearchCountAllMatches,
-                discoveryPolicy: requestedContext.discoveryPolicy, resultWindow: window)
+                discoveryPolicy: requestedContext.discoveryPolicy,
+                catalogScope: AtlasSearchCatalogScope(directory: requestedContext.catalogDirectory), resultWindow: window)
             if window == nil { clearSearch() }
             searchPending = true; searchWindowPending = window != nil
             searchTitle = input.pathScope.isVisible ? "Searching frozen atlas files" : "Searching project"
@@ -3060,7 +3069,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                         }
                     }
                     searchWindowPending = false
-                    guard report.discoveryPolicy == requestedContext.discoveryPolicy else {
+                    guard report.discoveryPolicy == requestedContext.discoveryPolicy,
+                          report.catalogScope.directory == requestedContext.catalogDirectory else {
                         status = AtlasSearchError.invalidResponse.message
                         searchSummary = status; searchTitle = "Search unavailable"
                         return

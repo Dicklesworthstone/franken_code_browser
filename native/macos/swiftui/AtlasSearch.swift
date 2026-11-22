@@ -324,7 +324,7 @@ struct AtlasSearchStructureCoverage: Equatable, Sendable {
 }
 
 enum AtlasSearchError: Error, Sendable {
-    case unavailable, invalidResponse, canceled, invalidRequest, invalidScope, invalidPathScope, invalidVisibleScope, identityExhausted, unsupportedMatching, unsupportedCounting, unsupportedDiscoveryPolicy
+    case unavailable, invalidResponse, canceled, invalidRequest, invalidScope, invalidPathScope, invalidVisibleScope, identityExhausted, unsupportedMatching, unsupportedCounting, unsupportedDiscoveryPolicy, invalidCatalogScope, unsupportedCatalogScope
     case query(String)
     var message: String {
         switch self {
@@ -337,6 +337,8 @@ enum AtlasSearchError: Error, Sendable {
         case .unsupportedMatching: return "This search connection does not support case-insensitive text. Turn on Match case to search."
         case .unsupportedCounting: return "This search connection cannot honor the requested count policy. Reconnect to search."
         case .unsupportedDiscoveryPolicy: return "This search connection cannot include ignored and generated files. Reconnect to search the selected discovery scope."
+        case .invalidCatalogScope: return "Choose a project-relative search folder of at most 2,048 original path bytes, with no empty or dot components."
+        case .unsupportedCatalogScope: return "This search connection cannot discover the selected folder independently. Reconnect before searching this scope."
         case .unavailable: return "Search unavailable. The project could not be read or the search exceeded its limits."
         case .invalidResponse: return "Search response could not be read. Results are unavailable, not an empty match set."
         case .query(let code):
@@ -388,6 +390,7 @@ struct AtlasSearchReport: Sendable {
     var visibleMissingFiles: Int = 0
     var expression: AtlasSearchExpression? = nil
     var discoveryPolicy: AtlasDiscoveryPolicy = .repositoryRules
+    var catalogScope: AtlasSearchCatalogScope = .workspace
     /// One bounded result window over the same explicitly retained index.
     var resultWindow: AtlasSearchResultWindow? = nil
     var isInProgress: Bool { progress?.isRunning == true }
@@ -560,6 +563,92 @@ struct AtlasSearchReport: Sendable {
     private struct FileRecord: Decodable { let file_id: String }
 }
 
+/// Metadata discovery is bounded independently inside this exact directory.
+/// It never changes the granted project root or the root-relative result paths.
+struct AtlasSearchCatalogScope: Equatable, Sendable {
+    static let maximumDirectoryBytes = 2048
+    static let maximumDirectoryComponents = 31
+    static let workspace = Self(validatedDirectory: [])
+    let directory: [UInt8]
+
+    init(directory: [UInt8]) throws {
+        guard directory.count <= Self.maximumDirectoryBytes,
+              directory.split(separator: 47, omittingEmptySubsequences: false).count <= Self.maximumDirectoryComponents,
+              directory.isEmpty || (!directory.contains(0)
+                && !directory.split(separator: 47, omittingEmptySubsequences: false).contains(where: {
+                    $0.isEmpty || $0.elementsEqual([46]) || $0.elementsEqual([46, 46])
+                })) else { throw AtlasSearchError.invalidCatalogScope }
+        self.directory = directory
+    }
+    private init(validatedDirectory: [UInt8]) { directory = validatedDirectory }
+    var isWorkspace: Bool { directory.isEmpty }
+    var directoryHex: String {
+        let digits = Array("0123456789abcdef".utf8)
+        return String(decoding: directory.flatMap { [digits[Int($0 >> 4)], digits[Int($0 & 15)]] }, as: UTF8.self)
+    }
+    func containsFile(_ raw: [UInt8]) -> Bool {
+        isWorkspace || (raw.count > directory.count + 1 && raw.starts(with: directory)
+            && raw[directory.count] == 47)
+    }
+}
+
+/// Opening fixes this discovery identity for every later retained response.
+/// A legacy workspace owner may omit the whole additive receipt; later phases
+/// must then remain absent instead of introducing an unpinned scope.
+struct AtlasSearchCatalogReceipt: Equatable, Sendable {
+    struct Path: Decodable, Sendable { let encoding, hex, display: String }
+    static let legacyWorkspace = Self(scope: .workspace, hasEcho: false)
+    let scope: AtlasSearchCatalogScope
+    let hasEcho: Bool
+
+    /// Decodable optionals alone cannot distinguish missing keys from JSON
+    /// null. Preserve the all-absent legacy contract before typed admission.
+    static func validateFieldPresence(in data: Data) throws {
+        _ = try JSONDecoder().decode(FieldPresence.self, from: data)
+    }
+    private struct FieldPresence: Decodable {
+        enum Key: String, CodingKey, CaseIterable { case discovery_scope, discovery_directory, path_basis }
+        init(from decoder: Decoder) throws {
+            let fields = try decoder.container(keyedBy: Key.self)
+            let count = Key.allCases.filter { fields.contains($0) }.count
+            guard count == 0 || count == 3 else { throw AtlasSearchError.invalidResponse }
+            if count == 3 {
+                _ = try fields.decode(String.self, forKey: .discovery_scope)
+                _ = try fields.decode(String.self, forKey: .path_basis)
+                _ = try fields.decodeIfPresent(Path.self, forKey: .discovery_directory)
+            }
+        }
+    }
+    private init(scope: AtlasSearchCatalogScope, hasEcho: Bool) {
+        self.scope = scope; self.hasEcho = hasEcho
+    }
+    init(scope: AtlasSearchCatalogScope, kind: String?, directory: Path?, pathBasis: String?,
+         requiresEcho: Bool = false) throws {
+        if kind == nil && directory == nil && pathBasis == nil {
+            guard scope.isWorkspace, !requiresEcho else { throw AtlasSearchError.invalidResponse }
+            self.init(scope: scope, hasEcho: false)
+            return
+        }
+        guard pathBasis == "project-root", kind == (scope.isWorkspace ? "workspace" : "directory") else {
+            throw AtlasSearchError.invalidResponse
+        }
+        if scope.isWorkspace {
+            guard directory == nil else { throw AtlasSearchError.invalidResponse }
+        } else {
+            guard let directory, directory.encoding == "unix-bytes",
+                  directory.hex.utf8.elementsEqual(scope.directoryHex.utf8),
+                  !directory.display.isEmpty, directory.display.utf8.count <= 16_384 else {
+                throw AtlasSearchError.invalidResponse
+            }
+        }
+        self.init(scope: scope, hasEcho: true)
+    }
+    func validate(kind: String?, directory: Path?, pathBasis: String?) throws {
+        guard try Self(scope: scope, kind: kind, directory: directory,
+            pathBasis: pathBasis, requiresEcho: hasEcho) == self else { throw AtlasSearchError.invalidResponse }
+    }
+}
+
 /// Validated, immutable input to the admitted search mode. Admission does
 /// not trim whitespace or normalize Unicode: those bytes are the query.
 /// A native capability for one immutable captured-index session and its exact
@@ -573,18 +662,20 @@ struct AtlasSearchResultWindowSource: Sendable {
     let mode: AtlasSearchMode
     let caseSensitive, countAllMatches: Bool
     let discoveryPolicy: AtlasDiscoveryPolicy
+    let catalogScope: AtlasSearchCatalogScope
 
     init(index: UUID, input: AtlasSearchInput, countAllMatches: Bool) {
         self.index = index; root = input.root; query = input.query
         fileScope = input.fileScope; pathScope = input.pathScope; mode = input.mode
         caseSensitive = input.caseSensitive; self.countAllMatches = countAllMatches
         discoveryPolicy = input.discoveryPolicy
+        catalogScope = input.catalogScope
     }
     func matches(_ input: AtlasSearchInput, countAllMatches: Bool) -> Bool {
         root.utf8.elementsEqual(input.root.utf8) && query.utf8.elementsEqual(input.query.utf8)
             && fileScope == input.fileScope && pathScope == input.pathScope && mode == input.mode
             && caseSensitive == input.caseSensitive && self.countAllMatches == countAllMatches
-            && discoveryPolicy == input.discoveryPolicy
+            && discoveryPolicy == input.discoveryPolicy && catalogScope == input.catalogScope
     }
 }
 
@@ -629,6 +720,7 @@ struct AtlasSearchInput: Sendable {
     /// and other modes stay bounded. Explicit choices are never substituted.
     let countAllMatches: Bool?
     let discoveryPolicy: AtlasDiscoveryPolicy
+    let catalogScope: AtlasSearchCatalogScope
     let resultWindow: AtlasSearchResultWindowRequest?
     var countsLiveMatches: Bool { countAllMatches ?? (mode == .text && caseSensitive) }
     func countsIndexedMatches(supportsCounting: Bool) -> Bool {
@@ -641,11 +733,13 @@ struct AtlasSearchInput: Sendable {
          mode: AtlasSearchMode = .text, nameMode: AtlasSearchNameMode = .contains,
          caseSensitive: Bool = true, countAllMatches: Bool? = nil,
          discoveryPolicy: AtlasDiscoveryPolicy = .repositoryRules,
+         catalogScope: AtlasSearchCatalogScope = .workspace,
          resultWindow: AtlasSearchResultWindowRequest? = nil) throws {
         guard !root.isEmpty, root.utf8.count <= 16_384, !root.utf8.contains(0),
               !query.isEmpty, query.utf8.count <= 1_024, !query.utf8.contains(0) else {
             throw AtlasSearchError.invalidRequest
         }
+        guard pathScope.isContained(in: catalogScope) else { throw AtlasSearchError.invalidCatalogScope }
         self.root = root
         self.query = query
         self.fileScope = fileScope
@@ -655,6 +749,7 @@ struct AtlasSearchInput: Sendable {
         self.caseSensitive = mode.isTextual ? caseSensitive : true
         self.countAllMatches = mode.isTextual ? countAllMatches : false
         self.discoveryPolicy = discoveryPolicy
+        self.catalogScope = catalogScope
         self.resultWindow = resultWindow
         if let resultWindow {
             guard mode.isTextual, resultWindow.offset <= 32 * 1024 * 1024,
@@ -665,6 +760,7 @@ struct AtlasSearchInput: Sendable {
         }
     }
     func requireLegacyScope() throws {
+        guard catalogScope.isWorkspace else { throw AtlasSearchError.unsupportedCatalogScope }
         guard resultWindow == nil else { throw AtlasSearchError.unavailable }
         guard discoveryPolicy == .repositoryRules else { throw AtlasSearchError.unsupportedDiscoveryPolicy }
         guard mode == .text else { throw AtlasSearchError.invalidRequest }
@@ -788,6 +884,18 @@ struct AtlasSearchPathScope: Equatable, Sendable {
         let prefix = Array(path.utf8)
         if kind == .file { return raw == prefix }
         return raw.count > prefix.count && raw.starts(with: prefix) && raw[prefix.count] == 47
+    }
+    /// A narrow metadata catalog cannot silently serve a wider query. Visible
+    /// membership is checked using the exact frozen paths, including raw names.
+    func isContained(in catalog: AtlasSearchCatalogScope) -> Bool {
+        if catalog.isWorkspace { return true }
+        if let visiblePaths { return visiblePaths.allSatisfy(catalog.containsFile) }
+        if kind == .file { return catalog.containsFile(Array(path.utf8)) }
+        if kind == .directory {
+            let raw = Array(path.utf8)
+            return raw == catalog.directory || catalog.containsFile(raw)
+        }
+        return false
     }
     func validateEcho(kind: String?, path: String?, hex: String?, regionSHA256: String? = nil,
         regionFiles: String? = nil, regionPathBytes: String? = nil) throws {
@@ -919,11 +1027,13 @@ struct AtlasSearchContext: Sendable {
     var caseSensitive: Bool = true
     var countAllMatches: Bool? = nil
     var discoveryPolicy: AtlasDiscoveryPolicy = .repositoryRules
+    var catalogDirectory: [UInt8] = []
 
     func matches(_ other: Self) -> Bool {
         loadGeneration == other.loadGeneration && atlasRevision == other.atlasRevision
             && mode == other.mode && nameMode == other.nameMode && caseSensitive == other.caseSensitive
             && countAllMatches == other.countAllMatches && discoveryPolicy == other.discoveryPolicy
+            && catalogDirectory == other.catalogDirectory
             && root.utf8.elementsEqual(other.root.utf8)
             && query.utf8.elementsEqual(other.query.utf8)
             && scope.utf8.elementsEqual(other.scope.utf8)

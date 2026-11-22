@@ -19,7 +19,8 @@ private final class StepControl: @unchecked Sendable {
                 return result
             }, queryBegin: base.queryBegin, queryStep: base.queryStep, page: base.page,
             sourceReader: base.sourceReader, close: base.close, retirementFailed: base.retirementFailed,
-            openWithPolicy: base.openWithPolicy)
+            pathScopedQueryBegin: base.pathScopedQueryBegin, scopedIndexBegin: base.scopedIndexBegin,
+            openWithPolicy: base.openWithPolicy, openDirectoryWithPolicy: base.openDirectoryWithPolicy)
     }
 }
 private final class Grant {}
@@ -40,6 +41,33 @@ private final class Grant {}
         try worker.run(root: root, query: query, cancellation: AtlasSearchCancellation(), access: access, progress: progress)
     }
     @MainActor static func main() throws {
+        for sameDirectory in [true, false] {
+            let fixture = IndexedFixture(), control = StepControl()
+            fixture.configure { $0.pathHex = "7a7a2d6c6174652f612e7273" }
+            let worker = AtlasIndexedSearch(transport: control.transport(fixture.catalogAwareTransport))
+            let directory = try AtlasSearchCatalogScope(directory: Array("zz-late".utf8))
+            let folder = try AtlasSearchPathScope(kind: .directory, path: "zz-late")
+            let input = try AtlasSearchInput(root: "/repo", query: "x", pathScope: folder, catalogScope: directory)
+            control.set(.cancelAfterReceipt)
+            canceled {
+                try worker.runScoped(input: input, cancellation: AtlasSearchCancellation(),
+                    access: AtlasSearchAccessLease(nil), progress: { _ in })
+            }
+            check(fixture.count("create:") == 1 && fixture.count("build-step:") == 1,
+                "An acknowledged directory step can pause without losing its discovery identity")
+            control.set(.normal)
+            let next: AtlasSearchInput
+            if sameDirectory { next = input }
+            else { next = try AtlasSearchInput(root: "/repo", query: "x") }
+            let result = try worker.runScoped(input: next, cancellation: AtlasSearchCancellation(),
+                access: AtlasSearchAccessLease(nil), progress: { _ in })
+            check(result.complete && result.catalogScope == next.catalogScope,
+                "Resumed or replaced preparation reports the actually searched directory")
+            check(fixture.count("create:") == (sameDirectory ? 1 : 2)
+                && fixture.count("build-begin:") == (sameDirectory ? 1 : 2)
+                && fixture.count("build-step:") == (sameDirectory ? 2 : 3),
+                "A broader catalog restarts discovery; an unchanged folder resumes only remaining work")
+        }
         do {
             let fixture = IndexedFixture(), control = StepControl()
             let worker = AtlasIndexedSearch(transport: control.transport(fixture.policyAwareTransport))

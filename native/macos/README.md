@@ -1143,6 +1143,46 @@ workflow. They are code-first additions and have not been executed in this
 session. Independent Rust/Swift execution and physical-Mac qualification remain
 pending.
 
+## Folder and visible-atlas search
+
+Choosing **Folder** in repository search now starts bounded metadata discovery
+inside that directory. Files in unrelated siblings do not consume the catalog
+allowance before the selected folder is reached. Live queries and **Captured
+index** use this same discovery scope, so a folder atlas beyond the whole-project
+file limit can also be searched.
+
+The project root remains the access boundary and the basis for every returned
+path. Repository rules inherited from the root and ancestor directories still
+apply, together with the selected **Include excluded files** policy. Choosing a
+folder does not create a different root or rewrite its source paths. Existing
+metadata, capture, verification and result limits continue to apply within that
+discovery scope; limited or unavailable sources keep results explicitly partial.
+
+**Visible atlas files** uses the discovery directory of the accepted atlas whose
+membership was frozen. It retains that exact visible membership rather than
+switching to a later layout. Raw native directory and filename bytes remain the
+identity behind displayed labels, including non-UTF-8 names. A stale atlas,
+different directory or changed grant cannot silently broaden the request.
+
+Completed indexes and paused index builds are reusable only under the same
+project root, access grant, discovery policy and actual discovery directory.
+Moving between folders, or from a folder to **Workspace**, prepares the newly
+requested catalog and captures. Within the same catalog, file/type changes keep
+the existing frozen-capture behavior: broadening beyond captured membership
+reports uncaptured files until **Refresh**. Editing text, expressions, case or
+counting options can reuse compatible captures without rereading live source.
+
+Retained open, search, index and source replies identify the discovery universe
+with `discovery_scope`, `discovery_directory` and `path_basis=project-root`.
+The native search host checks this identity through paging, resumption and source
+activation. A completed folder search therefore remains distinguishable from a
+completed workspace search. **File** requests still use the bounded root
+catalog; independently discovering an exact file is a separate capability.
+
+Focused host, registry, C ABI and native transport regression sources accompany
+this integration. Independent executable verification and physical-Mac
+interaction qualification remain pending.
+
 ## Workspace text search
 
 Text search starts with **Match case** enabled. Turn it off to compare Unicode

@@ -485,7 +485,170 @@ import Dispatch
         }
     }
 
+    @MainActor private static func directoryCatalogs() throws {
+        let directory = try AtlasSearchCatalogScope(directory: Array("zz-late".utf8))
+        let folder = try AtlasSearchPathScope(kind: .directory, path: "zz-late")
+        func selected(_ worker: AtlasIndexedSearch, catalog: AtlasSearchCatalogScope? = nil,
+                      path: AtlasSearchPathScope? = nil, policy: AtlasDiscoveryPolicy = .repositoryRules,
+                      reports: IndexReports = IndexReports()) throws -> AtlasSearchReport {
+            try worker.runScoped(input: AtlasSearchInput(root: "/repo", query: "x", pathScope: path ?? folder,
+                discoveryPolicy: policy, catalogScope: catalog ?? directory),
+                cancellation: AtlasSearchCancellation(), access: AtlasSearchAccessLease(nil), progress: reports.offer)
+        }
+        func fixture() -> IndexedFixture {
+            let value = IndexedFixture()
+            value.configure { $0.pathHex = "7a7a2d6c6174652f612e7273" }
+            return value
+        }
+        do {
+            let f = fixture(), worker = AtlasIndexedSearch(transport: f.catalogAwareTransport), reports = IndexReports()
+            let first = try selected(worker, reports: reports)
+            let retained = first.capture!.target(first.hits[0])!
+            check(first.complete && first.catalogScope == directory
+                && first.hits[0].sourcePath == "zz-late/a.rs" && retained.root == "/repo",
+                "A late-folder catalog preserves complete local coverage and original project-relative source identity")
+            check(f.count("discovery-directory:" + directory.directoryHex) == 1
+                && reports.values.allSatisfy { $0.catalogScope == directory },
+                "Directory discovery is explicit before capture and remains frozen in progressive reports")
+            let repeated = try selected(worker)
+            check(repeated.indexStatus?.reused == true && f.count("create:") == 1,
+                "Typing within one catalog reuses the retained source index")
+            let broad = try run(worker)
+            check(broad.catalogScope.isWorkspace && broad.indexStatus?.reused == false
+                && f.count("create:") == 2 && f.count("build-begin:") == 2
+                && f.count("discovery-directory:workspace") == 1,
+                "Workspace search cannot reuse an independently discovered folder as its source universe")
+            _ = try retained.openReader(100)
+            check(f.count("source:") == 1, "The old folder result remains readable after a wider index replaces it")
+            let prepared = try worker.prepare(root: "/repo", pathScope: folder, catalogScope: directory,
+                cancellation: AtlasSearchCancellation(), access: AtlasSearchAccessLease(nil), progress: { _ in })
+            check(prepared.basis.catalogReceipt.scope == directory && f.count("create:") == 3,
+                "Explicit preparation also keys reuse by the actual catalog directory")
+        }
+        do {
+            let f = fixture(), worker = AtlasIndexedSearch(transport: f.transport)
+            do { _ = try selected(worker); preconditionFailure("Legacy opener silently substituted the whole project") }
+            catch AtlasSearchError.unsupportedCatalogScope { checks += 1 }
+            check(f.count("create:") == 0 && f.count("build-begin:") == 0,
+                "Missing directory capability refuses before allocating a retained owner or reading sources")
+        }
+        do {
+            let f = fixture()
+            f.configure { $0.files = 1; $0.countedMatches = 1201 }
+            var transport = f.windowTransport
+            let scopedTransport = f.catalogAwareTransport
+            transport.openWithPolicy = scopedTransport.openWithPolicy
+            transport.openDirectoryWithPolicy = scopedTransport.openDirectoryWithPolicy
+            let worker = AtlasIndexedSearch(transport: transport)
+            let first = try selected(worker)
+            let request = first.resultWindow!.next!
+            let retained = first.capture!.target(first.hits[0])!
+            let next = try worker.runScoped(input: AtlasSearchInput(root: "/repo", query: "x",
+                pathScope: folder, catalogScope: directory, resultWindow: request),
+                cancellation: AtlasSearchCancellation(), access: AtlasSearchAccessLease(nil), progress: { _ in })
+            check(first.hits.count == 1000 && next.hits.count == 201 && next.indexStatus?.reused == true
+                && next.resultWindow?.source.index == first.resultWindow?.source.index
+                && next.resultWindow?.source.catalogScope == directory,
+                "Folder result windows reuse the same capture and retain exact discovery identity")
+            check(f.count("create:") == 1 && f.count("build-begin:") == 1
+                && f.count("query-window:1000") == 1, "Moving between result windows never recaptures a live folder")
+            _ = try retained.openReader(100)
+            let before = f.count("query-begin:")
+            do {
+                let invalid = try AtlasSearchInput(root: "/repo", query: "x", pathScope: folder, resultWindow: request)
+                _ = try worker.runScoped(input: invalid, cancellation: AtlasSearchCancellation(),
+                    access: AtlasSearchAccessLease(nil), progress: { _ in })
+                preconditionFailure("A folder window lease borrowed the whole-project catalog")
+            } catch AtlasSearchError.invalidRequest { checks += 1 }
+            check(f.count("create:") == 1 && f.count("query-begin:") == before,
+                "A catalog mismatch refuses the window before discovery or verification")
+        }
+        for phase in ["open", "build-begin", "build-step", "query-begin", "query-step", "page", "source"] {
+            let f = fixture(), worker = AtlasIndexedSearch(transport: f.catalogAwareTransport)
+            if phase == "page" { f.configure { $0.hitCount = 70 } }
+            f.patch { current, original in
+                var value = original
+                if current == phase {
+                    value["discovery_directory"] = ["encoding": "unix-bytes", "hex": "6f74686572", "display": "zz-late"]
+                }
+                return value
+            }
+            do {
+                let report = try selected(worker)
+                if phase == "source" { _ = try report.capture!.target(report.hits[0])!.openReader(100) }
+                preconditionFailure("Changed catalog directory accepted at " + phase)
+            } catch AtlasSearchError.invalidResponse { checks += 1 }
+            if phase == "open" { check(f.count("build-begin:") == 0, "A mismatched catalog cannot begin source capture") }
+        }
+        for missing in ["discovery_scope", "discovery_directory", "path_basis"] {
+            let f = fixture(), worker = AtlasIndexedSearch(transport: f.catalogAwareTransport)
+            f.patch { phase, original in
+                var value = original
+                if phase == "open" { value.removeValue(forKey: missing) }
+                return value
+            }
+            do { _ = try selected(worker); preconditionFailure("Partial directory receipt accepted") }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
+            check(f.count("build-begin:") == 0, "A partial discovery receipt cannot spend the capture allowance")
+        }
+        for phase in ["build-begin", "build-step", "query-begin", "query-step", "page", "source"] {
+            let f = IndexedFixture(), worker = AtlasIndexedSearch(transport: f.transport)
+            if phase == "page" { f.configure { $0.hitCount = 70 } }
+            f.patch { current, original in
+                var value = original
+                if current == phase {
+                    value["discovery_scope"] = "workspace"; value["discovery_directory"] = NSNull()
+                    value["path_basis"] = "project-root"
+                }
+                return value
+            }
+            do {
+                let report = try run(worker)
+                if phase == "source" { _ = try report.capture!.target(report.hits[0])!.openReader(100) }
+                preconditionFailure("A legacy catalog introduced a later unpinned receipt")
+            } catch AtlasSearchError.invalidResponse { checks += 1 }
+        }
+        for phase in ["open", "build-begin", "build-step", "query-begin", "query-step", "page", "source"] {
+            for defect in ["partial", "all-null"] {
+                let f = IndexedFixture(), worker = AtlasIndexedSearch(transport: f.transport)
+                if phase == "page" { f.configure { $0.hitCount = 70 } }
+                f.patch { current, original in
+                    var value = original
+                    if current == phase {
+                        value["discovery_directory"] = NSNull()
+                        if defect == "all-null" {
+                            value["discovery_scope"] = NSNull(); value["path_basis"] = NSNull()
+                        }
+                    }
+                    return value
+                }
+                do {
+                    let report = try run(worker)
+                    if phase == "source" { _ = try report.capture!.target(report.hits[0])!.openReader(100) }
+                    preconditionFailure("Legacy index accepted partial or null-only discovery metadata")
+                } catch AtlasSearchError.invalidResponse { checks += 1 }
+                if phase == "open" { check(f.count("build-begin:") == 0, "Malformed workspace metadata cannot start source capture") }
+            }
+        }
+        #if canImport(CryptoKit)
+        do {
+            let opaque = try AtlasSearchCatalogScope(directory: [122, 255, 92, 45])
+            let member = opaque.directory + Array("/a.rs".utf8)
+            let visible = try AtlasSearchPathScope(visiblePaths: [member])
+            let f = IndexedFixture(), worker = AtlasIndexedSearch(transport: f.catalogAwareTransport)
+            f.configure { $0.files = 1; $0.hitCount = 1; $0.pathHex = "7aff5c2d2f612e7273" }
+            let report = try selected(worker, catalog: opaque, path: visible, policy: .includeExcluded)
+            check(report.complete && report.catalogScope == opaque && report.pathScope == visible
+                && report.hits[0].sourcePath == nil && report.discoveryPolicy == .includeExcluded,
+                "Frozen visible raw filenames use their accepted folder and selected rule policy")
+            check(f.count("discovery-directory:" + opaque.directoryHex) == 1
+                && f.count("discovery-policy:1") == 1, "Visible discovery never substitutes the root's alphabetic prefix")
+        }
+        #endif
+    }
+
     @MainActor static func main() throws {
+        try directoryCatalogs()
         try discoveryPolicyOwnership()
         try structuralSearch()
         try countedSearch()

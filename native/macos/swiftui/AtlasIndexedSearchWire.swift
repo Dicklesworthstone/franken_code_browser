@@ -57,6 +57,19 @@ struct AtlasIndexWire: Decodable {
             guard try absent(["discovery_policy"]) else { throw Self.invalid() }
         }
     }
+    func catalogReceipt(scope: AtlasSearchCatalogScope) throws -> AtlasSearchCatalogReceipt {
+        do {
+            let keys = ["discovery_scope", "discovery_directory", "path_basis"]
+            let count = keys.filter { fields.contains(Key($0)) }.count
+            guard count == 0 || count == keys.count else { throw Self.invalid() }
+            return try AtlasSearchCatalogReceipt(scope: scope, kind: count == 0 ? nil : text("discovery_scope"),
+                directory: fields.decodeIfPresent(AtlasSearchCatalogReceipt.Path.self, forKey: Key("discovery_directory")),
+                pathBasis: count == 0 ? nil : text("path_basis"))
+        } catch { throw Self.invalid() }
+    }
+    func validateCatalogReceipt(_ expected: AtlasSearchCatalogReceipt) throws {
+        guard try catalogReceipt(scope: expected.scope) == expected else { throw Self.invalid() }
+    }
     func rows<T: Decodable>(_ key: String, limit: Int) throws -> [T] {
         var rows = try fields.nestedUnkeyedContainer(forKey: Key(key))
         if let count = rows.count, count > limit { throw Self.invalid() }
@@ -129,6 +142,7 @@ struct AtlasIndexedBasis: Sendable, Equatable {
     let discoveryComplete: Bool
     let captureScope: AtlasIndexedCaptureScope
     var discoveryPolicyReceipt: String? = nil
+    var catalogReceipt: AtlasSearchCatalogReceipt = .legacyWorkspace
 
     func validate(_ wire: AtlasIndexWire, command: String) throws {
         try wire.header(schema: "fcb.atlas-search/1", command: command, owner: owner)
@@ -139,6 +153,7 @@ struct AtlasIndexedBasis: Sendable, Equatable {
         }
         try captureScope.validate(wire, files: files)
         try wire.validateDiscoveryPolicyReceipt(discoveryPolicyReceipt)
+        try wire.validateCatalogReceipt(catalogReceipt)
     }
 }
 
@@ -466,6 +481,7 @@ struct AtlasIndexedQueryPage {
         guard hits.allSatisfy({ scope.admitsRawPath($0.rawPathBytes) && pathScope.admitsRawPath($0.rawPathBytes)
             && basis.captureScope.fileScope.admitsRawPath($0.rawPathBytes)
             && basis.captureScope.pathScope.admitsRawPath($0.rawPathBytes)
+            && basis.catalogReceipt.scope.containsFile($0.rawPathBytes)
             && (mode.isTextual
                 ? ($0.hit.structure == nil && (expression == nil || $0.hit.actualText != nil)
                     && AtlasSearchText.accepts(actualText: $0.hit.actualText, needle: primaryNeedle, caseSensitive: caseSensitive)

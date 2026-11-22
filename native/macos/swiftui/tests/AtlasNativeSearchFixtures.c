@@ -7,7 +7,7 @@
 
 static char *responses[5][8]; // open, begin, step, page, captured reader import
 static unsigned cursors[5];
-static _Atomic unsigned counts[16]; // create/open/begin/step/page/close/alloc/free/import/scoped-begin/path-begin/structure-begin/matching-begin/expression-begin/counted-begin/counted-expression
+static _Atomic unsigned counts[17]; // create/open/begin/step/page/close/alloc/free/import/scoped-begin/path-begin/structure-begin/matching-begin/expression-begin/counted-begin/counted-expression/directory-open
 static int cancel_step, refuse_create;
 static char expected_extensions[1025], expected_filenames[1025];
 static int expected_all;
@@ -16,6 +16,8 @@ static char expected_path[4097];
 static uint64_t expected_mode, expected_name_mode;
 static char expected_expression[1025];
 static uint64_t expected_expression_case, expected_counted_case, expected_policy;
+static uint8_t expected_directory[2048];
+static uint64_t expected_directory_length;
 extern void fixture_mark_canceled(void *);
 
 void fixture_reset(void) {
@@ -23,9 +25,9 @@ void fixture_reset(void) {
         for (unsigned j = 0; j < 8; ++j) { free(responses[i][j]); responses[i][j] = NULL; }
         cursors[i] = 0;
     }
-    for (unsigned i = 0; i < 16; ++i) atomic_store(&counts[i], 0);
+    for (unsigned i = 0; i < 17; ++i) atomic_store(&counts[i], 0);
     expected_extensions[0] = expected_filenames[0] = 0;
-    expected_all = 1; expected_path_kind = 0; expected_path[0] = 0;
+    expected_all = 1; expected_path_kind = 0; expected_path[0] = 0; expected_directory_length = 0;
     cancel_step = refuse_create = 0;
     expected_mode = expected_name_mode = 0;
     expected_expression[0] = 0; expected_expression_case = expected_counted_case = 1; expected_policy = 0;
@@ -34,8 +36,12 @@ void fixture_set(unsigned kind, unsigned index, const char *text) {
     assert(kind < 5 && index < 8);
     free(responses[kind][index]); responses[kind][index] = strdup(text);
 }
-unsigned fixture_count(unsigned key) { assert(key < 16); return atomic_load(&counts[key]); }
+unsigned fixture_count(unsigned key) { assert(key < 17); return atomic_load(&counts[key]); }
 void fixture_expect_policy(uint64_t policy) { assert(policy <= 1); expected_policy = policy; }
+void fixture_expect_directory(const uint8_t *directory, uint64_t length) {
+    assert(directory && length > 0 && length <= sizeof(expected_directory));
+    memcpy(expected_directory, directory, (size_t)length); expected_directory_length = length;
+}
 void fixture_expect_scope(const char *extensions, const char *filenames) {
     if (!extensions || !filenames) {
         assert(!extensions && !filenames); expected_all = 1; return;
@@ -74,9 +80,20 @@ static char *next(unsigned kind) {
 uint64_t fcb_atlas_create(void) { ++counts[0]; return refuse_create ? 0 : 11; }
 char *fcb_atlas_open_with_policy_cancelable(uint64_t handle, const char *root, uint64_t files,
                               uint64_t policy, int32_t (*poll)(void *), void *context) {
-    assert(policy == expected_policy);
+    assert(policy == expected_policy && expected_directory_length == 0);
     assert(handle == 11 && strcmp(root, "/project") == 0 && files == (expected_path_kind == 3 ? 20000 : 4096));
     assert(poll && context); ++counts[1];
+    if (poll(context)) return NULL;
+    return next(0);
+}
+char *fcb_atlas_open_directory_with_policy_cancelable(uint64_t handle, const char *root,
+                              const uint8_t *directory, uint64_t directory_length, uint64_t files,
+                              uint64_t policy, int32_t (*poll)(void *), void *context) {
+    assert(policy == expected_policy && directory && directory_length > 0
+        && directory_length == expected_directory_length
+        && !memcmp(directory, expected_directory, (size_t)directory_length));
+    assert(handle == 11 && !strcmp(root, "/project") && files == (expected_path_kind == 3 ? 20000 : 4096));
+    assert(poll && context); ++counts[1]; ++counts[16];
     if (poll(context)) return NULL;
     return next(0);
 }
