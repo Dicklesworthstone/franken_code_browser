@@ -20,7 +20,7 @@ extension AtlasReaderTransport {
             return try? target.openReader(handle)
         }, window: window, lines: lines, position: position, cancel: cancel, close: close,
         retirementFailed: retirementFailed, fork: fork, openBytes: openBytes, comparison: comparison,
-        references: references, textSelection: textSelection)
+        references: references, textSelection: textSelection, matchingDelimiter: matchingDelimiter)
     }
 }
 

@@ -67,6 +67,42 @@ struct AtlasReaderTextSelection: Sendable, Identifiable {
         return text
     }
 
+    /// Eligibility comes only from a resolved, lossless single ASCII scalar.
+    /// Original offsets retain their encoding width; UTF-16 is never rebased
+    /// to the one-byte decoded spelling used by the native text control.
+    var matchingBracket: String? {
+        guard !containsReplacements, text.utf8.count == 1,
+              nativeRange.length == 1, utf8Start < utf8End, utf8End - utf8Start == 1,
+              originalStart >= pageStart, originalStart < originalEnd,
+              originalEnd <= pageEnd, pageEnd <= identity.capturedBytes,
+              let byte = text.utf8.first else { return nil }
+        let partner: String
+        switch byte {
+        case 40: partner = ")"
+        case 41: partner = "("
+        case 91: partner = "]"
+        case 93: partner = "["
+        case 123: partner = "}"
+        case 125: partner = "{"
+        default: return nil
+        }
+        let hex = String(format: "%02x", byte)
+        let expected: String
+        switch identity.encoding {
+        case "utf8": expected = hex
+        case "utf16le":
+            guard originalStart.isMultiple(of: 2) else { return nil }
+            expected = hex + "00"
+        case "utf16be":
+            guard originalStart.isMultiple(of: 2) else { return nil }
+            expected = "00" + hex
+        default: return nil
+        }
+        guard originalEnd - originalStart == UInt64(expected.utf8.count / 2),
+              originalHex == expected else { return nil }
+        return partner
+    }
+
     static func decode(_ json: String?, request: AtlasReaderTextSelectionRequest,
                        captureSHA256: String? = nil) throws -> Self {
         let page = request.page
@@ -206,4 +242,102 @@ struct AtlasReaderSelectionQuery: Sendable {
 
 struct AtlasReaderTextSelectionTransport: Sendable {
     let resolve: @Sendable (UInt64, UInt64, UInt64, UInt64, UInt64) -> String?
+}
+
+/// A lexical candidate bound to the selected original range of one complete
+/// capture. Its mate becomes a native destination only after a fresh retained
+/// window proves the expected bracket at that original range.
+struct AtlasReaderDelimiterMatch: Sendable {
+    static let sourceLimit: UInt64 = 512 * 1024
+    enum State: String, Decodable, Equatable, Sendable {
+        case matched, unmatched, mismatched
+        case notCode = "not-code"
+        case notDelimiter = "not-delimiter"
+    }
+    let identity: AtlasReaderIdentity
+    let selectionID: UUID
+    let state: State
+    let matchingRange: AtlasReaderComparisonReport.Range?
+    let expectedBracket: String
+
+    var notice: String {
+        switch state {
+        case .matched: return "Matching bracket candidate · lexical source structure."
+        case .unmatched: return "No matching bracket was found in this retained source."
+        case .mismatched: return "The bracket nesting is inconsistent before a matching bracket could be established."
+        case .notCode: return "The selected bracket is in a comment, string, or other non-code text."
+        case .notDelimiter: return "Select one parenthesis, square bracket, or brace to find its matching bracket."
+        }
+    }
+
+    func selection(in page: AtlasReaderPage) throws -> AtlasReaderComparisonSelection {
+        guard state == .matched, let matchingRange else { throw AtlasReaderError.invalidResponse }
+        let selection = try AtlasReaderComparisonSelection.make(range: matchingRange, identity: identity, page: page)
+        guard selection.showsWholeRange, selection.nativeRange?.length == 1,
+              selection.shownText?.utf8.elementsEqual(expectedBracket.utf8) == true else {
+            throw AtlasReaderError.invalidResponse
+        }
+        return selection
+    }
+
+    static func decode(_ json: String?, selection: AtlasReaderTextSelection) throws -> Self {
+        guard let expectedBracket = selection.matchingBracket else { throw AtlasReaderError.invalidInput }
+        let data = try AtlasReaderWire.admit(json, handle: selection.identity.owner)
+        do {
+            let wire = try JSONDecoder().decode(Wire.self, from: data)
+            let identity = try wire.header.identity(handle: selection.identity.owner)
+            let selected = try wire.selected_range.values()
+            guard wire.header.command == "matching-delimiter", identity.matches(selection.identity),
+                  identity.capturedBytes <= sourceLimit,
+                  selected.start == selection.originalStart, selected.end == selection.originalEnd,
+                  wire.evidence_level == "lexical-delimiter-candidate",
+                  wire.source_context == "complete-capture", !wire.semantic_resolution,
+                  ["rust", "python", "javascript", "typescript", "jsx", "tsx", "go", "cpp", "swift", "java", "csharp"]
+                    .contains(wire.language) else { throw AtlasReaderError.invalidResponse }
+            let matchingRange: AtlasReaderComparisonReport.Range?
+            if let range = wire.matching_range {
+                let match = try range.values()
+                let opens = ["(", "[", "{"].contains(selection.text)
+                guard wire.delimiter_state == .matched, match.start < match.end,
+                      match.end <= identity.capturedBytes,
+                      match.end - match.start == selection.originalEnd - selection.originalStart,
+                      identity.encoding == "utf8" || match.start.isMultiple(of: 2),
+                      (opens ? match.start >= selected.end : match.end <= selected.start) else {
+                    throw AtlasReaderError.invalidResponse
+                }
+                matchingRange = .init(start: match.start, end: match.end)
+            } else {
+                guard wire.delimiter_state != .matched else { throw AtlasReaderError.invalidResponse }
+                matchingRange = nil
+            }
+            return Self(identity: identity, selectionID: selection.id, state: wire.delimiter_state,
+                matchingRange: matchingRange, expectedBracket: expectedBracket)
+        } catch let error as AtlasReaderError { throw error }
+        catch { throw AtlasReaderError.invalidResponse }
+    }
+
+    private struct Wire: Decodable {
+        let header: AtlasReaderWire.Header
+        let delimiter_state: State
+        let selected_range: AtlasReaderWire.Range
+        let matching_range: AtlasReaderWire.Range?
+        let evidence_level, source_context, language: String
+        let semantic_resolution: Bool
+        enum CodingKeys: String, CodingKey {
+            case delimiter_state, selected_range, matching_range, evidence_level,
+                 source_context, language, semantic_resolution
+        }
+        init(from decoder: Decoder) throws {
+            header = try AtlasReaderWire.Header(from: decoder)
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            delimiter_state = try c.decode(State.self, forKey: .delimiter_state)
+            selected_range = try c.decode(AtlasReaderWire.Range.self, forKey: .selected_range)
+            if try c.decodeNil(forKey: .matching_range) { matching_range = nil }
+            else { matching_range = try c.decode(AtlasReaderWire.Range.self, forKey: .matching_range) }
+            evidence_level = try c.decode(String.self, forKey: .evidence_level)
+            source_context = try c.decode(String.self, forKey: .source_context)
+            language = try c.decode(String.self, forKey: .language)
+            semantic_resolution = try c.decode(Bool.self, forKey: .semantic_resolution)
+        }
+    }
 }

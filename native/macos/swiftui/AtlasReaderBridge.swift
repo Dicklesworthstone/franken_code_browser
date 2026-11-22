@@ -14,6 +14,9 @@ private func fcb_reader_position(_ handle: UInt64, _ line: UInt64, _ column: UIn
     _ columnKind: UInt64, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_reader_cancel")
 private func fcb_reader_cancel(_ handle: UInt64) -> UInt8
+@_silgen_name("fcb_reader_matching_delimiter")
+private func fcb_reader_matching_delimiter(_ handle: UInt64, _ start: UInt64,
+    _ end: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_reader_close")
 private func fcb_reader_close(_ handle: UInt64) -> UInt8
 @_silgen_name("fcb_reader_fork")
@@ -59,7 +62,8 @@ extension AtlasReaderTransport {
             return SuppliedResponse(json: json, sha256: digest)
         }, comparison: AtlasReaderComparisonTransport(domain: UUID(), compare: {
             take(fcb_reader_compare($0, $1, $2, $3, $4))
-        }), references: .native, textSelection: .native)
+        }), references: .native, textSelection: .native,
+        matchingDelimiter: { take(fcb_reader_matching_delimiter($0, $1, $2)) })
 
     private static func take(_ pointer: UnsafeMutablePointer<CChar>?) -> String? {
         guard let pointer else { return nil }

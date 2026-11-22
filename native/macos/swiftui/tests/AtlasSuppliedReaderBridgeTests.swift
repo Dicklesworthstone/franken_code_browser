@@ -98,7 +98,20 @@ import Foundation
             precondition(suppliedCalls() == before + 3 && suppliedLive() == 0,
                          "occurrence ABI arguments or response ownership changed")
         }
+        guard let matchingDelimiter = AtlasReaderTransport.native.matchingDelimiter else {
+            fatalError("native retained bracket capability missing")
+        }
+        for mode in [Int32(0), 2, 3, 4, 5] {
+            suppliedMode(mode)
+            let before = suppliedCalls()
+            let matched = await Task.detached {
+                matchingDelimiter(handle, UInt64.max - 2, UInt64.max - 1)
+            }.value
+            precondition(matched == (mode == 0 ? "{\"delimiter_fixture\":true}" : nil))
+            precondition(suppliedCalls() == before + 1 && suppliedLive() == 0,
+                         "bracket ABI arguments or response ownership changed")
+        }
         precondition(AtlasReaderTransport.native.close(handle))
-        print("AtlasSuppliedReaderBridgeTests: exact raw buffer, SHA, empty capture, limits, pair/position/occurrence arguments and allocation checks passed")
+        print("AtlasSuppliedReaderBridgeTests: exact raw buffer, SHA, empty capture, limits, pair/position/occurrence/bracket arguments and allocation checks passed")
     }
 }

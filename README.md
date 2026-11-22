@@ -122,6 +122,15 @@ Open a repository → explore its atlas → select a file → read exact source
 The browsing product does not execute project code to open a directory. Editing, builds,
 debuggers and terminals are outside its initial release scope.
 
+**Matching brackets connects exact selections across retained source pages.**
+Select one parenthesis, square bracket or brace and choose **Go to matching
+bracket**. The reader skips comments and strings, checks the destination in the
+same captured source, and preserves selection and history on failed or canceled
+work. UTF-8 and UTF-16 use original byte offsets. The bounded lexical analysis
+currently admits complete sources up to 512 KiB; see
+[matching-bracket navigation](native/macos/README.md#going-to-a-matching-bracket)
+for language limits and pending independent native verification.
+
 **Saved reading trails connect exact source with user notes.** The native Saved Repository
 window opens FCBT trails, keeps mixed-archive and unavailable visits visible, and follows
 ordered ranges through independently verified archived readers. For a visit in another

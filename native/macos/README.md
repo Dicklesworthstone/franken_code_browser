@@ -2325,6 +2325,40 @@ and `swiftui/tests/test-desk-reader.sh`; the supplied-reader lane covers
 transport capability preservation. These are code-first additions awaiting
 independent strict-RCH execution and physical-Mac qualification.
 
+## Going to a matching bracket
+
+Select a single parenthesis, square bracket or brace in a retained source
+reader, then choose **Go to matching bracket** beside the selection tools.
+The reader searches the complete retained capture, opens the matching page
+and selects the corresponding bracket. The destination becomes an exact
+selection for copying, keeping in the Reading Desk or jumping back to its mate.
+Ordinary **Back** and **Forward** retain the visited source pages.
+
+Matching uses language tokens and skips comments, strings and template
+contents. It reports lexical candidates rather than compiler-resolved
+structure. Unmatched or inconsistent nesting has a distinct explanation.
+The source is the same captured version even if the live file changes.
+Canceled, refused and stale results preserve the current page, exact selection
+and navigation history; the destination is checked against its retained bytes
+before it replaces the page.
+
+The current analysis admits complete captures up to **512 KiB** in both
+original and decoded text, with at most **1,024** nested delimiters. UTF-8 and
+BOM-marked UTF-16 preserve their original byte offsets. Supported filename
+families are Rust, Python, JavaScript, TypeScript, JSX, TSX, Go, C/C++, Swift,
+Java and C#. Angle brackets, replacement-decoded text, incomplete literals
+and unqualified language contexts are refused explicitly. Swift code slashes
+currently refuse analysis because the pinned highlighter cannot reliably
+separate regex literals from division. Larger captures remain readable with
+the existing reader tools; Observed Range Reader windows do not claim a
+complete-source bracket match.
+
+The production decoder/model regressions run through
+`swiftui/tests/test-reader-text-selection.sh`; full-width C argument and
+response-ownership cases extend `swiftui/tests/test-supplied-reader.sh`.
+Rust, C-boundary and native tests are authored, with independent strict-RCH
+execution and physical-Mac qualification still pending.
+
 ## Exporting original captured bytes
 
 In a retained source reader, choose **Export bytes…** to save the entire capture,

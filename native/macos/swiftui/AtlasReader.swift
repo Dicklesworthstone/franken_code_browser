@@ -36,6 +36,20 @@ enum AtlasReaderError: Error, Sendable {
                 return "Regular expressions are unavailable. Use literal terms, quoted phrases and -excluded terms."
             case "QUERY_SYNTAX_ERROR":
                 return "The expression could not be parsed. Check quotes and provide a required term before exclusions."
+            case "DELIMITER_SOURCE_LIMIT":
+                return "Matching brackets currently supports complete retained sources up to 512 KiB in both original and decoded text."
+            case "DELIMITER_UNSUPPORTED_LANGUAGE":
+                return "Matching brackets is unavailable for this source language."
+            case "DELIMITER_UNSUPPORTED_ENCODING":
+                return "Matching brackets requires source text that can be decoded without replacements."
+            case "DELIMITER_UNSUPPORTED_LEXICAL_CONTEXT":
+                return "The language highlighter cannot establish bracket boundaries for this source context."
+            case "DELIMITER_COMPLEXITY_LIMIT", "DELIMITER_RESOURCE_DENIED":
+                return "Matching brackets exceeded the bounded analysis budget. The current selection is unchanged."
+            case "DELIMITER_INVALID_SELECTION":
+                return "Select one parenthesis, square bracket, or brace to find its matching bracket."
+            case "DELIMITER_INVALID_EVIDENCE":
+                return "The matching bracket candidate could not be verified against the retained source."
             default: return "Retained reader unavailable (\(code))."
             }
         }

@@ -30,6 +30,8 @@ struct AtlasReaderTransport: Sendable {
     let references: AtlasReaderReferencesTransport?
     /// Resolves native page coordinates using the retained source decoder.
     let textSelection: AtlasReaderTextSelectionTransport?
+    /// Bounded lexical bracket navigation over this exact retained capture.
+    let matchingDelimiter: (@Sendable (UInt64, UInt64, UInt64) -> String?)?
 
     init(create: @escaping @Sendable () -> UInt64,
          open: @escaping @Sendable (UInt64, String, UInt64) -> String?,
@@ -43,7 +45,8 @@ struct AtlasReaderTransport: Sendable {
          openBytes: (@Sendable (UInt64, String, Data) -> SuppliedResponse?)? = nil,
          comparison: AtlasReaderComparisonTransport? = nil,
          references: AtlasReaderReferencesTransport? = nil,
-         textSelection: AtlasReaderTextSelectionTransport? = nil) {
+         textSelection: AtlasReaderTextSelectionTransport? = nil,
+         matchingDelimiter: (@Sendable (UInt64, UInt64, UInt64) -> String?)? = nil) {
         self.create = create; self.open = open; self.window = window; self.lines = lines
         self.cancel = cancel; self.close = close; self.retirementFailed = retirementFailed
         self.fork = fork
@@ -51,6 +54,7 @@ struct AtlasReaderTransport: Sendable {
         self.comparison = comparison
         self.references = references
         self.textSelection = textSelection
+        self.matchingDelimiter = matchingDelimiter
         self.position = position
     }
 }
@@ -272,6 +276,7 @@ private final class AtlasReaderSession: @unchecked Sendable {
     var supportsDocument: Bool { documentTransport != nil }
     var supportsPosition: Bool { (session?.transport ?? transport).position != nil }
     var supportsTextSelection: Bool { (session?.transport ?? transport).textSelection != nil }
+    var supportsMatchingDelimiter: Bool { (session?.transport ?? transport).matchingDelimiter != nil }
     var canFork: Bool { session?.transport.fork != nil && info != nil }
     var supportsComparison: Bool {
         guard let info else { return false }
@@ -659,6 +664,35 @@ private final class AtlasReaderSession: @unchecked Sendable {
             return result
         } catch {
             if operation == ticket { activeTextSelection = nil; cancellation = nil }
+            throw Self.readerError(error)
+        }
+    }
+
+    /// Selection provenance is checked before foreign work and again at
+    /// delivery. Matching never reads the live path or changes query authority.
+    func matchingDelimiter(selection: AtlasReaderTextSelection) async throws -> AtlasReaderDelimiterMatch {
+        try Task.checkCancellation()
+        guard selection.matchingBracket != nil, let source = session, let original = info,
+              selection.identity.matches(original.identity),
+              let match = source.transport.matchingDelimiter else { throw AtlasReaderError.unavailable }
+        cancel()
+        let ticket = UUID(), flag = AtlasSearchCancellation()
+        operation = ticket; cancellation = flag
+        do {
+            let result = try await withTaskCancellationHandler(operation: {
+                try await io.perform(cancellation: flag, keepingAlive: [source]) {
+                    let json = match(source.handle, selection.originalStart, selection.originalEnd)
+                    guard !flag.isCanceled else { throw AtlasReaderError.canceled }
+                    return try AtlasReaderDelimiterMatch.decode(json, selection: selection)
+                }
+            }, onCancel: { flag.cancel(); source.cancel() })
+            try Task.checkCancellation()
+            guard session === source, operation == ticket, !flag.isCanceled,
+                  info?.identity.matches(original.identity) == true else { throw AtlasReaderError.canceled }
+            cancellation = nil
+            return result
+        } catch {
+            if operation == ticket { cancellation = nil }
             throw Self.readerError(error)
         }
     }

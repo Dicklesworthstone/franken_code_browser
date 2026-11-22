@@ -1233,6 +1233,39 @@ malformed text, UTF-16, lowercase expansion witnesses, later occurrence pages,
 stale/canceled requests and independent captured sources. Execution remains
 pending the repository's independent batch verification lane.
 
+## Matching brackets in retained source
+
+`ReaderSession::matching_delimiter(start, end, canceled)` finds a lexical mate
+for one selected `(`, `)`, `[`, `]`, `{` or `}` in the session's complete
+immutable capture. `start` and `end` are half-open **original byte offsets**;
+UTF-16 brackets occupy two original bytes. The shared capture map rejects
+interior scalar or surrogate boundaries. The operation performs no source I/O
+and preserves accepted Find, Outline and Occurrences state.
+
+The `fcb.reader-session/1` response uses `command: "matching-delimiter"` and
+echoes `selected_range`. `delimiter_state` is `matched`, `unmatched`,
+`mismatched`, `not-code` or `not-delimiter`; only `matched` carries a non-null
+`matching_range`. Receipts retain the ordinary source identities and declare
+`evidence_level: "lexical-delimiter-candidate"`,
+`source_context: "complete-capture"` and `semantic_resolution: false`.
+FrankenMarkdown supplies token boundaries; comments, strings and template
+contents remain opaque. Angle brackets are outside this operation.
+
+Language comes from the existing Rust, Python, JavaScript/TypeScript/JSX/TSX,
+Go, C/C++, Swift, Java and C# suffix policy. Original and decoded source each
+have a **512 KiB** limit, with at most **1,024** nested delimiters. Malformed
+encoding, incomplete literals and unqualified lexical contexts fail explicitly.
+These include C++ preprocessing/digraph boundaries, Java Unicode escapes,
+known JavaScript regex ambiguities and Swift code slashes where the pinned
+lexer cannot distinguish division from regex text. An analysis refusal does
+not shorten or invalidate the retained source.
+
+The additive C entry point is `fcb_reader_matching_delimiter(handle, start,
+end)` in `fcb_reader_sessions.h`. It uses the existing worker, handle epoch,
+cancel and owned-string rules. Regression sources cover core matching, public
+reader receipts, C transport ownership and native navigation. Executable
+verification remains pending the independent strict-RCH lane.
+
 ## C and C++ declaration candidates
 
 File, workspace, saved-repository and retained-reader symbol navigation share

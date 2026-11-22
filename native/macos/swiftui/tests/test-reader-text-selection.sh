@@ -20,6 +20,8 @@ set -- "$@" -swift-version 6 -warnings-as-errors \
     "$src/AtlasDocumentPreviewModel.swift" "$src/AtlasPagedReaderModel.swift"
 swiftc "$@" "$src/tests/AtlasReaderTextSelectionTests.swift" -o "$out/selection-tests"
 "$out/selection-tests"
+swiftc "$@" "$src/tests/AtlasReaderDelimiterTests.swift" -o "$out/delimiter-tests"
+"$out/delimiter-tests"
 
 clang -std=gnu11 -Wall -Wextra -Werror \
     -c "$src/tests/AtlasReaderTextSelectionFixtures.c" -o "$out/selection-fixture.o"

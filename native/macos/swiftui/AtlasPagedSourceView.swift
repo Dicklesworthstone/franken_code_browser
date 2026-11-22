@@ -374,6 +374,9 @@ import AppKit
                         .lineLimit(3).textSelection(.enabled)
                     Spacer(minLength: 4)
                     if let selected = model.textSelection {
+                        Button("Go to matching bracket") { model.goToMatchingBracket(selectionID: selected.id) }
+                            .disabled(!model.canGoToMatchingBracket)
+                            .help("Select one parenthesis, square bracket, or brace. Uses lexical structure across the complete retained source and skips comments and strings; the result is a candidate, without compiler semantics.")
                         Menu("Search selection") {
                             Button("Find text in this file") { model.findSelectedText(selectionID: selected.id) }
                                 .disabled(!model.canFindSelectedText)

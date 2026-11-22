@@ -42,6 +42,7 @@ import Observation
     private var knownFindMatchCount: UInt64?
     private var selectedRange: NSRange?
     private(set) var comparisonSelection: AtlasReaderComparisonSelection?
+    private var bracketSelection: AtlasReaderComparisonSelection?
     private(set) var textSelection: AtlasReaderTextSelection?
     private(set) var resolvingTextSelection = false
     private(set) var hasTextSelectionIntent = false
@@ -61,6 +62,7 @@ import Observation
     @ObservationIgnored private var outlineWork = false
     @ObservationIgnored private var referenceWork = false
     @ObservationIgnored private var positionWork = false
+    @ObservationIgnored private var delimiterWork = false
     private(set) var outlinePage: AtlasOutlinePage?
     private(set) var hasOutline = false
     private(set) var outlineRowsAuthorized = false
@@ -188,6 +190,7 @@ import Observation
         return "Match \(ordinal) of at least \(report.matchesSeen)"
     }
     var nativeSelectionRange: NSRange? {
+        if let bracketSelection, let page, bracketSelection.matches(page) { return bracketSelection.nativeRange }
         if let selection = currentComparisonSelection { return selection.nativeRange }
         if let position = page?.position { return position.nativeCaretRange }
         if findIsCurrent, page?.selection?.target.generation == findReport?.generation,
@@ -274,6 +277,74 @@ import Observation
         page != nil && coordinator.supportsFind
             && searchableSelection?.searchText(maximumUTF8Bytes: AtlasReaderFindReport.maximumNeedleBytes) != nil
     }
+    var canGoToMatchingBracket: Bool {
+        coordinator.supportsMatchingDelimiter && textSelectionTask == nil
+            && searchableSelection?.matchingBracket != nil
+    }
+
+    /// Keep the existing page, exact text selection and history until both the
+    /// lexical receipt and its independently read destination are verified.
+    @discardableResult func goToMatchingBracket(selectionID: UUID) -> Bool {
+        guard canGoToMatchingBracket, let selection = searchableSelection,
+              selection.id == selectionID, let intent = textSelectionIntent else { return false }
+        let ticket = begin(delimiter: true)
+        notice = "Finding the matching bracket in retained source…"
+        task = Task {
+            do {
+                let result = try await coordinator.matchingDelimiter(selection: selection)
+                guard acceptsDelimiter(ticket: ticket, selection: selection, intent: intent),
+                      result.selectionID == selection.id else { throw AtlasReaderError.canceled }
+                guard let range = result.matchingRange else {
+                    notice = result.notice
+                    finish(ticket)
+                    return
+                }
+                let request = AtlasReaderRequest.window(offset: range.start - min(range.start, 256),
+                    bytes: AtlasReaderLimits.pageBytes)
+                let next = try await coordinator.read(request)
+                guard acceptsDelimiter(ticket: ticket, selection: selection, intent: intent),
+                      next.identity.matches(selection.identity) else { throw AtlasReaderError.canceled }
+                let mapping = Task.detached(priority: .userInitiated) {
+                    try Task.checkCancellation()
+                    return try result.selection(in: next)
+                }
+                let destination = try await withTaskCancellationHandler(operation: { try await mapping.value },
+                    onCancel: { mapping.cancel() })
+                guard acceptsDelimiter(ticket: ticket, selection: selection, intent: intent),
+                      let nativeRange = destination.nativeRange,
+                      install(next, request: request, moving: history.visit(request)) else {
+                    throw AtlasReaderError.canceled
+                }
+                bracketSelection = destination
+                delimiterWork = false
+                notice = result.notice
+                // Programmatic AppKit navigation does not emit a user selection
+                // callback. Resolve the displayed mate through the same exact
+                // selection path so repeated jumps and copying retain provenance.
+                if let source { updateTextSelection(source: source, navigation: navigation, range: nativeRange) }
+                finish(ticket)
+            } catch { fail(error, ticket: ticket) }
+        }
+        return true
+    }
+
+    private func cancelDelimiterForSelectionChange() {
+        guard delimiterWork else { return }
+        operation = UUID()
+        task?.cancel(); task = nil
+        coordinator.cancel()
+        busy = false; delimiterWork = false
+        notice = "Bracket navigation canceled because the selection changed."
+    }
+
+    private func acceptsDelimiter(ticket: UUID, selection: AtlasReaderTextSelection,
+                                  intent: TextSelectionIntent) -> Bool {
+        !Task.isCancelled && busy && delimiterWork && operation == ticket
+            && textSelection?.id == selection.id && textSelectionIntent?.id == intent.id
+            && source === intent.source && navigation == intent.navigation
+            && page?.identity.matches(selection.identity) == true
+            && page?.start == selection.pageStart && page?.end == selection.pageEnd
+    }
     var canFindSelectedDeclarations: Bool {
         canBuildOutline && searchableSelection?.searchText(maximumUTF8Bytes: 256) != nil
     }
@@ -317,7 +388,9 @@ import Observation
     func updateTextSelection(source: AtlasSource, navigation: UUID, range: NSRange?) {
         guard self.source === source, self.navigation == navigation, let page else { return }
         comparisonSelection = nil
+        if range != bracketSelection?.nativeRange { bracketSelection = nil }
         guard let range, range.length != 0 else {
+            cancelDelimiterForSelectionChange()
             clearTextSelection()
             resumeDeferredReaderWork()
             return
@@ -325,6 +398,7 @@ import Observation
         if let intent = textSelectionIntent, intent.source === source,
            intent.navigation == navigation, intent.range == range,
            textSelection != nil || resolvingTextSelection { return }
+        cancelDelimiterForSelectionChange()
         let intent = TextSelectionIntent(id: UUID(), source: source, navigation: navigation,
             page: page, range: range)
         textSelectionIntent = intent
@@ -1182,7 +1256,7 @@ import Observation
     /// Explicit cancellation keeps a successfully installed page. Cancellation
     /// during initial capture instead releases its handle after work drains.
     func cancel() {
-        suspendTextSelection()
+        if !delimiterWork { suspendTextSelection() }
         cancelPin()
         let wasRefreshing = isRefreshing
         documentPreview.cancel(silent: true)
@@ -1198,6 +1272,7 @@ import Observation
         outlineWork = false
         referenceWork = false
         positionWork = false
+        delimiterWork = false
         notice = wasRefreshing ? "Refresh canceled. The previous retained source is unchanged."
             : (page == nil ? "Source opening canceled." : "Navigation canceled. The current retained page is unchanged.")
         resumeDeferredReaderWork()
@@ -1213,9 +1288,9 @@ import Observation
         refreshInput = nil; refreshImageSource = nil; refreshAccessLease = nil
         isRefreshing = false; refreshedFromDisk = false; forkedCapture = false
         retainedOnly = false
-        page = nil; source = nil; history.reset(); comparisonSelection = nil
+        page = nil; source = nil; history.reset(); comparisonSelection = nil; bracketSelection = nil
         findReport = nil; selectedHitIndex = nil; selectedRange = nil; knownFindMatchCount = nil
-        queryWork = false; outlineWork = false; referenceWork = false; positionWork = false
+        queryWork = false; outlineWork = false; referenceWork = false; positionWork = false; delimiterWork = false
         fileQuery = ""
         outlinePage = nil; hasOutline = false; outlineRowsAuthorized = false
         outlineHistory = []; outlineNeedle = ""; outlineMode = .contains; outlineLanguage = .automatic
@@ -1256,8 +1331,9 @@ import Observation
             } catch { fail(error, ticket: ticket) }
         }
     }
-    private func begin(query: Bool = false, outline: Bool = false, references: Bool = false, position: Bool = false) -> UUID {
-        suspendTextSelection()
+    private func begin(query: Bool = false, outline: Bool = false, references: Bool = false,
+                       position: Bool = false, delimiter: Bool = false) -> UUID {
+        if !delimiter { suspendTextSelection() }
         cancelPin()
         documentPreview.cancel(silent: true)
         task?.cancel()
@@ -1269,6 +1345,7 @@ import Observation
         outlineWork = outline
         referenceWork = references
         positionWork = position
+        delimiterWork = delimiter
         return operation
     }
     @discardableResult private func install(_ page: AtlasReaderPage, request: AtlasReaderRequest,
@@ -1291,6 +1368,7 @@ import Observation
         positionWork = false
         clearTextSelection()
         comparisonSelection = nil
+        bracketSelection = nil
         self.page = page
         // Search/outline/occurrence windows include context before their exact
         // target. Follow that verified original anchor, not the context start
@@ -1317,7 +1395,7 @@ import Observation
     }
     private func finish(_ ticket: UUID) {
         guard operation == ticket else { return }
-        busy = false; isRefreshing = false; task = nil; queryWork = false; outlineWork = false; referenceWork = false; positionWork = false
+        busy = false; isRefreshing = false; task = nil; queryWork = false; outlineWork = false; referenceWork = false; positionWork = false; delimiterWork = false
         resumeDeferredReaderWork()
     }
     private func fail(_ error: Error, ticket: UUID) {

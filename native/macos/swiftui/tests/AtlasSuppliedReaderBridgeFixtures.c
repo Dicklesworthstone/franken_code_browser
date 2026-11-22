@@ -67,6 +67,11 @@ static char *reference_reply(const char *json) {
     } else { result = strdup(mode == 5 ? "" : json); }
     assert(result); ++allocated; return result;
 }
+char *fcb_reader_matching_delimiter(uint64_t handle, uint64_t start, uint64_t end) {
+    /* Check transport width independently of the retained source admission. */
+    assert(handle == fixture_handle && start == UINT64_MAX - 2 && end == UINT64_MAX - 1);
+    return reference_reply("{\"delimiter_fixture\":true}");
+}
 char *fcb_reader_references(uint64_t handle, uint64_t generation,
     const char *name, uint64_t max_items) {
     assert(handle == fixture_handle && generation == UINT64_MAX);
