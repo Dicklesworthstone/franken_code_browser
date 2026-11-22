@@ -5,15 +5,20 @@
 #include <assert.h>
 static char *response;
 static unsigned calls, allocated, freed;
+static uint64_t requested_policy;
 static int cancel_during_call;
 extern void project_fixture_cancel(void *);
 void project_fixture_set(const char *json, int cancel) {
     free(response); response = json ? strdup(json) : NULL;
     calls = allocated = freed = 0; cancel_during_call = cancel;
+    requested_policy = UINT64_MAX;
 }
 unsigned project_fixture_count(unsigned kind) { return kind == 0 ? calls : (kind == 1 ? allocated : freed); }
-char *fcb_project_catalog_cancelable(const char *root, uint64_t limit, int32_t (*poll)(void *), void *context) {
-    ++calls;
+uint64_t project_fixture_policy(void) { return requested_policy; }
+char *fcb_project_catalog_with_policy_cancelable(const char *root, uint64_t limit, uint64_t policy,
+        int32_t (*poll)(void *), void *context) {
+    ++calls; requested_policy = policy;
+    assert(policy <= 1);
     assert(strcmp(root, "/project") == 0 && limit == 20000 && poll && context);
     assert(poll(context) == 0);
     if (cancel_during_call) { project_fixture_cancel(context); assert(poll(context) != 0); }
@@ -23,6 +28,9 @@ char *fcb_project_catalog_cancelable(const char *root, uint64_t limit, int32_t (
 void fcb_free_string(char *p) { if (p) { ++freed; free(p); } }
 // Referenced by the unchanged compatibility/source operations. Calling any
 // of them from catalogReport is a regression, not permitted fixture behavior.
+char *fcb_project_catalog_cancelable(const char *r, uint64_t n, int32_t (*p)(void *), void *c) {
+    (void)r; (void)n; (void)p; (void)c; assert(0 && "policy-unaware metadata catalog used"); return NULL;
+}
 char *fcb_atlas_layout_cancelable(const char *r, int32_t (*p)(void *), void *c) {
     (void)r; (void)p; (void)c; assert(0 && "legacy catalog unexpectedly used"); return NULL;
 }

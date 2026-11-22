@@ -1,6 +1,7 @@
 import Foundation
 @_silgen_name("project_fixture_set") private func configure(_ text: UnsafePointer<CChar>?, _ cancel: Int32)
 @_silgen_name("project_fixture_count") private func count(_ kind: UInt32) -> UInt32
+@_silgen_name("project_fixture_policy") private func requestedPolicy() -> UInt64
 @_cdecl("project_fixture_cancel") func projectFixtureCancel(_ context: UnsafeMutableRawPointer?) {
     guard let context else { preconditionFailure("Missing cancellation context") }
     Unmanaged<AtlasSearchCancellation>.fromOpaque(context).takeUnretainedValue().cancel()
@@ -11,12 +12,31 @@ import Foundation
         precondition(value(), message); checks += 1
     }
     @MainActor static func main() throws {
-        let json = #"{"schema":"fcb.project-catalog/1","status":"ok","command":"catalog","identity_scope":"response-local","native_presented":false,"source_payload_read":false,"payload_bytes_read":"0","read_calls":"0","discovery_complete":false,"catalogued_files":"1","policy":"fixture","world":{"w":4096,"h":4096},"files":[{"file_id":"9007199254740993","path":{"encoding":"unix-bytes","hex":"ff2e7273","display":"escaped raw name"},"observed_bytes":"5","x":0,"y":0,"w":1,"h":1}]}"#
+        let json = #"{"schema":"fcb.project-catalog/1","status":"ok","command":"catalog","identity_scope":"response-local","native_presented":false,"source_payload_read":false,"payload_bytes_read":"0","read_calls":"0","discovery_complete":false,"catalogued_files":"1","policy":"repository-rules-v1","world":{"w":4096,"h":4096},"files":[{"file_id":"9007199254740993","path":{"encoding":"unix-bytes","hex":"ff2e7273","display":"escaped raw name"},"observed_bytes":"5","x":0,"y":0,"w":1,"h":1}]}"#
         json.withCString { configure($0, 0) }
         let report = try AtlasProjectWorker.catalogReport(root: "/project", cancellation: AtlasSearchCancellation())
         check(!report.discoveryComplete && report.entries.count == 1, "Partial metadata crosses production native adapter")
         check(report.entries[0].sourcePath == nil && report.entries[0].id == 9_007_199_254_740_993, "Raw name and full-width ID preserved")
-        check(count(0) == 1 && count(1) == 1 && count(2) == 1, "One metadata call and one owned response release")
+        check(count(0) == 1 && count(1) == 1 && count(2) == 1 && requestedPolicy() == 0,
+              "Default repository-rules policy reaches C with one owned response release")
+        let includedJSON = json.replacingOccurrences(of: "repository-rules-v1", with: "all-regular-files/no-rule-files-v1")
+        includedJSON.withCString { configure($0, 0) }
+        let included = try AtlasProjectWorker.catalogReport(root: "/project", discoveryPolicy: .includeExcluded,
+            cancellation: AtlasSearchCancellation())
+        check(included.matchesDiscoveryPolicy(AtlasDiscoveryPolicy.includeExcluded.wireName)
+            && requestedPolicy() == 1 && count(1) == 1 && count(2) == 1,
+              "Include-excluded selection reaches the policy-aware ABI and validates its receipt")
+        for (policy, reply) in [(AtlasDiscoveryPolicy.includeExcluded, json), (.repositoryRules, includedJSON)] {
+            reply.withCString { configure($0, 0) }
+            do {
+                _ = try AtlasProjectWorker.catalogReport(root: "/project", discoveryPolicy: policy,
+                    cancellation: AtlasSearchCancellation())
+                preconditionFailure("Mismatched discovery receipt was accepted")
+            } catch AtlasProjectCatalog.DecodeError.invalidResponse {
+                check(requestedPolicy() == policy.rawValue && count(1) == 1 && count(2) == 1,
+                      "Wrong-scope metadata is refused and its allocation released")
+            }
+        }
         for invalid in ["", "/a\0b", String(repeating: "a", count: 16_385)] {
             json.withCString { configure($0, 0) }
             do { _ = try AtlasProjectWorker.catalogReport(root: invalid, cancellation: AtlasSearchCancellation()); preconditionFailure("Invalid input") }

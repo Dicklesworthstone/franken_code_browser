@@ -9,9 +9,11 @@ from pathlib import Path
 import sys
 src = Path(sys.argv[1])
 search = (src / 'AtlasSearchCoordinator.swift').read_text()
+policy_source = (src / 'AtlasSearch.swift').read_text()
+policy = policy_source[policy_source.index('enum AtlasDiscoveryPolicy:'):policy_source.index('struct SearchHit:')]
 io = (src / 'AtlasProjectIO.swift').read_text()
 Path(sys.argv[2]).write_text(search[:search.index('/// Immutable after admission.')]
-    + io[io.index('enum AtlasProjectIOError:'):io.index('/// Only immutable input')])
+    + io[io.index('enum AtlasProjectIOError:'):io.index('/// Only immutable input')] + policy)
 PY
 clang -std=gnu11 -Wall -Wextra -Werror -c "$src/tests/AtlasViewportFixture.c" -o "$out/fixture.o"
 swiftc -swift-version 6 -warnings-as-errors \

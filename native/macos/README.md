@@ -206,16 +206,26 @@ Use **Refresh project**, or the search surface's **Refresh file catalog**, after
 changing ignore rules. Captures and searches already retained by an earlier
 catalog keep their original identity and coverage.
 
-**Project Files → Include ignored and generated files** prepares a replacement
-catalog; the previous project and readers remain available until its first page
-is accepted. Failed or canceled switches preserve the previous scope, and
-**Refresh project** keeps the accepted policy. **Quick Open → Include ignored
-files** restarts filename discovery for the current query. **Search large
+**Project Files → Include ignored and generated files** prepares replacement
+Project Files and atlas metadata under the selected policy. The worker verifies
+that the metadata receipt matches the requested policy before publishing it;
+unknown policy names, malformed rule fingerprints and mismatched receipts are
+rejected. The previous project and readers remain available until preparation
+and first-page validation succeed. Failed or canceled switches preserve the
+previous scope, and **Refresh project** keeps the accepted policy.
+
+A policy change starts a fresh atlas membership set, including when the new
+scan is partial: files excluded by the new scope cannot survive from the old
+map as unconfirmed parcels. A partial refresh under the same policy still
+preserves prior unconfirmed observations. Camera and stable layout are retained
+where applicable; the receipt's partial coverage is not deletion evidence.
+
+**Quick Open → Include ignored files** restarts filename discovery for the current query. **Search large
 project files… → Include ignored files** applies to the next **Search** and
 survives **Reset search**. Superseded rows cannot authorize new actions; retained
 source evidence remains readable. These controls are local to each tool:
-ordinary sidebar search and atlas construction retain their own default scope,
-and visible-atlas search keeps its frozen membership. The override reports
+ordinary sidebar search retains its own default scope, and visible-atlas
+search keeps its frozen membership. The override reports
 `all-regular-files/no-rule-files-v1`, with no repository-rule configuration reads.
 Root confinement, symlink and special-object refusal, resource limits and
 independent exclusions for FCB's own artifacts still apply.
@@ -277,7 +287,7 @@ source bytes. Current-range observations are closed because they belong to the
 retired current-project authority. File and directory search scopes remain
 selected; an old visible-atlas search scope must be selected again.
 
-A partial metadata scan never proves that a missing path was deleted. Earlier
+A partial metadata scan under the same discovery policy never proves that a missing path was deleted. Earlier
 parcels not re-observed in that scan stay on the map, are counted as unconfirmed
 in the refresh notice, and show an explicit qualification in the inspector.
 Only a complete scan removes absent paths from map membership; it does not delete

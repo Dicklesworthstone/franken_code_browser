@@ -5,21 +5,24 @@ import Foundation
         ["file_id": id, "observed_bytes": bytes, "path": ["encoding": "unix-bytes", "hex": hex, "display": "label only"],
          "x": 0, "y": 0, "w": 32, "h": 16]
     }
-    private static func wire(_ files: [[String: Any]] = [file()], complete: Bool = true) -> [String: Any] {
+    private static func wire(_ files: [[String: Any]] = [file()], complete: Bool = true,
+        policy: String = "repository-rules-v1") -> [String: Any] {
         ["schema": "fcb.project-catalog/1", "status": "ok", "command": "catalog", "identity_scope": "response-local",
          "native_presented": false, "source_payload_read": false, "payload_bytes_read": "0", "read_calls": "0",
-         "discovery_complete": complete, "catalogued_files": String(files.count), "policy": "fixture-policy",
+         "discovery_complete": complete, "catalogued_files": String(files.count), "policy": policy,
          "world": ["w": 4096, "h": 4096], "files": files]
     }
-    private static func decode(_ object: [String: Any]) throws -> AtlasProjectCatalog {
-        try AtlasProjectCatalog.decode(JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]))
+    private static func decode(_ object: [String: Any], requestedPolicy: String = "repository-rules-v1") throws -> AtlasProjectCatalog {
+        try AtlasProjectCatalog.decode(JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
+            requestedPolicy: requestedPolicy)
     }
     @MainActor private static var checks = 0
     @MainActor private static func check(_ value: @autoclosure () -> Bool, _ message: String) {
         precondition(value(), message); checks += 1
     }
-    @MainActor private static func refuse(_ object: [String: Any], _ reason: String) throws {
-        do { _ = try decode(object); preconditionFailure("Accepted: " + reason) }
+    @MainActor private static func refuse(_ object: [String: Any], _ reason: String,
+        requestedPolicy: String = "repository-rules-v1") throws {
+        do { _ = try decode(object, requestedPolicy: requestedPolicy); preconditionFailure("Accepted: " + reason) }
         catch is AtlasProjectCatalog.DecodeError { checks += 1 }
     }
     @MainActor static func main() throws {
@@ -27,6 +30,23 @@ import Foundation
         check(r.entries.count == 1 && r.entries[0].sourcePath == "a.rs", "Native path comes from reversible bytes, not label")
         check(r.entries[0].displayPath == "label only" && r.entries[0].observedBytes == 17, "Metadata labels and exact sizes retained")
         check(r.entries[0].width == 32 && r.entries[0].height == 16, "Use supplied engine geometry")
+        let rules = "repository-rules-v1", all = "all-regular-files/no-rule-files-v1"
+        let fingerprint = String(repeating: "0123456789abcdef", count: 4)
+        let fingerprinted = try decode(wire(policy: rules + ":" + fingerprint))
+        check(fingerprinted.policy == rules + ":" + fingerprint && fingerprinted.matchesDiscoveryPolicy(rules),
+              "Snapshot fingerprint survives policy identity validation")
+        let included = try decode(wire(policy: all), requestedPolicy: all)
+        check(included.matchesDiscoveryPolicy(all) && !included.matchesDiscoveryPolicy(rules),
+              "Include-excluded receipt remains a distinct requested scope")
+        try refuse(wire(policy: rules), "Narrower rules receipt for include-excluded", requestedPolicy: all)
+        try refuse(wire(policy: all), "Broader include-excluded receipt for repository rules")
+        try refuse(wire(), "Unknown requested discovery policy", requestedPolicy: "invented")
+        for policy in ["fixture-policy", "product-defaults/no-rule-files-v1", rules + ":", rules + "#" + fingerprint,
+                       rules + ":" + String(fingerprint.dropLast()), rules + ":" + fingerprint + "0",
+                       rules + ":" + fingerprint.uppercased(), rules + ":" + String(repeating: "g", count: 64)] {
+            try refuse(wire(policy: policy), "Unknown or malformed discovery identity " + policy)
+        }
+        try refuse(wire(policy: all + ":" + fingerprint), "Include-excluded never carries repository rules", requestedPolicy: all)
         let partial = try decode(wire(complete: false))
         check(!partial.discoveryComplete && partial.entries.count == 1 && partial.summary.contains("more may exist"), "Known partial files are usable")
         let empty = try decode(wire([]))

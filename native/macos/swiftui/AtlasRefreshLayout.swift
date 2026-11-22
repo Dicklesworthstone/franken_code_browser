@@ -14,12 +14,16 @@ enum AtlasRefreshLayout {
     /// The supplied packer is the existing Rust parcel-layout adapter in the
     /// native host. Only new members need packing; source/size changes do not
     /// displace established landmarks. Explicit scope repack still compacts all.
-    static func reconcile(previous: [AtlasProjectCatalog.Entry], observed: [AtlasProjectCatalog.Entry],
-        complete: Bool, reservedRightEdge: Double? = nil,
+    /// A deliberate discovery-scope change starts a fresh membership set.
+    /// Old observations outside that scope are not unconfirmed new members;
+    /// replacing scope also does not establish that those files were deleted.
+    static func reconcile(previous previousEntries: [AtlasProjectCatalog.Entry], observed: [AtlasProjectCatalog.Entry],
+        complete: Bool, retainingPreviousMembership: Bool = true, reservedRightEdge: Double? = nil,
         pack: ([AtlasProjectCatalog.Entry]) -> [AtlasProjectCatalog.Entry]?) -> Result? {
-        guard previous.count <= AtlasProjectCatalog.maximumFiles,
+        guard previousEntries.count <= AtlasProjectCatalog.maximumFiles,
               observed.count <= AtlasProjectCatalog.maximumFiles,
               reservedRightEdge.map({ $0.isFinite && abs($0) <= 1e12 }) ?? true else { return nil }
+        let previous = retainingPreviousMembership ? previousEntries : []
         var earlier: [[UInt8]: AtlasProjectCatalog.Entry] = [:]
         var current: [[UInt8]: AtlasProjectCatalog.Entry] = [:]
         for entry in previous {

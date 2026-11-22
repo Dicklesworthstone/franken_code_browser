@@ -45,6 +45,17 @@ import Foundation
         let cleared = AtlasRefreshLayout.reconcile(previous: [a, b], observed: [], complete: true, pack: { $0 })!
         precondition(cleared.entries.isEmpty && cleared.removedCount == 2)
 
+        let narrower = AtlasRefreshLayout.reconcile(previous: [a, b], observed: [freshA], complete: false,
+            retainingPreviousMembership: false, pack: { $0 })!
+        precondition(narrower.entries.map(\.rawPath) == [a.rawPath] && narrower.unconfirmedRawPaths.isEmpty,
+            "Changing discovery scope cannot inherit excluded old parcels from a partial scan")
+        precondition(narrower.entries[0].observedBytes == freshA.observedBytes && narrower.removedCount == 0,
+            "A new scope uses its observations without declaring excluded files deleted")
+        let unknownScope = AtlasRefreshLayout.reconcile(previous: [a, b], observed: [], complete: false,
+            retainingPreviousMembership: false, pack: { _ in preconditionFailure("no new observations need packing") })!
+        precondition(unknownScope.entries.isEmpty && unknownScope.unconfirmedRawPaths.isEmpty && unknownScope.removedCount == 0,
+            "An incomplete empty replacement scope cannot relabel earlier membership as current")
+
         let composed = entry("é.rs"), decomposed = entry("e\u{301}.rs", id: 2, x: 100)
         let unicode = AtlasRefreshLayout.reconcile(previous: [composed, decomposed],
             observed: [entry("é.rs", bytes: 8)], complete: false, pack: { $0 })!
@@ -69,6 +80,10 @@ import Foundation
         precondition(AtlasRefreshLayout.reconcile(previous: old, observed: incoming, complete: false,
             pack: { _ in preconditionFailure("over-budget unions are refused before layout") }) == nil,
             "partial discovery cannot silently discard old members to make room")
+        let newScope = AtlasRefreshLayout.reconcile(previous: old, observed: incoming, complete: false,
+            retainingPreviousMembership: false, pack: { $0 })!
+        precondition(newScope.entries.count == incoming.count && newScope.unconfirmedRawPaths.isEmpty,
+            "An explicit scope change admits its bounded observations without unioning a different scope")
         print("Refresh parcel continuity, additions, coverage, raw identity and admission bounds passed.")
     }
 }

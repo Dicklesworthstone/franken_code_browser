@@ -230,18 +230,21 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     let files: [AtlasFile]
     let bounds: CGRect
     let addedBounds: CGRect?
+    let retainingPreviousMembership: Bool
 
-    static func prepare(root: String, previous: [AtlasProjectCatalog.Entry], previousBounds: CGRect,
+    static func prepare(root: String, discoveryPolicy: AtlasDiscoveryPolicy,
+        previous: [AtlasProjectCatalog.Entry], previousBounds: CGRect, retainingPreviousMembership: Bool,
         scope: AtlasSearchFileScope, includesUnsupportedNames: Bool,
         cancellation: AtlasSearchCancellation) throws -> Self {
-        let catalog = try AtlasProjectWorker.catalogReport(root: root, cancellation: cancellation)
+        let catalog = try AtlasProjectWorker.catalogReport(root: root, discoveryPolicy: discoveryPolicy,
+            cancellation: cancellation)
         let visible = catalog.entries.filter {
             $0.sourcePath == nil ? includesUnsupportedNames : scope.admitsRawPath($0.rawPath)
         }
         guard !cancellation.isCanceled else { throw AtlasProjectIOError.canceled }
         guard let reconciled = AtlasRefreshLayout.reconcile(previous: previous, observed: visible,
-            complete: catalog.discoveryComplete, reservedRightEdge: Double(previousBounds.maxX),
-            pack: { AtlasParcelLayout.compact($0) }) else {
+            complete: catalog.discoveryComplete, retainingPreviousMembership: retainingPreviousMembership,
+            reservedRightEdge: Double(previousBounds.maxX), pack: { AtlasParcelLayout.compact($0) }) else {
             throw AtlasProjectIOError.limit
         }
         guard !cancellation.isCanceled else { throw AtlasProjectIOError.canceled }
@@ -260,7 +263,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         }
         guard !cancellation.isCanceled else { throw AtlasProjectIOError.canceled }
         return Self(catalog: catalog, visibleCatalog: visible, reconciliation: reconciled, layout: layout,
-            files: files, bounds: bounds, addedBounds: added.isNull ? nil : added)
+            files: files, bounds: bounds, addedBounds: added.isNull ? nil : added,
+            retainingPreviousMembership: retainingPreviousMembership)
     }
 
     var notice: String {
@@ -270,7 +274,9 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         if !reconciliation.unconfirmedRawPaths.isEmpty {
             text += ". Partial discovery: \(reconciliation.unconfirmedRawPaths.count) earlier parcels were not re-observed and remain unconfirmed"
         } else if !catalog.discoveryComplete { text += ". Discovery remains incomplete" }
-        return text + ". Existing parcels and navigation stay in place. Visible source previews are observed again; open readers keep their captured bytes."
+        text += retainingPreviousMembership ? ". Existing parcels and navigation stay in place."
+            : ". Atlas membership now follows the selected discovery scope. Navigation is preserved."
+        return text + " Visible source previews are observed again; open readers keep their captured bytes."
     }
 }
 
@@ -2011,6 +2017,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         }
         let previous = projectBrowser, previousProject = browserProject
         let requestedDiscoveryPolicy = discoveryPolicy ?? previous.discoveryPolicy
+        let retainingPreviousMembership = requestedDiscoveryPolicy == previous.discoveryPolicy
         let requestedRoot = root, previousRevision = atlasRevision, previousRequest = atlasLayoutRequest
         let requestedScope = fileScope, requestedExtensions = Array(customExtensions.utf8)
         guard let scope = try? fileScope.searchScope(custom: customExtensions) else {
@@ -2037,9 +2044,10 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 guard refreshAtlas else { return }
                 stagedAtlas = try await projectRefreshIO.perform(cancellation: cancellation,
                     keepingAlive: accessLease.map { [$0] } ?? []) {
-                    try AtlasPreparedProjectRefresh.prepare(root: requestedRoot, previous: previousEntries,
-                        previousBounds: previousBounds, scope: scope, includesUnsupportedNames: includesUnsupportedNames,
-                        cancellation: cancellation)
+                    try AtlasPreparedProjectRefresh.prepare(root: requestedRoot, discoveryPolicy: requestedDiscoveryPolicy,
+                        previous: previousEntries, previousBounds: previousBounds,
+                        retainingPreviousMembership: retainingPreviousMembership, scope: scope,
+                        includesUnsupportedNames: includesUnsupportedNames, cancellation: cancellation)
                 }
             },
             accepted: { candidate in
@@ -2088,6 +2096,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         var replacementOpening = candidate.opening
         if let atlas {
             guard atlas.layout.root.utf8.elementsEqual(candidate.root.utf8),
+                  atlas.catalog.matchesDiscoveryPolicy(candidate.browser.discoveryPolicy.wireName),
                   replacementOpening.acceptPreparedAtlas(atlas.catalog, in: candidate.project,
                     hasOpenableFiles: !atlas.files.isEmpty),
                   atlasResidency.install(atlas.layout, accessLease: accessLease,
@@ -2275,13 +2284,15 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         if AtlasFileStartup.isPending { openStartupFile() }
     }
 
-    private func loadPreviewCatalog(root requestedRoot: String, ticket: AtlasProjectOpening.Ticket,
-        cancellation: AtlasSearchCancellation, accessLease: AnyObject?) async throws {
+    private func loadPreviewCatalog(root requestedRoot: String, discoveryPolicy: AtlasDiscoveryPolicy,
+        ticket: AtlasProjectOpening.Ticket, cancellation: AtlasSearchCancellation, accessLease: AnyObject?) async throws {
         let catalog = try await projectIO.perform(cancellation: cancellation,
             keepingAlive: accessLease.map { [$0] } ?? []) {
-            try AtlasProjectWorker.catalogReport(root: requestedRoot, cancellation: cancellation)
+            try AtlasProjectWorker.catalogReport(root: requestedRoot, discoveryPolicy: discoveryPolicy,
+                cancellation: cancellation)
         }
         guard !Task.isCancelled, !cancellation.isCanceled, projectOpening.accepts(ticket),
+              browserProject == ticket.project, projectBrowser.discoveryPolicy == discoveryPolicy,
               root.utf8.elementsEqual(requestedRoot.utf8),
               projectOpening.acceptPreviewCatalog(catalog, for: ticket) else { throw AtlasProjectIOError.canceled }
         // A retained map remains one coherent layout while its replacement is
@@ -2330,7 +2341,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         accessLease = nil
 #endif
         guard let ticket = projectOpening.beginPreviews() else { return }
-        let requestedRoot = root
+        let requestedRoot = root, requestedDiscoveryPolicy = projectBrowser.discoveryPolicy
         let cancellation = AtlasSearchCancellation()
         loadCancellation = cancellation
         // Publishing optional atlas tiles must not dismiss a file reader that
@@ -2339,14 +2350,15 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         loadProgress = projectOpening.catalog == nil ? "Collecting the bounded text-atlas catalog…"
             : "Preparing the file atlas…"
         loadTask = Task {
-            await prepareAtlas(root: requestedRoot, ticket: ticket,
+            await prepareAtlas(root: requestedRoot, discoveryPolicy: requestedDiscoveryPolicy, ticket: ticket,
                 cancellation: cancellation, accessLease: accessLease)
         }
     }
 
-    private func prepareAtlas(root requestedRoot: String, ticket: AtlasProjectOpening.Ticket,
-        cancellation: AtlasSearchCancellation, accessLease: AnyObject?) async {
+    private func prepareAtlas(root requestedRoot: String, discoveryPolicy: AtlasDiscoveryPolicy,
+        ticket: AtlasProjectOpening.Ticket, cancellation: AtlasSearchCancellation, accessLease: AnyObject?) async {
         guard !Task.isCancelled, !cancellation.isCanceled, projectOpening.accepts(ticket),
+              browserProject == ticket.project, projectBrowser.discoveryPolicy == discoveryPolicy,
               root.utf8.elementsEqual(requestedRoot.utf8) else { return }
         defer {
             if projectOpening.accepts(ticket) {
@@ -2354,9 +2366,9 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 loadTask = nil; loadCancellation = nil; loadProgress = ""
             }
         }
-        if projectOpening.catalog == nil {
+        if projectOpening.catalog?.matchesDiscoveryPolicy(discoveryPolicy.wireName) != true {
             do {
-                try await loadPreviewCatalog(root: requestedRoot, ticket: ticket,
+                try await loadPreviewCatalog(root: requestedRoot, discoveryPolicy: discoveryPolicy, ticket: ticket,
                     cancellation: cancellation, accessLease: accessLease)
             } catch {
                 if !cancellation.isCanceled, projectOpening.accepts(ticket) {
@@ -2365,7 +2377,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 return
             }
         }
-        guard !cancellation.isCanceled, projectOpening.accepts(ticket) else { return }
+        guard !cancellation.isCanceled, projectOpening.accepts(ticket),
+              browserProject == ticket.project, projectBrowser.discoveryPolicy == discoveryPolicy else { return }
         // This cache owner supplies only Rust's highlighted-source cache. Its
         // legacy hot document table never owns the viewport's evicted sources.
         if projectCache?.root.utf8.elementsEqual(requestedRoot.utf8) != true {
@@ -2395,7 +2408,9 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     /// arrival and eviction never call this method or alter parcel geometry.
     private func installAtlasScope(root requestedRoot: String, project: UUID, request: UUID,
         cancellation: AtlasSearchCancellation, accessLease: AnyObject?, preservingCaptures: Bool) async -> Bool {
-        guard let catalog = projectOpening.catalog else { return false }
+        let requestedDiscoveryPolicy = projectBrowser.discoveryPolicy
+        guard let catalog = projectOpening.catalog,
+              catalog.matchesDiscoveryPolicy(requestedDiscoveryPolicy.wireName) else { return false }
         let requestedScope = fileScope, requestedExtensions = Array(customExtensions.utf8)
         let scopeLabel = fileScope == .custom ? customExtensions : fileScope.rawValue
         let entries = catalog.entries.filter { entry in
@@ -2418,6 +2433,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         }
         guard !Task.isCancelled, !cancellation.isCanceled, loadGeneration == project,
               atlasLayoutRequest == request, root.utf8.elementsEqual(requestedRoot.utf8),
+              projectBrowser.discoveryPolicy == requestedDiscoveryPolicy,
               fileScope == requestedScope, Array(customExtensions.utf8) == requestedExtensions else { return false }
 #if FCB_APP_STORE
         guard rootAccess?.url.path.utf8.elementsEqual(requestedRoot.utf8) == true else { return false }

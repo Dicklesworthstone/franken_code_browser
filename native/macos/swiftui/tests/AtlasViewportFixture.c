@@ -4,8 +4,9 @@
 /* Link-only foreign symbols. These tests inject immutable capture packets into
  * the actual native worker; none of these stubs pretends to discover or parse. */
 typedef int32_t (*poll_fn)(void *);
-char *fcb_project_catalog_cancelable(const char *root, uint64_t limit, poll_fn poll, void *context) {
-    (void)root; (void)limit; (void)poll; (void)context; return NULL;
+char *fcb_project_catalog_with_policy_cancelable(const char *root, uint64_t limit, uint64_t policy,
+        poll_fn poll, void *context) {
+    (void)root; (void)limit; (void)policy; (void)poll; (void)context; return NULL;
 }
 char *fcb_atlas_layout_cancelable(const char *root, poll_fn poll, void *context) {
     (void)root; (void)poll; (void)context; return NULL;

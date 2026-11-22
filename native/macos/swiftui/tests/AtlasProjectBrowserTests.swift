@@ -570,6 +570,7 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         try repositoryRuleWireAndCoverage()
         try includeExcludedPolicyWire()
         try await discoveryPolicyTransactions()
+        try await refreshRejectsCatalogPolicyMismatch()
         try await repositoryRuleFailuresKeepRowsAndDirtyHints()
         try await emptyPagesLostRepliesPauseAndEviction()
         try await exactRawFileCaptureAndForgedReceipts()
@@ -916,6 +917,37 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
         }
         precondition(legacyFixture.calls.isEmpty && legacy.root.isEmpty && !legacy.supportsDiscoveryPolicy)
         legacy.close()
+    }
+    @MainActor private static func refreshRejectsCatalogPolicyMismatch() async throws {
+        for acceptedPolicy in [AtlasDiscoveryPolicy.repositoryRules, .includeExcluded] {
+            let requestedPolicy: AtlasDiscoveryPolicy = acceptedPolicy == .repositoryRules ? .includeExcluded : .repositoryRules
+            let fixture = ProjectBrowserFixture(policyAware: true)
+            let original = AtlasProjectBrowserModel(transport: fixture.transport)
+            try await original.open(root: "/repo", accessLease: nil, discoveryPolicy: acceptedPolicy)
+            let page = original.page!
+            let capture = try await original.openFile(page.files[0], from: page, readerTransport: fixture.readerTransport)
+            let originalBytes = capture.reader.page!.originalHex
+            let receipt: [String: Any] = ["schema": "fcb.project-catalog/1", "status": "ok", "command": "catalog",
+                "identity_scope": "response-local", "native_presented": false, "source_payload_read": false,
+                "payload_bytes_read": "0", "read_calls": "0", "discovery_complete": true,
+                "catalogued_files": "0", "policy": acceptedPolicy.wireName, "world": ["w": 4096, "h": 4096], "files": []]
+            let metadata = try JSONSerialization.data(withJSONObject: receipt)
+            let refresh = AtlasProjectRefresh(transport: fixture.transport)
+            var failed = false
+            precondition(refresh.stage(root: "/repo", project: UUID(), accessLease: nil,
+                discoveryPolicy: requestedPolicy, prepare: { _ in
+                    _ = try AtlasProjectCatalog.decode(metadata, requestedRoot: "/repo",
+                        requestedPolicy: requestedPolicy.wireName)
+                }, accepted: { _ in preconditionFailure("Wrong-policy atlas replaced the accepted project") },
+                failed: { _ in failed = true }) != nil)
+            await wait("wrong-policy atlas candidate did not drain") { !refresh.isRefreshing }
+            await wait("wrong-policy atlas candidate did not retire") { fixture.calls.contains("close:41") }
+            precondition(failed && original.canOperate && original.currentPage
+                && original.discoveryPolicy == acceptedPolicy && original.page?.info.owner == page.info.owner)
+            precondition(capture.reader.page?.originalHex == originalBytes && capture.reader.canPin,
+                "Atlas receipt refusal preserves the accepted policy, browser and independently retained reader")
+            refresh.close(); original.close(); capture.reader.close()
+        }
     }
     @MainActor private static func repositoryRuleFailuresKeepRowsAndDirtyHints() async throws {
         for failure in ["RULE_UNSUPPORTED_PATTERN", "RULE_READ_FAILED"] {

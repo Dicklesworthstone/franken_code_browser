@@ -33,7 +33,30 @@ struct AtlasProjectCatalog: Sendable {
     static let maximumFiles = 20_000
     static let maximumResponseBytes = 16 * 1024 * 1024
 
-    static func decode(_ data: Data, requestedRoot: String? = nil) throws -> Self {
+    /// A requested policy binds the metadata receipt to its discovery scope.
+    /// Snapshot-enabled hosts append the rule-observation fingerprint; retain
+    /// that identity while checking the selected policy independently.
+    func matchesDiscoveryPolicy(_ requested: String) -> Bool {
+        Self.matchesDiscoveryPolicy(policy, requested: requested)
+    }
+
+    private static func matchesDiscoveryPolicy(_ reported: String, requested: String) -> Bool {
+        switch requested {
+        case "all-regular-files/no-rule-files-v1": return reported == requested
+        case "repository-rules-v1":
+            if reported == requested { return true }
+            let prefix = requested + ":"
+            guard reported.hasPrefix(prefix) else { return false }
+            let fingerprint = reported.utf8.dropFirst(prefix.utf8.count)
+            return fingerprint.count == 64 && fingerprint.allSatisfy {
+                (48...57).contains($0) || (97...102).contains($0)
+            }
+        default: return false
+        }
+    }
+
+    static func decode(_ data: Data, requestedRoot: String? = nil,
+        requestedPolicy: String? = nil) throws -> Self {
         guard data.count <= maximumResponseBytes else { throw DecodeError.invalidResponse }
         do {
             let wire = try JSONDecoder().decode(Wire.self, from: data)
@@ -42,7 +65,10 @@ struct AtlasProjectCatalog: Sendable {
                   wire.payload_bytes_read == "0", wire.read_calls == "0",
                   wire.world.w == 4096, wire.world.h == 4096,
                   try integer(wire.catalogued_files) == UInt64(wire.files.count),
-                  !wire.policy.isEmpty, wire.policy.utf8.count <= 256 else { throw DecodeError.invalidResponse }
+                  !wire.policy.isEmpty, wire.policy.utf8.count <= 256,
+                  requestedPolicy.map({ matchesDiscoveryPolicy(wire.policy, requested: $0) }) != false else {
+                throw DecodeError.invalidResponse
+            }
             var paths = Set<[UInt8]>(), ids = Set<UInt64>()
             var retainedBytes = 0
             var entries: [Entry] = []
