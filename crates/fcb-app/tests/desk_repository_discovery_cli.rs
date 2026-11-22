@@ -158,11 +158,17 @@ fn failed_replacements_keep_the_previous_token_queries_and_reader_until_successf
         ("repository-rules\t0\tworkspace\t-", "DESK_REPOSITORY_FILE_LIMIT"),
         ("repository-rules\t20001\tworkspace\t-", "DESK_REPOSITORY_FILE_LIMIT"),
         ("repository-rules\t1\tworkspace\t6d61696e", "DESK_REPOSITORY_SCOPE"),
-        ("repository-rules\t1\tfile\t6d61696e2e7273", "DESK_REPOSITORY_SCOPE"),
+        ("repository-rules\t1\tvisible\t6d61696e2e7273", "DESK_REPOSITORY_SCOPE"),
         ("repository-rules\t1\tdirectory\t", "DESK_INVALID_HEX"),
         ("repository-rules\t1\tdirectory\tzz", "DESK_INVALID_HEX"),
         ("repository-rules\t1\tdirectory\t2e2e", "ATLAS_SESSION_INVALID_LIMITS"),
         ("repository-rules\t1\tdirectory\t00", "ATLAS_SESSION_INVALID_LIMITS"),
+        ("repository-rules\t1\tfile\t", "DESK_INVALID_HEX"),
+        ("repository-rules\t1\tfile\tzz", "DESK_INVALID_HEX"),
+        ("repository-rules\t1\tfile\t2e2e", "ATLAS_SESSION_INVALID_LIMITS"),
+        ("repository-rules\t1\tfile\t00", "ATLAS_SESSION_INVALID_LIMITS"),
+        ("repository-rules\t1\tfile\t2f6d61696e2e7273", "ATLAS_SESSION_INVALID_LIMITS"),
+        ("repository-rules\t1\tfile\t6d61696e2e72732f", "ATLAS_SESSION_INVALID_LIMITS"),
     ] {
         let row = s.push(&format!("repo-open-scoped\t{}\t{tail}", root.display()), false);
         invalid.push((row, code));
@@ -171,6 +177,10 @@ fn failed_replacements_keep_the_previous_token_queries_and_reader_until_successf
     for directory in [b"missing".as_slice(), b"alias", b"main.rs"] {
         unavailable.push(s.push(&format!("repo-open-scoped\t{}\tinclude-excluded\t1\tdirectory\t{}",
             root.display(), hex(directory)), false));
+    }
+    for member in [b"missing.rs".as_slice(), b"alias", b"main.rs/child.rs"] {
+        unavailable.push(s.push(&format!("repo-open-scoped\t{}\tinclude-excluded\t1\tfile\t{}",
+            root.display(), hex(member)), false));
     }
     let page = s.push("repo-page\t1\t1\t0\t10", false);
     let copied = s.push("copy\t1", false);
@@ -215,27 +225,168 @@ impl Read for ArmAfterLine<'_> {
 }
 
 #[test]
-fn canceled_directory_candidate_reports_the_prior_attachment_and_accepted_reader_revision() {
+fn canceled_scoped_candidates_report_the_prior_attachment_and_accepted_reader_revision() {
     let root = fixture(&[("selected/source.rs", b"original needle\n")]);
-    let mut s = Script::default();
-    s.push(&format!("repo-open\t{}", root.display()), false);
-    s.push("repo-find\t1\t1\t10\t1000\tneedle", false);
-    s.push("repo-hit\t1\t1\t1", true);
-    let copied = s.push("copy\t1", false);
-    let canceled = s.push(&format!("repo-open-scoped\t{}\tinclude-excluded\t1\tdirectory\t73656c6563746564",
+    for (scope, member) in [("directory", b"selected".as_slice()), ("file", b"selected/source.rs".as_slice())] {
+        let mut s = Script::default();
+        s.push(&format!("repo-open\t{}", root.display()), false);
+        s.push("repo-find\t1\t1\t10\t1000\tneedle", false);
+        s.push("repo-hit\t1\t1\t1", true);
+        let copied = s.push("copy\t1", false);
+        let canceled = s.push(&format!("repo-open-scoped\t{}\tinclude-excluded\t1\t{scope}\t{}",
+            root.display(), hex(member)), false);
+        s.push("quit", false);
+        let lines = Rc::new(Cell::new(0));
+        let mut input = ArmAfterLine { input: s.text.as_bytes(), lines: lines.clone() };
+        let mut output = Vec::new(); let mut errors = Vec::new(); let mut stops = 0;
+        let exit = run(&args(), &mut input, &mut output, &mut errors, || {
+            if lines.get() == canceled + 1 { stops += 1; true } else { false }
+        });
+        assert_eq!(exit, EXIT_CANCELED); assert!(errors.is_empty()); assert_eq!(stops, 1);
+        let rows = records(&output); assert_eq!(rows.len(), canceled + 1);
+        assert_eq!(result(&rows[copied]).get("original_hex").text(), hex(b"needle"));
+        assert_eq!(error(&rows[canceled]), "DESK_REPOSITORY_CANCELED");
+        assert_eq!(rows[canceled].get("repository_token").number(), 1);
+        assert_eq!(rows[canceled].get("repository_query_generation").number(), 1);
+        assert_eq!(rows[canceled].get("accepted_revision").number(), 3);
+    }
+}
+
+
+fn file_scope(receipt: &Json, member: &[u8]) {
+    assert_eq!(receipt.get("discovery_scope").text(), "file");
+    assert_eq!(receipt.get("discovery_directory"), &Json::Null);
+    assert_eq!(receipt.get("discovery_file").get("encoding").text(), "unix-bytes");
+    assert_eq!(receipt.get("discovery_file").get("hex").text(), hex(member));
+    assert_eq!(receipt.get("path_basis").text(), "project-root");
+}
+
+#[test]
+fn exact_file_attachment_reaches_an_omitted_member_and_activates_its_captured_index_result() {
+    let root = fixture(&[("selected/first.rs", b"original needle\n"),
+        ("selected/second.rs", b"original needle\n"), ("selected/third.rs", b"original needle\n")]);
+    let mut probe = Script::default();
+    probe.push(&format!("repo-open-scoped\t{}\tinclude-excluded\t1\tworkspace\t-", root.display()), false);
+    let root_hits = probe.push("repo-find\t1\t1\t10\t1000\tneedle", false);
+    let folder = probe.push(&format!("repo-open-scoped\t{}\tinclude-excluded\t1\tdirectory\t73656c6563746564",
         root.display()), false);
+    let folder_hits = probe.push(&format!("repo-find\t{}\t1\t10\t1000\tneedle", folder + 1), false);
+    probe.push("quit", false);
+    let (exit, observed) = invoke(&probe.text); assert_eq!(exit, EXIT_PARTIAL);
+    for row in [root_hits, folder_hits] {
+        assert!(!result(&observed[row]).get("discovery_complete").flag());
+        assert_eq!(result(&observed[row]).get("retained_hits").number(), 1);
+    }
+    let selected = ["selected/first.rs", "selected/second.rs", "selected/third.rs"].into_iter()
+        .find(|member| [root_hits, folder_hits].iter().all(|&row|
+            result(&observed[row]).get("hits").array().iter().all(|hit|
+                hit.get("path").get("hex").text() != hex(member.as_bytes())))).unwrap();
+    let mut s = Script::default();
+    let attached = s.push(&format!("repo-open-scoped\t{}\tinclude-excluded\t1\tfile\t{}",
+        root.display(), hex(selected.as_bytes())), false);
+    let info = s.push("repo-info\t1", false);
+    let index_begin = s.push("repo-index-begin\t1\t1\t1\t1000\t1000", false);
+    let index_done = s.push("repo-index-step\t1\t1\t0", false);
+    let query_begin = s.push("repo-begin-indexed-matching\t1\t1\t2\tsensitive\tbounded\t10\t1000\tworkspace\t-\tneedle", false);
+    let query_done = s.push("repo-step\t1\t2\t0", false);
+    let hit = s.push("repo-hit\t1\t2\t1", true);
+    s.push("repo-index-clear\t1\t3", false);
+    let close = s.push("repo-close\t1", false);
+    let copy = s.push("copy\t1", false); s.push("quit", false);
+    let mut input = s.text.as_bytes();
+    let mut output = Replace { bytes: Vec::new(), replies: 0, after: index_done + 1, path: root.join(selected) };
+    let mut errors = Vec::new();
+    assert_eq!(run(&args(), &mut input, &mut output, &mut errors, || false), EXIT_OK);
+    assert!(errors.is_empty()); let rows = records(&output.bytes);
+    for row in [attached, info, index_begin, index_done, query_begin, query_done] {
+        file_scope(result(&rows[row]), selected.as_bytes());
+        assert_eq!(rows[row].get("repository_token").number(), 1);
+    }
+    assert!(result(&rows[attached]).get("discovery_complete").flag());
+    assert_eq!(result(&rows[attached]).get("catalogued_files").number(), 1);
+    assert_eq!(result(&rows[attached]).get("root_path").get("hex").text(),
+        hex(fs::canonicalize(&root).unwrap().as_os_str().as_bytes()));
+    assert_eq!(result(&rows[index_begin]).get("initial_source_bytes_read").number(), 0);
+    assert!(result(&rows[index_done]).get("capture_complete").flag());
+    assert_eq!(result(&rows[index_done]).get("captured_files").number(), 1);
+    assert!(result(&rows[query_done]).get("search_complete").flag());
+    assert_eq!(result(&rows[query_done]).get("source_bytes_read").number(), 0);
+    assert_eq!(result(&rows[query_done]).get("retained_hits").number(), 1);
+    let found = &result(&rows[query_done]).get("hits").array()[0];
+    assert_eq!(found.get("path").get("hex").text(), hex(selected.as_bytes()));
+    assert_eq!(found.get("source_revision").number(), 1);
+    assert!(!result(&rows[hit]).get("source_reopened").flag());
+    assert_eq!(rows[close].get("repository_token"), &Json::Null);
+    assert_eq!(result(&rows[copy]).get("original_hex").text(), hex(b"needle"));
+}
+
+#[test]
+fn raw_root_and_exact_file_paths_round_trip_without_widening_the_selected_membership() {
+    let parent = fixture(&[]);
+    let root = parent.join(OsString::from_vec(b"root\xfe".to_vec())); fs::create_dir(&root).unwrap();
+    let member = b"C:\\raw\xff/leaf\t\xfd.rs";
+    let native = OsString::from_vec(member.to_vec());
+    file(&root, Path::new(&native), b"original NEEDLE\n");
+    file(&root, "sibling.rs", b"sibling needle\n");
+    let mut s = Script::default();
+    let opened = s.push(&format!("repo-open-scoped-hex\t{}\tinclude-excluded\t1\tfile\t{}",
+        hex(root.as_os_str().as_bytes()), hex(member)), false);
+    let paths = s.push(&format!("repo-paths-hex\t1\t1\texact\tsensitive\t10\t{}", hex(b"leaf\t\xfd.rs")), false);
+    let begin = s.push("repo-begin-matching\t1\t1\tunicode-lowercase\tbounded\t10\t1000\tworkspace\t-\tneedle", false);
+    let done = s.push("repo-step\t1\t1\t0", false);
+    let hit = s.push("repo-hit\t1\t1\t1", true);
+    s.push("repo-close\t1", false);
+    let copy = s.push("copy\t1", false); s.push("quit", false);
+    let mut input = s.text.as_bytes();
+    let mut output = Replace { bytes: Vec::new(), replies: 0, after: done + 1, path: root.join(&native) };
+    let mut errors = Vec::new();
+    assert_eq!(run(&args(), &mut input, &mut output, &mut errors, || false), EXIT_OK);
+    assert!(errors.is_empty()); let rows = records(&output.bytes);
+    for row in [opened, paths, begin, done] { file_scope(result(&rows[row]), member); }
+    assert_eq!(result(&rows[opened]).get("root_path").get("hex").text(),
+        hex(fs::canonicalize(&root).unwrap().as_os_str().as_bytes()));
+    assert_eq!(result(&rows[opened]).get("catalogued_files").number(), 1);
+    assert!(!result(&rows[paths]).get("source_payload_read").flag());
+    assert_eq!(result(&rows[paths]).get("hits").array().len(), 1);
+    assert_eq!(result(&rows[paths]).get("hits").array()[0].get("path").get("hex").text(), hex(member));
+    assert_eq!(result(&rows[begin]).get("source_bytes_read").number(), 0);
+    assert!(result(&rows[done]).get("search_complete").flag());
+    assert_eq!(result(&rows[done]).get("retained_hits").number(), 1);
+    assert_eq!(result(&rows[done]).get("hits").array()[0].get("path").get("hex").text(), hex(member));
+    assert!(!result(&rows[hit]).get("source_reopened").flag());
+    assert_eq!(result(&rows[copy]).get("original_hex").text(), hex(b"NEEDLE"));
+}
+
+#[test]
+fn exact_file_policy_receipts_separate_excluded_members_and_incomplete_ancestor_rules() {
+    let root = fixture(&[(".gitignore", b"ignored.rs\nblocked/\n"),
+        ("src/ignored.rs", b"private needle\n"), ("blocked/source.rs", b"private needle\n")]);
+    let mut s = Script::default(); let mut expected = Vec::new();
+    for (member, rules_complete) in [(b"src/ignored.rs".as_slice(), true), (b"blocked/source.rs".as_slice(), false)] {
+        for (policy, count, complete) in [("repository-rules", 0, rules_complete), ("include-excluded", 1, true)] {
+            let opened = s.push(&format!("repo-open-scoped\t{}\t{policy}\t1\tfile\t{}",
+                root.display(), hex(member)), false);
+            let found = s.push(&format!("repo-find\t{}\t1\t10\t1000\tneedle", opened + 1), false);
+            expected.push((opened, found, member, count, complete));
+        }
+    }
     s.push("quit", false);
-    let lines = Rc::new(Cell::new(0));
-    let mut input = ArmAfterLine { input: s.text.as_bytes(), lines: lines.clone() };
-    let mut output = Vec::new(); let mut errors = Vec::new(); let mut stops = 0;
-    let exit = run(&args(), &mut input, &mut output, &mut errors, || {
-        if lines.get() == canceled + 1 { stops += 1; true } else { false }
-    });
-    assert_eq!(exit, EXIT_CANCELED); assert!(errors.is_empty()); assert_eq!(stops, 1);
-    let rows = records(&output); assert_eq!(rows.len(), canceled + 1);
-    assert_eq!(result(&rows[copied]).get("original_hex").text(), hex(b"needle"));
-    assert_eq!(error(&rows[canceled]), "DESK_REPOSITORY_CANCELED");
-    assert_eq!(rows[canceled].get("repository_token").number(), 1);
-    assert_eq!(rows[canceled].get("repository_query_generation").number(), 1);
-    assert_eq!(rows[canceled].get("accepted_revision").number(), 3);
+    let (exit, rows) = invoke(&s.text); assert_eq!(exit, EXIT_PARTIAL);
+    for (opened, found, member, count, complete) in expected {
+        let info = result(&rows[opened]); let page = result(&rows[found]);
+        file_scope(info, member); file_scope(page, member);
+        assert_eq!(rows[opened].get("repository_token").number(), opened as u64 + 1);
+        assert_eq!(info.get("catalogued_files").number(), count);
+        assert_eq!(info.get("discovery_complete").flag(), complete);
+        assert_eq!(info.get("discovery_excluded_entries").number(), 1 - count);
+        assert_eq!(page.get("search_complete").flag(), complete);
+        assert_eq!(page.get("retained_hits").number(), count);
+        assert_eq!(page.get("excluded_files").number(), 0);
+        assert_eq!(page.get("discovery_excluded_entries").number(), 1 - count);
+        if count == 0 { assert_eq!(page.get("source_bytes_read").number(), 0); }
+        else {
+            assert!(!page.get("rule_files_enabled").flag());
+            assert_eq!(page.get("rule_policy"), &Json::Null);
+        }
+    }
 }

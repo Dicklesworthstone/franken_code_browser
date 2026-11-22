@@ -907,7 +907,7 @@ explicitly bounded catalog before any source query or index build. Use
 | --- | --- |
 | `POLICY` | `repository-rules` or `include-excluded`. |
 | `FILE_LIMIT` | 1–20,000 catalog entries. |
-| `SCOPE` / `SCOPE_VALUE` | `workspace -`, or `directory` followed by raw project-relative directory bytes encoded as hex. |
+| `SCOPE` / `SCOPE_VALUE` | `workspace -`, or `directory` / `file` followed by the raw project-relative path bytes encoded as hex. |
 
 For example, `directory 737263` discovers `src` directly. Unrelated siblings
 do not spend that catalog's file allowance, so a late folder can be searched
@@ -916,13 +916,26 @@ admit 1–2,048 raw bytes and 1–31 nonempty components; non-UTF-8 names and li
 Unix backslashes retain their identity. Absolute, dot and dot-dot components
 are refused.
 
+Use `file 7372632f6c69622e7273` to attach only `src/lib.rs`. Direct file
+admission does not enumerate sibling entries, so the selected file remains
+reachable even when both the root and its parent directory exceed their
+catalog limits. The file route admits 1–2,048 raw bytes and 1–32 components,
+keeps the full project-relative name, and uses the same text, expression,
+structural, filename and captured-index commands as other attachments.
+A missing file, directory, symlink or special object is refused at attachment.
+
 The original project root remains the grant and the basis for returned paths.
 Repository rules inherited through ancestor directories remain effective under
 `repository-rules`. `include-excluded` bypasses those rules and generated-file
 exclusions while retaining confinement, regular-file admission and the existing
 independent exclusions for FCB's own artifacts. Discovery receipts identify
-the actual directory, policy and coverage; a complete folder catalog does not
-claim complete coverage of the entire project.
+the actual scope, policy and coverage: `discovery_scope: "file"` carries
+`discovery_file` and a null `discovery_directory`; folder and workspace
+receipts carry a null `discovery_file`. A complete folder or file catalog
+covers only that selected universe. A deliberately excluded file can have
+complete, empty eligible membership with an exclusion count; unresolved rule
+coverage or an excluded ancestor remains partial. Explicit `include-excluded`
+is required to search a file excluded by repository rules.
 
 Use the returned repository token for subsequent text, expression, structural,
 filename and index commands. A successfully admitted replacement gets a new
@@ -936,7 +949,8 @@ The existing `repo-open` and `repo-open-hex` retain their 4,096-entry workspace
 catalog and repository-rules defaults. Query scopes narrow whichever catalog
 is attached. Capturing and verification retain their own independent budgets.
 Rust hosts can select the same behavior through
-`DeskRepository::open_with_policy` and `open_directory_with_policy`.
+`DeskRepository::open_with_policy`, `open_directory_with_policy` and
+`open_file_with_policy`.
 
 ## Search and count text in a live Reading Desk
 

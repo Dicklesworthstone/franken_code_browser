@@ -80,6 +80,14 @@ pub struct RepositoryOpen {
     pub reused_source: bool,
 }
 
+/// Discovery selection is independent of later query scopes. Both native-path
+/// variants retain the original project root and source identities.
+pub(crate) enum RepositoryDiscoveryScope {
+    Workspace,
+    Directory(NormalizedPath),
+    File(NormalizedPath),
+}
+
 /// One explicit live repository and at most one receiving desk owner. Hosts
 /// supply a fresh owner distinct from every desk/repository they already own.
 /// Source import bindings belong to the desk, not this repository. Closing this
@@ -101,7 +109,7 @@ impl DeskRepository {
     /// Replacing a repository is a host transaction; a failed candidate owns no desk state.
     pub fn open_with_policy(owner: ArenaOwnerId, root: &Path, options: AtlasSessionOptions,
         policy: CatalogDiscoveryPolicy, canceled: impl FnMut() -> bool) -> Result<Self, DeskRepositoryError> {
-        Self::open_scoped(owner, root, None, options, policy, canceled)
+        Self::open_scoped(owner, root, RepositoryDiscoveryScope::Workspace, options, policy, canceled)
     }
     /// Discover the selected directory before spending its independent metadata cap.
     /// The original project grant and project-relative source paths remain authoritative.
@@ -109,9 +117,19 @@ impl DeskRepository {
     pub fn open_directory_with_policy(owner: ArenaOwnerId, root: &Path, directory: NormalizedPath,
         options: AtlasSessionOptions, policy: CatalogDiscoveryPolicy,
         canceled: impl FnMut() -> bool) -> Result<Self, DeskRepositoryError> {
-        Self::open_scoped(owner, root, Some(directory), options, policy, canceled)
+        Self::open_scoped(owner, root, RepositoryDiscoveryScope::Directory(directory), options, policy, canceled)
     }
-    fn open_scoped(owner: ArenaOwnerId, root: &Path, directory: Option<NormalizedPath>,
+    /// Admit one explicitly selected regular member without discovering siblings.
+    /// A file outside a bounded root or parent catalog can therefore be searched,
+    /// indexed and imported under the original project grant. Repository rules
+    /// still apply unless the caller explicitly selects IncludeExcluded.
+    /// Use atlas_session::file_path to admit raw native file components.
+    pub fn open_file_with_policy(owner: ArenaOwnerId, root: &Path, file: NormalizedPath,
+        options: AtlasSessionOptions, policy: CatalogDiscoveryPolicy,
+        canceled: impl FnMut() -> bool) -> Result<Self, DeskRepositoryError> {
+        Self::open_scoped(owner, root, RepositoryDiscoveryScope::File(file), options, policy, canceled)
+    }
+    fn open_scoped(owner: ArenaOwnerId, root: &Path, scope: RepositoryDiscoveryScope,
         options: AtlasSessionOptions, policy: CatalogDiscoveryPolicy,
         mut canceled: impl FnMut() -> bool) -> Result<Self, DeskRepositoryError> {
         check(&mut canceled)?;
@@ -120,10 +138,13 @@ impl DeskRepository {
         let lease = budget.try_reserve_managed(owner,
             ResourceAllocationId::new(1).map_err(|_| AppError::Admission)?,
             ByteLength::new(size_of::<Self>() as u64)).map_err(|_| AppError::Admission)?;
-        let atlas = match directory {
-            Some(directory) => AtlasSession::open_directory_with_policy(owner, root, directory,
-                options, policy, &mut canceled)?,
-            None => AtlasSession::open_with_policy(owner, root, options, policy, &mut canceled)?,
+        let atlas = match scope {
+            RepositoryDiscoveryScope::Workspace =>
+                AtlasSession::open_with_policy(owner, root, options, policy, &mut canceled)?,
+            RepositoryDiscoveryScope::Directory(directory) =>
+                AtlasSession::open_directory_with_policy(owner, root, directory, options, policy, &mut canceled)?,
+            RepositoryDiscoveryScope::File(file) =>
+                AtlasSession::open_file_with_policy(owner, root, file, options, policy, &mut canceled)?,
         };
         let search = RetainedAtlasSearch::new(&atlas)?;
         let paths = RetainedAtlasPaths::new(&atlas)?;
