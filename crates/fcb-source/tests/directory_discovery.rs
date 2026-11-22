@@ -4,13 +4,15 @@
 //! Production subtree discovery: inherited policy, original path identity and
 //! bounded direct descent. Fixtures remain available for failure diagnosis.
 
-use std::{ffi::OsString, fs, os::unix::{ffi::OsStringExt, fs::symlink},
+use std::{collections::BTreeMap, ffi::OsString, fs, os::unix::{ffi::OsStringExt, fs::symlink},
     path::{Path, PathBuf}, sync::atomic::{AtomicU64, Ordering}};
-use fcb_core::{ArenaOwnerId, ByteLength, ResourceAllocationId, ResourceBudget, RootId};
+use fcb_core::{ArenaOwnerId, ByteLength, FileId, ResourceAllocationId, ResourceBudget, RootId, SourceRevision};
 use fcb_source::{BoundedDiscovery, CancelFlag, DiscoveryEntry, DiscoveryKind, DiscoveryLimits,
-    IgnoreMatcher, RawPath, RootGrant, ScanStatus, SourceError};
+    IgnoreMatcher, RawPath, RootGrant, ScanStatus, SourceError, SymlinkPolicy};
 use fcb_source::path::NormalizedPath;
 use fcb_source::ignore::repository::RuleLimits;
+use fcb_source::reconciliation::{DirtyHintTracker, KnownEntry, ReconciliationIncompleteReason,
+    ReconciliationPass};
 
 struct Tree(PathBuf);
 impl Tree {
@@ -63,6 +65,17 @@ fn drain(walker: &mut BoundedDiscovery) -> Vec<DiscoveryEntry> {
 fn included(entries: &[DiscoveryEntry]) -> Vec<Vec<u8>> {
     entries.iter().filter(|entry| entry.kind() == DiscoveryKind::File && !entry.is_excluded())
         .map(|entry| entry.path().as_bytes().to_vec()).collect()
+}
+fn known_catalog(tree: &Tree) -> BTreeMap<NormalizedPath, KnownEntry> {
+    let mut walker = BoundedDiscovery::open_metadata_only(tree.grant(),
+        SymlinkPolicy::DisallowAll, DiscoveryLimits::modest(), IgnoreMatcher::include_all()).unwrap();
+    assert_eq!(walker.directory(), None);
+    let entries = drain(&mut walker);
+    assert!(walker.is_complete());
+    entries.into_iter().enumerate().map(|(ordinal, entry)| (entry.path().clone(),
+        KnownEntry::new(FileId::new(owner(), ordinal as u64 + 1).unwrap(),
+            SourceRevision::new(owner(), 1).unwrap(), entry.kind(), entry.observed_len(), None, None)))
+        .collect()
 }
 
 #[test]
@@ -158,8 +171,10 @@ fn native_directory_bytes_are_never_utf8_or_separator_normalized() {
     let mut walker = BoundedDiscovery::open_metadata_only_in_directory(tree.grant(),
         NormalizedPath::from_dirent_name(b"C:\\raw\xff").unwrap(),
         limits(), IgnoreMatcher::include_all()).unwrap();
+    assert_eq!(walker.directory().unwrap().as_bytes(), b"C:\\raw\xff");
     assert_eq!(included(&drain(&mut walker)), vec![b"C:\\raw\xff/kept.rs".to_vec()]);
     assert!(walker.is_complete());
+    assert_eq!(walker.directory().unwrap().as_bytes(), b"C:\\raw\xff");
 }
 
 #[test]
@@ -211,4 +226,171 @@ fn empty_directory_is_complete_but_a_directory_lost_after_admission_is_partial()
     assert!(drain(&mut replaced).is_empty());
     assert!(!replaced.is_complete());
     assert!(replaced.aggregate().unavailable > 0);
+}
+
+#[test]
+fn scoped_discovery_reconciliation_preserves_the_rest_of_the_root_catalog() {
+    for rule_aware in [false, true] {
+        let tree = Tree::new();
+        let held = Tree::new();
+        for name in ["parent/selected/keep.rs", "parent/selected/gone.rs",
+            "parent/sibling/keep.rs", "parent/selectedish/keep.rs", "outside/keep.rs"] {
+            tree.file(name, b"kept");
+        }
+        let known = known_catalog(&tree);
+        fs::rename(tree.0.join("parent/selected/gone.rs"), held.0.join("gone.rs")).unwrap();
+        tree.file("parent/selected/new.rs", b"new");
+        let scope = path(b"parent/selected");
+        let gone = path(b"parent/selected/gone.rs");
+        let mut hints = DirtyHintTracker::new();
+        for (name, directory) in [(b"parent".as_slice(), true), (b"parent/selected", true),
+            (b"parent/selected/gone.rs", false), (b"parent/sibling", true),
+            (b"parent/selectedish", true), (b"outside", true)] {
+            hints.record_hint(path(name), directory);
+        }
+        let budget = budget();
+        let mut walker = if rule_aware { rules(&tree, scope.as_bytes(), &budget) } else {
+            BoundedDiscovery::open_metadata_only_in_directory(tree.grant(), scope.clone(),
+                limits(), IgnoreMatcher::include_all()).unwrap()
+        };
+        assert_eq!(walker.directory(), Some(&scope));
+        let report = ReconciliationPass::reconcile_from_discovery(
+            &mut walker, &CancelFlag::new(), &mut hints, known.clone(),
+        ).unwrap();
+
+        assert!(report.status.is_completed());
+        assert_eq!(report.directory, Some(scope.clone()));
+        assert_eq!(report.added, [path(b"parent/selected/new.rs")]);
+        assert_eq!(report.retained, [path(b"parent/selected/keep.rs")]);
+        assert_eq!(report.tombstoned, [gone.clone()]);
+        assert!(report.modified.is_empty());
+        assert_eq!(report.preserved_unseen, [path(b"outside"), path(b"outside/keep.rs"),
+            path(b"parent"), scope, path(b"parent/selectedish"), path(b"parent/selectedish/keep.rs"),
+            path(b"parent/sibling"), path(b"parent/sibling/keep.rs")]);
+        assert_eq!(hints.all_hints().iter().map(|hint| hint.path().as_bytes()).collect::<Vec<_>>(),
+            [b"parent".as_slice(), b"parent/sibling", b"parent/selectedish", b"outside"]);
+        assert!(report.is_honest_and_complete());
+
+        // A later complete root pass has authority to consume the remaining
+        // dirty work. Scoped protection must not disable genuine deletions.
+        let mut root = BoundedDiscovery::open_metadata_only(tree.grant(),
+            SymlinkPolicy::DisallowAll, DiscoveryLimits::modest(), IgnoreMatcher::include_all()).unwrap();
+        let report = ReconciliationPass::reconcile_from_discovery(
+            &mut root, &CancelFlag::new(), &mut hints, known,
+        ).unwrap();
+        assert!(report.status.is_completed());
+        assert_eq!(report.directory, None);
+        assert_eq!(report.tombstoned, [gone]);
+        assert!(report.preserved_unseen.is_empty());
+        assert_eq!(hints.pending_count(), 0);
+    }
+}
+
+#[test]
+fn interrupted_scoped_discovery_retains_scope_catalog_and_dirty_work() {
+    for interruption in ["canceled", "revoked", "moved"] {
+        let tree = Tree::new();
+        let held = Tree::new();
+        tree.file("parent/selected/keep.rs", b"kept");
+        tree.file("sibling/keep.rs", b"outside");
+        let known = known_catalog(&tree);
+        let expected_paths = known.keys().cloned().collect::<Vec<_>>();
+        let scope = path(b"parent/selected");
+        let grant = tree.grant();
+        let mut walker = BoundedDiscovery::open_metadata_only_in_directory(grant.clone(),
+            scope.clone(), limits(), IgnoreMatcher::include_all()).unwrap();
+        let mut hints = DirtyHintTracker::new();
+        hints.record_hint(path(b"parent"), true);
+        hints.record_hint(scope.clone(), true);
+        hints.record_hint(path(b"sibling"), true);
+        let expected_hints = hints.all_hints().to_vec();
+        let cancel = CancelFlag::new();
+        let reason = match interruption {
+            "canceled" => { cancel.cancel(); ReconciliationIncompleteReason::Canceled }
+            "revoked" => { grant.revoke(); ReconciliationIncompleteReason::GrantRevoked }
+            _ => {
+                fs::rename(tree.0.join("parent/selected"), held.0.join("moved")).unwrap();
+                ReconciliationIncompleteReason::EnumerationUnavailable
+            }
+        };
+        let report = ReconciliationPass::reconcile_from_discovery(
+            &mut walker, &cancel, &mut hints, known,
+        ).unwrap();
+        assert_eq!(report.directory, Some(scope.clone()));
+        assert_eq!(walker.directory(), Some(&scope));
+        assert_eq!(report.status.incomplete_reason(), Some(reason));
+        assert!(report.tombstoned.is_empty());
+        assert_eq!(report.preserved_unseen, expected_paths);
+        assert_eq!(hints.all_hints(), expected_hints.as_slice());
+        assert!(report.is_honest_and_complete());
+    }
+}
+
+#[test]
+fn ancestor_policy_or_artifact_exclusion_never_erases_a_scoped_catalog() {
+    for boundary in ["excluded", "invalid-policy", "owned-artifact"] {
+        let tree = Tree::new();
+        tree.file("parent/selected/keep.rs", b"kept");
+        tree.file("sibling/keep.rs", b"outside");
+        tree.file(".gitignore", match boundary {
+            "excluded" => b"parent/\n".as_slice(),
+            "invalid-policy" => b"[broken", _ => b"",
+        });
+        let known = known_catalog(&tree);
+        let expected_paths = known.keys().cloned().collect::<Vec<_>>();
+        let scope = path(b"parent/selected");
+        let budget = budget();
+        let mut walker = rules(&tree, scope.as_bytes(), &budget);
+        if boundary == "owned-artifact" {
+            walker.register_own_artifact_path(&tree.0.join("parent")).unwrap();
+        }
+        let mut hints = DirtyHintTracker::new();
+        hints.record_hint(path(b"parent"), true);
+        hints.record_hint(scope.clone(), true);
+        hints.record_hint(path(b"sibling"), true);
+        let expected_hints = hints.all_hints().to_vec();
+        let report = ReconciliationPass::reconcile_from_discovery(
+            &mut walker, &CancelFlag::new(), &mut hints, known,
+        ).unwrap();
+        assert_eq!(report.directory, Some(scope));
+        assert!(!report.status.is_completed(), "{boundary}");
+        assert!(report.tombstoned.is_empty());
+        assert_eq!(report.preserved_unseen, expected_paths);
+        assert_eq!(hints.all_hints(), expected_hints.as_slice());
+        assert_eq!(walker.root_is_excluded(), boundary != "invalid-policy");
+    }
+}
+
+#[test]
+fn scoped_reconciliation_keeps_excluded_descendants_while_deleting_observed_absence() {
+    let tree = Tree::new();
+    let held = Tree::new();
+    tree.file(".gitignore", b"parent/selected/build/\n");
+    for name in ["parent/selected/build/hidden.rs", "parent/selected/keep.rs",
+        "parent/selected/gone.rs", "sibling/keep.rs"] { tree.file(name, b"kept"); }
+    let known = known_catalog(&tree);
+    fs::rename(tree.0.join("parent/selected/gone.rs"), held.0.join("gone.rs")).unwrap();
+    let scope = path(b"parent/selected");
+    let hidden = path(b"parent/selected/build/hidden.rs");
+    let gone = path(b"parent/selected/gone.rs");
+    let sibling = path(b"sibling");
+    let mut hints = DirtyHintTracker::new();
+    hints.record_hint(scope.clone(), true);
+    hints.record_hint(hidden.clone(), false);
+    hints.record_hint(gone.clone(), false);
+    hints.record_hint(sibling.clone(), true);
+    let budget = budget();
+    let mut walker = rules(&tree, scope.as_bytes(), &budget);
+    let report = ReconciliationPass::reconcile_from_discovery(
+        &mut walker, &CancelFlag::new(), &mut hints, known,
+    ).unwrap();
+    assert!(report.status.is_completed());
+    assert!(!walker.root_is_excluded());
+    assert_eq!(report.directory, Some(scope.clone()));
+    assert_eq!(report.tombstoned, [gone]);
+    assert!(report.preserved_unseen.contains(&hidden));
+    assert!(report.preserved_unseen.contains(&path(b"sibling/keep.rs")));
+    assert_eq!(hints.all_hints().iter().map(|hint| hint.path()).collect::<Vec<_>>(),
+        [&scope, &hidden, &sibling]);
+    assert!(report.is_honest_and_complete());
 }

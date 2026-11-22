@@ -274,6 +274,10 @@ impl BoundedDiscovery {
     pub fn own_exclusions(&self) -> &OwnArtifactExclusion { &self.own_exclusions }
     pub fn own_exclusions_mut(&mut self) -> &mut OwnArtifactExclusion { &mut self.own_exclusions }
     pub fn register_own_artifact_path(&mut self, path: &Path) -> Result<(), SourceError> { self.own_exclusions.register_path(path) }
+    /// The immutable root-relative enumeration scope, or `None` for the whole
+    /// granted root. Reading ancestor rules does not widen this scope. Consumers
+    /// reconciling prior catalogs must retain it even after traversal stops.
+    pub fn directory(&self) -> Option<&NormalizedPath> { self.directory.as_ref() }
     pub fn limits(&self) -> DiscoveryLimits { self.limits }
     pub fn scan_epoch(&self) -> ScanEpoch { self.epoch }
     pub fn status(&self) -> ScanStatus { self.status }

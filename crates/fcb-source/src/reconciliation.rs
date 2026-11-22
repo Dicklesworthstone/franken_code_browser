@@ -519,14 +519,17 @@ impl ReconciliationPass {
         report
     }
 
-    /// Reconcile a directory pass directly using a `BoundedDiscovery` session.
+    /// Reconcile directly using a `BoundedDiscovery` session's admitted scope.
+    /// A focused directory walk cannot establish absence in the rest of a
+    /// supplied whole-root catalog, even when that walk completes successfully.
     pub fn reconcile_from_discovery(
         discovery: &mut BoundedDiscovery,
         cancel: &CancelFlag,
         dirty_tracker: &mut DirtyHintTracker,
         known_entries: BTreeMap<NormalizedPath, KnownEntry>,
     ) -> Result<ReconciliationReport, SourceError> {
-        let mut pass = Self::new(None, discovery.scan_epoch(), dirty_tracker, known_entries);
+        let mut pass = Self::new(discovery.directory().cloned(), discovery.scan_epoch(),
+            dirty_tracker, known_entries);
 
         loop {
             match discovery.next_batch(cancel) {
