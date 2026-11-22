@@ -14,6 +14,7 @@ use fcb_app::host::{HostResponse, desk::{DeskCommand, DeskError, DeskLimits, Des
     comparison::{DeskComparisonError, DeskComparisonLimits}}};
 use fcb_core::{ArenaOwnerId, ByteLength, ResourceAllocationId, ResourceBudget, ResourceLease};
 use super::reader_sessions::{self, ReaderSessions};
+use super::observed_reader_sessions::{self, ObservedReaderSessions};
 
 pub(super) const MAX_DESK_SESSIONS: usize = 2;
 
@@ -22,12 +23,16 @@ pub(super) enum AccessError {
     Unknown, NotOpen, AlreadyOpen, Busy, Capacity, Canceled, Closed, Poisoned,
     InvalidArgument, Desk(DeskSessionError), Checkpoint(CheckpointIoError),
     Reader(reader_sessions::AccessError), ReaderTransfer(DeskReaderError), Comparison(DeskComparisonError),
+    ObservedReader(observed_reader_sessions::AccessError),
 }
 impl From<DeskSessionError> for AccessError { fn from(e: DeskSessionError) -> Self { Self::Desk(e) } }
 impl From<CheckpointIoError> for AccessError { fn from(e: CheckpointIoError) -> Self { Self::Checkpoint(e) } }
 impl From<reader_sessions::AccessError> for AccessError { fn from(e: reader_sessions::AccessError) -> Self { Self::Reader(e) } }
 impl From<DeskReaderError> for AccessError { fn from(e: DeskReaderError) -> Self { Self::ReaderTransfer(e) } }
 impl From<DeskComparisonError> for AccessError { fn from(e: DeskComparisonError) -> Self { Self::Comparison(e) } }
+impl From<observed_reader_sessions::AccessError> for AccessError {
+    fn from(e: observed_reader_sessions::AccessError) -> Self { Self::ObservedReader(e) }
+}
 impl std::fmt::Display for AccessError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -39,6 +44,7 @@ impl std::fmt::Display for AccessError {
             Self::Desk(e) => return write!(f, "{e}"), Self::Checkpoint(e) => return write!(f, "{e}"),
             Self::Reader(e) => return write!(f, "{e}"), Self::ReaderTransfer(e) => return write!(f, "{e}"),
             Self::Comparison(e) => return write!(f, "{e}"),
+            Self::ObservedReader(e) => return write!(f, "{e}"),
         })
     }
 }
@@ -48,7 +54,7 @@ impl AccessError {
             Self::Canceled | Self::Closed => true,
             Self::Desk(e) => e.is_canceled(), Self::Checkpoint(e) => e.is_canceled(),
             Self::Reader(e) => e.canceled(), Self::ReaderTransfer(e) => e.is_canceled(),
-            Self::Comparison(e) => e.is_canceled(), _ => false,
+            Self::Comparison(e) => e.is_canceled(), Self::ObservedReader(e) => e.canceled(), _ => false,
         }
     }
     pub(super) fn json(self, handle: u64) -> String {
@@ -75,6 +81,10 @@ pub(super) enum Command<'a> {
         start: u64, end: u64, label: &'a str },
     Annotate { expected: u64, attempt: u64, pane: u64, label: &'a str, body: &'a str },
     EditBookmark { expected: u64, attempt: u64, bookmark: u64, label: &'a str, body: &'a str },
+    ObservedPassage { expected: u64, passage: u64 },
+    EditObservedPassage { expected: u64, attempt: u64, passage: u64, sequence: u64,
+        label: &'a str, body: &'a str },
+    ForgetObservedPassage { expected: u64, attempt: u64, passage: u64, sequence: u64 },
     SuggestReattachment { expected: u64, bookmark: u64, sequence: u64, pane: u64,
         max_work: u64, max_edits: usize },
     ReattachRange { expected: u64, attempt: u64, bookmark: u64, sequence: u64, pane: u64,
@@ -160,6 +170,16 @@ impl DeskSessions {
         self.with_session(handle, canceled, |desk, stop| {
             match command {
                 Command::State => return Ok(desk.state(&mut *stop)?),
+                Command::ObservedPassage { expected, passage } => {
+                    return Ok(desk.observed_passage(expected, passage, &mut *stop)?);
+                }
+                Command::EditObservedPassage { expected, attempt, passage, sequence, label, body } => {
+                    validate_note(label, body)?;
+                    desk.edit_observed_passage(expected, attempt, passage, sequence, label, body, &mut *stop)?;
+                }
+                Command::ForgetObservedPassage { expected, attempt, passage, sequence } => {
+                    desk.forget_observed_passage(expected, attempt, passage, sequence, &mut *stop)?;
+                }
                 Command::Open { expected, attempt, path } => { desk.open_file(expected, attempt, path, &mut *stop)?; }
                 Command::Restore { expected, attempt, path } => { desk.restore_checkpoint_file(expected, attempt, path, &mut *stop)?; }
                 Command::Annotate { expected, attempt, pane, label, body } => {
@@ -238,6 +258,20 @@ impl DeskSessions {
                 let origin = ImportedSourceId { file: capture.request().file(), revision: capture.request().revision() };
                 let label = fcb::source::RawPath::from_path(source.path()).display_escaped().to_string();
                 desk.import_source(expected, attempt, origin, &label, capture.bytes(), start, Some(selected), &mut *source_stop)?;
+                Ok(desk.state(&mut *source_stop)?)
+            }, &mut *desk_stop)
+        })
+    }
+    /// Retain selected observed bytes without treating an extent as a complete
+    /// capture. The source handle supplies provenance, decoder and exact data;
+    /// no caller-provided display text or pathname authorizes this transfer.
+    pub(super) fn import_observation(&self, handle: u64, readers: &ObservedReaderSessions,
+        reader: u64, expected: u64, attempt: u64, observation: u64, start: u64, end: u64,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
+        let selected = range(start, end)?;
+        self.with_session(handle, canceled, |desk, desk_stop| {
+            readers.with_retained(reader, |source, source_stop| {
+                desk.import_observation(expected, attempt, source, observation, selected, &mut *source_stop)?;
                 Ok(desk.state(&mut *source_stop)?)
             }, &mut *desk_stop)
         })
@@ -332,3 +366,7 @@ mod reader_tests;
 #[cfg(all(test, unix))]
 #[path = "desk_annotations_sessions_tests.rs"]
 mod annotation_tests;
+
+#[cfg(all(test, unix))]
+#[path = "desk_observed_sessions_tests.rs"]
+mod observed_tests;

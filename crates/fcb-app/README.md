@@ -1315,6 +1315,72 @@ short and complete canceled writes, source damage, and every observed
 construction/publication cancellation boundary. This implementation is
 code-first; independent executable verification remains pending.
 
+## Indexed case-insensitive search in saved repositories
+
+Saved literal search now uses compatible persisted indexes with `--ignore-case`,
+including forward FCBI segments, resident FCBO postings and demand-paged FCBD
+postings. `SavedRepositorySession::search_matching_page` exposes the same route
+to native hosts. Fresh index builds certify ASCII source rows and intersect
+bounded unions of upper/lowercase trigram variants before loading candidates.
+Every candidate still goes through the existing exact source-digest check and
+Unicode scalar-lowercase matcher. Match order, original byte ranges, total
+counts and `next_match_offset` keep their existing meaning.
+
+Unicode sources, UTF-16, malformed text, short or non-ASCII needles, and uncovered
+members keep the verified fallback route. Older semantics 1 indexes remain
+readable and usable for exact search; their original coverage records are not
+silently promoted into ASCII certificates. Build a fresh index to gain the new
+pruning. A refresh that reuses old records preserves their conservative fallback.
+Receipts identify `ascii-case-variants-with-source-fallback` and retain separate
+candidate, fallback, source-read and completeness accounting.
+
+## Retain and recover observed passages
+
+`DeskSession::import_observation` accepts an existing `ObservedReaderSession`, an
+accepted observation ID and a nonempty original-byte selection. The source
+reader validates the selection against its retained logical window; the Desk
+retains that observation's bounded bytes and decoder context. Neither this
+transfer nor a later read reopens the source pathname. The public C equivalents
+are in [`fcb_desk.h`](../fcb-bridge/include/fcb_desk.h).
+
+State exposes separate `observations` and `observed_passages` arrays. These
+records preserve absolute 64-bit offsets, reversible path bytes, original
+observation provenance, explicit encoding, before/after observed lengths,
+consistency evidence and an extent SHA-256. A passage stores its selected range,
+label, exact UTF-8 body and update sequence. It is distinct from a complete-file
+pane, and the unseen file never gains an immutability claim. Repeated current
+selections share retained observation storage; restored provenance cannot alias
+new live handles after a process restart.
+
+The default 32 source slots and 32 personal-record slots are shared with complete
+captures and bookmarks. Original bytes share the 32 MiB retained allowance.
+Selected passages are at most 256 KiB; imported observation backing is bounded
+by the core's 1 MiB extent limit and the Desk's source-byte limit. Reads return
+logical text plus exact selected `original_hex`, and disclose replacement text
+for malformed input. Editing or forgetting requires the current model revision,
+a fresh attempt and the accepted passage update sequence.
+
+After restoring an observed-passage checkpoint, `fcb desk --stdio` supports:
+
+```text
+EXPECTED_REV<TAB>observed-passage<TAB>PASSAGE
+EXPECTED_REV<TAB>edit-observed-passage<TAB>PASSAGE<TAB>UPDATE_SEQUENCE<TAB>LABEL<TAB>BODY
+EXPECTED_REV<TAB>edit-observed-passage-hex<TAB>PASSAGE<TAB>UPDATE_SEQUENCE<TAB>LABEL_UTF8_HEX<TAB>BODY_UTF8_HEX
+EXPECTED_REV<TAB>forget-observed-passage<TAB>PASSAGE<TAB>UPDATE_SEQUENCE
+```
+
+Checkpoint format FCBK 1.2 preserves observed bytes and all accepted notes, with
+fresh local identities on restore. Existing 1.0 and 1.1 checkpoints remain
+readable; desks with no observed passages still emit 1.1. A failed or canceled
+restore leaves the accepted Desk intact. Bookmark source-pack exports retain
+their narrower scope and report `observed_passages_included:false` and
+`excluded_observed_passages`; use a checkpoint to save the entire Desk.
+
+Regression sources cover large offsets, UTF-8/BOM and both UTF-16 byte orders,
+malformed bytes, canceled transfers, shared retention, stale note versions,
+offline checkpoint recovery and real C/stdio boundaries. Executable verification
+remains pending in the independent strict-RCH lane.
+
 ## Retained-reader expression Find
 
 `ReaderSession::search_expression_page` applies the shared bounded expression

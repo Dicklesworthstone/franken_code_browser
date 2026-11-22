@@ -51,6 +51,9 @@ Commands (arguments separated by literal TABs, not spaces):\n\
   bookmark PANE LABEL | recall BOOKMARK | forget BOOKMARK\n\
   annotate PANE LABEL BODY | annotate-hex PANE LABEL_UTF8_HEX BODY_UTF8_HEX\n\
   edit-bookmark BOOKMARK LABEL BODY | edit-bookmark-hex BOOKMARK LABEL_UTF8_HEX BODY_UTF8_HEX\n\
+  observed-passage PASSAGE | forget-observed-passage PASSAGE UPDATE_SEQUENCE\n\
+  edit-observed-passage PASSAGE UPDATE_SEQUENCE LABEL BODY\n\
+  edit-observed-passage-hex PASSAGE UPDATE_SEQUENCE LABEL_UTF8_HEX BODY_UTF8_HEX\n\
   repo-open ROOT | repo-open-hex ROOT_PATH_HEX\n\
   repo-info TOKEN | repo-close TOKEN | repo-clear TOKEN QUERY_GEN\n\
   repo-find TOKEN QUERY_GEN LIMIT SCAN_BYTES TEXT\n\
@@ -133,7 +136,7 @@ pub(crate) fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut im
     };
     // One reusable encoding reservation and bounded framing/derived descriptors.
     // Each actual index, layout and capture uses the desk's shared budget.
-    let budget = match ResourceBudget::new(owner(), ByteLength::new(16 * 1024 * 1024)) {
+    let budget = match ResourceBudget::new(owner(), ByteLength::new(32 * 1024 * 1024)) {
         Ok(b) => b, Err(_) => return EXIT_ERROR,
     };
     let _frame_lease = match budget.try_reserve_managed(owner(), allocation(1),
@@ -145,7 +148,7 @@ pub(crate) fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut im
     let mut frame = Vec::new();
     if frame.try_reserve_exact(MAX_FRAME_BYTES).is_err() || frame.capacity() > MAX_FRAME_BYTES { return EXIT_ERROR; }
     let mut input = BufReader::with_capacity(4096, stdin);
-    let mut output = match Output::new(owner(), 8 * 1024 * 1024, &budget, allocation(2)) {
+    let mut output = match Output::new(owner(), crate::output::MAX_ENCODED_BYTES, &budget, allocation(2)) {
         Ok(out) => out, Err(_) => return EXIT_ERROR,
     };
     let mut repository = RepositoryCommands::new();
@@ -359,6 +362,18 @@ fn execute(session: &mut DeskSession, attempt: u64, frame: &str,
             Some(ReadingTarget::Line(LineNumber::new(number(line)?).map_err(|_| Failure::Protocol("DESK_INVALID_LINE"))?)),
             ReadingWindowOptions::default(), &mut *canceled)?, false)),
         ("copy", [p]) => return Ok((session.copy_selection(expected, pane(session, p)?, &mut *canceled)?, false)),
+        ("observed-passage", [id]) => return Ok((session.observed_passage(expected, number(id)?, &mut *canceled)?, false)),
+        ("edit-observed-passage" | "edit-observed-passage-hex", [id, sequence, label, body]) => {
+            let encoded = command == "edit-observed-passage-hex";
+            let label = personal_text(label, MAX_BOOKMARK_LABEL_BYTES, encoded, DeskError::InvalidLabel)?;
+            let body = personal_text(body, MAX_ANNOTATION_BODY_BYTES, encoded, DeskError::InvalidBody)?;
+            session.edit_observed_passage(expected, attempt, number(id)?, number(sequence)?, &label, &body, &mut *canceled)?;
+            None
+        }
+        ("forget-observed-passage", [id, sequence]) => {
+            session.forget_observed_passage(expected, attempt, number(id)?, number(sequence)?, &mut *canceled)?;
+            None
+        }
         ("find" | "find-text-hex", [p, generation, limit, bytes, text]) => {
             let decoded;
             let needle = if command == "find-text-hex" {

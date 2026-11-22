@@ -11,6 +11,7 @@ use super::{reply, string_out, SearchCancellationCallback};
 use super::observed_reader_sessions::{AccessError, Command, ObservedReaderSessions};
 
 static READERS: OnceLock<ObservedReaderSessions> = OnceLock::new();
+pub(super) fn registry() -> Option<&'static ObservedReaderSessions> { READERS.get() }
 const MAX_PATH_BYTES: usize = 16_384;
 
 fn answer(handle: u64, work: impl FnOnce(&ObservedReaderSessions) -> Result<HostResponse, AccessError>)

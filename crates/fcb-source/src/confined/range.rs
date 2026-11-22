@@ -94,6 +94,44 @@ struct ExtentData {
 #[derive(Clone, Debug)]
 pub struct ObservedExtent(Arc<ExtentData>);
 impl ObservedExtent {
+    /// Restore recorded evidence without upgrading its consistency or filling
+    /// missing bytes. `range` must be the exact delivered prefix of `request`.
+    /// The caller reserves the complete batch before allocation; shared leases
+    /// must cover the sum of every payload and descriptor using that batch.
+    /// The lease stays alive with every clone and derived text view.
+    pub fn restore_recorded(request: CaptureRequest, range: ByteRange,
+        observed_length: ByteLength, final_length: Option<ByteLength>,
+        consistency: ExtentConsistency, bytes: &[u8], lease: ResourceLease)
+        -> Result<Self, ExtentError> {
+        let requested = checked_request(request, observed_length)?;
+        if range.start() != requested.start() || range.end() > requested.end()
+            || range.len().get() != bytes.len() as u64 {
+            return Err(SourceError::MetadataMismatch.into());
+        }
+        let full = range == requested;
+        let valid = match consistency {
+            ExtentConsistency::ShortRead => !full,
+            ExtentConsistency::HostSupplied | ExtentConsistency::UnchangedMetadata =>
+                full && final_length == Some(observed_length),
+            ExtentConsistency::ChangedDuringRead => full && final_length.is_some(),
+            ExtentConsistency::MetadataUnavailable => full
+                && final_length.is_none_or(|length| length == observed_length),
+        };
+        if !valid { return Err(SourceError::MetadataMismatch.into()); }
+        let charge = bytes.len().checked_add(size_of::<ExtentData>() + 4 * size_of::<usize>())
+            .ok_or(ExtentError::InvalidLimits)?;
+        let info = lease.info();
+        if info.owner() != request.file().owner()
+            || info.kind() != fcb_core::ResourceKind::Managed || info.bytes().get() < charge as u64 {
+            return Err(ExtentError::ResourceDenied);
+        }
+        let mut owned = Vec::new();
+        owned.try_reserve_exact(bytes.len()).map_err(|_| ExtentError::AllocationFailed)?;
+        if owned.capacity() > bytes.len() { return Err(ExtentError::ResourceDenied); }
+        owned.extend_from_slice(bytes);
+        Ok(Self::publish(request, range, owned, observed_length, final_length, consistency, lease))
+    }
+
     /// Admit and copy exactly the requested host-supplied range. This bounded
     /// worker operation does not hash an unseen whole file or infer its encoding.
     pub fn from_bytes(request: CaptureRequest, observed_length: ByteLength, bytes: &[u8],

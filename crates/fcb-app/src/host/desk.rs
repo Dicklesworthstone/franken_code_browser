@@ -21,6 +21,7 @@ use fcb::ui::reading_panes::desk::DeskView;
 use crate::{AppError, EXIT_OK, EXIT_PARTIAL, MANAGED_BYTES};
 use crate::output::{Output, OutputError, MAX_RESPONSE_BYTES};
 use super::{HostError, HostResponse, MAX_HOST_TEXT_BYTES};
+use super::observed_reader::ObservedReaderError;
 
 pub const MAX_DESK_MATCHES: usize = 4096;
 pub const MAX_DESK_NEEDLE_BYTES: usize = 1024;
@@ -29,7 +30,7 @@ pub const MAX_DESK_COPY_BYTES: usize = 256 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeskSessionError {
     Desk(DeskError), Host(HostError), App(AppError), Reader(ReaderError),
-    Stream(StreamReadError), Output(OutputError), MissingQuery, StaleQuery, MissingHit,
+    Stream(StreamReadError), Output(OutputError), Observed(ObservedReaderError), MissingQuery, StaleQuery, MissingHit,
 }
 impl std::fmt::Display for DeskSessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -37,6 +38,7 @@ impl std::fmt::Display for DeskSessionError {
             Self::Desk(e) => write!(f, "{e}"), Self::Host(e) => write!(f, "{e}"),
             Self::App(e) => write!(f, "{e}"), Self::Reader(e) => write!(f, "{e}"),
             Self::Stream(e) => write!(f, "{e}"), Self::Output(e) => write!(f, "{e}"),
+            Self::Observed(e) => write!(f, "{e}"),
             Self::MissingQuery => f.write_str("DESK_NO_QUERY"), Self::StaleQuery => f.write_str("DESK_STALE_QUERY"),
             Self::MissingHit => f.write_str("DESK_MISSING_HIT"),
         }
@@ -49,11 +51,13 @@ impl From<AppError> for DeskSessionError { fn from(e: AppError) -> Self { Self::
 impl From<ReaderError> for DeskSessionError { fn from(e: ReaderError) -> Self { Self::Reader(e) } }
 impl From<StreamReadError> for DeskSessionError { fn from(e: StreamReadError) -> Self { Self::Stream(e) } }
 impl From<OutputError> for DeskSessionError { fn from(e: OutputError) -> Self { Self::Output(e) } }
+impl From<ObservedReaderError> for DeskSessionError { fn from(e: ObservedReaderError) -> Self { Self::Observed(e) } }
 impl DeskSessionError {
     pub fn is_canceled(self) -> bool {
         match self {
             Self::Desk(DeskError::Canceled) | Self::Reader(ReaderError::Canceled) => true,
             Self::App(e) | Self::Host(HostError::App(e)) => e.is_canceled(),
+            Self::Observed(e) => e.is_canceled(),
             _ => false,
         }
     }
@@ -104,8 +108,7 @@ impl DeskSession {
         self.validate_mutation(expected, attempt)?;
         check(&mut canceled)?;
         if path.as_os_str().is_empty() || path.as_os_str().len() > 16_384 { return Err(DeskError::InvalidLocation.into()); }
-        let id = self.next_source;
-        self.next_source = id.checked_add(1).ok_or(DeskError::IdentityExhausted)?;
+        let id = self.claim_source_identity()?;
         let raw = super::read_bytes(path, self.desk.limits().source_bytes as usize, &mut canceled)?;
         let raw_len = raw.bytes.len() as u64;
         self.initial_source_bytes_read = self.initial_source_bytes_read.checked_add(raw_len).ok_or(DeskError::IdentityExhausted)?;
@@ -182,7 +185,9 @@ impl DeskSession {
             out.literal(",\"update_sequence\":")?; out.integer(mark.update_sequence())?;
             location_fields(&mut out, mark.location())?; out.literal("}")?;
         }
-        out.literal("]}\n")?;
+        out.literal("]")?;
+        observations::encode_state(&mut out, &self.desk, &mut canceled)?;
+        out.literal("}\n")?;
         self.finish(out, EXIT_OK, &mut canceled)
     }
 
@@ -316,6 +321,13 @@ impl DeskSession {
         if attempt == 0 || attempt <= self.desk.last_attempt() { return Err(DeskError::StaleAttempt.into()); }
         Ok(())
     }
+    fn claim_source_identity(&mut self) -> Result<u64, DeskSessionError> {
+        // Failed checkpoint/import preparations may have spent core identities
+        // without changing the accepted model. Never reuse those identities.
+        let id = self.next_source.max(self.desk.next_source_identity()?);
+        self.next_source = id.checked_add(1).ok_or(DeskError::IdentityExhausted)?;
+        Ok(id)
+    }
     fn next_id(&mut self) -> Result<ResourceAllocationId, DeskSessionError> {
         let n = self.next_allocation;
         self.next_allocation = n.checked_add(1).ok_or(DeskError::IdentityExhausted)?;
@@ -328,7 +340,11 @@ impl DeskSession {
     }
     fn output(&mut self, command: &str) -> Result<Output, DeskSessionError> {
         let id = self.next_id()?;
-        let mut out = Output::new(self.desk.owner(), MAX_RESPONSE_BYTES, &self.budget, id)?;
+        // Legal saved paths and personal text can expand when JSON-escaped.
+        // At the maximum 64 observations/notes their conservative full state
+        // bound remains below 16 MiB; reads keep the ordinary 8 MiB response cap.
+        let limit = if command == "state" { crate::output::MAX_ENCODED_BYTES } else { MAX_RESPONSE_BYTES };
+        let mut out = Output::new(self.desk.owner(), limit, &self.budget, id)?;
         out.literal("{\"schema\":\"fcb.reading-desk/1\",\"status\":\"ok\",\"command\":")?; out.quoted(command)?;
         out.literal(",\"owner\":")?; out.integer(self.desk.owner().get())?;
         out.literal(",\"model_revision\":")?; out.integer(self.desk.revision())?;
@@ -373,6 +389,8 @@ pub mod persistence;
 pub mod export;
 /// Bounded cross-owner source transfer with exact identity receipts.
 pub mod imports;
+/// Exact observed passages, personal notes and offline checkpoint retention.
+pub mod observations;
 
 /// Explicit repository search and exact-result adoption into persistent readers.
 pub mod repository;

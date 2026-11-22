@@ -13,7 +13,7 @@
 use std::io::{self, Read};
 
 use crate::store::envelope::{Sha256, Sha256Digest, CHECKSUM_LEN, FRAME_LEN, HEADER_LEN};
-use super::{MAX_CHECKPOINT_BYTES, SCHEMA};
+use super::{MAX_CHECKPOINT_BYTES, SCHEMA, OBSERVATION_SCHEMA};
 
 const READ_BYTES: usize = 64 * 1024;
 const MAX_READ_CALLS: u64 = 65_536;
@@ -75,7 +75,7 @@ pub fn verify_checkpoint_integrity(
     }
     let major = u16::from_le_bytes(header[8..10].try_into().expect("fixed header"));
     let minor = u16::from_le_bytes(header[10..12].try_into().expect("fixed header"));
-    if major != SCHEMA.major || minor > SCHEMA.minor || header[12..16] != [0; 4] {
+    if major != SCHEMA.major || minor > OBSERVATION_SCHEMA.minor || header[12..16] != [0; 4] {
         return Err(CheckpointIntegrityError::UnsupportedVersion);
     }
     let mut remaining = u64::from_le_bytes(header[16..24].try_into().expect("fixed header"));

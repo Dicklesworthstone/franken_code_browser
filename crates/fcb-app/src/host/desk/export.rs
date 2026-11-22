@@ -55,6 +55,7 @@ pub struct DeskSourcePackExport {
     write: CheckpointSave,
     limits: DeskSourcePackLimits,
     coverage: DeskSourcePackCoverage,
+    excluded_observed_passages: u64,
     scalars: u64,
 }
 impl DeskSourcePackExport {
@@ -85,7 +86,7 @@ impl DeskSession {
                 document_bytes: 0, source_bytes: 0, digest: None, error: None },
             limits, coverage: DeskSourcePackCoverage {
                 total_bookmarks: self.desk.bookmarks().len() as u64, ..Default::default()
-            }, scalars: 0,
+            }, excluded_observed_passages: self.desk.observed_passages().len() as u64, scalars: 0,
         };
         let result = (|| -> Result<(), CheckpointIoError> {
             if expected != self.desk.revision() { return Err(DeskSessionError::from(DeskError::StaleRevision).into()); }
@@ -199,6 +200,8 @@ impl DeskSession {
         match saved.digest() { Some(digest) => out.quoted(&digest.to_hex())?, None => out.literal("null")? }
         out.literal(",\"budgets\":")?; limits_output(&mut out, saved.limits)?;
         out.literal(",\"coverage\":")?; coverage_output(&mut out, saved.coverage)?;
+        out.literal(",\"completeness_scope\":\"all-bookmarked-selections\",\"observed_passages_included\":false,\"excluded_observed_passages\":")?;
+        out.integer(saved.excluded_observed_passages)?;
         out.literal(",\"complete\":")?; out.boolean(saved.document_bytes() > 0 && saved.coverage.complete())?;
         out.literal(",\"contains_source_payloads\":")?; out.boolean(saved.coverage.selected_original_bytes > 0)?;
         out.literal(",\"contains_personal_labels\":true,\"contains_user_text\":true,\"redacted\":false,\"encrypted\":false,\"overwritten\":false,\"live_roots_accessed\":false,\"native_presented\":false,\"power_loss_qualified\":false,\"error\":")?;
@@ -217,6 +220,8 @@ fn header(out: &mut Output, session: &DeskSession, limits: DeskSourcePackLimits)
     out.literal(",\"owner\":")?; out.integer(session.desk.owner().get())?;
     out.literal(",\"model_revision\":")?; out.integer(session.desk.revision())?;
     out.literal(",\"last_attempt\":")?; out.integer(session.desk.last_attempt())?;
+    out.literal(",\"observed_passages_included\":false,\"excluded_observed_passages\":")?;
+    out.integer(session.desk.observed_passages().len() as u64)?;
     out.literal(",\"source_representation\":\"original-bytes-lowercase-hex\",\"character_representation\":\"unicode-scalars-in-serialized-utf8-json\",\"completeness_scope\":\"all-bookmarked-selections\",\"deduplication\":\"none-preserve-bookmark-order\",\"live_roots_accessed\":false,\"redacted\":false,\"encrypted\":false,\"payload_truncated\":false,\"source_labels_are_path_authority\":false,\"budgets\":")?;
     limits_output(out, limits)?;
     out.literal(",\"admission\":{\"policy\":\"whole-selections-with-reserved-provenance\",\"per_entry_overhead_reserved\":")?;

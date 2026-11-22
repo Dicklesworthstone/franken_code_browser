@@ -151,7 +151,7 @@ fn checksummed_hostile_counts_versions_and_wide_lengths_are_rejected() {
         let mut bytes = saved.bytes().to_vec(); bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes()); resign(&mut bytes);
         assert!(d.restore_checkpoint(1, attempt, &bytes, alloc(3000 + attempt), || false).is_err());
     }
-    let mut bytes = saved.bytes().to_vec(); bytes[10] = 2; resign(&mut bytes);
+    let mut bytes = saved.bytes().to_vec(); bytes[10] = 3; resign(&mut bytes);
     assert_eq!(d.restore_checkpoint(1, 5, &bytes, alloc(3005), || false), Err(CheckpointError::UnsupportedVersion));
     assert_eq!(d.revision(), 1);
 }

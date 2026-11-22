@@ -119,6 +119,45 @@ pub extern "C" fn fcb_desk_import_reader(handle: u64, expected: u64, attempt: u6
         desks.import_reader(handle, readers, reader, expected, attempt, start, end, || false)
     }))
 }
+/// Keep a verified selection from one retained bounded observation. Both opaque
+/// handles must remain alive through return; no source path or text is supplied.
+/// Canceled/lost mutation replies require state reconciliation before retry.
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_desk_import_observation(handle: u64, expected: u64, attempt: u64,
+    reader: u64, observation: u64, start: u64, end: u64) -> *mut c_char {
+    reply(|| answer(handle, |desks| {
+        let readers = super::observed_reader_ffi::registry().ok_or(AccessError::InvalidArgument)?;
+        desks.import_observation(handle, readers, reader, expected, attempt, observation, start, end, || false)
+    }))
+}
+/// Read exact saved original bytes and logical text, without source I/O.
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_desk_observed_passage(handle: u64, expected: u64, passage: u64) -> *mut c_char {
+    reply(|| answer(handle, |desks| desks.execute(handle,
+        Command::ObservedPassage { expected, passage }, || false)))
+}
+/// Edit personal text only, guarded by model revision, attempt and note version.
+/// # Safety
+/// Label/body contracts are identical to fcb_desk_annotate, including exact
+/// embedded NUL handling in length-prefixed bodies and one free per response.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_desk_edit_observed_passage(handle: u64, expected: u64, attempt: u64,
+    passage: u64, sequence: u64, label: *const c_char, body: *const u8, body_bytes: u64) -> *mut c_char {
+    reply(|| answer(handle, |desks| {
+        let body = unsafe { note_body(body, body_bytes) }?;
+        let label = unsafe { cstr(label) }.ok_or(AccessError::InvalidArgument)?;
+        desks.execute(handle, Command::EditObservedPassage {
+            expected, attempt, passage, sequence, label, body,
+        }, || false)
+    }))
+}
+/// Forget one exact note version and release its observation when unreferenced.
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_desk_forget_observed_passage(handle: u64, expected: u64, attempt: u64,
+    passage: u64, sequence: u64) -> *mut c_char {
+    reply(|| answer(handle, |desks| desks.execute(handle,
+        Command::ForgetObservedPassage { expected, attempt, passage, sequence }, || false)))
+}
 /// Open an exact retained pane into an admitted empty reader. No path argument
 /// exists: the desk's label cannot authorize a live source read. A non-null
 /// response is always desk JSON; successful receipts contain ordinary reader
@@ -190,3 +229,7 @@ mod reader_tests;
 #[cfg(all(test, unix))]
 #[path = "desk_annotations_ffi_tests.rs"]
 mod annotation_tests;
+
+#[cfg(all(test, unix))]
+#[path = "desk_observed_ffi_tests.rs"]
+mod observed_tests;

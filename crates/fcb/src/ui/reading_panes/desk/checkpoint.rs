@@ -6,12 +6,20 @@
 //! engine. Includes EACH retained capture once, including sources referenced only
 //! by closed-pane history/bookmarks/annotations. Personal text is not filesystem authority. This
 //! module never opens files. Hosts must obtain consent before exporting sources.
+//! Version 1.2 adds observation/passage counts after the 1.1 header fields,
+//! immutable observation records after complete sources, and passage records
+//! after ordinary bookmarks. Passages refer to observation indexes; all live
+//! identities are rebased on restore. Recorded origin IDs remain provenance.
+//! Empty observation state keeps the exact 1.1 encoding for older consumers.
 //! Encoding/decoding are bounded worker operations; the existing envelope's
 //! checksum pass is synchronous, with cancellation checked before and after it.
 
 pub mod integrity;
 
 use super::*;
+use super::observations::{decode_charge, extent_error, hash_extent, owned_path, validate_selection_with_scratch};
+use fcb_source::{CaptureRequest, DetectedEncoding};
+use crate::search::extents::{ExtentConsistency, ObservedExtent};
 use crate::store::envelope::{EnvelopeError, EnvelopeLimits, EnvelopeReader,
     EnvelopeSchema, EnvelopeWriter, Sha256Digest, UnknownPolicy, FRAME_LEN};
 
@@ -19,7 +27,8 @@ pub const MAX_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
 const SCHEMA: EnvelopeSchema = EnvelopeSchema {
     magic: *b"FCBK", schema_id: 0x4b53_4544, major: 1, minor: 1,
 };
-// The 1.0 record has only a label/location. Writers always emit 1.1, including
+const OBSERVATION_SCHEMA: EnvelopeSchema = EnvelopeSchema { minor: 2, ..SCHEMA };
+// The 1.0 record has only a label/location. Ordinary desks still emit 1.1, including
 // an empty body for ordinary bookmarks. A 1.0 reader explicitly rejects a
 // nonzero minor version rather than opening then resaving a desk without notes.
 const LEGACY_SCHEMA: EnvelopeSchema = EnvelopeSchema {
@@ -80,30 +89,42 @@ impl ReadingDesk {
         check(&mut canceled)?;
         let state = &self.state;
         let source_bytes = self.retained_source_bytes();
-        let labels: usize = state.sources.iter().map(|s| s.capture.logical_path().len()).sum();
-        let notes: usize = state.bookmarks.iter().map(|b| b.label.len() + b.body.len()).sum();
+        let labels: usize = state.sources.iter().map(|s| s.capture.logical_path().len()).sum::<usize>()
+            + state.observations.iter().map(|o| o.path.len()).sum::<usize>();
+        let notes: usize = state.bookmarks.iter().map(|b| b.label.len() + b.body.len()).sum::<usize>()
+            + state.observed_passages.iter().map(|p| p.label.len() + p.body.len()).sum::<usize>();
         // A checked upper bound on the exact positional encoding, then a
         // conservative allowance for the existing writer's geometric growth.
         let bound = usize::try_from(source_bytes).ok().and_then(|n| n.checked_add(labels))
             .and_then(|n| n.checked_add(notes + FRAME_LEN + 128 + state.sources.len() * 64
-                + state.panes.len() * 128 + state.history.len() * 64 + state.bookmarks.len() * 96))
+                + state.panes.len() * 128 + state.history.len() * 64 + state.bookmarks.len() * 96
+                + state.observations.len() * 192 + state.observed_passages.len() * 96))
             .ok_or(CheckpointError::Limit)?;
         if bound > MAX_CHECKPOINT_BYTES { return Err(CheckpointError::Limit); }
         let lease = self.budget.try_reserve_managed(self.owner, allocation,
             ByteLength::new((4 * bound + size_of::<DeskCheckpoint>()) as u64))
             .map_err(|_| DeskError::ResourceDenied)?;
-        let mut out = EnvelopeWriter::new(SCHEMA);
+        let has_observations = !state.observations.is_empty() || !state.observed_passages.is_empty();
+        let mut out = EnvelopeWriter::new(if has_observations { OBSERVATION_SCHEMA } else { SCHEMA });
         out.put_u64(state.sources.len() as u64);
         out.put_u64(state.panes.len() as u64);
         out.put_u64(state.history.len() as u64);
         out.put_u64(state.bookmarks.len() as u64);
         out.put_u64(state.cursor.map_or(NONE, |n| n as u64));
         out.put_u64(state.panes.active_pane_id().unwrap_or(0));
+        if has_observations {
+            out.put_u64(state.observations.len() as u64);
+            out.put_u64(state.observed_passages.len() as u64);
+        }
         for retained in &state.sources {
             check(&mut canceled)?;
             let source = &retained.capture;
             out.put_u64(source.file().get()); out.put_u64(source.revision().get());
             out.put_str(source.logical_path()); out.put_bytes(source.bytes());
+        }
+        for observation in &state.observations {
+            check(&mut canceled)?;
+            put_observation(&mut out, observation)?;
         }
         for pane in state.panes.iter() {
             check(&mut canceled)?;
@@ -117,6 +138,14 @@ impl ReadingDesk {
             check(&mut canceled)?;
             out.put_str(&mark.label); out.put_str(&mark.body); out.put_u64(mark.update_sequence);
             put_location(&mut out, state, mark.location)?;
+        }
+        for passage in &state.observed_passages {
+            check(&mut canceled)?;
+            out.put_str(&passage.label); out.put_str(&passage.body); out.put_u64(passage.update_sequence);
+            let index = state.observations.iter().position(|o| o.id == passage.observation)
+                .ok_or(CheckpointError::InvalidDocument)?;
+            out.put_u64(index as u64);
+            put_range(&mut out, passage.selection);
         }
         check(&mut canceled)?;
         let bytes = out.finish();
@@ -140,11 +169,12 @@ impl ReadingDesk {
         let limits = EnvelopeLimits { max_document_bytes: MAX_CHECKPOINT_BYTES,
             max_payload_bytes: MAX_CHECKPOINT_BYTES - FRAME_LEN, max_field_bytes: MAX_CHECKPOINT_BYTES };
         let mut input = EnvelopeReader::open(bytes, LEGACY_SCHEMA, limits, UnknownPolicy::Strict)?;
-        // Accept only the two explicitly defined layouts, with no extension
+        // Accept only the explicitly defined layouts, with no extension
         // fields or header flags. Check wide
         // lengths BEFORE the underlying envelope's usize conversions as well.
-        let has_annotations = match input.schema().minor {
-            0 => false, 1 => true, _ => return Err(CheckpointError::UnsupportedVersion),
+        let (has_annotations, has_observations) = match input.schema().minor {
+            0 => (false, false), 1 => (true, false), 2 => (true, true),
+            _ => return Err(CheckpointError::UnsupportedVersion),
         };
         if bytes[12..16] != [0, 0, 0, 0] {
             return Err(CheckpointError::UnsupportedVersion);
@@ -158,6 +188,9 @@ impl ReadingDesk {
         let nb = bounded_count(input.get_u64()?, self.limits.bookmarks)?;
         let cursor = input.get_u64()?;
         let active = input.get_u64()?;
+        let no = if has_observations { bounded_count(input.get_u64()?, self.limits.sources - ns)? } else { 0 };
+        let npa = if has_observations { bounded_count(input.get_u64()?, self.limits.bookmarks - nb)? } else { 0 };
+        if (no == 0) != (npa == 0) { return Err(CheckpointError::InvalidDocument); }
         if (nh == 0 && cursor != NONE) || (nh != 0 && cursor >= nh as u64)
             || ((np == 0) != (active == 0)) { return Err(CheckpointError::InvalidDocument); }
         let mut records: [Option<SourceRecord<'_>>; MAX_DESK_SOURCES] = [None; MAX_DESK_SOURCES];
@@ -175,20 +208,38 @@ impl ReadingDesk {
             labels += label.len();
             records[i] = Some(SourceRecord { file, revision, label, data });
         }
+        let mut observation_records: [Option<ObservationRecord<'_>>; MAX_DESK_SOURCES] = [None; MAX_DESK_SOURCES];
+        for i in 0..no {
+            check(&mut canceled)?;
+            let record = get_observation(&mut input, self.limits.source_bytes, &mut canceled)?;
+            total = total.checked_add(record.data.len() as u64).ok_or(CheckpointError::Limit)?;
+            if total > self.limits.retained_bytes { return Err(CheckpointError::Limit); }
+            labels += record.path.len();
+            observation_records[i] = Some(record);
+        }
         let first = self.source_high_water.checked_add(1).ok_or(DeskError::IdentityExhausted)?;
-        let next_source = first.checked_add(ns as u64).ok_or(DeskError::IdentityExhausted)?;
+        let next_source = first.checked_add((ns + no) as u64).ok_or(DeskError::IdentityExhausted)?;
         self.source_high_water = next_source - 1;
         // Admit old + candidate overlap while the old desk is still retained.
         // Imported captures share a batch lease, conservatively held until its
         // LAST source/exported view retires. Conversion scratch is precharged.
+        let observation_scratch = if no == 0 { 0 } else {
+            let length = observation_records[..no].iter().flatten().map(|r| r.data.len() as u64)
+                .max().unwrap_or(0).min(crate::search::extents::MAX_EXTENT_TEXT_BYTES as u64);
+            decode_charge(ByteRange::new(ByteOffset::new(0), ByteOffset::new(length))
+                .map_err(|_| CheckpointError::InvalidDocument)?)?
+        };
         let lease = self.budget.try_reserve_managed(self.owner, allocation,
             ByteLength::new(total.checked_mul(2).and_then(|n| n.checked_add(
-                (2 * labels + ns * (size_of::<RetainedSource>() + 128) + 4096) as u64))
+                (2 * labels + ns * (size_of::<RetainedSource>() + 128)
+                    + no * (size_of::<DeskObservation>() + 1024) + 4096) as u64))
+                .and_then(|n| n.checked_add(observation_scratch))
                 .ok_or(CheckpointError::Limit)?)).map_err(|_| DeskError::ResourceDenied)?;
         let mut next = State { revision: self.revision(), panes: ReadingPaneManager::new(),
             offsets: Vec::new(), sources: Vec::new(), history: Vec::new(),
             cursor: if nh == 0 { None } else { Some(cursor as usize) }, bookmarks: Vec::new(),
-            next_bookmark: self.state.next_bookmark };
+            next_bookmark: self.state.next_bookmark,
+            observations: Vec::new(), observed_passages: Vec::new(), next_observation: self.state.next_observation };
         next.panes.next_id = self.state.panes.next_id;
         reserve_state(&mut next, self.limits)?;
         for i in 0..ns {
@@ -205,6 +256,22 @@ impl ReadingDesk {
                 SourceRevision::new(self.owner, first + i as u64).map_err(|_| DeskError::IdentityExhausted)?,
                 r.label, owned).map_err(|_| CheckpointError::InvalidDocument)?;
             next.sources.push(Arc::new(RetainedSource { capture, _lease: lease.clone() }));
+        }
+        for i in 0..no {
+            check(&mut canceled)?;
+            let record = observation_records[i].ok_or(CheckpointError::InvalidDocument)?;
+            let identity = first + ns as u64 + i as u64;
+            let request = CaptureRequest::new(FileId::new(self.owner, identity).map_err(|_| DeskError::IdentityExhausted)?,
+                SourceRevision::new(self.owner, identity).map_err(|_| DeskError::IdentityExhausted)?)
+                .and_then(|r| r.with_range(record.requested)).map_err(|_| CheckpointError::InvalidDocument)?;
+            let extent = ObservedExtent::restore_recorded(request, record.captured, record.observed_length,
+                record.final_length, record.consistency, record.data, lease.clone()).map_err(extent_error)?;
+            if extent.request_filled() != record.request_filled { return Err(CheckpointError::InvalidDocument); }
+            let id = next.next_observation;
+            next.next_observation = id.checked_add(1).filter(|_| id != 0).ok_or(DeskError::IdentityExhausted)?;
+            next.observations.push(Arc::new(DeskObservation { id, live_import: false, origin_owner: record.origin_owner,
+                origin_file: record.origin_file, origin_observation: record.origin_observation,
+                path: owned_path(record.path)?, encoding: record.encoding, extent, extent_sha256: record.digest }));
         }
         let mut pane_map = [(0u64, 0u64); MAX_DESK_PANES];
         for i in 0..np {
@@ -253,6 +320,24 @@ impl ReadingDesk {
             next.next_bookmark = id.checked_add(1).filter(|_| id != 0).ok_or(DeskError::IdentityExhausted)?;
             next.bookmarks.push(DeskBookmark { id, label, body, update_sequence, location: at });
         }
+        for _ in 0..npa {
+            check(&mut canceled)?;
+            let label = get_label(&mut input, MAX_BOOKMARK_LABEL_BYTES)?;
+            let body = std::str::from_utf8(get_field(&mut input, MAX_ANNOTATION_BODY_BYTES as u64)?)
+                .map_err(|_| CheckpointError::InvalidDocument)?;
+            let update_sequence = input.get_u64()?;
+            if update_sequence == 0 { return Err(CheckpointError::InvalidDocument); }
+            let index = input.get_u64()?;
+            if index >= no as u64 { return Err(CheckpointError::InvalidDocument); }
+            let observation = &next.observations[index as usize];
+            let selection = get_range(&mut input)?;
+            validate_selection_with_scratch(&observation.extent, observation.encoding, selection, &mut canceled)?;
+            let id = next.next_bookmark;
+            next.next_bookmark = id.checked_add(1).filter(|_| id != 0).ok_or(DeskError::IdentityExhausted)?;
+            next.observed_passages.push(DeskObservedPassage { id, observation: observation.id, selection,
+                label: personal_text(label, MAX_BOOKMARK_LABEL_BYTES)?, body: personal_text(body, MAX_ANNOTATION_BODY_BYTES)?,
+                update_sequence });
+        }
         if input.remaining() != 0 { return Err(CheckpointError::InvalidDocument); }
         // Reject hidden/unreferenced source payloads, rather than silently
         // discarding part of an allegedly complete personal-state checkpoint.
@@ -264,6 +349,11 @@ impl ReadingDesk {
                 return Err(CheckpointError::InvalidDocument);
             }
         }
+        for o in &next.observations {
+            if !next.observed_passages.iter().any(|p| p.observation == o.id) {
+                return Err(CheckpointError::InvalidDocument);
+            }
+        }
         let change = self.publish(next, attempt, None, &mut canceled)?;
         Ok(RestoredDesk { change, next_source_identity: next_source })
     }
@@ -271,6 +361,76 @@ impl ReadingDesk {
 
 #[derive(Clone, Copy)]
 struct SourceRecord<'a> { file: u64, revision: u64, label: &'a str, data: &'a [u8] }
+
+#[derive(Clone, Copy)]
+struct ObservationRecord<'a> {
+    origin_owner: ArenaOwnerId, origin_file: u64, origin_observation: u64,
+    path: &'a [u8], encoding: DetectedEncoding, requested: ByteRange, captured: ByteRange,
+    observed_length: ByteLength, final_length: Option<ByteLength>, consistency: ExtentConsistency,
+    request_filled: bool, digest: Sha256Digest, data: &'a [u8],
+}
+fn put_observation(out: &mut EnvelopeWriter, observation: &DeskObservation) -> Result<(), CheckpointError> {
+    let extent = &observation.extent;
+    out.put_u64(observation.origin_owner.get()); out.put_u64(observation.origin_file);
+    out.put_u64(observation.origin_observation); out.put_bytes(&observation.path);
+    out.put_u8(match observation.encoding {
+        DetectedEncoding::Utf8 { has_bom: false } => 0, DetectedEncoding::Utf8 { has_bom: true } => 1,
+        DetectedEncoding::Utf16Le => 2, DetectedEncoding::Utf16Be => 3,
+        DetectedEncoding::Unsupported => return Err(CheckpointError::InvalidDocument),
+    });
+    put_range(out, extent.request().range().ok_or(CheckpointError::InvalidDocument)?);
+    put_range(out, extent.range()); out.put_u64(extent.observed_length().get());
+    out.put_u8(u8::from(extent.final_length().is_some()));
+    if let Some(length) = extent.final_length() { out.put_u64(length.get()); }
+    out.put_u8(match extent.consistency() {
+        ExtentConsistency::HostSupplied => 0, ExtentConsistency::UnchangedMetadata => 1,
+        ExtentConsistency::ChangedDuringRead => 2, ExtentConsistency::ShortRead => 3,
+        ExtentConsistency::MetadataUnavailable => 4,
+    });
+    out.put_u8(u8::from(extent.request_filled()));
+    out.put_bytes(observation.extent_sha256.as_bytes()); out.put_bytes(extent.bytes());
+    Ok(())
+}
+fn get_observation<'a>(input: &mut EnvelopeReader<'a>, source_limit: u64,
+    canceled: &mut impl FnMut() -> bool) -> Result<ObservationRecord<'a>, CheckpointError> {
+    let origin_owner = ArenaOwnerId::new(input.get_u64()?).map_err(|_| CheckpointError::InvalidDocument)?;
+    let origin_file = input.get_u64()?; let origin_observation = input.get_u64()?;
+    if origin_file == 0 || origin_observation == 0 { return Err(CheckpointError::InvalidDocument); }
+    let path = get_field(input, MAX_READING_PATH_BYTES as u64)?;
+    if path.is_empty() { return Err(CheckpointError::InvalidDocument); }
+    let encoding = match input.get_u8()? {
+        0 => DetectedEncoding::Utf8 { has_bom: false }, 1 => DetectedEncoding::Utf8 { has_bom: true },
+        2 => DetectedEncoding::Utf16Le, 3 => DetectedEncoding::Utf16Be,
+        _ => return Err(CheckpointError::InvalidDocument),
+    };
+    let requested = get_range(input)?; let captured = get_range(input)?;
+    let observed_length = ByteLength::new(input.get_u64()?);
+    let final_length = if get_bool(input)? { Some(ByteLength::new(input.get_u64()?)) } else { None };
+    let consistency = match input.get_u8()? {
+        0 => ExtentConsistency::HostSupplied, 1 => ExtentConsistency::UnchangedMetadata,
+        2 => ExtentConsistency::ChangedDuringRead, 3 => ExtentConsistency::ShortRead,
+        4 => ExtentConsistency::MetadataUnavailable, _ => return Err(CheckpointError::InvalidDocument),
+    };
+    let request_filled = get_bool(input)?;
+    let digest = Sha256Digest::new(get_field(input, 32)?.try_into().map_err(|_| CheckpointError::InvalidDocument)?);
+    let data = get_field(input, source_limit.min(fcb_source::confined::range::MAX_OBSERVED_EXTENT_BYTES as u64))?;
+    if requested.is_empty() || requested.end().get() > observed_length.get()
+        || requested.len().get() > fcb_source::confined::range::MAX_OBSERVED_EXTENT_BYTES as u64
+        || captured.start() != requested.start() || captured.end() > requested.end()
+        || captured.len().get() != data.len() as u64 || request_filled != (captured == requested) {
+        return Err(CheckpointError::InvalidDocument);
+    }
+    if hash_extent(data, canceled)? != digest { return Err(CheckpointError::Integrity); }
+    Ok(ObservationRecord { origin_owner, origin_file, origin_observation, path, encoding, requested, captured,
+        observed_length, final_length, consistency, request_filled, digest, data })
+}
+fn put_range(out: &mut EnvelopeWriter, range: ByteRange) {
+    out.put_u64(range.start().get()); out.put_u64(range.end().get());
+}
+fn get_range(input: &mut EnvelopeReader<'_>) -> Result<ByteRange, CheckpointError> {
+    ByteRange::new(ByteOffset::new(input.get_u64()?), ByteOffset::new(input.get_u64()?))
+        .map_err(|_| CheckpointError::InvalidDocument)
+}
 fn bounded_count(n: u64, limit: usize) -> Result<usize, CheckpointError> {
     if n > limit as u64 { Err(CheckpointError::Limit) } else { Ok(n as usize) }
 }
@@ -318,3 +478,5 @@ fn remap_hint(map: &[(u64, u64)], old: u64) -> u64 {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod observations_tests;

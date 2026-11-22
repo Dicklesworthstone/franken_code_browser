@@ -150,6 +150,16 @@ pub struct ObservedReaderSession {
     budget: ResourceBudget,
     _lease: ResourceLease,
 }
+
+/// A verified selection from one retained observation. The extent keeps its
+/// original evidence and lease; the path is provenance, never new authority.
+/// Borrowing this record does not reopen, stat, seek or read the live file.
+pub struct RetainedObservedSelection<'a> {
+    pub extent: ObservedExtent,
+    pub path: &'a Path,
+    pub encoding: DetectedEncoding,
+    pub selection: ByteRange,
+}
 impl ObservedReaderSession {
     /// Open the CURRENT explicitly selected root-relative native path. No
     /// catalog/search capture is accepted or silently substituted by this API.
@@ -290,6 +300,30 @@ impl ObservedReaderSession {
         check(&mut canceled)?;
         let page = self.observation(observation)?.clone(); // Shares payload AND its lease.
         self.page_response("retained-window", &page, false, &mut canceled)
+    }
+
+    /// Retain an exact nonempty selection from the logical window the host
+    /// accepted. Decoder context alone does not authorize a visible selection.
+    /// Round-trip the original endpoints through the shared decoder so BOMs,
+    /// surrogate pairs and malformed-input replacements cannot be split.
+    pub fn retained_selection(&mut self, observation: u64, selection: ByteRange,
+        mut canceled: impl FnMut() -> bool) -> Result<RetainedObservedSelection<'_>, ObservedReaderError> {
+        check(&mut canceled)?;
+        if selection.is_empty() || selection.len().get() > MAX_OBSERVED_READER_WINDOW_BYTES as u64 {
+            return Err(ObservedReaderError::InvalidRange);
+        }
+        let page = self.observation(observation)?.clone();
+        let ids = self.allocations()?;
+        let text = decode(&page, &self.budget, ids, &mut canceled)?;
+        let logical = text.source_to_text(selection)?;
+        let selected = text.text_selection(logical)?;
+        if selected.original_range != selection
+            || selected.original_bytes != page.extent.range_bytes(selection)? {
+            return Err(ObservedReaderError::InvalidRange);
+        }
+        check(&mut canceled)?;
+        let encoding = page.encoding.for_extent(&page.extent);
+        Ok(RetainedObservedSelection { extent: page.extent, path: &self.path, encoding, selection })
     }
 
     /// Exact retained bytes, never a live read or a clipboard side effect.

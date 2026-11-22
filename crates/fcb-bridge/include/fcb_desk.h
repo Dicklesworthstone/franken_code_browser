@@ -21,6 +21,26 @@ extern "C" {
 uint64_t fcb_desk_create(void);
 char *fcb_desk_start(uint64_t handle);
 char *fcb_desk_state(uint64_t handle);
+/* First-class observed passages retain a bounded extent, not a complete file.
+ * State has separate observations and observed_passages arrays. Original byte
+ * offsets remain full-width absolute coordinates; paths are provenance only.
+ * Observations share the source/byte limits, passages share the bookmark limit.
+ * Checkpoints preserve their bytes, decoder and consistency evidence offline.
+ * Import binds a retained observed-reader handle plus observation identity and
+ * nonempty visible selection. Keep both handles alive until the worker returns.
+ * Repeated selections share immutable observation backing, with distinct notes.
+ * Read returns command observed-passage, nested observation/passage, logical
+ * text, exact selected original_hex and contains_replacements. It performs no
+ * live source reads and never claims the unseen file is immutable.
+ * Edit/forget additionally require the accepted passage update_sequence.
+ * Label/body contracts match fcb_desk_annotate; late cancel is not rollback. */
+char *fcb_desk_import_observation(uint64_t handle, uint64_t expected, uint64_t attempt,
+    uint64_t reader, uint64_t observation, uint64_t start, uint64_t end);
+char *fcb_desk_observed_passage(uint64_t handle, uint64_t expected, uint64_t passage);
+char *fcb_desk_edit_observed_passage(uint64_t handle, uint64_t expected, uint64_t attempt,
+    uint64_t passage, uint64_t sequence, const char *label, const uint8_t *body, uint64_t body_bytes);
+char *fcb_desk_forget_observed_passage(uint64_t handle, uint64_t expected, uint64_t attempt,
+    uint64_t passage, uint64_t sequence);
 /* Explicit current-file observation. UTF-8 path is host authority; no implicit
  * root access is conferred. Regular source files only, no source writes. */
 char *fcb_desk_open(uint64_t handle, uint64_t expected, uint64_t attempt, const char *path);
@@ -107,6 +127,8 @@ char *fcb_desk_save(uint64_t handle, uint64_t expected, const char *path, uint64
 char *fcb_desk_restore(uint64_t handle, uint64_t expected, uint64_t attempt, const char *path);
 /* Explicit bounded JSON source pack of ALL bookmark labels/notes and whole
  * saved selections, encoded reversibly as original-byte hex. No live reads or
+ * observed-passage payloads/notes: excluded_observed_passages reports their
+ * count explicitly. Use a checkpoint to preserve the entire Reading Desk.
  * inferred selection from a caret. Missing selections and budget omissions are
  * reported per entry; metadata refusal creates no file. Source limit includes
  * repeated selections; output bytes/scalars cover the complete escaped JSON.

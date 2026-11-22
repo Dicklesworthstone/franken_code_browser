@@ -17,6 +17,11 @@ use fcb_core::{ArenaOwnerId, ByteLength, ByteOffset, ByteRange, FileId,
 use crate::{BrowserSession, BrowserView, SourceCapture};
 use super::{ReadingPane, ReadingPaneManager, MAX_READING_PATH_BYTES};
 
+#[cfg(feature = "search")]
+mod observations;
+#[cfg(feature = "search")]
+pub use observations::{DeskObservation, DeskObservationChange, DeskObservedPassage};
+
 pub const MAX_DESK_PANES: usize = 8;
 pub const MAX_DESK_SOURCES: usize = 64;
 pub const MAX_DESK_HISTORY: usize = 128;
@@ -46,6 +51,7 @@ pub enum DeskError {
     MissingPane, MissingSource, MissingBookmark, StaleBookmark, SelectionMismatch, NoActivePane, EmptyHistory,
     PaneLimit, SourceLimit, RetainedByteLimit, BookmarkLimit, InvalidLabel, InvalidBody,
     IdentityConflict, IdentityExhausted, ResourceDenied, Canceled,
+    MissingObservation, MissingPassage, StalePassage,
 }
 impl DeskError {
     pub const fn code(self) -> &'static str {
@@ -62,6 +68,8 @@ impl DeskError {
             Self::IdentityConflict => "DESK_IDENTITY_CONFLICT",
             Self::IdentityExhausted => "DESK_IDENTITY_EXHAUSTED", Self::ResourceDenied => "DESK_RESOURCE_DENIED",
             Self::Canceled => "DESK_CANCELED",
+            Self::MissingObservation => "DESK_MISSING_OBSERVATION",
+            Self::MissingPassage => "DESK_MISSING_PASSAGE", Self::StalePassage => "DESK_STALE_PASSAGE",
         }
     }
 }
@@ -159,6 +167,12 @@ struct State {
     cursor: Option<usize>,
     bookmarks: Vec<DeskBookmark>,
     next_bookmark: u64,
+    #[cfg(feature = "search")]
+    observations: Vec<Arc<DeskObservation>>,
+    #[cfg(feature = "search")]
+    observed_passages: Vec<DeskObservedPassage>,
+    #[cfg(feature = "search")]
+    next_observation: u64,
 }
 
 /// A retained source view with its accounting capability. Dropping the desk
@@ -202,11 +216,21 @@ impl ReadingDesk {
             + limits.history * (size_of::<DeskLocation>() + 32)
             + limits.bookmarks * (size_of::<DeskBookmark>() + MAX_BOOKMARK_LABEL_BYTES
                 + MAX_ANNOTATION_BODY_BYTES + 64);
+        #[cfg(feature = "search")]
+        let charge = charge + limits.sources * size_of::<Arc<DeskObservation>>()
+            + limits.bookmarks * size_of::<DeskObservedPassage>();
         let lease = budget.try_reserve_managed(owner, allocation,
             ByteLength::new((charge * 3 + size_of::<Self>() + 4096) as u64))
             .map_err(|_| DeskError::ResourceDenied)?;
         let state = State { revision: 0, panes: ReadingPaneManager::new(), offsets: Vec::new(),
-            sources: Vec::new(), history: Vec::new(), cursor: None, bookmarks: Vec::new(), next_bookmark: 1 };
+            sources: Vec::new(), history: Vec::new(), cursor: None, bookmarks: Vec::new(), next_bookmark: 1,
+            #[cfg(feature = "search")]
+            observations: Vec::new(),
+            #[cfg(feature = "search")]
+            observed_passages: Vec::new(),
+            #[cfg(feature = "search")]
+            next_observation: 1,
+        };
         let mut desk = Self { owner, limits, state, last_attempt: 0, source_high_water: 0,
             budget: budget.clone(), _lease: lease };
         desk.reserve_state()?;
@@ -216,6 +240,11 @@ impl ReadingDesk {
     pub const fn limits(&self) -> DeskLimits { self.limits }
     pub fn revision(&self) -> u64 { self.state.revision }
     pub const fn last_attempt(&self) -> u64 { self.last_attempt }
+    /// Includes identities consumed by failed imports/restores, not only live
+    /// sources. A host allocating captures must respect this high-water mark.
+    pub fn next_source_identity(&self) -> Result<u64, DeskError> {
+        self.source_high_water.checked_add(1).ok_or(DeskError::IdentityExhausted)
+    }
     pub fn panes(&self) -> &ReadingPaneManager { &self.state.panes }
     pub fn active(&self) -> Option<DeskPaneId> { self.state.panes.active_pane_id().map(|value| self.id(value)) }
     pub fn bookmarks(&self) -> &[DeskBookmark] { &self.state.bookmarks }
@@ -223,9 +252,17 @@ impl ReadingDesk {
     pub fn history_cursor(&self) -> Option<usize> { self.state.cursor }
     pub fn can_go_back(&self) -> bool { self.state.cursor.is_some_and(|i| i > 0) }
     pub fn can_go_forward(&self) -> bool { self.state.cursor.is_some_and(|i| i + 1 < self.state.history.len()) }
-    pub fn retained_source_count(&self) -> usize { self.state.sources.len() }
+    pub fn retained_source_count(&self) -> usize {
+        let count = self.state.sources.len();
+        #[cfg(feature = "search")]
+        let count = count + self.state.observations.len();
+        count
+    }
     pub fn retained_source_bytes(&self) -> u64 {
-        self.state.sources.iter().map(|s| s.capture.bytes().len() as u64).sum()
+        let bytes: u64 = self.state.sources.iter().map(|s| s.capture.bytes().len() as u64).sum();
+        #[cfg(feature = "search")]
+        let bytes = bytes + self.state.observations.iter().map(|s| s.extent().bytes().len() as u64).sum::<u64>();
+        bytes
     }
     /// Resolve a wire ordinal only within THIS desk's live model.
     pub fn pane_id(&self, ordinal: u64) -> Result<DeskPaneId, DeskError> {
@@ -289,7 +326,7 @@ impl ReadingDesk {
             && s.capture.revision() == capture.revision()) {
             if old.capture.bytes() != capture.bytes() { return Err(DeskError::IdentityConflict); }
         } else {
-            if next.sources.len() == self.limits.sources { return Err(DeskError::SourceLimit); }
+            if self.retained_source_count() == self.limits.sources { return Err(DeskError::SourceLimit); }
             let bytes = capture.bytes().len() as u64;
             if bytes > self.limits.source_bytes { return Err(DeskError::SourceLimit); }
             // Admit the old/new overlap, before history truncation or retirement.
@@ -443,6 +480,12 @@ impl ReadingDesk {
             offsets: self.state.offsets.clone(), sources: self.state.sources.clone(),
             history: self.state.history.clone(), cursor: self.state.cursor,
             bookmarks: Vec::new(), next_bookmark: self.state.next_bookmark,
+            #[cfg(feature = "search")]
+            observations: self.state.observations.clone(),
+            #[cfg(feature = "search")]
+            observed_passages: Vec::new(),
+            #[cfg(feature = "search")]
+            next_observation: self.state.next_observation,
         };
         reserve_state(&mut next, self.limits)?;
         for mark in &self.state.bookmarks {
@@ -451,6 +494,10 @@ impl ReadingDesk {
                 body: personal_text(&mark.body, MAX_ANNOTATION_BODY_BYTES)?,
                 update_sequence: mark.update_sequence, location: mark.location,
             });
+        }
+        #[cfg(feature = "search")]
+        for passage in &self.state.observed_passages {
+            next.observed_passages.push(passage.try_copy()?);
         }
         Ok(next)
     }
@@ -465,6 +512,8 @@ impl ReadingDesk {
                 || history.iter().any(|h| h.file == file && h.revision == rev)
                 || bookmarks.iter().any(|b| b.location.file == file && b.location.revision == rev)
         });
+        #[cfg(feature = "search")]
+        next.observations.retain(|o| next.observed_passages.iter().any(|p| p.observation() == o.id()));
         check(canceled)?;
         next.revision = attempt;
         self.state = next;
@@ -484,6 +533,15 @@ fn reserve_state(state: &mut State, limits: DeskLimits) -> Result<(), DeskError>
     reserve(&mut state.sources, limits.sources)?;
     reserve(&mut state.history, limits.history)?;
     reserve(&mut state.bookmarks, limits.bookmarks)?;
+    #[cfg(feature = "search")]
+    {
+        reserve(&mut state.observations, limits.sources)?;
+        reserve(&mut state.observed_passages, limits.bookmarks)?;
+        if state.sources.len() + state.observations.len() > limits.sources
+            || state.bookmarks.len() + state.observed_passages.len() > limits.bookmarks {
+            return Err(DeskError::ResourceDenied);
+        }
+    }
     if state.bookmarks.iter().any(|mark| mark.label.capacity() > MAX_BOOKMARK_LABEL_BYTES
         || mark.body.capacity() > MAX_ANNOTATION_BODY_BYTES) { return Err(DeskError::ResourceDenied); }
     Ok(())
@@ -507,13 +565,19 @@ fn add_bookmark(state: &mut State, owner: ArenaOwnerId, limits: DeskLimits,
     pane: DeskPaneId, label: &str, body: &str) -> Result<u64, DeskError> {
     let at = location(state, owner, pane)?;
     validate_personal_text(label, body)?;
-    if state.bookmarks.len() == limits.bookmarks { return Err(DeskError::BookmarkLimit); }
+    if personal_count(state) == limits.bookmarks { return Err(DeskError::BookmarkLimit); }
     let id = state.next_bookmark;
     state.next_bookmark = id.checked_add(1).filter(|_| id != 0).ok_or(DeskError::IdentityExhausted)?;
     let label = personal_text(label, MAX_BOOKMARK_LABEL_BYTES)?;
     let body = personal_text(body, MAX_ANNOTATION_BODY_BYTES)?;
     state.bookmarks.push(DeskBookmark { id, label, body, update_sequence: 1, location: at });
     Ok(id)
+}
+fn personal_count(state: &State) -> usize {
+    let count = state.bookmarks.len();
+    #[cfg(feature = "search")]
+    let count = count + state.observed_passages.len();
+    count
 }
 /// Compare the two explicitly selected original-byte ranges without allocating
 /// decoded text, guessing a path mapping, or scanning for a convenient match.

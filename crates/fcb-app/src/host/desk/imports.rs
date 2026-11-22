@@ -70,8 +70,7 @@ impl DeskSession {
         if bytes.len() as u64 > self.desk.limits().retained_bytes.saturating_sub(self.desk.retained_source_bytes()) {
             return Err(DeskError::RetainedByteLimit.into());
         }
-        let next = self.next_source;
-        self.next_source = next.checked_add(1).ok_or(DeskError::IdentityExhausted)?;
+        let next = self.claim_source_identity()?;
         let revision = SourceRevision::new(self.desk.owner(), next).map_err(|_| DeskError::IdentityExhausted)?;
         // Captured revisions of one provider file keep their logical relation,
         // while different owners with equal ordinals remain distinct files.

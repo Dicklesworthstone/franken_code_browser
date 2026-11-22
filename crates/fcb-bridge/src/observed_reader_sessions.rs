@@ -12,7 +12,7 @@ use fcb_core::{ArenaOwnerId, ByteLength, ResourceAllocationId, ResourceBudget, R
 
 pub(super) const MAX_SESSIONS: usize = 4;
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum AccessError {
     Unknown, NotOpen, AlreadyOpen, Busy, Capacity, Canceled, Closed,
     Poisoned, IdentityExhausted, InvalidArgument, Reader(ObservedReaderError),
@@ -38,7 +38,7 @@ impl std::fmt::Display for AccessError {
     }
 }
 impl AccessError {
-    fn canceled(&self) -> bool {
+    pub(super) fn canceled(&self) -> bool {
         matches!(self, Self::Canceled | Self::Closed)
             || matches!(self, Self::Reader(error) if error.is_canceled())
     }
@@ -211,6 +211,23 @@ impl ObservedReaderSessions {
         };
         cell.validate(epoch)?;
         result.map_err(AccessError::from)
+    }
+    /// Borrow an accepted observation provider for an explicit cross-owner
+    /// transfer. Both cancellation epochs are checked through publication and
+    /// response delivery. A canceled delivery does not undo accepted Desk work.
+    pub(super) fn with_retained<T, E: From<AccessError>>(&self, handle: u64,
+        work: impl FnOnce(&mut ObservedReaderSession, &mut dyn FnMut() -> bool) -> Result<T, E>,
+        mut canceled: impl FnMut() -> bool) -> Result<T, E> {
+        let cell = self.get(handle)?;
+        let epoch = cell.epoch.load(Ordering::Acquire);
+        let mut state = lock(&cell.state)?;
+        cell.validate(epoch)?;
+        if canceled() { return Err(AccessError::Canceled.into()); }
+        let reader = state.as_mut().ok_or(AccessError::NotOpen)?;
+        let result = work(reader, &mut || cell.validate(epoch).is_err() || canceled());
+        cell.validate(epoch)?;
+        if canceled() { return Err(AccessError::Canceled.into()); }
+        result
     }
     pub(super) fn cancel(&self, handle: u64) -> Result<(), AccessError> {
         let cell = self.get(handle)?;
