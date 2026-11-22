@@ -29,9 +29,12 @@ import Foundation
     @MainActor static func main() async throws {
         try inputAndWire()
         try lineInputAndWire()
+        try positionInputAndWire()
         try await retainedNavigation()
         try await lineNavigation()
         try await lineEditsAndCancellation()
+        try await positionNavigation()
+        try await positionEditsAndCancellation()
         try await latestAndReopen()
         try await currentFileEditorAuthority()
         try await cancellationAndGrantDrain()
@@ -410,6 +413,292 @@ import Foundation
         closing.release()
         await wait("Line scan did not release its owner and grant") { probe.closedCount == 1 && probe.hasReleased("line-drain") }
         check(model.page == nil && model.closed, "A line response cannot reopen a revoked presentation")
+    }
+
+    @MainActor private static func positionInputAndWire() throws {
+        let input = try AtlasObservedReaderInput(root: "/repo", relativePath: Array("large.log".utf8))
+        rejectInput { _ = try AtlasObservedReaderPositionRequest(line: 0, column: 1) }
+        rejectInput { _ = try AtlasObservedReaderPositionRequest(line: 1, column: 0) }
+        for bytes in [UInt64(0), 3, AtlasObservedReaderLimits.maximumPageBytes + 1] {
+            rejectInput { _ = try AtlasObservedReaderPositionRequest(line: 1, column: 1, maximumSelectedBytes: bytes) }
+        }
+        for bytes in [UInt64(0), AtlasObservedReaderLimits.maximumLineScanBytes + 1] {
+            rejectInput { _ = try AtlasObservedReaderPositionRequest(line: 1, column: 1, maximumScanBytes: bytes) }
+        }
+        let fullWidth = try AtlasObservedReaderPositionRequest(line: UInt64.max, column: UInt64.max,
+            maximumSelectedBytes: 4, maximumScanBytes: 1)
+        check(fullWidth.line == UInt64.max && fullWidth.column == UInt64.max,
+            "Typed coordinates preserve full-width integers independently of bounded scan admission")
+
+        let request = try AtlasObservedReaderPositionRequest(line: 50_001, column: 4,
+            maximumSelectedBytes: 64, maximumScanBytes: 1 << 32)
+        let offset: UInt64 = 3 * 1024 * 1024 * 1024
+        let object = try ObservedReaderFixture.positionPage(41, input, 2, request,
+            offset: offset, originalOffset: offset + 3, windowUTF8Offset: 3, readCalls: 200_000)
+        func decode(_ object: [String: Any]) throws -> AtlasObservedReaderPage {
+            try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(object), handle: 41, input: input, position: request)
+        }
+        let page = try decode(object)
+        check(page.positionNavigation?.originalOffset == offset + 3 && page.positionSelection == NSRange(location: 3, length: 0)
+            && page.positionNavigation!.scannedInputBytes < page.visibleRange.end
+            && page.positionNavigation!.payloadBytesRead >= page.observation.capturedRange.end
+            && page.observation.sourceBytesRead > page.observation.capturedRange.count
+            && page.firstPhysicalLine == nil && !page.observation.wholeFileObserved,
+            "The scan can resolve a point before completing its same-pass context; neither bound becomes a whole-file capture")
+        var knownLine = object; knownLine["first_physical_line"] = String(request.line)
+        let provenLine = try decode(knownLine)
+        check(provenLine.firstPhysicalLine == request.line,
+            "The same prefix scan can prove a far page's first physical line")
+        check(page.firstPhysicalLine == nil,
+            "A context window that may precede the selected line keeps its first line unknown")
+        let prefixRequest = try AtlasObservedReaderPositionRequest(line: 2, column: 1, maximumSelectedBytes: 4)
+        let prefixObject = try ObservedReaderFixture.positionPage(41, input, 9, prefixRequest,
+            offset: 0, originalOffset: 2, windowUTF8Offset: 2, text: "A\nB\n")
+        let prefixPage = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(prefixObject),
+            handle: 41, input: input, position: prefixRequest)
+        check(prefixPage.firstPhysicalLine == 1 && prefixPage.positionNavigation?.line == 2,
+            "File-prefix context independently proves line one while the requested point belongs to a later line")
+        let badFields: [(String, Any)] = [
+            ("command", "window"), ("position_navigation", NSNull()), ("encoding", "utf16be"),
+            ("first_physical_line", "50000"),
+            ("consistency", "unchanged-metadata-not-atomic"), ("observation_source_bytes_read", "17"),
+            ("observation_read_calls", "1"), ("additional_source_bytes_read", "0"),
+            ("additional_read_calls", "0"), ("final_observed_length", NSNull()),
+            ("whole_file_observed", true), ("requested_bytes", "65"),
+            ("text", "new\n"), ("original_hex", "6e65770a"),
+        ]
+        for (key, value) in badFields {
+            var bad = object; bad[key] = value
+            rejectWire { _ = try decode(bad) }
+        }
+        let navigation = object["position_navigation"] as! [String: String]
+        let badNavigation = [
+            ("line", "50000"), ("column", "3"), ("column_kind", "display_cells"),
+            ("column_kind", "utf16_code_unit"), ("original_offset", String(offset + 2)),
+            ("window_utf8_offset", "2"), ("window_utf8_offset", "5"),
+            ("max_scan_bytes", "4294967295"), ("max_selected_bytes", "128"),
+            ("scanned_input_bytes", "0"), ("scanned_input_bytes", String(offset + 2)),
+            ("scanned_input_bytes", "4294967296"), ("payload_bytes_read", "4294967297"),
+            ("read_calls", "0"), ("read_calls", "1048577"), ("metadata_consistency", "atomic"),
+        ]
+        for (key, value) in badNavigation {
+            var bad = object, changed = navigation; changed[key] = value; bad["position_navigation"] = changed
+            rejectWire { _ = try decode(bad) }
+        }
+        for key in navigation.keys {
+            var bad = object, changed = navigation; changed.removeValue(forKey: key); bad["position_navigation"] = changed
+            rejectWire { _ = try decode(bad) }
+        }
+        let lineRequest = try AtlasObservedReaderLineRequest(firstLine: request.line, lines: 1,
+            maximumSelectedBytes: request.maximumSelectedBytes, maximumScanBytes: request.maximumScanBytes)
+        let lineObject = try ObservedReaderFixture.linePage(41, input, 2, lineRequest, offset: offset)
+        var mixed = object; mixed["line_navigation"] = lineObject["line_navigation"]
+        rejectWire { _ = try decode(mixed) }
+        let ordinaryRequest = try AtlasObservedReaderRequest(offset: offset, bytes: 64)
+        rejectWire {
+            _ = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(object), handle: 41, input: input, request: ordinaryRequest)
+        }
+        let replay = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(ObservedReaderFixture.retained(object)),
+            handle: 41, input: input, retained: page)
+        check(replay.matches(page) && replay.positionSelection == page.positionSelection,
+            "History restores the original typed point and native caret with zero source reads")
+        let copy = try AtlasObservedReaderCopy.decode(ObservedReaderFixture.encode(ObservedReaderFixture.copy(object)),
+            handle: 41, input: input, page: page)
+        check(copy.originalHex == page.originalHex, "Original-byte copy retains the same position scan receipt")
+        for command in ["retained-window", "copy-range"] {
+            var bad = command == "copy-range" ? ObservedReaderFixture.copy(object) : ObservedReaderFixture.retained(object)
+            var changed = navigation; changed["column"] = "3"; bad["position_navigation"] = changed
+            rejectWire {
+                if command == "copy-range" {
+                    _ = try AtlasObservedReaderCopy.decode(ObservedReaderFixture.encode(bad), handle: 41, input: input, page: page)
+                } else {
+                    _ = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(bad), handle: 41, input: input, retained: page)
+                }
+            }
+            bad = command == "copy-range" ? ObservedReaderFixture.copy(object) : ObservedReaderFixture.retained(object)
+            bad["additional_read_calls"] = "1"
+            rejectWire {
+                if command == "copy-range" {
+                    _ = try AtlasObservedReaderCopy.decode(ObservedReaderFixture.encode(bad), handle: 41, input: input, page: page)
+                } else {
+                    _ = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(bad), handle: 41, input: input, retained: page)
+                }
+            }
+        }
+
+        for encoding in AtlasObservedReaderEncoding.allCases {
+            for (kind, column) in [(AtlasObservedReaderColumnKind.unicodeScalar, UInt64(3)),
+                (.utf16CodeUnit, 4), (.decodedUTF8Byte, 6)] {
+                let request = try AtlasObservedReaderPositionRequest(line: 2, column: column, kind: kind,
+                    maximumSelectedBytes: 32, encoding: encoding)
+                let prefix = AtlasObservedReaderSearchRequest.originalBytes("A🦀", encoding: encoding)
+                let object = try ObservedReaderFixture.positionPage(41, input, 3, request, offset: 64,
+                    originalOffset: 64 + UInt64(prefix.count), windowUTF8Offset: 5, text: "A🦀B\n")
+                let page = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(object),
+                    handle: 41, input: input, position: request)
+                check(page.positionSelection == NSRange(location: 3, length: 0)
+                    && page.positionNavigation?.kind == kind,
+                    "Scalar, UTF-16 and decoded UTF-8 columns reach the same non-BMP boundary without confusing byte domains")
+                var split = object, splitNavigation = object["position_navigation"] as! [String: String]
+                splitNavigation["window_utf8_offset"] = "2"; split["position_navigation"] = splitNavigation
+                rejectWire {
+                    _ = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(split), handle: 41, input: input, position: request)
+                }
+                // Selection-copy receipts preserve the original page-relative
+                // point even when the copied selection starts at that point.
+                let selectionRequest = try AtlasObservedReaderSelectionRequest(page: page, nativeRange: NSRange(location: 3, length: 1))
+                let selected = AtlasObservedReaderSearchRequest.originalBytes("B", encoding: encoding)
+                let selection = ObservedReaderFixture.selection(object, utf8Start: 5, utf8End: 6,
+                    originalStart: 64 + UInt64(prefix.count), originalEnd: 64 + UInt64(prefix.count + selected.count),
+                    text: "B", originalHex: ObservedReaderFixture.hex(selected))
+                let copied = try AtlasObservedReaderSelection.decode(ObservedReaderFixture.encode(selection),
+                    input: input, request: selectionRequest)
+                check(copied.text == "B" && copied.originalHex == ObservedReaderFixture.hex(selected),
+                    "Copied subranges retain page-relative position coordinates without rebasing the receipt")
+            }
+
+            let request = try AtlasObservedReaderPositionRequest(line: 2, column: 2, maximumSelectedBytes: 32, encoding: encoding)
+            let prefix = AtlasObservedReaderSearchRequest.originalBytes("e", encoding: encoding)
+            let combining = try ObservedReaderFixture.positionPage(41, input, 4, request, offset: 64,
+                originalOffset: 64 + UInt64(prefix.count), windowUTF8Offset: 1, text: "e\u{301}x")
+            let exact = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(combining),
+                handle: 41, input: input, position: request)
+            check(exact.positionNavigation?.windowUTF8Offset == 1 && exact.positionSelection == nil,
+                "A logical point inside a composed character remains exact and is never rounded to a native caret")
+
+            let bom: [UInt8]
+            switch encoding {
+            case .utf8: bom = [0xef, 0xbb, 0xbf]
+            case .utf16le: bom = [0xff, 0xfe]
+            case .utf16be: bom = [0xfe, 0xff]
+            }
+            let start = try AtlasObservedReaderPositionRequest(line: 1, column: 1, maximumSelectedBytes: 4, encoding: encoding)
+            var onlyBOM = try ObservedReaderFixture.positionPage(41, input, 5, start, offset: 0,
+                originalOffset: UInt64(bom.count), windowUTF8Offset: 0, length: UInt64(bom.count),
+                text: "", originalHex: ObservedReaderFixture.hex(bom))
+            onlyBOM["visible_range"] = ObservedReaderFixture.range(UInt64(bom.count), UInt64(bom.count))
+            onlyBOM["original_hex"] = ""; onlyBOM["boundaries_adjusted"] = true
+            let empty = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(onlyBOM),
+                handle: 41, input: input, position: start)
+            check(empty.visibleRange.count == 0 && empty.firstPhysicalLine == 1
+                && empty.positionNavigation?.originalOffset == UInt64(bom.count)
+                && empty.positionSelection == NSRange(location: 0, length: 0),
+                "A BOM-only source preserves line one and the exact content-start caret")
+        }
+        let malformedRequest = try AtlasObservedReaderPositionRequest(line: 2, column: 3, maximumSelectedBytes: 16)
+        let malformed = try ObservedReaderFixture.positionPage(41, input, 6, malformedRequest, offset: 64,
+            originalOffset: 66, windowUTF8Offset: 4, text: "A�B", originalHex: "41ff42", replacements: true)
+        let replacement = try AtlasObservedReaderPage.decode(ObservedReaderFixture.encode(malformed),
+            handle: 41, input: input, position: malformedRequest)
+        check(replacement.positionNavigation?.originalOffset == 66 && replacement.positionSelection == nil,
+            "Replacement decoding retains the authoritative original point without inventing native byte correspondence")
+    }
+
+    @MainActor private static func positionNavigation() async throws {
+        let probe = ObservedReaderProbe(), input = try AtlasObservedReaderInput(root: "/repo", relativePath: Array("large.log".utf8))
+        let model = AtlasObservedReaderModel(transport: probe.transport)
+        model.pageBytes = 4; model.open(source(input))
+        await wait("Position reader never opened") { !model.busy && model.page != nil }
+        let initial = model.page!
+        model.lineInput = "50001"; model.columnInput = "3"; model.columnKind = .decodedUTF8Byte
+        check(model.supportsPosition && model.canReadPosition, "Observed reader exposes the optional typed position capability")
+        model.observePositionInput()
+        await wait("Typed position never committed") { !model.busy && model.page?.positionNavigation?.line == 50_001 }
+        let accepted = model.page!
+        check(model.searchSelection == NSRange(location: 2, length: 0)
+            && probe.windowOffsets == [0] && probe.requestedPositions.count == 1 && model.canBack,
+            "Position navigation installs the exact zero-length caret and retains its own observation")
+        model.back()
+        await wait("Position Back failed") { !model.busy && model.page?.matches(initial) == true }
+        model.forward()
+        await wait("Position Forward failed") { !model.busy && model.page?.matches(accepted) == true }
+        let copied = await model.copyOriginalHex()
+        check(copied == accepted.originalHex && probe.windowOffsets == [0] && probe.requestedPositions.count == 1
+            && model.searchSelection == accepted.positionSelection,
+            "History and original-byte copy reuse accepted position bytes and caret without fresh I/O")
+        model.searchText = "different query"
+        check(model.searchSelection == accepted.positionSelection, "Changing search cannot erase a page's independently retained position caret")
+        let beforeFailures = model.navigation
+        for code in ["OBSERVED_READER_COLUMN_MISSING", "OBSERVED_READER_POSITION_SCAN_BYTE_LIMIT",
+            "OBSERVED_READER_POSITION_READ_CALL_LIMIT"] {
+            probe.failPosition(code); model.observePositionInput()
+            await wait("Position failure never settled") { !model.busy }
+            check(model.page?.matches(accepted) == true && model.navigation == beforeFailures
+                && model.searchSelection == accepted.positionSelection,
+                "Missing columns and bounded scan failures preserve the accepted page, point and history")
+        }
+        let requests = probe.requestedPositions.count
+        for field in 0..<2 {
+            for invalid in ["0", "01", "-1", "", "18446744073709551616"] {
+                model.lineInput = "50001"; model.columnInput = "3"
+                if field == 0 { model.lineInput = invalid } else { model.columnInput = invalid }
+                model.observePositionInput()
+                check(!model.canReadPosition && !model.busy && probe.requestedPositions.count == requests,
+                    "Noncanonical, zero and overflowing typed input never crosses the source transport")
+            }
+        }
+        model.observeAgain()
+        await wait("Observe again did not restore the saved position request") {
+            !model.busy && model.page?.observation.id != accepted.observation.id
+        }
+        check(probe.requestedPositions.count == requests + 1 && model.lineInput == "50001" && model.columnInput == "3"
+            && model.columnKind == .decodedUTF8Byte && probe.windowOffsets == [0],
+            "Observe again repeats the saved typed request rather than replacing it with a byte-window read")
+        model.nextRange()
+        await wait("Byte navigation after position never settled") { !model.busy && model.page?.positionNavigation == nil }
+        check(model.searchSelection == nil, "An unrelated byte page cannot inherit an old line/column point")
+        model.close()
+        await wait("Position reader did not retire") { probe.closedCount == probe.createCount }
+    }
+
+    @MainActor private static func positionEditsAndCancellation() async throws {
+        let probe = ObservedReaderProbe(), modelInput = try AtlasObservedReaderInput(root: "/repo", relativePath: Array("large.log".utf8))
+        let model = AtlasObservedReaderModel(transport: probe.transport)
+        model.pageBytes = 4; model.open(source(modelInput, access: ObservedReaderGrant(probe, "position-drain")))
+        await wait("Position edit reader never opened") { !model.busy && model.page != nil }
+        let accepted = model.page!
+        for field in 0..<6 {
+            let line = UInt64(10 + field), gate = ObservedReaderGate()
+            model.encoding = .utf8; model.pageBytes = 4; model.columnInput = "2"; model.columnKind = .unicodeScalar
+            model.lineScanBytes = AtlasObservedReaderLimits.lineScanBytes; model.lineInput = String(line)
+            probe.blockPosition(line, on: gate); model.observePositionInput()
+            await wait("Pending position scan never entered") { gate.entered }
+            switch field {
+            case 0: model.lineInput = String(line + 1)
+            case 1: model.columnInput = "3"
+            case 2: model.columnKind = .utf16CodeUnit
+            case 3: model.encoding = .utf16le
+            case 4: model.pageBytes = 16
+            default: model.lineScanBytes = 16 * 1024 * 1024
+            }
+            check(!model.busy && model.page?.matches(accepted) == true, "Every typed position input field revokes pending delivery")
+            gate.release()
+            await wait("Obsolete position scan did not drain") { probe.activeReads == 0 }
+            await Task.yield()
+            check(model.page?.matches(accepted) == true && !model.canBack, "An obsolete position receipt never appends history")
+        }
+        model.encoding = .utf8; model.pageBytes = 4; model.columnInput = "2"; model.columnKind = .unicodeScalar
+        let before = probe.requestedPositions.count, gate = ObservedReaderGate()
+        probe.blockPosition(100, on: gate); model.lineInput = "100"; model.observePositionInput()
+        await wait("First coalesced position never entered") { gate.entered }
+        model.lineInput = "101"; model.observePositionInput(); await Task.yield()
+        model.lineInput = "102"; model.observePositionInput(); await Task.yield()
+        gate.release()
+        await wait("Latest position never committed") { !model.busy && model.page?.positionNavigation?.line == 102 }
+        check(probe.requestedPositions.dropFirst(before).map(\.line) == [100, 102] && probe.maximumActive == 1,
+            "Position requests share the serial worker and coalesce queued obsolete locations")
+        let current = model.page!, closing = ObservedReaderGate()
+        probe.blockPosition(200, on: closing); model.lineInput = "200"; model.observePositionInput()
+        await wait("Closing position scan never entered") { closing.entered }
+        model.cancel()
+        check(!model.busy && model.page?.matches(current) == true && model.searchSelection == current.positionSelection,
+            "Explicit cancellation preserves accepted source and caret")
+        model.close()
+        check(!probe.hasReleased("position-drain") && probe.closedCount == 0,
+            "An entered position scan retains its source owner and grant until return")
+        closing.release()
+        await wait("Position grant did not drain") { probe.closedCount == 1 && probe.hasReleased("position-drain") }
+        check(model.closed && model.page == nil, "A late position receipt cannot reopen a closed presentation")
     }
 
     @MainActor private static func retainedNavigation() async throws {

@@ -91,6 +91,36 @@ enum ObservedReaderFixture {
             "metadata_consistency": "unchanged-metadata-not-atomic"]
         return out
     }
+    static func positionPage(_ owner: UInt64, _ input: AtlasObservedReaderInput, _ id: UInt64,
+                             _ request: AtlasObservedReaderPositionRequest, offset: UInt64,
+                             originalOffset: UInt64, windowUTF8Offset: UInt64,
+                             length: UInt64 = ObservedReaderFixture.length, text: String = "old\n",
+                             originalHex: String? = nil, scannedInputBytes: UInt64? = nil,
+                             readCalls: UInt64 = 1, replacements: Bool = false) throws -> [String: Any] {
+        let encoded = originalHex ?? Self.hex(AtlasObservedReaderSearchRequest.originalBytes(text, encoding: request.encoding))
+        let end = offset + UInt64(encoded.utf8.count / 2)
+        let captureStart = offset > 4 ? offset - 4 : 0, captureEnd = min(length, end + 4)
+        let bytes = try AtlasObservedReaderRequest(offset: offset, bytes: request.maximumSelectedBytes, encoding: request.encoding)
+        var out = page(owner, input, id, bytes, length: length, text: text, originalHex: encoded)
+        out["command"] = "position"
+        out["requested_visible_range"] = range(offset, end); out["visible_range"] = range(offset, end)
+        out["requested_capture_range"] = range(captureStart, captureEnd)
+        out["captured_range"] = range(captureStart, captureEnd); out["captured_bytes"] = String(captureEnd - captureStart)
+        out["consistency"] = "host-supplied-sequence"; out["whole_file_observed"] = false
+        out["has_replacements"] = replacements
+        out["first_physical_line"] = offset == 0 ? "1" as Any : NSNull()
+        out["next_offset"] = end < length ? String(end) as Any : NSNull()
+        out["observation_source_bytes_read"] = String(captureEnd); out["additional_source_bytes_read"] = String(captureEnd)
+        out["observation_read_calls"] = String(readCalls); out["additional_read_calls"] = String(readCalls)
+        out["position_navigation"] = ["line": String(request.line), "column": String(request.column),
+            "column_kind": request.kind.rawValue, "original_offset": String(originalOffset),
+            "window_utf8_offset": String(windowUTF8Offset), "max_scan_bytes": String(request.maximumScanBytes),
+            "max_selected_bytes": String(request.maximumSelectedBytes),
+            "scanned_input_bytes": String(scannedInputBytes ?? max(1, originalOffset)),
+            "payload_bytes_read": String(captureEnd), "read_calls": String(readCalls),
+            "metadata_consistency": "unchanged-metadata-not-atomic"]
+        return out
+    }
     static func retained(_ page: [String: Any]) -> [String: Any] {
         var out = page; out["command"] = "retained-window"
         out["additional_source_bytes_read"] = "0"; out["additional_read_calls"] = "0"
@@ -142,13 +172,16 @@ final class ObservedReaderProbe: @unchecked Sendable {
     private var pages: [UInt64: [UInt64: [String: Any]]] = [:]
     private var requests: [UInt64] = []
     private var lineRequests: [AtlasObservedReaderLineRequest] = []
+    private var positionRequests: [AtlasObservedReaderPositionRequest] = []
     private var active = 0, mostActive = 0, creates = 0, opens = 0, copies = 0, restores = 0
     private var gates: [UInt64: ObservedReaderGate] = [:]
     private var lineGates: [UInt64: ObservedReaderGate] = [:]
+    private var positionGates: [UInt64: ObservedReaderGate] = [:]
     private var selectionGates: [UInt64: ObservedReaderGate] = [:]
     private var selections = 0
     private var selectionStarts: [UInt64] = []
     private var nextLineFailure: String?
+    private var nextPositionFailure: String?
     private var nextWindowFailure: String?
     private var failureOnNextOpen = false
     private var closeAllowed = true
@@ -167,14 +200,17 @@ final class ObservedReaderProbe: @unchecked Sendable {
             copy: { owner, id, start, end in try self.copy(owner, id, start, end) },
             cancel: { _ in true }, close: { self.close($0) }, retirementFailed: { self.failedRetirement() },
             lines: { owner, request, _ in try self.lines(owner, request) },
+            position: { owner, request, _ in try self.position(owner, request) },
             resolveSelection: { owner, observation, start, end in try self.selection(owner, observation, start, end) })
     }
     func block(_ offset: UInt64, on gate: ObservedReaderGate) { lock.lock(); gates[offset] = gate; lock.unlock() }
     func blockLine(_ first: UInt64, on gate: ObservedReaderGate) { lock.lock(); lineGates[first] = gate; lock.unlock() }
+    func blockPosition(_ line: UInt64, on gate: ObservedReaderGate) { lock.lock(); positionGates[line] = gate; lock.unlock() }
     func blockSelection(_ start: UInt64, on gate: ObservedReaderGate) { lock.lock(); selectionGates[start] = gate; lock.unlock() }
     var selectionCount: Int { lock.lock(); defer { lock.unlock() }; return selections }
     var requestedSelectionStarts: [UInt64] { lock.lock(); defer { lock.unlock() }; return selectionStarts }
     func failLine(_ code: String) { lock.lock(); nextLineFailure = code; lock.unlock() }
+    func failPosition(_ code: String) { lock.lock(); nextPositionFailure = code; lock.unlock() }
     func failWindow(_ code: String) { lock.lock(); nextWindowFailure = code; lock.unlock() }
     func failOpen() { lock.lock(); failureOnNextOpen = true; lock.unlock() }
     func setCloseAllowed(_ value: Bool) { lock.lock(); closeAllowed = value; lock.unlock() }
@@ -184,6 +220,7 @@ final class ObservedReaderProbe: @unchecked Sendable {
     func evict(_ owner: UInt64, _ id: UInt64) { lock.lock(); pages[owner]?.removeValue(forKey: id); lock.unlock() }
     var windowOffsets: [UInt64] { lock.lock(); defer { lock.unlock() }; return requests }
     var requestedLines: [AtlasObservedReaderLineRequest] { lock.lock(); defer { lock.unlock() }; return lineRequests }
+    var requestedPositions: [AtlasObservedReaderPositionRequest] { lock.lock(); defer { lock.unlock() }; return positionRequests }
     var maximumActive: Int { lock.lock(); defer { lock.unlock() }; return mostActive }
     var activeReads: Int { lock.lock(); defer { lock.unlock() }; return active }
     var createCount: Int { lock.lock(); defer { lock.unlock() }; return creates }
@@ -247,6 +284,29 @@ final class ObservedReaderProbe: @unchecked Sendable {
         if let failure { return try ObservedReaderFixture.failure(owner, failure) }
         let page = try ObservedReaderFixture.linePage(owner, input, id, request,
             offset: (request.firstLine - 1) * 4, text: text)
+        pages[owner, default: [:]][id] = page
+        if let keys = pages[owner]?.keys.sorted(), keys.count > 8, let first = keys.first { pages[owner]?.removeValue(forKey: first) }
+        return try ObservedReaderFixture.encode(page)
+    }
+    private func position(_ owner: UInt64, _ request: AtlasObservedReaderPositionRequest) throws -> String? {
+        lock.lock()
+        guard let input = inputs[owner] else { lock.unlock(); return nil }
+        positionRequests.append(request); active += 1; mostActive = max(mostActive, active)
+        let id = (ids[owner] ?? 0) + 1; ids[owner] = id
+        let gate = positionGates.removeValue(forKey: request.line), text = content, failure = nextPositionFailure
+        nextPositionFailure = nil
+        lock.unlock()
+        gate?.wait() // Native publication must reject an otherwise valid obsolete reply.
+        lock.lock(); defer { active -= 1; lock.unlock() }
+        if let failure { return try ObservedReaderFixture.failure(owner, failure) }
+        // Model lifecycle cases use ASCII content; authored wire cases below
+        // exercise UTF-16, non-BMP, combining and replacement boundaries.
+        let utf8Offset = min(request.column - 1, UInt64(text.utf8.count))
+        let prefix = String(decoding: text.utf8.prefix(Int(utf8Offset)), as: UTF8.self)
+        let offset = (request.line - 1) * 4
+        let original = offset + UInt64(AtlasObservedReaderSearchRequest.originalBytes(prefix, encoding: request.encoding).count)
+        let page = try ObservedReaderFixture.positionPage(owner, input, id, request,
+            offset: offset, originalOffset: original, windowUTF8Offset: utf8Offset, text: text)
         pages[owner, default: [:]][id] = page
         if let keys = pages[owner]?.keys.sorted(), keys.count > 8, let first = keys.first { pages[owner]?.removeValue(forKey: first) }
         return try ObservedReaderFixture.encode(page)

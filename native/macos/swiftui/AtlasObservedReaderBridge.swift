@@ -18,6 +18,10 @@ private typealias ObservedReaderPoll = @convention(c) (UnsafeMutableRawPointer?)
     _ handle: UInt64, _ firstLine: UInt64, _ lines: UInt64, _ maximumBytes: UInt64,
     _ maximumScanBytes: UInt64, _ encoding: UInt64,
     _ poll: ObservedReaderPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_observed_reader_position") private func observedReaderPosition(
+    _ handle: UInt64, _ line: UInt64, _ column: UInt64, _ columnKind: UInt64,
+    _ maximumBytes: UInt64, _ maximumScanBytes: UInt64, _ encoding: UInt64,
+    _ poll: ObservedReaderPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_observed_reader_copy") private func observedReaderCopy(
     _ handle: UInt64, _ observation: UInt64, _ start: UInt64, _ end: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_observed_reader_resolve_selection") private func observedReaderResolveSelection(
@@ -153,6 +157,11 @@ extension AtlasObservedReaderTransport {
             try observedReaderPolling(cancellation) { poll, context in
                 observedReaderLines(handle, request.firstLine, request.lines, request.maximumSelectedBytes,
                     request.maximumScanBytes, request.encoding.abi, poll, context)
+            }
+        }, position: { handle, request, cancellation in
+            try observedReaderPolling(cancellation) { poll, context in
+                observedReaderPosition(handle, request.line, request.column, request.kind.abi,
+                    request.maximumSelectedBytes, request.maximumScanBytes, request.encoding.abi, poll, context)
             }
         }, resolveSelection: { try observedReaderTake(observedReaderResolveSelection($0, $1, $2, $3)) },
         domain: nativeDomain)

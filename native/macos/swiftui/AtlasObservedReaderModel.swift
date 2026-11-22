@@ -242,6 +242,12 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     var lineInput = "1" {
         didSet { if oldValue != lineInput { revokeLineRequest() } }
     }
+    var columnInput = "1" {
+        didSet { if oldValue != columnInput { revokeLineRequest() } }
+    }
+    var columnKind: AtlasObservedReaderColumnKind = .unicodeScalar {
+        didSet { if oldValue != columnKind { revokeLineRequest() } }
+    }
     var lineCountInput = "20" {
         didSet { if oldValue != lineCountInput { revokeLineRequest() } }
     }
@@ -283,6 +289,8 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     }
     var canObserve: Bool { !closed && session != nil }
     var canReadLines: Bool { canObserve && transport.lines != nil && (try? lineRequest()) != nil }
+    var supportsPosition: Bool { transport.position != nil }
+    var canReadPosition: Bool { canObserve && supportsPosition && (try? positionRequest()) != nil }
     var canReopen: Bool { !closed && authority != nil }
     /// Current path authority belongs to the accepted opened file, independently
     /// of which bounded observation is visible. A pending reopen cannot replace
@@ -653,7 +661,12 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     }
     func observeAgain() {
         guard let page else { return }
-        if let lines = page.lineNavigation {
+        if let position = page.positionNavigation {
+            lineInput = String(position.line); columnInput = String(position.column); columnKind = position.kind
+            lineScanBytes = position.maximumScanBytes; pageBytes = position.maximumSelectedBytes
+            encoding = page.observation.request.encoding
+            observePositionInput()
+        } else if let lines = page.lineNavigation {
             lineInput = String(lines.requestedFirstLine); lineCountInput = String(lines.requestedLines)
             lineScanBytes = lines.maximumScanBytes; pageBytes = lines.maximumSelectedBytes
             encoding = page.observation.request.encoding
@@ -668,6 +681,46 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
         }
         return try .init(firstLine: first, lines: count, maximumSelectedBytes: pageBytes,
             maximumScanBytes: lineScanBytes, encoding: encoding)
+    }
+
+    private func positionRequest() throws -> AtlasObservedReaderPositionRequest {
+        guard let line = UInt64(lineInput), String(line) == lineInput,
+              let column = UInt64(columnInput), String(column) == columnInput else {
+            throw AtlasObservedReaderError.invalidInput
+        }
+        return try .init(line: line, column: column, kind: columnKind, maximumSelectedBytes: pageBytes,
+            maximumScanBytes: lineScanBytes, encoding: encoding)
+    }
+
+    /// A point can be reached inside a line larger than the retained window.
+    /// The scan retains its own context; it never resolves against one read
+    /// and opens a different current range to pretend they share provenance.
+    func observePositionInput() {
+        guard canObserve, let session, let input = authority?.input,
+              let readPosition = session.transport.position else { return }
+        let request: AtlasObservedReaderPositionRequest
+        do { request = try positionRequest() }
+        catch { notice = "Enter a one-based line and column, with a valid range and scan allowance."; return }
+        let (ticket, flag) = begin("Finding line \(request.line), column \(request.column) within a \(request.maximumScanBytes)-byte scan of the opened file…")
+        lineOperation = true
+        task = Task {
+            do {
+                let page = try await io.perform(cancellation: flag, keepingAlive: [session]) {
+                    try AtlasObservedReaderPage.decode(readPosition(session.handle, request, flag),
+                        handle: session.handle, input: input, position: request)
+                }
+                guard accepts(ticket, flag), self.session === session,
+                      (try? self.positionRequest()) == request else { return }
+                guard page.observation.id > latestObservation, let position = page.positionNavigation else {
+                    throw AtlasObservedReaderError.invalidResponse
+                }
+                install(page, append: true); finish(ticket)
+                notice = "Retained line \(position.line), column \(position.column) (\(position.kind.label)) at original byte \(position.originalOffset). The same scan read \(position.payloadBytesRead) bytes."
+                if page.positionSelection == nil {
+                    notice += " The exact logical point is retained; a native caret is unavailable inside a composed character or replacement-decoded text."
+                }
+            } catch { fail(error, ticket: ticket) }
+        }
     }
 
     /// Resolve and retain complete physical lines from one forward scan of the
@@ -969,7 +1022,7 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
         // query. Revoking query/external context cannot invalidate that retained
         // page receipt or make its exact highlight disappear during a failed
         // replacement operation.
-        let retainedSelection = page?.verifiedSearchSelection
+        let retainedSelection = page?.positionSelection ?? page?.verifiedSearchSelection
         if searchSelection != retainedSelection { clearTextSelection(); navigation = UUID() }
         searchSelection = retainedSelection; searchContext = nil; externalContext = nil
     }
@@ -981,7 +1034,7 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
     private func revokeLineRequest() {
         guard lineOperation else { return }
         cancelWork()
-        notice = "Line request changed. The accepted observation is unchanged; the earlier scan may still be draining."
+        notice = "Location request changed. The accepted observation is unchanged; the earlier scan may still be draining."
         startTextSelectionWork()
     }
 
@@ -1045,10 +1098,18 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
                     return "The captured excerpt does not contain enough complete source characters to open a reader page. Its retained match and captured hex remain available."
                 case "OBSERVED_READER_LINE_MISSING":
                     return "The scan reached the end of the opened file before the requested line. The accepted page is unchanged."
+                case "OBSERVED_READER_COLUMN_MISSING":
+                    return "The requested column is beyond this line's content. Columns are one-based and exclude the source BOM and line terminator. The accepted page is unchanged."
+                case "OBSERVED_READER_POSITION_SCAN_BYTE_LIMIT":
+                    return "The scan allowance ended before the line, column and bounded context were resolved. Increase Scan up to and try again; the location is not known to be missing. The accepted page is unchanged."
+                case "OBSERVED_READER_POSITION_READ_CALL_LIMIT":
+                    return "The scan reached its read-call limit before resolving this location. The location is not known to be missing. The accepted page is unchanged."
+                case "OBSERVED_READER_INVALID_RANGE":
+                    return "The location is outside the allowed range or splits a source scalar. Choose a Unicode-scalar column, or a complete UTF-16 or decoded UTF-8 boundary."
                 case "OBSERVED_READER_LINE_SCAN_BYTE_LIMIT":
                     return "The scan allowance ended before the requested lines and decoding context were resolved. Increase Scan up to and try again; the line is not known to be missing. The accepted page is unchanged."
                 case "OBSERVED_READER_LINE_OUTPUT_BYTE_LIMIT":
-                    return "The requested complete lines exceed the selected Range allowance. Request fewer lines or a larger Range; no truncated line replaced the accepted page."
+                    return "The requested complete lines exceed the selected Range allowance. Request fewer lines, a larger Range, or use Go to location to reach a column inside a giant line. The accepted page is unchanged."
                 case "OBSERVED_READER_LINE_READ_CALL_LIMIT":
                     return "The scan reached its read-call limit before resolving the requested lines. The line is not known to be missing. The accepted page is unchanged."
                 default: break
@@ -1074,7 +1135,7 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
         self.page = page
         latestObservation = max(latestObservation, page.observation.id)
         source = AtlasSource(path: page.observation.identity.displayPath, text: page.text)
-        searchSelection = page.verifiedSearchSelection
+        searchSelection = page.positionSelection ?? page.verifiedSearchSelection
         if let hit = page.findHit, let witness = selectedSearchWitness,
            page.observation.identity == witness.target.identity,
            searchReport?.admits(witness.target) == true,
@@ -1086,7 +1147,11 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
                 : .expressionPrimaryVerified(selection: searchSelection)
         }
         offsetInput = String(page.observation.request.offset)
-        if let lines = page.lineNavigation {
+        if let position = page.positionNavigation {
+            lineInput = String(position.line); columnInput = String(position.column); columnKind = position.kind
+            lineScanBytes = position.maximumScanBytes; pageBytes = position.maximumSelectedBytes
+            encoding = page.observation.request.encoding
+        } else if let lines = page.lineNavigation {
             lineInput = String(lines.requestedFirstLine); lineCountInput = String(lines.requestedLines)
             lineScanBytes = lines.maximumScanBytes
         }

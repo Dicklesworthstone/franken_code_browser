@@ -23,8 +23,8 @@ source-code files and folders; it does not take over default file associations.
 
 Larger files open directly in the **Observed Range Reader** using the selected
 file's own access. Opening reads metadata and the first **64 KiB** range with
-bounded decoding context. Byte navigation, physical-line navigation, bounded
-Find, retained observation history and original-byte selection/copy work without
+bounded decoding context. Byte navigation, physical-line and typed-column navigation,
+bounded Find, retained observation history and original-byte selection/copy work without
 capturing the whole file or choosing its containing project. The first range
 uses explicitly labeled UTF-8 decoding; choose UTF-16LE or UTF-16BE when needed.
 Each range is a separate observation; unread regions remain unknown.
@@ -2171,8 +2171,8 @@ first line, an exhausted prefix-scan allowance, an oversized selected window,
 a read-call limit, cancellation, and a detected source change have distinct
 outcomes. They preserve the accepted page; a limit never becomes a claim that
 the requested line is missing. Reduce **Lines** or increase the relevant
-allowance when a selected window does not fit. Byte navigation remains useful
-for a single line larger than the maximum retained window.
+allowance when a selected window does not fit. Use **Go to location** to reach
+a column within a single line larger than the maximum retained window.
 
 Each request admits at most 4,096 lines, 256 KiB of selected source plus bounded
 decoding context, 4 GiB of scan input, and 1,048,576 read calls. The scan keeps a
@@ -2186,6 +2186,34 @@ Rust host, C-boundary, native transport, and reader-model regression cases
 cover same-scan retention, UTF-16 and CRLF boundaries, large prefixes, retained
 history, limits, stale replies, and cancellation. These are code-first changes;
 executable Rust/Swift and physical-Mac qualification remain pending.
+
+### Exact columns inside giant lines
+
+Enter a **Line**, **Column** and **Count** unit, then choose **Go to location**.
+The units are Unicode scalars, UTF-16 code units, or decoded UTF-8 bytes. Both
+line and column start at one. A tab counts as one unit before visual expansion;
+the source BOM and physical line terminator are excluded. The position at the
+end of the line's content is valid. A column inside a UTF-8 scalar or UTF-16
+surrogate pair is refused rather than moved to another character.
+
+This action can reach a point deep inside a giant line without requiring that
+whole line to fit the Range allowance. The line/column scanner and bounded
+surrounding bytes come from the same forward read pass over the opened file.
+The selected Range and Scan up to limits, cancellation and metadata checks
+continue to apply. A scan cutoff does not establish that the line or column
+is missing.
+
+The accepted page shows the exact original byte offset and typed location.
+A native caret is shown only when its position can be checked against the
+retained original bytes and is a native composed-character boundary. Logical
+points inside combining sequences and replacement-decoded text remain exact
+without presenting a rounded caret. Back, Forward and Copy use the retained
+observation without file I/O; **Observe again** repeats its original typed
+request as a new observation. Editing any location request field revokes an
+obsolete pending result.
+
+Source, host, C-boundary, native transport and model regression cases cover
+these routes. Executable and physical-Mac qualification remain pending.
 
 ## Appearance
 

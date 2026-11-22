@@ -108,6 +108,14 @@ extension AtlasObservedReaderModel {
                                     .font(.caption).foregroundStyle(.secondary)
                             }
                         }
+                        if let position = page.positionNavigation {
+                            Text("Line \(position.line), column \(position.column) (\(position.kind.label)) · original byte \(position.originalOffset) · scanned \(position.scannedInputBytes) bytes")
+                                .font(.caption).foregroundStyle(.secondary)
+                            if page.positionSelection == nil {
+                                Text("The exact logical point is retained. A native caret is unavailable inside a composed character or replacement-decoded text.")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
                         if let finalLength = observation.finalObservedLength, finalLength != observation.observedLength {
                             Text("Length after read: \(finalLength) bytes; the file changed during this observation.")
                                 .font(.caption).foregroundStyle(.orange)
@@ -230,7 +238,7 @@ extension AtlasObservedReaderModel {
                 Button("Next bytes", action: model.nextRange).disabled(!model.canNext)
                     .help("Read a new observation after this byte range")
                 Button("Observe again", action: model.observeAgain).disabled(model.page == nil || model.busy)
-                    .help("Repeat this page's byte or physical-line request against the same opened file object")
+                    .help("Repeat this page's byte, physical-line or typed-column request against the same opened file object")
                 Spacer()
                 Menu("Display") {
                     Toggle("Line numbers", isOn: $showsLineNumbers)
@@ -279,7 +287,23 @@ extension AtlasObservedReaderModel {
                     .help("Scan from the beginning of the opened file and retain the requested complete lines from that same scan. Range limits the selected bytes.")
                 Spacer()
             }
-            Text("Line navigation uses the selected decoding and Range allowance. A scan limit preserves the accepted page; it does not mean the line is missing.")
+            if model.supportsPosition {
+                HStack(spacing: 7) {
+                    Text("Column").font(.caption)
+                    TextField("1", text: $model.columnInput).frame(width: 130)
+                        .textFieldStyle(.roundedBorder).onSubmit(model.observePositionInput)
+                        .accessibilityLabel("Column on the entered line, starting at one")
+                    Picker("Count", selection: $model.columnKind) {
+                        ForEach(AtlasObservedReaderColumnKind.allCases) { Text($0.label).tag($0) }
+                    }.frame(width: 230)
+                    Button("Go to location", action: model.observePositionInput).disabled(!model.canReadPosition)
+                        .help("Reach the entered line and column even inside a line larger than Range. Scan up to bounds the work; Range bounds the retained context from that same scan.")
+                    Spacer()
+                }
+                Text("Line and column start at one. Columns count decoded content before tab expansion; the BOM and line ending are excluded. A position inside a UTF-16 surrogate pair or UTF-8 scalar is refused.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            Text("Line and location navigation use the selected decoding and Range allowance. A scan limit preserves the accepted page; it does not mean the location is missing.")
                 .font(.caption2).foregroundStyle(.secondary)
             Text("Decoding is explicit for the next observation. It does not determine the encoding of unknown file regions.")
                 .font(.caption2).foregroundStyle(.secondary)

@@ -6,6 +6,7 @@ import Foundation
 @_silgen_name("observed_reader_fixture_allocations") private func allocations() -> UInt32
 @_silgen_name("observed_reader_fixture_frees") private func frees() -> UInt32
 @_silgen_name("observed_reader_fixture_encodings") private func encodings() -> UInt32
+@_silgen_name("observed_reader_fixture_position_kinds") private func positionKinds() -> UInt32
 
 @_cdecl("observed_reader_fixture_cancel") func cancelObservedReaderFixture(_ context: UnsafeMutableRawPointer?) {
     guard let context else { preconditionFailure("Missing live cancellation context") }
@@ -367,6 +368,45 @@ import Foundation
         let selected = try resolveSelection(handle, observation, offset + 3, offset + 17)
         precondition(selected == expected && count(18) == beforeSelection + 1 && allocations() == frees(),
             "Selection ABI preserves full-width observation and decoded coordinates and frees its receipt")
+        guard let readPosition = transport.position else { preconditionFailure("Native typed-position transport is missing") }
+        let position = try AtlasObservedReaderPositionRequest(line: offset, column: observation,
+            maximumScanBytes: 1 << 32)
+        let priorPositionAllocations = allocations(), priorPositionPolls = count(8)
+        for encoding in AtlasObservedReaderEncoding.allCases {
+            for kind in AtlasObservedReaderColumnKind.allCases {
+                let request = try AtlasObservedReaderPositionRequest(line: offset, column: observation, kind: kind,
+                    maximumScanBytes: 1 << 32, encoding: encoding)
+                let result = try readPosition(handle, request, AtlasSearchCancellation())
+                precondition(result == expected && allocations() == frees())
+            }
+        }
+        precondition(count(29) == 9 && count(8) == priorPositionPolls + 9
+            && allocations() == priorPositionAllocations + 9 && positionKinds() == 0b1110,
+            "Position ABI preserves full-width line and column, typed 1/2/3 column units, every encoding and both byte limits")
+        let enteredPositions = count(29), priorPositionFrees = frees()
+        do { _ = try readPosition(handle, position, canceled); preconditionFailure("Canceled position crossed ABI") }
+        catch AtlasObservedReaderError.canceled { }
+        precondition(count(29) == enteredPositions && frees() == priorPositionFrees)
+        mode(1)
+        let beforeMissingPosition = allocations()
+        let missingPosition = try readPosition(handle, position, AtlasSearchCancellation())
+        precondition(missingPosition == nil && allocations() == beforeMissingPosition && allocations() == frees(),
+            "A null position response stays unavailable without inventing owned storage")
+        for invalid in [Int32(2), Int32(3)] {
+            mode(invalid); let beforeFrees = frees()
+            do { _ = try readPosition(handle, position, AtlasSearchCancellation()); preconditionFailure("Malformed position response accepted") }
+            catch AtlasObservedReaderError.invalidResponse { }
+            precondition(frees() == beforeFrees + 1 && allocations() == frees(),
+                "Every owned malformed or oversized position response is freed exactly once")
+        }
+        for late in [Int32(4), Int32(5)] {
+            mode(late); let flag = AtlasSearchCancellation(), beforePolls = count(8)
+            do { _ = try readPosition(handle, position, flag); preconditionFailure("Late position cancellation accepted") }
+            catch AtlasObservedReaderError.canceled { }
+            precondition(flag.isCanceled && count(8) == beforePolls + 2 && allocations() == frees(),
+                "Position polls retain their context and free any late response before reporting cancellation")
+        }
+        mode(0)
         precondition(transport.cancel(handle) && transport.close(handle))
         mode(6)
         precondition(transport.create() == 0 && !transport.cancel(handle) && !transport.close(handle))

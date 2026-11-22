@@ -9,8 +9,8 @@
 enum { CREATE, OPEN, INFO, WINDOW, RETAINED, COPY, CANCEL, CLOSE, POLLS, FIND, HIT, OBSERVE_HIT, LINES, COUNTED_FIND,
     MATCHING_FIND, MATCHING_COUNTED, OCCURRENCES_FIND, OCCURRENCES_COUNTED, RESOLVE_SELECTION, OPEN_FILE,
     PAGED_FIND, PAGED_COUNTED, PAGED_LOWERCASE, PAGED_OCCURRENCES,
-    EXPRESSION_FIND, EXPRESSION_COUNTED, EXPRESSION_LOWERCASE, PAGED_EXPRESSION, SEARCH_EXCERPT, COUNTERS };
-static uint32_t counts[COUNTERS], allocations, frees, encoding_bits;
+    EXPRESSION_FIND, EXPRESSION_COUNTED, EXPRESSION_LOWERCASE, PAGED_EXPRESSION, SEARCH_EXCERPT, POSITION, COUNTERS };
+static uint32_t counts[COUNTERS], allocations, frees, encoding_bits, position_kind_bits;
 static int32_t mode;
 static char *owned;
 static const uint64_t handle_value = UINT64_C(0xfedcba9876543210);
@@ -21,13 +21,14 @@ extern void observed_reader_fixture_cancel(void *context);
 
 void observed_reader_fixture_reset(void) {
     assert(owned == NULL && allocations == frees);
-    memset(counts, 0, sizeof(counts)); allocations = frees = encoding_bits = 0; mode = 0;
+    memset(counts, 0, sizeof(counts)); allocations = frees = encoding_bits = position_kind_bits = 0; mode = 0;
 }
 void observed_reader_fixture_mode(int32_t value) { mode = value; }
 uint32_t observed_reader_fixture_count(uint32_t kind) { assert(kind < COUNTERS); return counts[kind]; }
 uint32_t observed_reader_fixture_allocations(void) { return allocations; }
 uint32_t observed_reader_fixture_frees(void) { return frees; }
 uint32_t observed_reader_fixture_encodings(void) { return encoding_bits; }
+uint32_t observed_reader_fixture_position_kinds(void) { return position_kind_bits; }
 
 static void poll_context(fcb_observed_reader_poll poll, void *context) {
     assert(poll != NULL && context != NULL);
@@ -92,6 +93,16 @@ char *fcb_observed_reader_lines(uint64_t handle, uint64_t first_line, uint64_t l
     assert(encoding >= 1 && encoding <= 3);
     encoding_bits |= 1u << (unsigned)encoding;
     ++counts[LINES]; poll_context(poll, context); return response();
+}
+char *fcb_observed_reader_position(uint64_t handle, uint64_t line, uint64_t column, uint64_t kind,
+    uint64_t max_bytes, uint64_t max_scan_bytes, uint64_t encoding,
+    fcb_observed_reader_poll poll, void *context) {
+    assert(handle == handle_value && line == offset_value && column == observation_value);
+    assert(kind >= 1 && kind <= 3 && encoding >= 1 && encoding <= 3);
+    assert(max_bytes == 65536 && max_scan_bytes == UINT64_C(4294967296));
+    position_kind_bits |= 1u << (unsigned)kind;
+    encoding_bits |= 1u << (unsigned)encoding;
+    ++counts[POSITION]; poll_context(poll, context); return response();
 }
 char *fcb_observed_reader_retained(uint64_t handle, uint64_t observation) {
     assert(handle == handle_value && observation == observation_value);

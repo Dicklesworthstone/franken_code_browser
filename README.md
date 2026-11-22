@@ -71,10 +71,11 @@ See the [native search workflow](native/macos/README.md#searching-large-files-ac
 for discovery, I/O and result limits. This addition still requires executable and
 physical-Mac qualification; it is not a claim about an already released binary.
 
-The large-file **Observed Range Reader** now also supports bounded line-number
-navigation. It scans the opened file for the requested physical lines and keeps
-their original bytes from that same scan, with explicit scan and selection
-limits, cancellation, and retained history. See [line navigation in large files](native/macos/README.md#line-navigation-in-large-files).
+The large-file **Observed Range Reader** supports bounded line-number and exact
+line/column navigation, including columns deep inside a line too large to retain
+in full. Choose Unicode-scalar, UTF-16 or decoded UTF-8 columns. It scans the
+opened file and keeps the point's surrounding bytes from that same pass, with
+explicit scan and selection limits, cancellation, and retained history. See [line navigation in large files](native/macos/README.md#line-navigation-in-large-files).
 This source addition likewise awaits executable and physical-Mac qualification.
 
 > [!IMPORTANT]
