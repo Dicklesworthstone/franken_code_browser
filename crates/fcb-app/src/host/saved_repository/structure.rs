@@ -7,7 +7,7 @@
 
 use std::mem::size_of;
 use fcb_core::ResourceLease;
-use fcb::{ArenaOwnerId, ByteLength, FileId, QueryGeneration, SourceRevision};
+use fcb::{ArenaOwnerId, ByteLength, ByteRange, FileId, QueryGeneration, SourceRevision};
 pub use fcb::search::SymbolNameMode;
 pub use fcb::search::snapshot_structure::StructureMode;
 use fcb::search::snapshot_structure::{StructureError, StructureHit, StructureOptions,
@@ -199,6 +199,20 @@ struct StructureReader {
     window: HostResponse,
 }
 
+/// Small provenance receipt copied from a retained structural witness before
+/// source I/O. Opening still requires the original private-construction hit.
+/// No names, parser positions or JSON fields are reinterpreted as a selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SavedStructureTarget {
+    pub generation: u64,
+    pub hit_id: u64,
+    pub member: usize,
+    pub selection: ByteRange,
+    pub evidence: ByteRange,
+    pub mode: StructureMode,
+    pub candidate_id: u64,
+}
+
 impl SavedRepositorySession {
     pub fn accepted_structure_generation(&self) -> Option<u64> {
         self.structure.as_ref().map(|query| query.generation)
@@ -274,17 +288,37 @@ impl SavedRepositorySession {
         Ok(query)
     }
 
+    pub(super) fn structure_target(&self, generation: u64, hit_id: u64)
+        -> Result<SavedStructureTarget, SavedRepositoryError> {
+        let query = self.accepted_structure(generation)?;
+        let hit = query.hit(hit_id)?;
+        Ok(SavedStructureTarget { generation, hit_id, member: hit.ordinal(),
+            selection: hit.original_range(), evidence: hit.evidence_range(),
+            mode: query.report.mode(), candidate_id: hit.candidate_id() })
+    }
+
+    pub(super) fn load_structure_target(&mut self, target: SavedStructureTarget,
+        canceled: &mut impl FnMut() -> bool) -> Result<PagedCapture, SavedRepositoryError> {
+        check(canceled)?;
+        if self.structure_target(target.generation, target.hit_id)? != target {
+            return Err(SavedRepositoryError::StaleQuery);
+        }
+        let generation = QueryGeneration::new(self.owner(), target.generation)
+            .map_err(|_| SavedRepositoryError::StaleQuery)?;
+        let allocations = self.allocations()?;
+        let hit = self.structure.as_ref().ok_or(SavedRepositoryError::MissingQuery)?.hit(target.hit_id)?;
+        Ok(hit.open(&mut self.archive, generation, &self.budget, allocations, &mut *canceled)?)
+    }
+
     fn prepare_structure_reader(&mut self, reader_owner: ArenaOwnerId, generation: u64, hit_id: u64,
         canceled: &mut impl FnMut() -> bool) -> Result<StructureReader, SavedRepositoryError> {
         check(canceled)?;
         if reader_owner == self.owner() { return Err(super::PagedSearchError::OwnerMismatch.into()); }
-        let qgen = QueryGeneration::new(self.owner(), generation).map_err(|_| SavedRepositoryError::StaleQuery)?;
-        let allocations = self.allocations()?;
-        let hit = self.structure.as_ref().ok_or(SavedRepositoryError::MissingQuery)?.hit(hit_id)?;
-        let capture = hit.open(&mut self.archive, qgen, &self.budget, allocations, &mut *canceled)?;
-        let member = self.archive.directory().member(hit.ordinal()).ok_or(SavedRepositoryError::MissingHit)?;
+        let target = self.structure_target(generation, hit_id)?;
+        let capture = self.load_structure_target(target, canceled)?;
+        let member = self.archive.directory().member(target.member).ok_or(SavedRepositoryError::MissingHit)?;
         let label = RawPath::from_bytes(member.path).to_path_buf();
-        let range = hit.original_range();
+        let range = target.selection;
         let mut reader = ReaderSession::from_bytes(reader_owner, &label, capture.bytes(), &mut *canceled)?;
         let info = reader.info(&mut *canceled)?;
         let start = range.start().get().saturating_sub(CONTEXT_BYTES);

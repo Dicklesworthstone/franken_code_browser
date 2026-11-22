@@ -132,6 +132,18 @@ preserving the previous trail and all its visits. The CLI offers the same immuta
 workflow. This source implementation still requires
 independent native verification.
 
+**Offline Desk navigation connects saved search to retained reading work.**
+The persistent `fcb desk --stdio` session now offers `saved-paths` Quick Open
+and `saved-structure` searches for declaration candidates, Markdown headings
+and whole-token occurrences. Path matching reads archive metadata only.
+Activating a result verifies the captured member and retains it in the ordinary
+Desk, where exact selections can be annotated, bookmarked and checkpointed after
+the archive is detached. Repeated filename, structural and literal hits reuse
+the same capture. Queries have independent generations, explicit work limits,
+raw-path/UTF-8 hex forms and bounded pages; later structural match windows do
+not alias earlier hit IDs. `fcb desk --help` lists the protocol commands.
+This source addition awaits independent executable verification.
+
 **Reading Desk recovery preserves accepted work between sessions.** The native
 desk's **Recovery…** controls can enable local automatic checkpoints containing
 captured sources, bookmarks, reading locations and accepted notes. The bounded

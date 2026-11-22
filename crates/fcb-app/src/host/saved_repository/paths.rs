@@ -298,8 +298,15 @@ impl SavedRepositorySession {
         hit_id: u64, mut canceled: impl FnMut() -> bool)
         -> Result<(ReaderSession, HostResponse), SavedRepositoryError> {
         check(&mut canceled)?;
-        let member = self.accepted_paths(generation)?.hit(hit_id)?.member;
+        let member = self.path_hit_member(generation, hit_id)?;
         self.open_member_reader(reader_owner, member, &mut canceled)
+    }
+
+    /// A typed, metadata-only handoff shared by independent readers and the
+    /// source-owning Desk. Archived names never become lookup authority.
+    pub(super) fn path_hit_member(&self, generation: u64, hit_id: u64)
+        -> Result<usize, SavedRepositoryError> {
+        Ok(self.accepted_paths(generation)?.hit(hit_id)?.member)
     }
 
     fn accepted_paths(&self, generation: u64) -> Result<&AcceptedPaths, SavedRepositoryError> {

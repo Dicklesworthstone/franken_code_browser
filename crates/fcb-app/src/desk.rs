@@ -297,8 +297,9 @@ fn execute(session: &mut DeskSession, attempt: u64, frame: &str,
     repository: &mut RepositoryCommands, documents: &mut DocumentCommands,
     comparisons: &mut ComparisonCommands, saved: &mut SavedCommands,
     code: &mut CodeCommands, readers: &mut ReadingCommands) -> Result<(HostResponse, bool), Failure> {
-    // Fixed field array: a hostile frame cannot allocate an unbounded token vector.
-    let mut fields = [""; 8]; let mut used = 0;
+    // Revision + command + at most eight structural-search arguments. Keep
+    // framing fixed-size even when a hostile frame contains many separators.
+    let mut fields = [""; 10]; let mut used = 0;
     for field in frame.split('\t') {
         if used == fields.len() { return Err(Failure::Protocol("DESK_FIELD_LIMIT")); }
         fields[used] = field; used += 1;

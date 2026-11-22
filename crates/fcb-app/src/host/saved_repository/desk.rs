@@ -12,6 +12,7 @@ use crate::host::desk::{DeskSession, DeskSessionError, DeskError,
 use super::{SavedRepositorySession, SavedRepositoryError, PagedCapture, PagedHit,
     PagedMemberData, PagedSearchError, PagedSnapshotError, FileId, SourceRevision, ByteLength,
     RawPath, Sha256Digest, HostResponse, OutputError, AppError, check,
+    structure::SavedStructureTarget,
     imports::{SavedImportError, SavedImportSide},
     relationships::{RelationshipSide, SavedRelationshipError, FragmentResolution}};
 
@@ -59,6 +60,8 @@ pub struct SavedDeskOpen {
     member: usize,
     source_digest: Sha256Digest,
     query: Option<(u64, u64)>,
+    path_query: Option<(u64, u64)>,
+    structure: Option<SavedStructureTarget>,
     expression: Option<(u64, u64)>,
     relationship: Option<(u64, u64, RelationshipSide, FragmentResolution)>,
     import_link: Option<(u64, u64, SavedImportSide)>,
@@ -84,6 +87,40 @@ impl SavedRepositorySession {
             .ok_or(SavedRepositoryError::MissingHit)?;
         let hit = *self.accepted(generation)?.report.hits().get(position).ok_or(SavedRepositoryError::MissingHit)?;
         self.open_desk(desk, expected, attempt, hit.ordinal(), Some((hit_id, hit)), &mut canceled)
+    }
+
+    /// Quick Open selects a retained directory result, then independently
+    /// verifies the captured member. Filename matches select no source text.
+    pub fn open_path_hit_desk(&mut self, desk: &mut DeskSession, expected: u64, attempt: u64,
+        generation: u64, hit_id: u64, mut canceled: impl FnMut() -> bool)
+        -> Result<SavedDeskOpen, SavedDeskError> {
+        validate_desk(desk, expected, attempt)?;
+        check(&mut canceled)?;
+        let member = self.path_hit_member(generation, hit_id)?;
+        let mut opened = self.open_desk(desk, expected, attempt, member, None, &mut canceled)?;
+        opened.path_query = Some((generation, hit_id));
+        Ok(opened)
+    }
+
+    /// Declarations, headings and occurrences retain their own evidence class
+    /// and exact original-byte selection. The shared structural witness checks
+    /// archive identity, source digest and containment before Desk publication.
+    pub fn open_structure_hit_desk(&mut self, desk: &mut DeskSession, expected: u64, attempt: u64,
+        generation: u64, hit_id: u64, mut canceled: impl FnMut() -> bool)
+        -> Result<SavedDeskOpen, SavedDeskError> {
+        validate_desk(desk, expected, attempt)?;
+        check(&mut canceled)?;
+        let target = self.structure_target(generation, hit_id)?;
+        self.validate_desk_member(desk, expected, attempt, target.member, &mut canceled)?;
+        let before = self.archive.load_stats();
+        let capture = self.load_structure_target(target, &mut canceled)?;
+        let after = self.archive.load_stats();
+        let mut opened = self.import_desk_capture(desk, expected, attempt, target.member,
+            &capture, Some(target.selection), None,
+            (after.bytes_read - before.bytes_read, after.read_calls - before.read_calls), &mut canceled)?;
+        // The accepted mutation is final; its provenance is already prepared.
+        opened.structure = Some(target);
+        Ok(opened)
     }
 
     /// Follow the complete original Markdown evidence or its exact captured member into
@@ -184,7 +221,8 @@ impl SavedRepositorySession {
         let imported = desk.import_source(expected, attempt, origin, &label, capture.bytes(),
             selection.map_or(0, |r| r.start().get()), selection, &mut *canceled)?;
         // No fallible work or cancellation gate after the accepted transaction.
-        Ok(SavedDeskOpen { imported, archive, member: ordinal, source_digest, query, expression: None,
+        Ok(SavedDeskOpen { imported, archive, member: ordinal, source_digest, query,
+            path_query: None, structure: None, expression: None,
             relationship: None, import_link: None, selection,
             member_bytes_read: io.0, member_read_calls: io.1 })
     }
@@ -212,6 +250,18 @@ impl SavedRepositorySession {
         out.literal(",\"pane\":")?; super::optional(&mut out, opened.imported.change.active.map(|p| p.get()))?;
         out.literal(",\"query_generation\":")?; super::optional(&mut out, opened.query.map(|q| q.0))?;
         out.literal(",\"hit_id\":")?; super::optional(&mut out, opened.query.map(|q| q.1))?;
+        out.literal(",\"path_generation\":")?; super::optional(&mut out, opened.path_query.map(|q| q.0))?;
+        out.literal(",\"path_hit_id\":")?; super::optional(&mut out, opened.path_query.map(|q| q.1))?;
+        out.literal(",\"structure_generation\":")?; super::optional(&mut out, opened.structure.map(|s| s.generation))?;
+        out.literal(",\"structure_hit_id\":")?; super::optional(&mut out, opened.structure.map(|s| s.hit_id))?;
+        out.literal(",\"structure\":")?;
+        if let Some(structure) = opened.structure {
+            out.literal("{\"requested_mode\":")?; out.quoted(structure.mode.requested())?;
+            out.literal(",\"evidence_level\":")?; out.quoted(structure.mode.realized())?;
+            out.literal(",\"semantic_complete\":false,\"candidate_id\":")?; out.integer(structure.candidate_id)?;
+            out.literal(",\"evidence_range\":")?; out.range(structure.evidence)?;
+            out.literal("}")?;
+        } else { out.literal("null")?; }
         out.literal(",\"expression_generation\":")?; super::optional(&mut out, opened.expression.map(|q| q.0))?;
         out.literal(",\"expression_hit_id\":")?; super::optional(&mut out, opened.expression.map(|q| q.1))?;
         out.literal(",\"relationship_generation\":")?; super::optional(&mut out, opened.relationship.map(|r| r.0))?;
@@ -227,7 +277,8 @@ impl SavedRepositorySession {
         out.literal(",\"selection_namespace\":")?;
         out.quoted(if opened.import_link.is_some() { "saved-import" } else if opened.relationship.is_some() {
             "saved-relationship" } else if opened.expression.is_some() {
-            "saved-expression" } else if opened.query.is_some() { "saved-literal" } else { "saved-member" })?;
+            "saved-expression" } else if opened.structure.is_some() { "saved-structure" } else if opened.path_query.is_some() {
+            "saved-paths" } else if opened.query.is_some() { "saved-literal" } else { "saved-member" })?;
         out.literal(",\"selection\":")?;
         match opened.selection { Some(r) => out.range(r)?, None => out.literal("null")? }
         out.literal("}\n")?;
