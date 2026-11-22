@@ -145,3 +145,54 @@ fn empty_and_bom_only_documents_have_valid_empty_views() {
         assert!(reader.window(0, 10).unwrap().whole_document_visible());
     }
 }
+
+#[test]
+fn rendered_offset_navigation_uses_the_flow_domain_and_checks_scalar_boundaries() {
+    let source = capture("\u{feff}# Intro\n\nA **Café 😀** paragraph with enough text to wrap.\n".as_bytes());
+    let budget = budget();
+    let reader = DocumentReader::prepare(&source, id(), generation(1),
+        DocumentReadOptions { width_columns: 14, ..Default::default() },
+        &budget, allocation(1), || false).unwrap();
+    let mut visited = 0;
+    for first in 0..reader.total_lines() {
+        let page = reader.window(first, 1).unwrap();
+        let line = &page.lines()[0];
+        if line.rendered_range.is_empty() { continue; }
+        let target = reader.window_at_rendered(line.rendered_range.start, 1).unwrap();
+        assert_eq!(target.first_index(), first);
+        assert_eq!(target.lines()[0].rendered_text, line.rendered_text);
+        visited += 1;
+    }
+    assert!(visited > 2);
+    let middle = reader.rendered_text().find('é').unwrap() + 1;
+    assert_eq!(reader.window_at_rendered(middle, 1).err(), Some(DocumentReadError::InvalidRange));
+    assert_eq!(reader.window_at_rendered(usize::MAX, 1).err(), Some(DocumentReadError::InvalidRange));
+    for count in [0, 1025] {
+        assert_eq!(reader.window_at_rendered(0, count).err(), Some(DocumentReadError::InvalidRange));
+    }
+    let eof = reader.window_at_rendered(reader.rendered_text().len(), 1).unwrap();
+    assert_eq!(eof.first_index(), reader.total_lines());
+    assert!(eof.lines().is_empty());
+    assert_eq!(reader.capture().bytes(), source.bytes());
+}
+
+#[test]
+fn every_rendered_scalar_boundary_has_flow_context_even_in_layout_separator_gaps() {
+    for bytes in [b"# Heading\n\nA paragraph.\n\nAnother paragraph.\n".as_slice(), b"```\n```\n".as_slice()] {
+        let source = capture(bytes); let budget = budget(); let reader = read(&source, &budget);
+        let mut rows = Vec::new();
+        for first in 0..reader.total_lines() {
+            let page = reader.window(first, 1).unwrap();
+            rows.push((page.lines()[0].rendered_range.end, first));
+        }
+        assert!(!reader.rendered_text().is_empty());
+        for (offset, _) in reader.rendered_text().char_indices() {
+            let window = reader.window_at_rendered(offset, 1).unwrap();
+            let expected = rows.iter().find(|&&(end, _)| offset < end)
+                .or_else(|| rows.last()).map_or(0, |row| row.1);
+            assert_eq!(window.first_index(), expected);
+            if rows.is_empty() { assert!(window.lines().is_empty()); }
+        }
+        assert!(reader.window_at_rendered(reader.rendered_text().len(), 1).unwrap().lines().is_empty());
+    }
+}

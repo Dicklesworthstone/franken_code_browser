@@ -3,7 +3,7 @@
 //! Thin marshaling for the same retained-reader document service used by hosts.
 //! No native renderer, Markdown engine, source lookup or independent registry.
 use std::{ffi::c_char, path::Path};
-use fcb_app::host::reader::{ReaderDocumentOptions, DocumentCopyMode};
+use fcb_app::host::reader::{ReaderDocumentOptions, DocumentCopyMode, MAX_READER_DOCUMENT_FIND_NEEDLE_BYTES};
 use super::{answer, cstr, number, reply, AccessError, Command};
 
 #[unsafe(no_mangle)]
@@ -23,6 +23,34 @@ pub extern "C" fn fcb_reader_document_window(handle: u64, generation: u64, first
     reply(|| answer(handle, |readers| readers.execute(handle,
         Command::DocumentWindow { generation, first: number(first)?, count: number(count)? }, || false)))
 }
+/// Case-sensitive literal Find over retained upstream rendered text. Pages
+/// replay the immutable layout; offsets never claim original source bytes.
+/// # Safety
+/// needle is null or readable through its NUL terminator, or through 1025
+/// bytes when no terminator occurs within the 1024-byte payload limit. The
+/// buffer remains immutable until return and no foreign pointer is retained.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_reader_document_find(handle: u64, generation: u64,
+    needle: *const c_char, first: u64, count: u64) -> *mut c_char {
+    reply(|| answer(handle, |readers| {
+        let needle = unsafe { find_needle(needle) }?;
+        readers.execute(handle, Command::DocumentFind { generation, needle,
+            first: number(first)?, count: number(count)? }, || false)
+    }))
+}
+
+unsafe fn find_needle<'a>(pointer: *const c_char) -> Result<&'a str, AccessError> {
+    if pointer.is_null() { return Err(AccessError::InvalidArgument); }
+    for length in 0..=MAX_READER_DOCUMENT_FIND_NEEDLE_BYTES {
+        if unsafe { *pointer.add(length) } == 0 {
+            if length == 0 { return Err(AccessError::InvalidArgument); }
+            let bytes = unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), length) };
+            return std::str::from_utf8(bytes).map_err(|_| AccessError::InvalidArgument);
+        }
+    }
+    Err(AccessError::InvalidArgument)
+}
+
 /// Prepare exact upstream glyph geometry for an already accepted logical
 /// document generation. This is host-worker work, never a drawing callback.
 #[unsafe(no_mangle)]

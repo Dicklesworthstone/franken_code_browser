@@ -13,6 +13,7 @@ fn take(pointer: *mut c_char) -> String {
 fn all_document_entrypoint_types_and_public_header_names_agree() {
     let _: extern "C" fn(u64, u64, u64, u64, u64, u64, u64) -> *mut c_char = fcb_reader_document;
     let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_reader_document_window;
+    let _: unsafe extern "C" fn(u64, u64, *const c_char, u64, u64) -> *mut c_char = fcb_reader_document_find;
     let _: extern "C" fn(u64, u64, u64) -> *mut c_char = fcb_reader_document_display;
     let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_reader_document_display_page;
     let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_reader_document_display_from_source;
@@ -30,7 +31,7 @@ fn all_document_entrypoint_types_and_public_header_names_agree() {
     let _: extern "C" fn(u64, u64, u64, u64, u8) -> *mut c_char = fcb_reader_document_copy;
     let _: extern "C" fn(u64, u64) -> *mut c_char = fcb_reader_document_clear;
     let header = include_str!("../include/fcb_reader_document.h");
-    for name in ["fcb_reader_document(", "fcb_reader_document_window(", "fcb_reader_document_headings(",
+    for name in ["fcb_reader_document(", "fcb_reader_document_window(", "fcb_reader_document_find(", "fcb_reader_document_headings(",
         "fcb_reader_document_display(", "fcb_reader_document_display_page(", "fcb_reader_document_display_font(",
         "fcb_reader_document_display_from_source(",
         "fcb_reader_document_images_authorize(", "fcb_reader_document_image_prepare(", "fcb_reader_document_image_chunk(",
@@ -57,6 +58,8 @@ fn unknown_handles_null_slugs_and_wide_offsets_return_owned_error_strings() {
     let pointers = [
         fcb_reader_document(u64::MAX, 1, 100, 65536, 8192, 8192, 4096),
         fcb_reader_document_window(u64::MAX, 1, u64::MAX, 1),
+        unsafe { fcb_reader_document_find(u64::MAX, 1, slug.as_ptr(), 0, 1) },
+        unsafe { fcb_reader_document_find(u64::MAX, 1, std::ptr::null(), 0, 1) },
         fcb_reader_document_display(u64::MAX, 1, u64::MAX),
         fcb_reader_document_display_page(u64::MAX, 1, u64::MAX, 1),
         fcb_reader_document_display_from_source(u64::MAX, 1, u64::MAX, 1),
@@ -258,4 +261,62 @@ fn local_image_c_route_requires_explicit_root_and_retains_exact_encoded_capture(
         .contains("\"status\":\"error\""));
     let source = take(crate::reader_ffi::fcb_reader_window(handle.0, 0, 4096));
     assert!(source.contains("Red pixel"), "image retirement discarded retained source");
+}
+
+#[test]
+fn rendered_find_bounds_foreign_queries_before_decoding_or_registry_execution() {
+    assert_eq!(unsafe { find_needle(std::ptr::null()) }, Err(AccessError::InvalidArgument));
+    for bytes in [vec![0], vec![0xff, 0], vec![b'x'; MAX_READER_DOCUMENT_FIND_NEEDLE_BYTES + 1]] {
+        assert_eq!(unsafe { find_needle(bytes.as_ptr().cast()) }, Err(AccessError::InvalidArgument));
+    }
+    let exact = CString::new("x".repeat(MAX_READER_DOCUMENT_FIND_NEEDLE_BYTES)).unwrap();
+    assert_eq!(unsafe { find_needle(exact.as_ptr()) }.unwrap().len(), MAX_READER_DOCUMENT_FIND_NEEDLE_BYTES);
+    let unicode = CString::new("é😀").unwrap();
+    assert_eq!(unsafe { find_needle(unicode.as_ptr()) }.unwrap(), "é😀");
+}
+
+#[test]
+fn rendered_find_pages_navigate_actual_c_reader_flow_and_reject_retired_layouts() {
+    let _guard = crate::reader_ffi::FFI_TEST_LOCK.lock().unwrap();
+    struct OpenReader(u64);
+    impl Drop for OpenReader {
+        fn drop(&mut self) { crate::reader_ffi::fcb_reader_close(self.0); }
+    }
+    let handle = OpenReader(crate::reader_ffi::fcb_reader_create());
+    assert_ne!(handle.0, 0);
+    let needle = CString::new("bold phrase").unwrap();
+    crate::reader_ffi::registry().unwrap().supply(handle.0,
+        b"# Heading\n\nA **bold** phrase.\n\nAnother **bold** phrase.\n").unwrap();
+    take(fcb_reader_document(handle.0, 1, 100, 65536, 8192, 8192, 4096));
+    let first = take(unsafe { fcb_reader_document_find(handle.0, 1, needle.as_ptr(), 0, 1) });
+    for required in ["\"command\":\"document-find\"", "\"document_generation\":\"1\"",
+        "\"needle\":\"bold phrase\"", "\"search_domain\":\"rendered-text-utf8\"",
+        "\"max_scan_bytes\":\"16777216\"", "\"overlapping\":true",
+        "\"match_count_complete\":true", "\"matches_seen\":\"2\"", "\"match_id\":\"1\"",
+        "\"first_match\":\"0\"", "\"next_match\":\"1\"", "\"additional_source_bytes_read\":\"0\""] {
+        assert!(first.contains(required), "{required}: {first}");
+    }
+    assert!(!first.contains("\"enclosing_original_range\""));
+    let line: u64 = first.split_once("\"first_flow_line\":\"").unwrap().1
+        .split('"').next().unwrap().parse().unwrap();
+    assert!(take(fcb_reader_document_window(handle.0, 1, line, 4)).contains("bold phrase"));
+    let second = take(unsafe { fcb_reader_document_find(handle.0, 1, needle.as_ptr(), 1, 1) });
+    assert!(second.contains("\"match_id\":\"2\"") && second.contains("\"next_match\":null"), "{second}");
+    let again = take(unsafe { fcb_reader_document_find(handle.0, 1, needle.as_ptr(), 0, 1) });
+    assert_eq!(again, first);
+    for pointer in [
+        unsafe { fcb_reader_document_find(handle.0, 1, std::ptr::null(), 0, 1) },
+        unsafe { fcb_reader_document_find(handle.0, 1, needle.as_ptr(), 0, 0) },
+        unsafe { fcb_reader_document_find(handle.0, 1, needle.as_ptr(), 0, 129) },
+        unsafe { fcb_reader_document_find(handle.0, 1, needle.as_ptr(), u64::MAX, 1) },
+    ] { assert!(take(pointer).contains("\"status\":\"error\"")); }
+    take(fcb_reader_document(handle.0, 2, 80, 65536, 8192, 8192, 4096));
+    let stale = take(unsafe { fcb_reader_document_find(handle.0, 1, needle.as_ptr(), 0, 1) });
+    assert!(stale.contains("DOCUMENT_READ_STALE_GENERATION"), "{stale}");
+    assert!(take(unsafe { fcb_reader_document_find(handle.0, 2, needle.as_ptr(), 0, 1) })
+        .contains("\"matches_seen\":\"2\""));
+    take(fcb_reader_document_clear(handle.0, 3));
+    assert!(take(unsafe { fcb_reader_document_find(handle.0, 2, needle.as_ptr(), 0, 1) })
+        .contains("READER_SESSION_NO_DOCUMENT"));
+    assert!(first.contains("\"document_generation\":\"1\""), "owned reply outlives its retired layout");
 }

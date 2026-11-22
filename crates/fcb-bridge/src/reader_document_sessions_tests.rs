@@ -193,3 +193,28 @@ fn link_inventory_cancellation_preserves_the_accepted_generation_and_reader_capt
         .contains("\"original_hex\":\"23204b657074\""));
     readers.close(handle).unwrap();
 }
+
+#[test]
+fn rendered_find_uses_independent_documents_and_existing_cancellation_ownership() {
+    let readers = ReaderSessions::new();
+    let a = readers.create().unwrap(); let b = readers.create().unwrap();
+    readers.supply(a, b"# Alpha\n\nA **bold** phrase.\n").unwrap();
+    readers.supply(b, b"# Beta\n\nA different phrase.\n").unwrap();
+    prepare(&readers, a, 1); prepare(&readers, b, 1);
+    let find = |handle| readers.execute(handle, Command::DocumentFind {
+        generation: 1, needle: "bold phrase", first: 0, count: 64 }, || false);
+    let accepted = find(a).unwrap();
+    assert!(accepted.as_str().contains("\"matches_seen\":\"1\""));
+    assert!(find(b).unwrap().as_str().contains("\"matches_seen\":\"0\""));
+    let mut polls = 0;
+    let canceled = readers.execute(a, Command::DocumentFind {
+        generation: 1, needle: "bold phrase", first: 0, count: 64 }, || {
+            polls += 1; if polls == 3 { readers.cancel(a).unwrap(); } false
+        }).err().unwrap();
+    assert!(canceled.canceled());
+    assert_eq!(find(a).unwrap().as_str(), accepted.as_str());
+    readers.close(a).unwrap();
+    assert_eq!(find(a).err(), Some(AccessError::UnknownHandle));
+    assert!(find(b).is_ok(), "closing one reader must not invalidate another layout");
+    assert!(accepted.as_str().contains("\"needle\":\"bold phrase\""));
+}

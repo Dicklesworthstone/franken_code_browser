@@ -25,12 +25,15 @@ pub(crate) mod document;
 mod document_display;
 mod document_images;
 mod document_links;
+mod document_find;
 #[cfg(test)]
 mod shared_tests;
 pub use outline::{ReaderOutlineOptions, MAX_READER_SYMBOL_PAGE, MAX_READER_SYMBOL_QUERY_BYTES};
 pub use references::{MAX_READER_REFERENCE_PAGE, MAX_READER_REFERENCE_NAME_BYTES,
     MAX_READER_REFERENCES, MAX_READER_REFERENCE_SOURCE_BYTES};
 pub use document::{DocumentCopyMode, ReaderDocumentOptions, MAX_READER_DOCUMENT_PAGE};
+pub use document_find::{MAX_READER_DOCUMENT_FIND_NEEDLE_BYTES, MAX_READER_DOCUMENT_FIND_PAGE,
+    MAX_READER_DOCUMENT_FIND_BYTES};
 pub use document_images::{DocumentImageError, MAX_DOCUMENT_IMAGE_BYTES,
     MAX_DOCUMENT_IMAGE_CACHE_BYTES, MAX_DOCUMENT_IMAGE_CHUNK, MAX_DOCUMENT_IMAGES};
 pub use comparison::ReaderComparisonLimits;

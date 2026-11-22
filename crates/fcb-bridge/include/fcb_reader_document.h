@@ -45,6 +45,34 @@ char *fcb_reader_document(uint64_t handle, uint64_t generation,
 char *fcb_reader_document_window(uint64_t handle, uint64_t generation,
     uint64_t first, uint64_t count);
 
+/* Stateless Find in the retained upstream logical rendered text.
+ * needle is case-sensitive literal UTF-8, 1..1024 bytes; overlapping matches
+ * are counted. The pointer is readable through NUL, or through 1025 bytes
+ * when there is no terminator within the payload bound; it is never retained.
+ * first is a zero-based occurrence ordinal and count is 1..128. Each page
+ * replays at most 16 MiB of already rendered UTF-8, retaining only that page.
+ * No source I/O, reparsing, layout replacement, or document-sized hit table.
+ *
+ * "document-find" echoes needle and document_generation with the ordinary
+ * document summary. search_domain="rendered-text-utf8", case_sensitive=true,
+ * normalization="exact", overlapping=true, max_scan_bytes="16777216".
+ * scanned_rendered_bytes equals rendered_utf8_bytes; match_count_complete=true
+ * on success. first_match, matches_seen and nullable next_match describe the
+ * result page. matches[] carries one-based match_id, rendered_utf8_range and
+ * first_flow_line. This is containing/next flow-row context; trailing layout
+ * separators use the last row. With zero flow rows, first_flow_line=0 names
+ * the valid empty window, not a fabricated row. first==matches_seen is a
+ * valid empty terminal result page.
+ *
+ * Callers fence their own query/job token and exact needle before accepting a
+ * reply. Reflow/clear invalidates old document generations. Use the ordinary
+ * document window at first_flow_line to navigate; these are neither original
+ * source offsets nor glyph-exact highlight coordinates. Original-source
+ * actions still require the separate document_source provenance audit.
+ */
+char *fcb_reader_document_find(uint64_t handle, uint64_t generation,
+                               const char *needle, uint64_t first, uint64_t count);
+
 /* Optional native drawing packet for an already accepted logical document.
  * FrankenMarkdown owns styles, wrapping, table/list geometry and glyph shaping;
  * the native consumer draws exact bundled-face glyph IDs without reshaping.

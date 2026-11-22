@@ -204,6 +204,24 @@ impl<'capture> DocumentReader<'capture> {
         Ok(DocumentWindow { reader: self, first, end })
     }
 
+    /// Navigate using a UTF-8 byte offset in this generation's retained logical
+    /// rendered text, never original Markdown bytes or native glyph positions.
+    /// Use the containing or next upstream flow row. Layout separators after
+    /// the last row show that final row; a layout with no rows has only an empty
+    /// window. This is navigation context, not a glyph/source correspondence.
+    /// Interior scalar bytes are refused; rendered EOF is an empty window.
+    pub fn window_at_rendered(&self, offset: usize, count: usize)
+        -> Result<DocumentWindow<'_, 'capture>, DocumentReadError> {
+        if !self.rendered_text().is_char_boundary(offset) {
+            return Err(DocumentReadError::InvalidRange);
+        }
+        if offset == self.rendered_text().len() { return self.window(self.total_lines(), count); }
+        let first = self.output.lines.partition_point(|line| line.rendered_range.end <= offset);
+        // Upstream omits newline/blank-line separators from flow rows. Keep
+        // their rendered matches usable without inventing a visible row.
+        self.window(first.min(self.total_lines().saturating_sub(1)), count)
+    }
+
     /// Navigate from original source to the FIRST logical row of its enclosing
     /// upstream-mapped source region. This is a block-level correspondence, not
     /// an exact glyph/column or a claim that all source bytes are rendered.
