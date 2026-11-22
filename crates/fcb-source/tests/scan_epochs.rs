@@ -966,6 +966,65 @@ fn missing_or_replaced_queued_directory_does_not_hide_other_accessible_work() {
 }
 
 #[test]
+fn scoped_discovery_keeps_sibling_catalog_and_excluded_dirty_work() {
+    let dir = TempTestDir::new("scoped_discovery");
+    write_test_file(dir.path(), "src/keep.rs", b"kept");
+    write_test_file(dir.path(), "src/build/hidden.rs", b"hidden");
+    write_test_file(dir.path(), "tests/keep.rs", b"kept");
+    let mut known = known_files(dir.path(), SymlinkPolicy::DisallowAll);
+    let hidden = NormalizedPath::new("src/build/hidden.rs").unwrap();
+    let absent = NormalizedPath::new("src/gone.rs").unwrap();
+    let outside_absent = NormalizedPath::new("tests/gone.rs").unwrap();
+    let outside = NormalizedPath::new("tests/keep.rs").unwrap();
+    for (id, path) in [(90, absent.clone()), (91, outside_absent.clone())] {
+        known.insert(path, KnownEntry::new(
+            FileId::new(test_owner_id(1), id).unwrap(),
+            SourceRevision::new(test_owner_id(1), 1).unwrap(),
+            DiscoveryKind::File, Some(1), None, None,
+        ));
+    }
+    write_test_file(dir.path(), "tests/keep.rs", b"changed outside this pass");
+    write_test_file(dir.path(), "tests/new.rs", b"new outside this pass");
+
+    let scope = NormalizedPath::new("src").unwrap();
+    let sibling = NormalizedPath::new("tests").unwrap();
+    let mut hints = DirtyHintTracker::new();
+    hints.record_hint(scope.clone(), true);
+    hints.record_hint(hidden.clone(), false);
+    hints.record_hint(sibling.clone(), true);
+    hints.record_hint(absent.clone(), false);
+    let mut ignore = IgnoreMatcher::include_all();
+    ignore.add_scope_rule("src/build/");
+    let mut discovery = metadata_discovery(
+        dir.path(), DiscoveryLimits::modest(), ignore, SymlinkPolicy::DisallowAll,
+    );
+    let mut pass = ReconciliationPass::new(
+        Some(scope.clone()), discovery.scan_epoch(), &hints, known,
+    );
+    // A root-wide discovery producer feeds a scoped reconciliation consumer.
+    // The consumer must enforce its own scope for every DiscoveryEntry.
+    while let Some(batch) = discovery.next_batch(&CancelFlag::new()).unwrap() {
+        for entry in batch.entries() {
+            pass.record_discovery_entry(entry);
+        }
+        if !batch.more() { break; }
+    }
+    assert!(discovery.is_complete());
+    let report = pass.finish(
+        ReconciliationStatus::Completed { epoch: discovery.scan_epoch() }, &mut hints,
+    );
+    assert_eq!(report.tombstoned, [absent]);
+    assert_eq!(report.preserved_unseen, [hidden.clone(), outside_absent, outside]);
+    assert_eq!(report.retained, [NormalizedPath::new("src/keep.rs").unwrap()]);
+    assert!(report.modified.is_empty());
+    assert_eq!(report.added, [scope.clone(), NormalizedPath::new("src/build").unwrap()]);
+    assert_eq!(hints.all_hints().iter().map(|hint| hint.path()).collect::<Vec<_>>(), [
+        &scope, &hidden, &sibling,
+    ]);
+    assert!(report.is_honest_and_complete());
+}
+
+#[test]
 fn excluded_subtree_preserves_files_and_dirty_ancestors_without_protecting_similar_names() {
     let dir = TempTestDir::new("excluded_reconcile");
     let held = TempTestDir::new("excluded_reconcile_moved");

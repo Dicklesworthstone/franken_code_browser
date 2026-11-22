@@ -30,6 +30,18 @@ use crate::old_anchor::{fnv1a, OldAnchor};
 use crate::path::NormalizedPath;
 use crate::{CancelFlag, ObservationDigest, SourceError};
 
+// Compare authoritative path bytes at component boundaries. Native backslashes
+// and non-UTF8 names must not be normalized again when determining scan scope.
+fn is_descendant(path: &NormalizedPath, directory: &NormalizedPath) -> bool {
+    let path = path.as_bytes();
+    let directory = directory.as_bytes();
+    path.starts_with(directory) && path.get(directory.len()) == Some(&b'/')
+}
+
+fn is_within_scope(path: &NormalizedPath, directory: Option<&NormalizedPath>) -> bool {
+    directory.is_none_or(|directory| path == directory || is_descendant(path, directory))
+}
+
 /// A dirty hint recorded for a path or directory from an external watcher or user action.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DirtyHint {
@@ -135,7 +147,9 @@ impl DirtyHintTracker {
         })
     }
 
-    /// Clear dirty hints affecting `directory` up to and including `up_to_sequence`.
+    /// Clear dirty hints fully contained by `directory` up to and including
+    /// `up_to_sequence`. `None` covers the entire root. An ancestor hint remains
+    /// pending because reconciling one child cannot reconcile its siblings.
     pub fn clear_directory_hints(
         &mut self,
         directory: Option<&NormalizedPath>,
@@ -145,10 +159,7 @@ impl DirtyHintTracker {
             if h.sequence > up_to_sequence {
                 return true;
             }
-            match directory {
-                None => false,
-                Some(dir) => !h.affects(dir),
-            }
+            !is_within_scope(&h.path, directory)
         });
     }
 
@@ -276,18 +287,23 @@ pub struct ReconciliationReport {
     pub modified: Vec<NormalizedPath>,
     pub retained: Vec<NormalizedPath>,
     pub tombstoned: Vec<NormalizedPath>,
+    /// Unobserved known entries kept because absence was not established,
+    /// including entries outside this pass's directory scope.
     pub preserved_unseen: Vec<NormalizedPath>,
     pub intervening_hints_detected: bool,
 }
 
 impl ReconciliationReport {
     /// Invariant assertion: An incomplete scan or a scan with intervening dirty hints
-    /// must NEVER tombstone any unseen entries!
+    /// must NEVER tombstone any unseen entries. A directory-scoped scan cannot
+    /// tombstone entries outside that directory or the directory itself.
     pub fn is_honest_and_complete(&self) -> bool {
         if !self.status.is_completed() || self.intervening_hints_detected {
             self.tombstoned.is_empty()
         } else {
-            true
+            self.tombstoned.iter().all(|path| {
+                self.directory.as_ref().is_none_or(|directory| is_descendant(path, directory))
+            })
         }
     }
 }
@@ -319,6 +335,11 @@ pub struct ReconciliationPass {
 }
 
 impl ReconciliationPass {
+    /// Start a recursive directory reconciliation, or a whole-root pass when
+    /// `directory` is `None`. `known_entries` may contain the entire root catalog;
+    /// entries outside the enumerated directory remain preserved. The directory
+    /// entry itself also remains preserved unless explicitly observed, because
+    /// enumerating its children cannot establish its own absence.
     pub fn new(
         directory: Option<NormalizedPath>,
         epoch: ScanEpoch,
@@ -348,6 +369,8 @@ impl ReconciliationPass {
         self.start_hint_sequence
     }
 
+    /// Record a source observation within this pass's scope. Observations from
+    /// other directories are ignored and cannot change their catalog entries.
     pub fn record_observation(
         &mut self,
         path: NormalizedPath,
@@ -356,6 +379,9 @@ impl ReconciliationPass {
         inode: Option<u64>,
         digest: Option<ObservationDigest>,
     ) {
+        if !is_within_scope(&path, self.directory.as_ref()) {
+            return;
+        }
         self.observed_entries.insert(
             ObservedPath(path),
             ReconciliationObservation {
@@ -365,8 +391,11 @@ impl ReconciliationPass {
         );
     }
 
-    /// Record observations from a `DiscoveryEntry`.
+    /// Record observations from a `DiscoveryEntry` within this pass's scope.
     pub fn record_discovery_entry(&mut self, entry: &DiscoveryEntry) {
+        if !is_within_scope(entry.path(), self.directory.as_ref()) {
+            return;
+        }
         self.observed_entries.insert(
             ObservedPath(entry.path().clone()),
             ReconciliationObservation {
@@ -465,7 +494,11 @@ impl ReconciliationPass {
                 // successfully and NO intervening dirty hints arrived.
                 // Explicit exclusions can make a policy-scoped scan complete,
                 // but never establish absence inside the excluded subtree.
-                if completed && !intervening_hints && !self.is_excluded_by_observation(path.as_bytes()) {
+                let enumerated = self.directory.as_ref()
+                    .is_none_or(|directory| is_descendant(path, directory));
+                if completed && !intervening_hints && enumerated
+                    && !self.is_excluded_by_observation(path.as_bytes())
+                {
                     report.tombstoned.push(path.clone());
                 } else {
                     report.preserved_unseen.push(path.clone());
@@ -478,7 +511,7 @@ impl ReconciliationPass {
         if completed && !intervening_hints {
             dirty_tracker.hints.retain(|hint| {
                 hint.sequence > self.start_hint_sequence
-                    || self.directory.as_ref().is_some_and(|dir| !hint.affects(dir))
+                    || !is_within_scope(&hint.path, self.directory.as_ref())
                     || self.exclusion_affects_hint(hint)
             });
         }
