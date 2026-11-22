@@ -350,6 +350,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     @State private var markdownPreview = AtlasMarkdownPreviewPreference()
     @State private var observedReader: AtlasObservedReaderPresentation?
     @State private var workspaceStreamSearch: AtlasWorkspaceStreamPresentation?
+    @State private var workspaceStructureSearch: AtlasWorkspaceStructurePresentation?
     @State private var projectLinks: AtlasProjectLinksPresentation?
     @State private var readingDesk = AtlasReadingDeskModel(transport: .native, recovery: .local)
     @State private var showsReadingDesk = false
@@ -442,7 +443,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         showsReader && projectViewActive && !loadingProject && !readerHistory.busy
             && !nativeOpen.showsReader && !showsFileFinder && !showsReadingDesk
             && !showsSavedRepository && !showsSnapshotComparison
-            && projectLinks == nil && observedReader == nil && workspaceStreamSearch == nil
+            && projectLinks == nil && observedReader == nil && workspaceStreamSearch == nil && workspaceStructureSearch == nil
     }
     private var hasSourcePane: Bool {
         selectedPath != nil || readerHistory.current != nil || readerHistory.busy || !readerHistory.notice.isEmpty
@@ -499,19 +500,31 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             return
         }
         closeWorkspaceStreamSearch()
+        closeWorkspaceStructureSearch()
         let source = AtlasWorkspaceStreamSource(root: authority.root,
             project: authority.identity.project, browserOwner: authority.identity.browserOwner,
             access: authority.access, fileScope: types, pathScope: pathScope)
-        workspaceStreamSearch = AtlasWorkspaceStreamPresentation(source: source,
-            query: query, caseSensitive: searchCaseSensitive,
-            countAllMatches: searchCountAllMatches,
-            mode: searchMode == .occurrences ? .occurrences : searchMode == .expression ? .expression : .text,
-            transport: pathScope.isVisible ? .native : .catalogNative)
+        if searchMode == .symbols || searchMode == .headings {
+            workspaceStructureSearch = AtlasWorkspaceStructurePresentation(source: source, query: query,
+                mode: searchMode == .symbols ? .symbols : .headings, nameMode: searchNameMode,
+                discoveryPolicy: projectBrowser.discoveryPolicy, transport: .native)
+        } else {
+            workspaceStreamSearch = AtlasWorkspaceStreamPresentation(source: source,
+                query: query, caseSensitive: searchCaseSensitive,
+                countAllMatches: searchCountAllMatches,
+                mode: searchMode == .occurrences ? .occurrences : searchMode == .expression ? .expression : .text,
+                transport: pathScope.isVisible ? .native : .catalogNative)
+        }
     }
 
     private func closeWorkspaceStreamSearch() {
         workspaceStreamSearch?.close()
         workspaceStreamSearch = nil
+    }
+
+    private func closeWorkspaceStructureSearch() {
+        workspaceStructureSearch?.close()
+        workspaceStructureSearch = nil
     }
 
     private func openProjectLinks(_ direction: AtlasProjectLinkDirection = .all,
@@ -735,6 +748,10 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             AtlasWorkspaceStreamView(presentation: presentation, desk: readingDesk).id(presentation.id)
                 .onDisappear { presentation.close() }
         }
+        .sheet(item: $workspaceStructureSearch, onDismiss: finishReadingDeskReview) { presentation in
+            AtlasWorkspaceStructureView(presentation: presentation).id(presentation.id)
+                .onDisappear { presentation.close() }
+        }
         .onAppear {
             projectViewActive = true
             nativeOpen.cancelExternal = { [weak nativeDrop] in nativeDrop?.cancel() }
@@ -789,6 +806,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             snapshotExport.cancel()
             closeObservedReader()
             closeWorkspaceStreamSearch()
+            closeWorkspaceStructureSearch()
             closeProjectLinks()
             showsSavedRepository = false
             showsSnapshotComparison = false
@@ -827,6 +845,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             snapshotExport.cancel()
             closeObservedReader()
             closeWorkspaceStreamSearch()
+            closeWorkspaceStructureSearch()
             closeProjectLinks()
         }
         .onChange(of: atlasResidency.contentRevision) { _, _ in
@@ -964,12 +983,13 @@ private struct AtlasPreparedProjectRefresh: Sendable {
 
     private func reviewReadingDeskBeforeClosing() {
         guard !readingDesk.closed, !showsReadingDesk else { return }
-        if showsFileFinder || showsSavedRepository || showsSnapshotComparison || observedReader != nil || workspaceStreamSearch != nil || projectLinks != nil {
+        if showsFileFinder || showsSavedRepository || showsSnapshotComparison || observedReader != nil || workspaceStreamSearch != nil || workspaceStructureSearch != nil || projectLinks != nil {
             // Wait for the other sheet's actual dismissal before presenting
             // the desk. An active note editor is preserved by the close guard.
             reviewDeskAfterSheetDismissal = true
             showsFileFinder = false; showsSavedRepository = false; showsSnapshotComparison = false; closeObservedReader()
             closeWorkspaceStreamSearch()
+            closeWorkspaceStructureSearch()
             closeProjectLinks()
         } else { showsReadingDesk = true }
     }
@@ -1185,10 +1205,13 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             }
             .font(.caption).padding(.horizontal, 10).padding(.top, 6)
             Button(action: openWorkspaceStreamSearch) {
-                Label("Search large project files…", systemImage: "doc.text.magnifyingglass")
+                Label(searchMode == .symbols || searchMode == .headings
+                    ? "Search project structure…" : "Search large project files…", systemImage: "doc.text.magnifyingglass")
             }
             .disabled(snapshotExportSource == nil)
-            .help("Search text with optional Unicode lowercase matching in the selected location and file types, including sources beyond capture limits. The sheet keeps this scope fixed and offers a total I/O budget.")
+            .help(searchMode == .symbols || searchMode == .headings
+                ? "Discover symbols or Markdown headings beyond the atlas file-count limit. The sheet keeps the selected location, file types and discovery policy fixed and reports sources it cannot analyze."
+                : "Search text with optional Unicode lowercase matching in the selected location and file types, including sources beyond capture limits. The sheet keeps this scope fixed and offers a total I/O budget.")
             .padding(.horizontal, 10).padding(.top, 8)
             if wantsCapturedIndex {
                 Text("The first search captures the selected scope. Later queries reuse those bytes; Refresh captures the current scope and file edits. Limits within that scope: 4096 files, 1 MiB per file, 32 MiB total.")
@@ -1594,7 +1617,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
               !atlasLayoutPending, projectOpening.canBrowse, !projectBrowser.closed, !projectBrowser.busy,
               browserProject == loadGeneration, projectBrowser.root.utf8.elementsEqual(root.utf8),
               (try? fileScope.searchScope(custom: customExtensions)) != nil,
-              observedReader == nil, workspaceStreamSearch == nil, projectLinks == nil,
+              observedReader == nil, workspaceStreamSearch == nil, workspaceStructureSearch == nil, projectLinks == nil,
               !snapshotExport.busy, !showsFileFinder, !showsReadingDesk,
               !showsSavedRepository, !showsSnapshotComparison,
               !nativeOpen.isLoading, !nativeOpen.showsReader,
@@ -2374,6 +2397,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         snapshotExport.cancel()
         closeObservedReader()
         closeWorkspaceStreamSearch()
+        closeWorkspaceStructureSearch()
         closeProjectLinks()
         retainedAtlasRevision = nil
         readerHistory.catalogRefreshed()
@@ -2454,6 +2478,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         snapshotExport.cancel()
         closeObservedReader()
         closeWorkspaceStreamSearch()
+        closeWorkspaceStructureSearch()
         closeProjectLinks()
         closeAtlasResidency()
         readerHistory.close()

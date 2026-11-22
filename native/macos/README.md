@@ -1225,6 +1225,52 @@ Focused host, registry, C ABI and native transport regression sources accompany
 this integration. Independent executable verification and physical-Mac
 interaction qualification remain pending.
 
+## Searching project symbols and headings beyond the atlas
+
+Choose **Symbols** or **Headings** in the sidebar, set the location and file
+types, then open **Search project structure…**. The sheet keeps that location,
+file-type selection, original project grant and discovery policy fixed. Exact,
+prefix and substring matching apply to extracted declaration names or Markdown
+heading titles, case-sensitively. A nonempty sidebar query starts immediately;
+you can edit the query and matching rule in the sheet.
+
+Discovery continues through bounded catalog pages instead of stopping at the
+retained atlas's file prefix. Each worker batch discovers metadata or analyzes
+a bounded complete source. **Pause** waits for the current batch, then lets you
+open or page through its accepted results. **Continue** resumes the same
+observation. **Stop and keep results** ends it with explicit partial coverage.
+Changing query inputs or canceling revokes result activation while preserving
+an independently opened source reader; old rows keep their accepted query label.
+
+Choosing a result initializes an ordinary selectable source reader from the
+exact complete capture that produced it. The live pathname is not reopened.
+The reader starts at the result's original byte offset, including UTF-16 source
+coordinates, and retains its bytes if the working file changes. Symbols remain
+heuristic outline candidates. Headings use the shared Markdown extractor and
+qualified original-source mapping; neither mode claims compiler completeness.
+
+The default total source-read allowance is **256 MiB**, with **1 GiB** and
+**4 GiB** choices. Per-file extraction currently admits complete symbol sources
+up to **64 KiB** and Markdown sources up to **256 KiB**. At most **256 result
+rows** and **32 MiB of matching source** are retained independently of the scan
+allowance. Counts continue after row storage fills. Unsupported, oversized,
+unavailable and extraction-limited files, missing visible-scope members,
+discovery limits and stopped work keep coverage explicitly incomplete.
+
+**Previous page** and **Next page** browse the retained results without reading
+source files. **Earlier matches…** and **Later matches…** start a new observation
+of current files for another bounded match window; they are not pages of a
+frozen workspace snapshot. Actual retained occurrence numbers determine the
+next window even when some labels or captures could not be retained. Files,
+ordering and counts can change between those scans. The open reader keeps its
+original capture.
+
+Application, registry, C ABI and native protocol/model regression sources cover
+scope admission, continued discovery, count/row limits, original-byte witnesses,
+stale identities, cancellation and retained-reader handoff. The native entry
+point is `swiftui/tests/test-workspace-structure.sh`. The implementation remains
+code-first; independent executable and physical-Mac qualification are pending.
+
 ## Workspace text search
 
 Text search starts with **Match case** enabled. Turn it off to compare Unicode
