@@ -8,6 +8,9 @@
 use super::{Failure, DeskSession, HostResponse, PathBuf, number, count, hex, raw_path};
 use crate::host::{atlas_session::AtlasSessionOptions, atlas_search::{AtlasSearchOptions, AtlasIndexOptions},
     atlas_paths::{AtlasPathOptions, PathCase, PathMatchMode}, desk::repository::DeskRepository};
+use crate::host::atlas_search::{AtlasSearchScope, AtlasSearchPathKind, AtlasStructureMode,
+    AtlasStructureOptions, AtlasIndexedStructureOptions, MAX_SEARCH_SCOPE_PATH_BYTES};
+use fcb::search::SymbolNameMode;
 use crate::output::{Output, OutputError};
 use crate::{EXIT_OK, EXIT_PARTIAL};
 pub(super) use crate::host::desk::repository::DeskRepositoryError;
@@ -23,6 +26,22 @@ pub(super) const WORK_HELP: &str = "\nIncremental repository work (no background
   repo-find-indexed TOKEN INDEX_GEN QUERY_GEN LIMIT VERIFY_BYTES TEXT\n\
   repo-begin-indexed TOKEN INDEX_GEN QUERY_GEN LIMIT VERIFY_BYTES TEXT\n\
 Both indexed query commands also accept a -text-hex suffix.\n\
+  repo-begin-structure TOKEN QUERY_GEN MODE NAME_MODE LIMIT SOURCE_BYTES SCOPE SCOPE_VALUE TEXT\n\
+  repo-begin-indexed-structure TOKEN INDEX_GEN QUERY_GEN MODE NAME_MODE LIMIT VERIFY_BYTES SCOPE SCOPE_VALUE TEXT\n\
+Both structural commands also accept a -text-hex suffix for a UTF-8 hex needle.\n\
+MODE is symbols, headings or occurrences; NAME_MODE is exact, prefix or contains.\n\
+Names are case-sensitive. Occurrences require exact mode and include comments\n\
+and strings; symbols are heuristic candidates, never compiler-resolved facts.\n\
+SCOPE is workspace (SCOPE_VALUE is -), directory/file (hex UTF-8 relative path),\n\
+or visible (sorted unique lowercase raw-path hex CSV; - is explicitly empty).\n\
+Visible membership is declared by the caller, not proof of native presentation.\n\
+Scope is frozen before quotas; it cannot widen the repository's original grant.\n\
+LIMIT is 1..4096. SOURCE_BYTES is 1..33554432; VERIFY_BYTES is 0..33554432.\n\
+Extractor-specific per-file caps and unavailable sources remain explicit.\n\
+Structural queries share text/index generations, repo-step/page/progress/cancel,\n\
+and repo-hit activation. Indexed extraction reuses captures with no live reads,\n\
+including captures without grams. Bytes and selections survive index clearing\n\
+or repository detachment after activation in the Desk.\n\
 Begin admits work without reading source payloads. Step visits at most one file.\n\
 Use step_count (queries) or build_steps (indexes), initially 0, as EXPECTED_STEP.\n\
 A stale step is rejected; inspect progress instead of replaying blindly.\n\
@@ -138,6 +157,44 @@ impl RepositoryCommands {
                 self.progress_reply = repo.work_state().pending_query == Some(generation);
                 Ok(response)
             }
+            ("repo-begin-structure" | "repo-begin-structure-text-hex",
+                [token, generation, mode, name_mode, limit, bytes, scope, scope_value, text]) => {
+                let mode = structure_mode(mode)?;
+                let name_mode = structure_name_mode(name_mode)?;
+                let scope = structure_scope(scope, scope_value)?;
+                let decoded;
+                let needle = if command.ends_with("text-hex") {
+                    decoded = String::from_utf8(hex(text, 1024)?).map_err(|_| Failure::Protocol("DESK_INVALID_TEXT"))?;
+                    decoded.as_str()
+                } else { text };
+                let options = AtlasStructureOptions { mode, name_mode,
+                    limits: AtlasSearchOptions { max_matches: count(limit)?, max_source_bytes: count(bytes)?,
+                        ..AtlasSearchOptions::default() } };
+                let generation = number(generation)?;
+                let repo = self.get(number(token)?)?;
+                let response = repo.begin_structure(generation, needle, scope, options, &mut *canceled)?;
+                self.progress_reply = repo.work_state().pending_query == Some(generation);
+                Ok(response)
+            }
+            ("repo-begin-indexed-structure" | "repo-begin-indexed-structure-text-hex",
+                [token, index, generation, mode, name_mode, limit, bytes, scope, scope_value, text]) => {
+                let mode = structure_mode(mode)?;
+                let name_mode = structure_name_mode(name_mode)?;
+                let scope = structure_scope(scope, scope_value)?;
+                let decoded;
+                let needle = if command.ends_with("text-hex") {
+                    decoded = String::from_utf8(hex(text, 1024)?).map_err(|_| Failure::Protocol("DESK_INVALID_TEXT"))?;
+                    decoded.as_str()
+                } else { text };
+                let options = AtlasIndexedStructureOptions { mode, name_mode,
+                    max_matches: count(limit)?, max_scan_bytes: number(bytes)? };
+                let generation = number(generation)?;
+                let repo = self.get(number(token)?)?;
+                let response = repo.begin_indexed_structure(generation, number(index)?, needle,
+                    scope, options, &mut *canceled)?;
+                self.progress_reply = repo.work_state().pending_query == Some(generation);
+                Ok(response)
+            }
             ("repo-page", [token, generation, offset, limit]) => {
                 let generation = number(generation)?; let repo = self.get(number(token)?)?;
                 let response = repo.page(generation, count(offset)?, count(limit)?, &mut *canceled)?;
@@ -207,5 +264,44 @@ impl RepositoryCommands {
             }
             _ => Err(Failure::Protocol("DESK_REPOSITORY_COMMAND_SYNTAX")),
         }
+    }
+}
+
+fn structure_mode(mode: &str) -> Result<AtlasStructureMode, Failure> {
+    match mode {
+        "symbols" => Ok(AtlasStructureMode::Symbols),
+        "headings" => Ok(AtlasStructureMode::Headings),
+        "occurrences" => Ok(AtlasStructureMode::Occurrences),
+        _ => Err(Failure::Protocol("DESK_STRUCTURE_MODE")),
+    }
+}
+fn structure_name_mode(mode: &str) -> Result<SymbolNameMode, Failure> {
+    match mode {
+        "exact" => Ok(SymbolNameMode::Exact),
+        "prefix" => Ok(SymbolNameMode::Prefix),
+        "contains" => Ok(SymbolNameMode::Contains),
+        _ => Err(Failure::Protocol("DESK_STRUCTURE_NAME_MODE")),
+    }
+}
+
+/// Scope only narrows the repository's already authorized catalog. Directory
+/// and file values are hex-encoded UTF-8 paths for lossless TAB framing; the
+/// engine validates component boundaries without filesystem access. Visible
+/// membership uses its canonical raw-path hex CSV and remains host-declared,
+/// not evidence that a native frame was displayed. "-" explicitly means empty
+/// workspace/visible payload; it never broadens an invalid file/directory scope.
+fn structure_scope(kind: &str, value: &str) -> Result<AtlasSearchScope, Failure> {
+    let scope = AtlasSearchScope::all();
+    match kind {
+        "workspace" if value == "-" => Ok(scope),
+        "visible" => scope.with_path(AtlasSearchPathKind::Visible, if value == "-" { "" } else { value })
+            .map_err(DeskRepositoryError::from).map_err(Failure::from),
+        "directory" | "file" => {
+            let path = String::from_utf8(hex(value, MAX_SEARCH_SCOPE_PATH_BYTES)?)
+                .map_err(|_| Failure::Protocol("DESK_INVALID_TEXT"))?;
+            let kind = if kind == "directory" { AtlasSearchPathKind::Directory } else { AtlasSearchPathKind::File };
+            scope.with_path(kind, &path).map_err(DeskRepositoryError::from).map_err(Failure::from)
+        }
+        _ => Err(Failure::Protocol("DESK_STRUCTURE_SCOPE")),
     }
 }

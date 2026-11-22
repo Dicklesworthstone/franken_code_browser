@@ -886,6 +886,72 @@ cargo test --locked -p fcb-app --test whole_file_cli
 No compiled binary, execution receipt, signed artifact, native qualification or
 product gate closure is asserted by the presence of this implementation.
 
+## Search live repository structure in a Reading Desk
+
+A live repository attached with `repo-open` can search declaration names,
+Markdown headings, and identifier occurrences without leaving `fcb desk --stdio`.
+The public `DeskRepository::begin_structure` and
+`begin_indexed_structure` methods expose the same workflow to Rust hosts.
+These methods reuse the retained atlas search engine and its source captures;
+they do not introduce another parser or matcher.
+
+| Command | Behavior |
+| --- | --- |
+| `repo-begin-structure TOKEN QUERY_GEN MODE NAME_MODE LIMIT SOURCE_BYTES SCOPE SCOPE_VALUE TEXT` | Admit a bounded query over the attached catalog; subsequent steps capture live sources. |
+| `repo-begin-indexed-structure TOKEN INDEX_GEN QUERY_GEN MODE NAME_MODE LIMIT VERIFY_BYTES SCOPE SCOPE_VALUE TEXT` | Extract from a previously prepared in-memory index's captures, with zero live-source reads. |
+| `repo-step TOKEN QUERY_GEN EXPECTED_STEP` | Advance at most one eligible file; use the response's `step_count` for the next step. |
+| `repo-page TOKEN QUERY_GEN OFFSET LIMIT` | Page retained matches without advancing the query. |
+| `repo-hit TOKEN QUERY_GEN HIT_ID` | Import the exact captured source and select the original byte range in the Desk. |
+
+Both begin commands accept a `-text-hex` suffix when the needle needs
+lossless UTF-8 hex framing. Modes are `symbols`, `headings`, and
+`occurrences`. Name matching is case-sensitive with `exact`, `prefix`,
+or `contains`; occurrences require `exact` and include tokens in comments
+and string literals. Symbol results remain heuristic outline candidates.
+Heading extraction is owned by FrankenMarkdown. Neither mode claims compiler
+resolution or semantic completeness.
+
+The scope is frozen at admission, before file, byte and match quotas:
+
+| Scope | `SCOPE_VALUE` |
+| --- | --- |
+| `workspace` | `-`, meaning the existing authorized catalog. |
+| `directory` | Hex-encoded UTF-8 relative directory path; component boundaries are respected. |
+| `file` | Hex-encoded UTF-8 relative file path. |
+| `visible` | Sorted unique lowercase raw-path hex values separated by commas; `-` means an explicitly empty set. |
+
+Visible membership is supplied by the host and does not prove that a native
+frame was displayed. Missing members remain explicit partial coverage.
+Scopes cannot grant access outside the attached repository. Invalid scope
+payloads do not fall back to workspace search.
+
+`LIMIT` is 1–4,096. Live `SOURCE_BYTES` is 1–33,554,432; indexed
+`VERIFY_BYTES` is 0–33,554,432. Existing per-file, extraction, metadata and
+response limits also apply. Unsupported files, unavailable captures and
+quota stops are reported rather than treated as complete absence. Indexed
+structural search considers captured source even if it has no search grams.
+
+For example, these are literal TAB-separated input frames (displayed below
+using shell `printf` escapes). The directory scope `737263` is `src`:
+
+```sh
+printf '0\trepo-open\t/path/to/project\n0\trepo-begin-structure\t1\t1\tsymbols\texact\t100\t33554432\tdirectory\t737263\tload_config\n0\trepo-step\t1\t1\t0\n0\trepo-page\t1\t1\t0\t64\n0\tquit\n' | fcb desk --stdio
+```
+
+This fixed example inspects one step, then quits; if more files remain, its
+session exit is partial. An interactive host should keep stepping while
+`search_in_progress` is true, using each returned `step_count`, or explicitly
+cancel the running generation. It should not send cancel after completion. A running reply's `exit_code=3` is progress, while a
+terminal coverage failure or uncompleted work at EOF makes the session partial.
+Query, index and clear attempts share an increasing generation counter.
+
+`repo-progress`, `repo-cancel`, `repo-hit` and all ordinary Desk reading,
+copying, pinning, history and bookmark operations work with these hits.
+`repo-hit` uses the searched capture even when its live file has changed;
+after activation, that source remains readable after clearing the index or
+detaching the repository. Repository search itself does not change the Desk
+revision; successful hit activation does.
+
 ## Follow saved imports in a persistent reading desk
 
 `fcb desk --stdio` can browse lexical source imports inside an opened FCBS

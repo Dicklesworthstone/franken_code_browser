@@ -61,7 +61,7 @@ Commands (arguments separated by literal TABs, not spaces):\n\
 Copy returns original bytes as hex; it does not write the clipboard.\n\
 open reads one regular file (max 4 MiB), never a directory or implicit stdin.\n\
 Later operations use retained bytes even after a live file changes.\n\
-UTF-8/BOM UTF-16 windows use the shared reader. Search is exact literal text.\n\
+UTF-8/BOM UTF-16 windows use the shared reader. Pane Find uses exact literal text.\n\
 Notes use the same exact anchors as bookmarks: 256-byte labels and 16 KiB UTF-8\n\
 bodies. Empty bodies are allowed; hex accepts multiline text, tabs and NUL.\n\
 Editing changes personal text only, preserving the capture and original range.\n\
@@ -297,9 +297,9 @@ fn execute(session: &mut DeskSession, attempt: u64, frame: &str,
     repository: &mut RepositoryCommands, documents: &mut DocumentCommands,
     comparisons: &mut ComparisonCommands, saved: &mut SavedCommands,
     code: &mut CodeCommands, readers: &mut ReadingCommands) -> Result<(HostResponse, bool), Failure> {
-    // Revision + command + at most eight structural-search arguments. Keep
-    // framing fixed-size even when a hostile frame contains many separators.
-    let mut fields = [""; 10]; let mut used = 0;
+    // Revision + command + at most ten scoped structural-search arguments.
+    // Keep framing fixed-size even for a hostile separator-heavy frame.
+    let mut fields = [""; 12]; let mut used = 0;
     for field in frame.split('\t') {
         if used == fields.len() { return Err(Failure::Protocol("DESK_FIELD_LIMIT")); }
         fields[used] = field; used += 1;
@@ -309,6 +309,12 @@ fn execute(session: &mut DeskSession, attempt: u64, frame: &str,
     if expected != session.model().revision() { return Err(DeskError::StaleRevision.into()); }
     let args = &fields[2..used];
     let command = fields[1];
+    // Only the new scoped commands need the two additional fields. Preserve
+    // the established framing bound for every existing protocol command.
+    if used > 10 && !matches!(command, "repo-begin-structure" | "repo-begin-structure-text-hex"
+        | "repo-begin-indexed-structure" | "repo-begin-indexed-structure-text-hex") {
+        return Err(Failure::Protocol("DESK_FIELD_LIMIT"));
+    }
     if command.starts_with("repo-") {
         return Ok((repository.execute(session, expected, attempt, command, args, &mut *canceled)?, false));
     }

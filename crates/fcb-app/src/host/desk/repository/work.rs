@@ -7,7 +7,8 @@
 //! A canceled replacement preserves accepted results/indexes and imported panes.
 
 use super::*;
-use crate::host::atlas_search::{AtlasIndexOptions, AtlasIndexBuildProgress, AtlasSearchProgress};
+use crate::host::atlas_search::{AtlasIndexOptions, AtlasIndexBuildProgress, AtlasSearchProgress,
+    AtlasSearchScope, AtlasStructureOptions, AtlasIndexedStructureOptions};
 
 /// Query and index preparation are distinct lifecycles. All new work uses the
 /// engine's common strictly increasing generation sequence. A build may coexist
@@ -39,6 +40,28 @@ impl DeskRepository {
         canceled: impl FnMut() -> bool) -> Result<HostResponse, DeskRepositoryError> {
         Ok(self.search.begin(&self.atlas, generation, needle, options, canceled)?)
     }
+    /// Admit declaration-name, Markdown-heading or whole-token occurrence
+    /// navigation through the same frozen catalog and retained-hit lifecycle.
+    /// The scope is captured before any source/file quota; it never adds a root
+    /// grant. Begin reads no source payload. step_query(), page() and open_hit()
+    /// operate on these results exactly as they do on literal-text results.
+    pub fn begin_structure(&mut self, generation: u64, needle: &str,
+        scope: AtlasSearchScope, options: AtlasStructureOptions,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, DeskRepositoryError> {
+        Ok(self.search.begin_structure(&self.atlas, generation, needle, scope, options, canceled)?)
+    }
+
+    /// Run the shared extractors over the explicitly prepared capture set.
+    /// Gram coverage never filters structural candidates. Source revisions and
+    /// original byte ranges come from the captures, not the new query number;
+    /// importing a hit keeps those bytes alive after index clear or detachment.
+    pub fn begin_indexed_structure(&mut self, generation: u64, index_generation: u64,
+        needle: &str, scope: AtlasSearchScope, options: AtlasIndexedStructureOptions,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, DeskRepositoryError> {
+        Ok(self.search.begin_indexed_structure(&self.atlas, generation, index_generation,
+            needle, scope, options, canceled)?)
+    }
+
     /// Advance one file only when the caller observed the current step count.
     /// A delayed duplicate fails without retiring/advancing the current query.
     /// An already terminal generation is inspectable even after another work
