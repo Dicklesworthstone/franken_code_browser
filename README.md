@@ -128,7 +128,9 @@ The Reading Desk's **Observed passages** section keeps the original byte offsets
 exact observed bytes, decoding context and personal notes through checkpoint
 save and recovery. Closing the reader or replacing the live file does not change
 that saved evidence. See [keeping observed passages](native/macos/README.md#keeping-large-file-passages-in-the-reading-desk)
-for limits and the source-pack distinction. This source implementation awaits
+for limits. **Export source pack…** also includes saved observed passages and
+all their notes, including desks recovered without access to the source files.
+The pack preserves each absolute selection and its observation evidence. This source implementation awaits
 independent executable and physical-Mac verification.
 
 **Saved indexes accelerate case-insensitive literal search.** Fresh index builds

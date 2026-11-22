@@ -38,6 +38,20 @@ fn c_observed_passage_outlives_source_and_round_trips_length_prefixed_notes() {
         label.as_ptr(), std::ptr::null(), 1) }).contains("DESK_HANDLE_INVALID_ARGUMENT"));
     assert!(consume(fcb_desk_forget_observed_passage(desk, 2, 4, passage, 1))
         .contains("\"status\":\"error\""));
+    let destination = root.join("observed-pack.json");
+    let destination_c = CString::new(destination.as_os_str().as_encoded_bytes()).unwrap();
+    let export = ok(unsafe { fcb_desk_export(desk, 2, destination_c.as_ptr(), 64 * 1024, 1024 * 1024, 1024 * 1024) });
+    assert!(export.contains("\"pack_schema\":\"fcb.desk-source-pack/2\""));
+    assert!(export.contains("\"observed_passages_included\":true"));
+    assert_eq!(field(&export, "total_observed_passages"), 1);
+    assert_eq!(field(&export, "selected_original_bytes"), 4);
+    let pack = fs::read_to_string(&destination).unwrap();
+    assert!(pack.contains("\"selected_original_hex\":\"f09fa680\""));
+    assert!(pack.contains("Keep\\nexact\\u0000evidence"));
+    assert!(pack.contains("\"capture_kind\":\"observed-extent\""));
+    assert!(pack.contains("\"whole_file_immutable\":false"));
+    assert!(pack.contains("\"source_reopened\":false"));
+    assert!(!pack.contains("different live bytes"));
     let pending = fcb_desk_observed_passage(desk, 2, passage);
     assert_eq!(fcb_desk_close(desk), 1);
     let retained = ok(pending);

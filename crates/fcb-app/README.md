@@ -1386,9 +1386,25 @@ EXPECTED_REV<TAB>forget-observed-passage<TAB>PASSAGE<TAB>UPDATE_SEQUENCE
 Checkpoint format FCBK 1.2 preserves observed bytes and all accepted notes, with
 fresh local identities on restore. Existing 1.0 and 1.1 checkpoints remain
 readable; desks with no observed passages still emit 1.1. A failed or canceled
-restore leaves the accepted Desk intact. Bookmark source-pack exports retain
-their narrower scope and report `observed_passages_included:false` and
-`excluded_observed_passages`; use a checkpoint to save the entire Desk.
+restore leaves the accepted Desk intact.
+
+`DeskSession::export_source_pack` exports explicit bookmark selections and saved
+observed passages through the existing host/C/native destination workflow.
+Complete-capture-only desks retain `fcb.desk-source-pack/1`; desks with observed
+passages emit `fcb.desk-source-pack/2`. Its typed observed entries carry absolute
+selected ranges, exact selected original bytes, full notes and the retained
+observation's raw path, encoding, extent digest and consistency evidence. The
+surrounding extent is provenance, not additional exported source payload. No
+live source path is opened, including after checkpoint restoration.
+
+All records share source-byte, serialized-byte and serialized-scalar budgets.
+Metadata for every record is reserved before any destination is created;
+whole selections that cannot fit retain their notes and explicit omission
+reasons. Coverage counts both record kinds. `observed_passages_included:true`,
+`total_observed_passages`, and `all-bookmarked-selections-and-observed-passages`
+identify the expanded scope. Complete-only receipts remain compatible, and the
+native client accepts older observed-exclusion receipts only when that narrower
+scope is explicit. Checkpoints remain the format for recovering the entire Desk.
 
 Regression sources cover large offsets, UTF-8/BOM and both UTF-16 byte orders,
 malformed bytes, canceled transfers, shared retention, stale note versions,

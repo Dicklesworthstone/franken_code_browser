@@ -738,7 +738,9 @@ struct AtlasDeskSourcePackTarget: Sendable {
     func isCurrent(in current: AtlasDeskState?) -> Bool {
         current?.owner == state.owner && current?.revision == state.revision && current?.lastAttempt == state.lastAttempt
     }
-    var selectionCount: Int { state.bookmarks.filter { $0.location.selection != nil }.count }
+    var selectionCount: Int {
+        state.bookmarks.filter { $0.location.selection != nil }.count + state.observedPassages.count
+    }
 }
 
 struct AtlasDeskSourcePackLimits: Sendable, Equatable {
@@ -757,13 +759,21 @@ struct AtlasDeskSourcePackReceipt: Sendable {
     let digest: String?
     let errorCode: String?
     let succeeded, complete: Bool
+    var includedObservedPassages: UInt64 = 0
     var excludedObservedPassages: UInt64 = 0
 
     var message: String {
         if succeeded {
-            let coverage = complete ? "All bookmarked selections are included."
-                : "Omitted: \(omittedNoSelection) without a saved selection, \(omittedSourceLimit) over the source budget and \(omittedOutputLimit) over the JSON budget. All bookmark labels and their full notes are included."
-            return "Exported \(exported) selections (\(selectedBytes) original bytes). \(written) JSON bytes written; file and parent synchronization completed. \(coverage) Excluded \(excludedObservedPassages) observed passages and their notes; save a checkpoint for the complete desk."
+            let coverage = complete
+                ? (includedObservedPassages > 0 ? "All bookmarked selections and observed passages are included."
+                    : "All bookmarked selections are included.")
+                : "Omitted source payloads: \(omittedNoSelection) without a saved selection, \(omittedSourceLimit) over the source budget and \(omittedOutputLimit) over the JSON budget. All exported records retain their labels, full notes and provenance."
+            let observed = includedObservedPassages > 0
+                ? " \(includedObservedPassages) observed passage records preserve original locations and observation evidence; their payloads contain only the selected bytes."
+                : (excludedObservedPassages > 0
+                    ? " Excluded \(excludedObservedPassages) observed passages and their notes; this host exports bookmarked captures only."
+                    : "")
+            return "Exported \(exported) selections (\(selectedBytes) original bytes). \(written) JSON bytes written; file and parent synchronization completed. \(coverage)\(observed)"
         }
         if effect == "none" { return "No export destination was created (\(errorCode ?? "unavailable")). Review the budget and choose a new filename." }
         let stage: String
@@ -783,20 +793,35 @@ struct AtlasDeskSourcePackReceipt: Sendable {
             let w = try JSONDecoder().decode(Wire.self, from: data), c = w.coverage
             let counts = [c.exported_selections.value, c.omitted_no_selection.value,
                 c.omitted_source_limit.value, c.omitted_output_limit.value]
-            let total = UInt64(state.bookmarks.count)
-            guard limits.isValid, w.pack_schema == "fcb.desk-source-pack/1",
+            let withObservations = w.pack_schema == "fcb.desk-source-pack/2"
+            let bookmarks = UInt64(state.bookmarks.count), observations = UInt64(state.observedPassages.count)
+            let includedObservations = withObservations ? observations : 0
+            let total = bookmarks + includedObservations
+            let observationCoverage: Bool
+            if withObservations {
+                observationCoverage = observations > 0 && c.total_observed_passages?.value == observations
+                    && w.observed_passages_included == true && w.excluded_observed_passages?.value == 0
+                    && w.completeness_scope == "all-bookmarked-selections-and-observed-passages"
+            } else {
+                // Accept earlier hosts only when the narrower coverage is
+                // explicit. Legacy receipts without these fields are valid
+                // solely for desks with no observed passages to omit.
+                observationCoverage = (c.total_observed_passages?.value ?? 0) == 0
+                    && (w.completeness_scope == nil || w.completeness_scope == "all-bookmarked-selections")
+                    && ((w.observed_passages_included == nil && w.excluded_observed_passages == nil && observations == 0)
+                        || (w.observed_passages_included == false && w.excluded_observed_passages?.value == observations))
+            }
+            guard limits.isValid, ["fcb.desk-source-pack/1", "fcb.desk-source-pack/2"].contains(w.pack_schema),
                   w.model_revision.value == state.revision, w.last_attempt.value == state.lastAttempt,
                   w.budgets.source_bytes.value == limits.sourceBytes,
                   w.budgets.output_bytes.value == limits.outputBytes, w.budgets.output_scalars.value == limits.outputScalars,
                   w.bytes_written.value <= w.export_bytes.value, w.export_bytes.value <= limits.outputBytes,
                   w.export_scalars.value <= limits.outputScalars, w.export_scalars.value <= w.export_bytes.value,
-                  c.total_bookmarks.value == total, counts.allSatisfy({ $0 <= total }),
+                  c.total_bookmarks.value == bookmarks, counts.allSatisfy({ $0 <= total }),
                   c.selected_original_bytes.value <= limits.sourceBytes,
                   w.contains_source_payloads == (c.selected_original_bytes.value > 0),
                   w.contains_personal_labels, w.contains_user_text, !w.redacted, !w.encrypted,
-                  ((w.observed_passages_included == nil && w.excluded_observed_passages == nil && state.observedPassages.isEmpty)
-                    || (w.observed_passages_included == false
-                        && w.excluded_observed_passages?.value == UInt64(state.observedPassages.count))),
+                  observationCoverage,
                   !w.overwritten, !w.live_roots_accessed, !w.native_presented, !w.power_loss_qualified,
                   w.error == nil || (!w.error!.code.isEmpty && w.error!.code.utf8.count <= 512),
                   (w.status == "ok") == (w.error == nil),
@@ -807,10 +832,13 @@ struct AtlasDeskSourcePackReceipt: Sendable {
             }
             if w.export_bytes.value > 0 {
                 let selected = state.bookmarks.compactMap { $0.location.selection }
-                let selectedBytes = selected.reduce(UInt64(0)) { $0 + $1.end - $1.start }
+                let observedBytes = withObservations
+                    ? state.observedPassages.reduce(UInt64(0)) { $0 + $1.selection.count } : 0
+                let selectedBytes = selected.reduce(observedBytes) { $0 + $1.end - $1.start }
+                let selectedCount = UInt64(selected.count) + includedObservations
                 guard counts.reduce(0, +) == total, w.export_scalars.value > 0,
-                      c.omitted_no_selection.value == total - UInt64(selected.count),
-                      c.exported_selections.value <= UInt64(selected.count),
+                      c.omitted_no_selection.value == bookmarks - UInt64(selected.count),
+                      c.exported_selections.value <= selectedCount,
                       c.selected_original_bytes.value <= selectedBytes,
                       c.selected_original_bytes.value <= w.export_bytes.value / 2,
                       w.complete == (c.exported_selections.value == total) else { throw AtlasReadingDeskError.invalidResponse }
@@ -837,6 +865,7 @@ struct AtlasDeskSourcePackReceipt: Sendable {
                 exported: c.exported_selections.value, omittedNoSelection: c.omitted_no_selection.value,
                 omittedSourceLimit: c.omitted_source_limit.value, omittedOutputLimit: c.omitted_output_limit.value,
                 digest: w.export_digest, errorCode: w.error?.code, succeeded: w.status == "ok", complete: w.complete,
+                includedObservedPassages: includedObservations,
                 excludedObservedPassages: w.excluded_observed_passages?.value ?? 0)
         } catch let error as AtlasReadingDeskError { throw error }
         catch { throw AtlasReadingDeskError.invalidResponse }
@@ -852,10 +881,12 @@ struct AtlasDeskSourcePackReceipt: Sendable {
         let error: AtlasDeskWire.Failure?
         let observed_passages_included: Bool?
         let excluded_observed_passages: AtlasDeskNumber?
+        let completeness_scope: String?
     }
     private struct Budgets: Decodable { let source_bytes, output_bytes, output_scalars: AtlasDeskNumber }
     private struct Coverage: Decodable {
         let total_bookmarks, exported_selections, omitted_no_selection, omitted_source_limit, omitted_output_limit, selected_original_bytes: AtlasDeskNumber
+        let total_observed_passages: AtlasDeskNumber?
     }
 }
 

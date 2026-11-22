@@ -1984,9 +1984,21 @@ observed context and accepted notes in FCBK 1.2. Existing 1.0 and 1.1 checkpoint
 still open, and a Desk without observed passages still writes 1.1. Recovery never
 reopens stored source paths. Unsaved note drafts retain the existing close
 protection, and an unconfirmed Keep or note response is reconciled before another
-copy can be submitted. **Export source pack…** currently includes complete-source
-bookmarks and explicitly reports excluded observed passages; use a checkpoint
-to preserve the entire Desk.
+copy can be submitted.
+
+**Export source pack…** includes complete-source bookmarks and observed passages,
+including a Desk containing observed passages only. The export preserves each
+saved selection's exact original bytes, label, full note and observation evidence
+without reopening a live path. An observed passage exports only its selected
+range, with absolute original offsets and an explicit observed-extent identity;
+it never claims a complete immutable file. Source and JSON limits apply to the
+whole export. A selection that does not fit retains its metadata and note with
+an omission reason. If all metadata cannot fit, no destination is created.
+
+Complete-capture-only exports retain `fcb.desk-source-pack/1`. Exports with
+observed passages use `fcb.desk-source-pack/2`, preserving bookmarks followed by
+observed passages without deduplicating personal records. A source pack shares
+selected evidence; a checkpoint preserves the entire recoverable Desk.
 
 Core, host, actual C transport and native regression sources cover bounded
 retention, full-width offsets, UTF-16, malformed bytes, source closure, stale note

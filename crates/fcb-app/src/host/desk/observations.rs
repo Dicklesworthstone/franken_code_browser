@@ -90,7 +90,7 @@ pub(super) fn encode_state(out: &mut Output, desk: &ReadingDesk,
     Ok(())
 }
 
-fn encode_observation(out: &mut Output, observation: &DeskObservation) -> Result<(), OutputError> {
+pub(super) fn encode_observation(out: &mut Output, observation: &DeskObservation) -> Result<(), OutputError> {
     let extent = observation.extent();
     let path = RawPath::from_bytes(observation.path_bytes());
     out.literal("{\"observation\":")?; out.integer(observation.id())?;

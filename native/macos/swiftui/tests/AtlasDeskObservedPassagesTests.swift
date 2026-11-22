@@ -13,8 +13,13 @@ private final class ObservedDeskFixture: @unchecked Sendable {
     private var passages: [[String: Any]] = []
     private var checkpoint: [[String: Any]]?
     private var lost = false, failedReads = 0, calls = 0
+    private var exports = 0, lostExportResponse = false
+    private var lastExport: String?
     private var gate: ObservedReaderGate?
     var mutationCount: Int { locked { calls } }
+    var exportCount: Int { locked { exports } }
+    var lastExportJSON: String? { locked { lastExport } }
+    func loseNextExportReply() { locked { lostExportResponse = true } }
     func loseReply(stateFailures: Int = 0) { locked { lost = true; failedReads = stateFailures } }
     func blockNextKeep(_ gate: ObservedReaderGate) { locked { self.gate = gate } }
     func configure(_ selected: AtlasObservedReaderSelection) {
@@ -53,6 +58,37 @@ private final class ObservedDeskFixture: @unchecked Sendable {
         out["observed_passages"] = passages
         return out
     }
+    private func exportSourcePack(_ limits: AtlasDeskSourcePackLimits) -> String? {
+        exports += 1
+        var selectedBytes: UInt64 = 0, exported: UInt64 = 0
+        for _ in passages {
+            let count = input!.originalRange.count
+            if count <= limits.sourceBytes - selectedBytes {
+                selectedBytes += count; exported += 1
+            }
+        }
+        var out = header("export")
+        out["pack_schema"] = "fcb.desk-source-pack/2"
+        out["effect"] = "complete-file-and-parent-sync-requested"
+        out["bytes_written"] = "4096"; out["export_bytes"] = "4096"; out["export_scalars"] = "4096"
+        out["export_digest"] = String(repeating: "c", count: 64)
+        out["budgets"] = ["source_bytes": String(limits.sourceBytes),
+            "output_bytes": String(limits.outputBytes), "output_scalars": String(limits.outputScalars)]
+        out["coverage"] = ["total_bookmarks": "0", "total_observed_passages": String(passages.count),
+            "exported_selections": String(exported), "omitted_no_selection": "0",
+            "omitted_source_limit": String(UInt64(passages.count) - exported),
+            "omitted_output_limit": "0", "selected_original_bytes": String(selectedBytes)]
+        out["completeness_scope"] = "all-bookmarked-selections-and-observed-passages"
+        out["observed_passages_included"] = true; out["excluded_observed_passages"] = "0"
+        out["complete"] = exported == UInt64(passages.count)
+        out["contains_source_payloads"] = selectedBytes > 0
+        out["contains_personal_labels"] = true; out["contains_user_text"] = true
+        out["redacted"] = false; out["encrypted"] = false; out["overwritten"] = false
+        out["live_roots_accessed"] = false; out["power_loss_qualified"] = false; out["error"] = NSNull()
+        lastExport = encode(out)
+        if lostExportResponse { lostExportResponse = false; return nil }
+        return lastExport
+    }
     private func mutationReply() -> String? {
         calls += 1
         if lost { lost = false; return nil }
@@ -82,6 +118,9 @@ private final class ObservedDeskFixture: @unchecked Sendable {
                     out["contains_source_payloads"] = true; out["contains_personal_labels"] = true
                     out["encrypted"] = false; out["overwritten"] = false; out["error"] = NSNull()
                     return encode(out)
+                case .exportSourcePack(let expected, _, let limits):
+                    precondition(expected == revision)
+                    return exportSourcePack(limits)
                 case .restore(let expected, let next, _):
                     guard admits(handle, expected, next), let checkpoint else { return nil }
                     passages = checkpoint.map { old in
@@ -278,6 +317,16 @@ private final class ObservedDeskFixture: @unchecked Sendable {
         precondition(restored.id != savedTarget.id && !savedTarget.isCurrent(in: desk.state))
         let restoredPage = try await desk.readObservedPassage(restored)
         precondition(restoredPage.text == page.text && restored.passage.body == draft.body)
+        // An old review must not authorize an export after notes or retained
+        // identities changed. A fresh review can share a restored observed-only
+        // desk after the original reader has completely retired.
+        desk.exportSourcePack(AtlasDeskSourcePackTarget(state: state),
+            limits: .init(sourceBytes: 64 * 1024), path: "/chosen/stale.json", accessLease: nil)
+        precondition(fixture.exportCount == 0 && desk.notice.contains("changed after export review"))
+        let readsBeforeExport = probe.windowOffsets.count, mutationsBeforeExport = fixture.mutationCount
+        try await observedExports(desk, fixture: fixture)
+        precondition(probe.windowOffsets.count == readsBeforeExport && fixture.mutationCount == mutationsBeforeExport)
+        precondition(!desk.hasUnsavedContents, "Sharing does not change or checkpoint personal work")
         desk.close()
 
         // Closing the source while its transfer is in flight cannot retire its
@@ -302,6 +351,80 @@ private final class ObservedDeskFixture: @unchecked Sendable {
         precondition(racingFixture.mutationCount == 1)
         await wait("racing source retired") { racingProbe.closedCount == 1 }
         racingDesk.close()
-        print("Observed passage native model, provenance, note and lifecycle regressions passed")
+        print("Observed passage native model, provenance, note, export and lifecycle regressions passed")
+    }
+
+    @MainActor private static func observedExports(_ desk: AtlasReadingDeskModel,
+        fixture: ObservedDeskFixture) async throws {
+        let review = AtlasDeskSourcePackTarget(state: desk.state!)
+        let limits = AtlasDeskSourcePackLimits(sourceBytes: 64 * 1024)
+        precondition(review.selectionCount == 1 && review.state.bookmarks.isEmpty)
+        desk.exportSourcePack(review, limits: limits, path: "/chosen/observed.json", accessLease: nil)
+        await wait("observed export") { !desk.busy }
+        precondition(fixture.exportCount == 1 && desk.lastExport?.succeeded == true)
+        precondition(desk.lastExport?.complete == true && desk.lastExport?.selectedBytes == 3)
+        precondition(desk.lastExport?.includedObservedPassages == 1 && desk.lastExport?.excludedObservedPassages == 0)
+        precondition(desk.notice.contains("only the selected bytes"))
+        let accepted = try JSONSerialization.jsonObject(with: Data(fixture.lastExportJSON!.utf8)) as! [String: Any]
+        func rejectsExport(_ object: [String: Any]) {
+            rejects { _ = try AtlasDeskSourcePackReceipt.decode(ObservedReaderFixture.encode(object),
+                target: review, limits: limits) }
+        }
+        var invalid = accepted
+        invalid["pack_schema"] = "fcb.desk-source-pack/1"; rejectsExport(invalid)
+        invalid = accepted; invalid["observed_passages_included"] = false; rejectsExport(invalid)
+        invalid = accepted; invalid["excluded_observed_passages"] = "1"; rejectsExport(invalid)
+        invalid = accepted; invalid["completeness_scope"] = "all-bookmarked-selections"; rejectsExport(invalid)
+        invalid = accepted; invalid.removeValue(forKey: "completeness_scope"); rejectsExport(invalid)
+        var coverage = accepted["coverage"] as! [String: Any]
+        coverage.removeValue(forKey: "total_observed_passages")
+        invalid = accepted; invalid["coverage"] = coverage; rejectsExport(invalid)
+        coverage = accepted["coverage"] as! [String: Any]; coverage["total_observed_passages"] = "2"
+        invalid = accepted; invalid["coverage"] = coverage; rejectsExport(invalid)
+        coverage = accepted["coverage"] as! [String: Any]; coverage["selected_original_bytes"] = "4"
+        invalid = accepted; invalid["coverage"] = coverage; rejectsExport(invalid)
+        coverage = accepted["coverage"] as! [String: Any]; coverage["omitted_no_selection"] = "1"
+        invalid = accepted; invalid["coverage"] = coverage; rejectsExport(invalid)
+        coverage = accepted["coverage"] as! [String: Any]; coverage["exported_selections"] = "18446744073709551615"
+        invalid = accepted; invalid["coverage"] = coverage; rejectsExport(invalid)
+
+        // Earlier hosts remain interpretable only with an explicit disclosure
+        // that observed passages and their notes were excluded.
+        var legacy = accepted
+        legacy["pack_schema"] = "fcb.desk-source-pack/1"
+        legacy["coverage"] = ["total_bookmarks": "0", "exported_selections": "0", "omitted_no_selection": "0",
+            "omitted_source_limit": "0", "omitted_output_limit": "0", "selected_original_bytes": "0"]
+        legacy["observed_passages_included"] = false; legacy["excluded_observed_passages"] = "1"
+        legacy["completeness_scope"] = "all-bookmarked-selections"; legacy["contains_source_payloads"] = false
+        let old = try AtlasDeskSourcePackReceipt.decode(ObservedReaderFixture.encode(legacy), target: review, limits: limits)
+        precondition(old.succeeded && old.includedObservedPassages == 0 && old.excludedObservedPassages == 1)
+        precondition(old.message.contains("Excluded 1 observed passages"))
+        legacy.removeValue(forKey: "observed_passages_included")
+        legacy.removeValue(forKey: "excluded_observed_passages"); rejectsExport(legacy)
+
+        // An admission failure still describes the reviewed observed snapshot,
+        // with zero output and no claim that its source payload was exported.
+        var refused = accepted
+        refused["status"] = "error"; refused["effect"] = "none"
+        refused["bytes_written"] = "0"; refused["export_bytes"] = "0"; refused["export_scalars"] = "0"
+        refused["export_digest"] = NSNull(); refused["complete"] = false
+        refused["contains_source_payloads"] = false; refused["error"] = ["code": "OUTPUT_LIMIT"]
+        refused["coverage"] = ["total_bookmarks": "0", "total_observed_passages": "1",
+            "exported_selections": "0", "omitted_no_selection": "0", "omitted_source_limit": "0",
+            "omitted_output_limit": "0", "selected_original_bytes": "0"]
+        let failure = try AtlasDeskSourcePackReceipt.decode(ObservedReaderFixture.encode(refused), target: review, limits: limits)
+        precondition(!failure.succeeded && failure.written == 0 && failure.includedObservedPassages == 1)
+
+        desk.exportSourcePack(review, limits: .init(sourceBytes: 0), path: "/chosen/notes-only.json", accessLease: nil)
+        await wait("observed omission receipt") { !desk.busy }
+        precondition(fixture.exportCount == 2 && desk.lastExport?.succeeded == true && desk.lastExport?.complete == false)
+        precondition(desk.lastExport?.selectedBytes == 0 && desk.lastExport?.omittedSourceLimit == 1)
+        precondition(desk.notice.contains("full notes and provenance"))
+
+        fixture.loseNextExportReply()
+        desk.exportSourcePack(review, limits: limits, path: "/chosen/lost-observed-reply.json", accessLease: nil)
+        await wait("lost observed export reply") { !desk.busy }
+        precondition(fixture.exportCount == 3 && desk.lastExport == nil)
+        precondition(desk.notice.contains("Inspect it before retrying"), "A lost write reply must never trigger replay")
     }
 }

@@ -8,7 +8,7 @@ mod support;
 use std::{ffi::OsString, fs::{self, OpenOptions}, os::unix::{ffi::OsStringExt, fs::FileExt},
     path::{Path, PathBuf}, sync::atomic::{AtomicU64, Ordering}};
 use fcb::{ArenaOwnerId, ByteOffset, ByteRange};
-use fcb_app::host::{HostResponse, desk::{DeskSession, DeskLimits, export::DeskSourcePackLimits},
+use fcb_app::host::{HostResponse, desk::{DeskSession, DeskLimits, DeskCommand, export::DeskSourcePackLimits},
     observed_reader::{ObservedReaderSession, ObservedReaderEncoding, MAX_OBSERVED_READER_OBSERVATIONS}};
 use support::{Json, parse};
 
@@ -99,17 +99,35 @@ fn passage_above_four_gib_keeps_raw_path_provenance_and_recovers_without_live_ac
     assert_eq!(replay.get("additional_source_bytes_read").number(), 0);
     assert_eq!(recovered.get("initial_source_bytes_read").number(), 0);
 
-    // The separate bookmark export must explicitly disclose its narrower scope.
-    let pack = root.join("bookmark-pack.json");
+    // Sharing restored evidence exports only selected bytes and their saved
+    // provenance, even when the original path can no longer be a source file.
+    let pack = root.join("observed-pack.json");
     let export = restored.export_source_pack(restored.model().revision(), &pack,
         DeskSourcePackLimits::default(), || false);
     assert_eq!(export.error(), None);
     let manifest = parse(&fs::read(&pack).unwrap()).unwrap();
-    assert!(!manifest.get("observed_passages_included").flag());
-    assert_eq!(manifest.get("excluded_observed_passages").number(), 1);
+    assert_eq!(manifest.get("schema").text(), "fcb.desk-source-pack/2");
+    assert!(manifest.get("observed_passages_included").flag());
+    assert_eq!(manifest.get("excluded_observed_passages").number(), 0);
+    assert!(manifest.get("complete").flag());
+    assert_eq!(manifest.get("entries").array().len(), 1);
+    let entry = &manifest.get("entries").array()[0];
+    assert_eq!(entry.get("capture_kind").text(), "observed-extent");
+    assert_eq!(entry.get("payload_scope").text(), "selected-range-only");
+    assert_eq!(entry.get("passage_id"), note.get("passage"));
+    assert_eq!(entry.get("passage_update_sequence").number(), 2);
+    assert_eq!(entry.get("selection"), note.get("selection"));
+    assert_eq!(entry.get("body"), note.get("body"));
+    assert_eq!(entry.get("observation"), restored_observation);
+    assert_eq!(entry.get("selected_original_hex").text(), "6e6565646c65");
+    assert_eq!(export.coverage().total_bookmarks, 0);
+    assert_eq!(export.coverage().total_observed_passages, 1);
+    assert_eq!(export.coverage().selected_original_bytes, 6);
     let receipt = json(&restored.source_pack_response(&export).unwrap());
-    assert_eq!(receipt.get("excluded_observed_passages").number(), 1);
-    assert_eq!(receipt.get("completeness_scope").text(), "all-bookmarked-selections");
+    assert_eq!(receipt.get("pack_schema").text(), "fcb.desk-source-pack/2");
+    assert_eq!(receipt.get("excluded_observed_passages").number(), 0);
+    assert_eq!(receipt.get("coverage"), manifest.get("coverage"));
+    assert_eq!(receipt.get("completeness_scope").text(), "all-bookmarked-selections-and-observed-passages");
 }
 
 #[test]
@@ -141,6 +159,18 @@ fn utf16_selections_share_one_observation_and_personal_edits_preserve_the_origin
         "Stale", "Cannot replace", || false).is_err());
     assert_eq!(read(&mut kept, crab).get("passage").get("selection"),
         before.get("observed_passages").array()[0].get("selection"));
+    let destination = root.join("utf16le-pack.json");
+    let exported = kept.export_source_pack(kept.model().revision(), &destination,
+        DeskSourcePackLimits::default(), || false);
+    assert_eq!(exported.error(), None);
+    let pack = parse(&fs::read(&destination).unwrap()).unwrap();
+    let entries = pack.get("entries").array();
+    assert_eq!(entries[0].get("selected_original_hex").text(), "3ed880dd");
+    assert_eq!(entries[0].get("body").text(), "Line one\nline two\0");
+    assert_eq!(entries[0].get("observation").get("encoding").text(), "utf16le");
+    assert_eq!(entries[1].get("selected_original_hex").text(), "4100");
+    assert_eq!(entries[0].get("observation"), entries[1].get("observation"));
+    assert_eq!(exported.coverage().selected_original_bytes, 6);
     kept.forget_observed_passage(kept.model().revision(), 12, first, 1, || false).unwrap();
     assert_eq!(state(&mut kept).get("retained_sources").number(), 1);
     kept.forget_observed_passage(kept.model().revision(), 13, crab, 2, || false).unwrap();
@@ -165,6 +195,14 @@ fn malformed_bytes_stay_exact_and_checkpointed_replacement_text_is_disclosed() {
     let selected = read(&mut restored, id);
     assert_eq!(selected.get("original_hex").text(), "ff");
     assert!(selected.get("contains_replacements").flag());
+    drop(source); fs::rename(&path, root.join("moved-malformed")).unwrap();
+    let destination = root.join("malformed-pack.json");
+    let exported = restored.export_source_pack(restored.model().revision(), &destination,
+        DeskSourcePackLimits::default(), || false);
+    assert_eq!(exported.error(), None);
+    let pack = parse(&fs::read(&destination).unwrap()).unwrap();
+    assert_eq!(pack.get("entries").array()[0].get("selected_original_hex").text(), "ff");
+    assert_eq!(exported.coverage().selected_original_bytes, 1);
 }
 
 #[test]
@@ -208,4 +246,100 @@ fn headless_recovery_can_read_edit_and_forget_observed_notes_without_live_source
     assert_eq!(records[3].get("result").get("original_hex").text(), "6b657074");
     assert!(records[5].get("result").get("observed_passages").array().is_empty());
     assert_eq!(records[5].get("result").get("retained_source_bytes").number(), 0);
+}
+
+#[test]
+fn mixed_exports_share_budgets_and_keep_every_duplicate_note_and_observed_identity() {
+    let root = fixture();
+    let complete_path = root.join("complete"); fs::write(&complete_path, b"captured").unwrap();
+    let observed_path = root.join("utf16be");
+    let bytes: Vec<u8> = "\u{feff}A🦀B".encode_utf16().flat_map(u16::to_be_bytes).collect();
+    fs::write(&observed_path, &bytes).unwrap();
+    let mut source = reader(&observed_path);
+    observe(&mut source, 0, 64, ObservedReaderEncoding::Utf16Be);
+    let mut kept = desk();
+    let pane = kept.open_file(0, 1, &complete_path, || false).unwrap().active.unwrap();
+    kept.apply(1, 2, DeskCommand::Navigate { pane, offset: 0, selection: Some(range(0, 2)) }, || false).unwrap();
+    kept.apply(2, 3, DeskCommand::Annotate { pane, label: "Whole capture".into(), body: "Original capture note".into() }, || false).unwrap();
+    let first = keep(&mut kept, &mut source, 1, range(4, 8));
+    let duplicate = keep(&mut kept, &mut source, 1, range(4, 8));
+    let last = keep(&mut kept, &mut source, 1, range(2, 4));
+    kept.edit_observed_passage(kept.model().revision(), kept.model().last_attempt() + 1,
+        first, 1, "First reason", "Why this crab?\nNUL:\0", || false).unwrap();
+    kept.edit_observed_passage(kept.model().revision(), kept.model().last_attempt() + 1,
+        duplicate, 1, "Independent reason", "Same bytes; separate evidence", || false).unwrap();
+    let before = state(&mut kept);
+    drop(source);
+    fs::rename(&observed_path, root.join("moved-observation")).unwrap();
+    fs::write(&complete_path, b"replacement").unwrap();
+
+    let full_path = root.join("all.json");
+    let full = kept.export_source_pack(kept.model().revision(), &full_path,
+        DeskSourcePackLimits::default(), || false);
+    assert_eq!(full.error(), None);
+    assert!(full.coverage().complete());
+    assert_eq!(full.coverage().selected_original_bytes, 12);
+    let full_pack = parse(&fs::read(&full_path).unwrap()).unwrap();
+    let full_entries = full_pack.get("entries").array();
+    assert_eq!(full_entries.len(), 4);
+    assert_eq!(full_entries[0].get("capture_kind").text(), "complete-capture");
+    assert_eq!(full_entries[0].get("selected_original_hex").text(), "6361");
+    for entry in &full_entries[1..3] {
+        assert_eq!(entry.get("capture_kind").text(), "observed-extent");
+        assert_eq!(entry.get("payload_scope").text(), "selected-range-only");
+        assert_eq!(entry.get("selected_original_hex").text(), "d83edd80");
+        assert_eq!(entry.get("observation").get("encoding").text(), "utf16be");
+        assert!(!entry.get("observation").get("whole_file_immutable").flag());
+    }
+    assert_ne!(full_entries[1].get("passage_id"), full_entries[2].get("passage_id"));
+    assert_eq!(full_entries[1].get("observation"), full_entries[2].get("observation"));
+    assert_eq!(full_entries[3].get("selected_original_hex").text(), "0041");
+
+    let limited_path = root.join("limited.json");
+    let limited = kept.export_source_pack(kept.model().revision(), &limited_path,
+        DeskSourcePackLimits { source_bytes: 4, ..DeskSourcePackLimits::default() }, || false);
+    assert_eq!(limited.error(), None);
+    assert_eq!(limited.exit_code(), fcb_app::EXIT_PARTIAL);
+    assert_eq!(limited.coverage().total_bookmarks, 1);
+    assert_eq!(limited.coverage().total_observed_passages, 3);
+    assert_eq!(limited.coverage().exported_selections, 2);
+    assert_eq!(limited.coverage().omitted_source_limit, 2);
+    assert_eq!(limited.coverage().selected_original_bytes, 4);
+    let limited_pack = parse(&fs::read(&limited_path).unwrap()).unwrap();
+    let entries = limited_pack.get("entries").array();
+    for ordinal in 0..4 {
+        assert_eq!(entries[ordinal].get("ordinal").number(), ordinal as u64);
+        assert_eq!(entries[ordinal].get("label"), full_entries[ordinal].get("label"));
+        assert_eq!(entries[ordinal].get("body"), full_entries[ordinal].get("body"));
+        assert_eq!(entries[ordinal].get("selection"), full_entries[ordinal].get("selection"));
+    }
+    for entry in &entries[1..3] {
+        assert_eq!(entry.get("outcome").text(), "omitted");
+        assert_eq!(entry.get("reason").text(), "DESK_EXPORT_SOURCE_BYTE_LIMIT");
+        assert_eq!(entry.get("selected_original_hex"), &Json::Null);
+        assert_eq!(entry.get("observation"), full_entries[1].get("observation"));
+    }
+    assert_eq!(entries[3].get("selected_original_hex").text(), "0041");
+    assert_eq!(state(&mut kept), before);
+
+    // All provenance and notes must fit before any destination is created,
+    // even when no source bytes were requested.
+    let tiny_path = root.join("metadata-refused.json");
+    let refused = kept.export_source_pack(kept.model().revision(), &tiny_path,
+        DeskSourcePackLimits { source_bytes: 0, output_scalars: 1024, ..DeskSourcePackLimits::default() }, || false);
+    assert!(refused.error().is_some()); assert!(!tiny_path.exists());
+    assert_eq!(refused.bytes_written(), 0);
+    assert_eq!(state(&mut kept), before);
+
+    // A delayed terminal receipt describes the exported snapshot, not whatever
+    // notes remain after the publication.
+    for (passage, sequence) in [(first, 2), (duplicate, 2), (last, 1)] {
+        kept.forget_observed_passage(kept.model().revision(), kept.model().last_attempt() + 1,
+            passage, sequence, || false).unwrap();
+    }
+    let receipt = json(&kept.source_pack_response(&limited).unwrap());
+    assert_eq!(receipt.get("pack_schema").text(), "fcb.desk-source-pack/2");
+    assert_eq!(receipt.get("coverage"), limited_pack.get("coverage"));
+    assert_eq!(receipt.get("model_revision"), limited_pack.get("model_revision"));
+    assert!(receipt.get("observed_passages_included").flag());
 }

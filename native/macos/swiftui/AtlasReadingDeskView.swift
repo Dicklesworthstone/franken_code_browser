@@ -45,7 +45,7 @@ private final class AtlasDeskFileAccess {
                     Button("Up to 64 KiB of selected source…") { exportSourcePack(sourceBytes: 64 * 1024) }
                     Button("Up to 1 MiB of selected source…") { exportSourcePack(sourceBytes: 1024 * 1024) }
                     Button("Up to 4 MiB of selected source…") { exportSourcePack(sourceBytes: 4 * 1024 * 1024) }
-                }.disabled(!model.canOperate || model.state?.bookmarks.isEmpty != false)
+                }.disabled(!model.canOperate || (model.state?.annotationCount ?? 0) == 0)
                 Button("Done") { readerTask?.cancel(); pins.closeAll(); dismiss() }.keyboardShortcut(.cancelAction)
             }
             HSplitView {
@@ -329,14 +329,14 @@ private final class AtlasDeskFileAccess {
         panelNotice = ""; model.save(path: url.path, accessLease: access)
     }
     private func exportSourcePack(sourceBytes: UInt64) {
-        guard model.canOperate, let state = model.state, !state.bookmarks.isEmpty else { return }
+        guard model.canOperate, let state = model.state, state.annotationCount > 0 else { return }
         let target = AtlasDeskSourcePackTarget(state: state)
         let limits = AtlasDeskSourcePackLimits(sourceBytes: sourceBytes)
         let panel = NSSavePanel()
-        panel.title = "Export bookmarked source and notes"
+        panel.title = "Export retained source and notes"
         panel.prompt = "Export"
         panel.nameFieldStringValue = "Reading-desk-source.json"
-        panel.message = "Includes all \(state.bookmarks.count) bookmark labels and their full personal notes, plus up to \(sourceBytes) original bytes from \(target.selectionCount) bookmarked selections, unredacted and unencrypted. Excludes \(state.observedPassages.count) observed passages and their notes; save a checkpoint for the complete desk. Whole selections that exceed the budget are listed as omitted. JSON is limited to 16 MiB. Source labels may contain private paths. Review your notes before sharing. Choose a new filename; existing files are preserved."
+        panel.message = "Includes all labels and full personal notes from \(state.bookmarks.count) bookmarks and \(state.observedPassages.count) observed passages, plus up to \(sourceBytes) original bytes from \(target.selectionCount) saved selections, unredacted and unencrypted. Observed passages retain original byte locations and observation evidence; only their selected bytes are exported. Whole selections that exceed the shared budget are listed as omitted with their notes intact. JSON is limited to 16 MiB. Provenance may contain private paths. Review your notes before sharing. Choose a new filename; existing files are preserved."
         panel.canCreateDirectories = true
         guard model.withAutomaticRecoveryDeferred({ panel.runModal() }) == .OK, let url = panel.url else { return }
         guard let access = AtlasDeskFileAccess(selectedURL: url) else { panelNotice = "The selected destination did not grant current write access."; return }
