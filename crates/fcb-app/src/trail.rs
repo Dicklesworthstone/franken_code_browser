@@ -17,15 +17,21 @@ use crate::{AppError, SCHEMA, MANAGED_BYTES, EXIT_OK, EXIT_ERROR, EXIT_PARTIAL, 
 use crate::args::{decimal, MAX_ARGUMENTS, MAX_ARGUMENT_BYTES, MAX_SINGLE_ARGUMENT};
 use crate::output::{Output, OutputError, MAX_RESPONSE_BYTES};
 
-mod export;
+pub(crate) mod export;
+
+const MAX_EXPORT_ARCHIVES: usize = 8;
+const MAX_EXPORT_VALIDATION_BYTES: u64 = 256 * 1024 * 1024;
 
 const HELP: &str = "fcb trail add ARCHIVE --member NAME --start N --end N --output NEW_TRAIL [--note TEXT] [--json]\n\
   Append without overwriting: add ... --from EXISTING_TRAIL --output NEW_TRAIL\n\
   Native names: --member-hex HEX instead of --member NAME; optional --title for a new trail.\n\
 fcb trail inspect TRAIL [--limit N] [--json]\n\
 fcb trail read TRAIL --archive ARCHIVE [--item N] [--bytes N] [--lines N] [--raw] [--json]\n\
-fcb trail export TRAIL --archive ARCHIVE --output NEW_PACK [--format json] [--json]\n\
+fcb trail export TRAIL --archive ARCHIVE [--archive ANOTHER_ARCHIVE ...] --output NEW_PACK [--format json] [--json]\n\
   Optional: --limit N --max-source-bytes N --max-output-bytes N --max-output-chars N\n\
+  Archive validation: --max-validation-bytes N (default/maximum 256 MiB, including EOF probes).\n\
+  Supply up to 8 archives; verified digests route saved visits, never names or argument order.\n\
+  Archive directories share a 64 MiB admission limit; omitted archives remain unavailable.\n\
   Defaults: 128 entries, 32 MiB member verification, 4 MiB output, 4 Mi Unicode scalars.\n\
   Exports original selected bytes as lossless hex with provenance and explicit omissions.\n\
   JSON packs contain selected source and user notes without redaction; only NEW_PACK is written.\n\
@@ -35,10 +41,10 @@ Trails contain user notes and source references, not source payloads or access g
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Mode { Help, Add, Inspect, Read, Export }
 struct Settings {
-    mode: Mode, source: Option<PathBuf>, archive: Option<PathBuf>, previous: Option<PathBuf>, output: Option<PathBuf>,
+    mode: Mode, source: Option<PathBuf>, archives: Vec<PathBuf>, previous: Option<PathBuf>, output: Option<PathBuf>,
     member: Option<Vec<u8>>, start: Option<u64>, end: Option<u64>, note: String, title: String,
     item: usize, limit: usize, bytes: usize, lines: usize, raw: bool, json: bool,
-    export_source_bytes: u64, export_bytes: usize, export_characters: usize,
+    export_source_bytes: u64, export_bytes: usize, export_characters: usize, export_validation_bytes: u64,
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Effect { None, Created, Written, Synced }
@@ -62,7 +68,7 @@ impl From<AppError> for Failure { fn from(e: AppError) -> Self { fail(e) } }
 fn takes_value(arg: &str) -> bool {
     matches!(arg, "--member" | "--member-hex" | "--start" | "--end" | "--note" | "--title" | "--from"
         | "--output" | "--archive" | "--item" | "--limit" | "--bytes" | "--lines" | "--format"
-        | "--max-source-bytes" | "--max-output-bytes" | "--max-output-chars")
+        | "--max-source-bytes" | "--max-output-bytes" | "--max-output-chars" | "--max-validation-bytes")
 }
 fn wants_json(args: &[OsString]) -> bool {
     let mut i = 0;
@@ -87,11 +93,12 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
         Some("export") => Mode::Export,
         _ => return Err(Failure::new("TRAIL_UNKNOWN_COMMAND")),
     };
-    let mut s = Settings { mode, source: None, archive: None, previous: None, output: None, member: None,
+    let mut s = Settings { mode, source: None, archives: Vec::new(), previous: None, output: None, member: None,
         start: None, end: None, note: String::new(), title: "Reading trail".to_owned(),
         item: 1, limit: if mode == Mode::Export { 128 } else { 100 }, bytes: 64 * 1024, lines: 100,
         raw: false, json: false, export_source_bytes: 32 * 1024 * 1024,
-        export_bytes: 4 * 1024 * 1024, export_characters: 4 * 1024 * 1024 };
+        export_bytes: 4 * 1024 * 1024, export_characters: 4 * 1024 * 1024,
+        export_validation_bytes: MAX_EXPORT_VALIDATION_BYTES };
     let mut seen = 0u32; let mut positional = false; let mut i = usize::from(!args.is_empty());
     while i < args.len() {
         let arg = &args[i]; i += 1;
@@ -103,9 +110,12 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
                 "--archive" => 256, "--item" => 512, "--limit" => 1024, "--bytes" => 2048,
                 "--lines" => 4096, "--raw" => 8192, "--format" => 16384,
                 "--max-source-bytes" => 32768, "--max-output-bytes" => 65536,
-                "--max-output-chars" => 131072, _ => return Err(Failure::new("CLI_UNKNOWN_OPTION")),
+                "--max-output-chars" => 131072, "--max-validation-bytes" => 262144,
+                _ => return Err(Failure::new("CLI_UNKNOWN_OPTION")),
             };
-            if seen & bit != 0 { return Err(Failure::new("CLI_DUPLICATE_OPTION")); }
+            if seen & bit != 0 && !(option == "--archive" && mode == Mode::Export) {
+                return Err(Failure::new("CLI_DUPLICATE_OPTION"));
+            }
             seen |= bit;
             if option == "--json" { s.json = true; continue; }
             if option == "--raw" { s.raw = true; continue; }
@@ -113,7 +123,13 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
             if matches!(option, "--archive" | "--from" | "--output") {
                 if value.is_empty() { return Err(Failure::new("CLI_MISSING_VALUE")); }
                 let path = PathBuf::from(value);
-                match option { "--archive" => s.archive = Some(path), "--from" => s.previous = Some(path), _ => s.output = Some(path) }
+                match option {
+                    "--archive" => {
+                        if s.archives.len() == MAX_EXPORT_ARCHIVES { return Err(Failure::new("TRAIL_EXPORT_ARCHIVE_LIMIT")); }
+                        s.archives.push(path);
+                    }
+                    "--from" => s.previous = Some(path), _ => s.output = Some(path),
+                }
                 continue;
             }
             if option == "--member" {
@@ -143,6 +159,7 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
                 "--max-source-bytes" if n <= fcb::search::trail::MAX_TRAIL_EXPORT_SOURCE_BYTES => s.export_source_bytes = n,
                 "--max-output-bytes" if (1..=crate::output::MAX_ENCODED_BYTES as u64).contains(&n) => s.export_bytes = n as usize,
                 "--max-output-chars" if (1..=crate::output::MAX_ENCODED_BYTES as u64).contains(&n) => s.export_characters = n as usize,
+                "--max-validation-bytes" if n <= MAX_EXPORT_VALIDATION_BYTES => s.export_validation_bytes = n,
                 _ => return Err(Failure::new("CLI_ARGUMENT_LIMIT")),
             }
         } else {
@@ -156,10 +173,10 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
             && s.output.is_some() && seen & !(1 | 2 | 4 | 8 | 16 | 32 | 64 | 128) == 0
             && !(s.previous.is_some() && seen & 32 != 0),
         Mode::Inspect => s.source.is_some() && seen & !(1 | 1024) == 0,
-        Mode::Read => s.source.is_some() && s.archive.is_some() && seen & !(1 | 256 | 512 | 2048 | 4096 | 8192) == 0
+        Mode::Read => s.source.is_some() && s.archives.len() == 1 && seen & !(1 | 256 | 512 | 2048 | 4096 | 8192) == 0
             && !(s.raw && seen & 4096 != 0),
-        Mode::Export => s.source.is_some() && s.archive.is_some() && s.output.is_some()
-            && seen & !(1 | 128 | 256 | 1024 | 16384 | 32768 | 65536 | 131072) == 0,
+        Mode::Export => s.source.is_some() && !s.archives.is_empty() && s.output.is_some()
+            && seen & !(1 | 128 | 256 | 1024 | 16384 | 32768 | 65536 | 131072 | 262144) == 0,
     };
     if !valid { return Err(Failure::new("CLI_INCOMPATIBLE_OPTIONS")); }
     Ok(s)
@@ -216,7 +233,7 @@ fn metadata(out: &mut Output, view: TrailView<'_>) -> Result<(), OutputError> {
     out.literal(",\"referenced_bytes_including_repeats\":")?; out.integer(view.reference_bytes())?;
     out.literal(",\"contains_source_payloads\":false,\"contains_user_text\":true")
 }
-fn entry_output(out: &mut Output, entry: TrailEntry<'_>, ordinal: usize) -> Result<(), OutputError> {
+pub(crate) fn entry_output(out: &mut Output, entry: TrailEntry<'_>, ordinal: usize) -> Result<(), OutputError> {
     out.literal("{\"item\":")?; out.integer(ordinal as u64 + 1)?;
     out.literal(",\"evidence\":\"user-selection\",\"archive_digest\":")?; out.quoted(&entry.archive.to_hex())?;
     out.literal(",\"source_digest\":")?; out.quoted(&entry.source.to_hex())?;
@@ -279,7 +296,7 @@ fn execute(s: &Settings, out: &mut Output, budget: &ResourceBudget, effect: &mut
         if s.json { out.literal("]}\n")?; }
         return Ok(if view.len() > s.limit { EXIT_PARTIAL } else { EXIT_OK });
     }
-    let mut archive = open_archive(s.archive.as_deref().ok_or_else(|| Failure::new("TRAIL_ARCHIVE_REQUIRED"))?, budget, canceled)?;
+    let mut archive = open_archive(s.archives.first().ok_or_else(|| Failure::new("TRAIL_ARCHIVE_REQUIRED"))?, budget, canceled)?;
     let mut navigator = TrailNavigator::new(view, generation()); navigator.select(s.item - 1).map_err(fail)?;
     let target = navigator.target().map_err(fail)?.ok_or_else(|| Failure::new("TRAIL_ITEM_NOT_FOUND"))?;
     let capture = target.open(&mut archive, view.digest(), navigator.generation(), file_id(), revision(), budget,
@@ -394,6 +411,8 @@ mod tests {
         assert!(!wants_json(&args(&["inspect", "--", "--json"])));
         assert!(!wants_json(&args(&["export", "a", "--format", "--json"])));
         assert!(!wants_json(&args(&["export", "a", "--max-output-bytes", "--json"])));
+        assert!(!wants_json(&args(&["export", "a", "--archive", "--json"])));
+        assert!(!wants_json(&args(&["export", "a", "--max-validation-bytes", "--json"])));
     }
     #[test]
     fn explicit_ranges_and_destinations_required_and_no_silent_option_ignoring() {
@@ -409,5 +428,23 @@ mod tests {
         assert!(parse(&args(&["export", "a", "--archive", "b", "--output", "new", "--max-output-chars", "0"])).is_err());
         assert!(parse(&args(&["export", "a", "--archive", "b", "--output", "new", "--format", "json", "--format", "json"])).is_err());
         assert!(parse(&args(&["export", "a", "--archive", "b", "--output", "new", "--max-source-bytes", "0", "--limit", "0"])).is_ok());
+    }
+
+    #[test]
+    fn repeatable_archives_and_validation_budget_are_export_only_and_bounded() {
+        let many = parse(&args(&["export", "trail", "--archive", "old", "--archive", "new",
+            "--output", "pack", "--max-validation-bytes", "4096"])).unwrap();
+        assert_eq!(many.archives, [PathBuf::from("old"), PathBuf::from("new")]);
+        assert_eq!(many.export_validation_bytes, 4096);
+        assert!(parse(&args(&["read", "trail", "--archive", "old", "--archive", "new"])).is_err());
+        assert!(parse(&args(&["read", "trail", "--archive", "old", "--max-validation-bytes", "4096"])).is_err());
+        assert!(parse(&args(&["export", "trail", "--output", "pack"])).is_err());
+        assert!(parse(&args(&["export", "trail", "--archive", "old", "--output", "pack",
+            "--max-validation-bytes", "268435457"])).is_err());
+        let mut maximum = args(&["export", "trail", "--output", "pack"]);
+        for _ in 0..MAX_EXPORT_ARCHIVES { maximum.extend(args(&["--archive", "archive"])); }
+        assert!(parse(&maximum).is_ok());
+        maximum.extend(args(&["--archive", "one-too-many"]));
+        assert_eq!(parse(&maximum).err().unwrap().code, "TRAIL_EXPORT_ARCHIVE_LIMIT");
     }
 }

@@ -63,6 +63,44 @@ metadata diagnostic never silently widens that authority.
 The CLI also provides bounded saved-archive and reading-trail commands, including
 `trail add`, `inspect`, `read` and `export`. The native Saved Repository window can
 follow the resulting FCBT files; see [reading-trail usage](../../native/macos/README.md#following-saved-reading-trails).
+
+An exported trail can include exact selections from several captured repository
+versions. Supply each archive explicitly; the verified archive digest chooses
+the source for each saved visit, even when the archives contain identical paths:
+
+```sh
+fcb trail export investigation.fcbt --archive before.fcbs --archive after.fcbs --output investigation.json --json
+fcb trail export investigation.fcbt --archive before.fcbs --archive after.fcbs --output smaller-pack.json --max-source-bytes 1048576 --max-validation-bytes 33554432 --json
+```
+
+Up to eight `--archive` arguments are accepted for `export`; `read` still accepts
+one. Repeated or copied archives are fully validated before duplicate digests
+share a retained handle. Explicit trail visits and notes remain ordered and are
+never deduplicated. A reference to an archive that was not supplied stays visible
+as unavailable (`TRAIL_OTHER_ARCHIVE`), and the export reports partial coverage.
+An unreadable, corrupt, or over-budget supplied archive refuses the export before
+creating the destination.
+
+Archive opening has a separate cumulative allowance from selected-member
+verification. `--max-validation-bytes` defaults to and cannot exceed 256 MiB;
+admission counts each observed archive length plus one byte for its EOF probe.
+Each archive retains the existing 80 MiB envelope limit. All retained archive
+directories share a 64 MiB managed admission limit. The pack and receipt report
+actual validation reads, admitted bytes, distinct/duplicate archives, and retained
+and peak directory charges. Member verification still uses one shared
+`--max-source-bytes` budget, including repeated visits. Output byte and Unicode
+scalar limits include headers, provenance, and every retained note; source
+selections are included whole or omitted with a reason.
+
+The `fcb.trail-source-pack/1` pack includes an `archives` inventory. Its existing
+`archive` object remains available when one distinct archive was supplied and is
+`null` when several were supplied. Selected original bytes use lossless hex,
+including UTF-16 and malformed text. Exports contain selected source and full
+user notes without redaction, access no live source roots, and exclusively create
+the requested new destination. Cancellation and response-delivery failure retain
+the reported file effect; they cannot undo a completed write. Executable
+regression verification of the multi-archive route remains pending.
+
 On macOS, human `fcb open` and bare `fcb` can hand off to an installed native app.
 This CLI lane does not claim completion of all FCB-057 acceptance criteria.
 

@@ -41,6 +41,28 @@ impl Fixture {
             archive.as_os_str().to_owned(), "--output".into(), destination.as_os_str().to_owned(),
             "--format".into(), "json".into(), "--json".into()]
     }
+    fn append(&self, archive: &PathBuf, previous: &PathBuf, destination: &PathBuf,
+        start: u64, end: u64, note: &str) {
+        let mut args = self.add(archive, start, end);
+        args[10] = note.into(); args[12] = destination.as_os_str().to_owned();
+        args.extend(["--from".into(), previous.as_os_str().to_owned()]);
+        assert_eq!(invoke(&args, || false).0, EXIT_OK);
+    }
+    fn export_many(&self, trail: &PathBuf, archives: &[&PathBuf], destination: &PathBuf) -> Vec<OsString> {
+        let mut args = vec!["trail".into(), "export".into(), trail.as_os_str().to_owned(),
+            "--output".into(), destination.as_os_str().to_owned(), "--json".into()];
+        for archive in archives { args.extend(["--archive".into(), archive.as_os_str().to_owned()]); }
+        args
+    }
+    fn mixed_trail(&self) -> (PathBuf, PathBuf, PathBuf) {
+        let old = self.archive("old.fcbs", b"a.rs", b"old-one");
+        let new = self.archive("new.fcbs", b"a.rs", b"new-two");
+        assert_eq!(invoke(&self.add(&old, 0, 3), || false).0, EXIT_OK);
+        let second = self.0.join("second.fcbt"); let third = self.0.join("third.fcbt");
+        self.append(&new, &self.trail(), &second, 0, 3, "Inspect the changed capture");
+        self.append(&old, &second, &third, 0, 3, "Return to the earlier exact selection");
+        (old, new, third)
+    }
 }
 impl Drop for Fixture { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
 struct NeverRead;
@@ -337,4 +359,172 @@ fn actual_binary_exports_saved_evidence_and_rejects_bad_format_and_corrupt_archi
     let rejected = f.0.join("corrupt.json");
     let (exit, receipt) = invoke(&f.export(&archive, &rejected), || false); assert_eq!(exit, EXIT_ERROR);
     assert_eq!(receipt.get("effect").text(), "none"); assert!(!rejected.exists());
+}
+
+#[test]
+fn mixed_archive_export_routes_by_digest_and_preserves_visit_order_and_repeats() {
+    let f = Fixture::new(); let (old, new, trail) = f.mixed_trail();
+    let destination = f.0.join("mixed.json");
+    // Reverse input order, and use the same member path in both archives. A
+    // position/path-based implementation would return the wrong source here.
+    let (exit, receipt) = invoke(&f.export_many(&trail, &[&new, &old], &destination), || false);
+    assert_eq!(exit, EXIT_OK); assert!(receipt.get("complete").flag());
+    let pack = parse(&fs::read(destination).unwrap()).unwrap();
+    assert!(matches!(pack.get("archive"), Json::Null));
+    assert_eq!(pack.get("archives").array().len(), 2);
+    let entries = pack.get("entries").array();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries.iter().map(|entry| entry.get("selected_original_hex").text()).collect::<Vec<_>>(),
+        ["6f6c64", "6e6577", "6f6c64"]);
+    assert_eq!(entries.iter().map(|entry| entry.get("selection").get("item").number()).collect::<Vec<_>>(), [1, 2, 3]);
+    assert_eq!(entries[0].get("selection").get("archive_digest"), entries[2].get("selection").get("archive_digest"));
+    assert_ne!(entries[0].get("selection").get("archive_digest"), entries[1].get("selection").get("archive_digest"));
+    assert_eq!(entries[1].get("selection").get("rationale").text(), "Inspect the changed capture");
+    assert_eq!(entries[2].get("selection").get("rationale").text(), "Return to the earlier exact selection");
+    assert_eq!(pack.get("coverage").get("source_bytes_read").number(), 21);
+    assert_eq!(pack.get("coverage").get("selected_original_bytes").number(), 9);
+    let validation = pack.get("archive_validation");
+    let envelope_bytes = fs::metadata(&old).unwrap().len() + fs::metadata(&new).unwrap().len();
+    assert_eq!(validation.get("validation_bytes_read").number(), envelope_bytes);
+    assert_eq!(validation.get("validation_bytes_admitted").number(), envelope_bytes + 2);
+    assert_eq!(validation.get("distinct_archives").number(), 2);
+    assert!(validation.get("retained_directory_bytes").number() <= validation.get("max_directory_bytes").number());
+    assert!(validation.get("peak_directory_bytes").number() <= validation.get("max_directory_bytes").number());
+    assert_eq!(receipt.get("archive_validation"), validation);
+}
+
+#[test]
+fn omitted_archive_keeps_unavailable_visits_and_source_budget_spans_all_archives() {
+    let f = Fixture::new(); let (old, new, trail) = f.mixed_trail();
+    let missing = f.0.join("omitted.json");
+    let (exit, receipt) = invoke(&f.export_many(&trail, &[&new], &missing), || false);
+    assert_eq!(exit, EXIT_PARTIAL); assert!(!receipt.get("complete").flag());
+    let pack = parse(&fs::read(missing).unwrap()).unwrap(); let entries = pack.get("entries").array();
+    for index in [0, 2] {
+        assert_eq!(entries[index].get("readiness").text(), "unavailable");
+        assert_eq!(entries[index].get("reason").text(), "TRAIL_OTHER_ARCHIVE");
+        assert!(matches!(entries[index].get("selected_original_hex"), Json::Null));
+    }
+    assert_eq!(entries[1].get("selected_original_hex").text(), "6e6577");
+    assert_eq!(entries[2].get("selection").get("rationale").text(), "Return to the earlier exact selection");
+    assert_eq!(pack.get("coverage").get("unavailable_entries").number(), 2);
+    assert_eq!(pack.get("coverage").get("source_bytes_read").number(), 7);
+    assert_eq!(pack.get("archive").get("digest"), pack.get("archives").array()[0].get("digest"));
+
+    let limited = f.0.join("global-source-limit.json");
+    let mut args = f.export_many(&trail, &[&old, &new], &limited);
+    args.extend(["--max-source-bytes".into(), "14".into()]);
+    assert_eq!(invoke(&args, || false).0, EXIT_PARTIAL);
+    let pack = parse(&fs::read(limited).unwrap()).unwrap(); let entries = pack.get("entries").array();
+    assert_eq!(entries[0].get("selected_original_hex").text(), "6f6c64");
+    assert_eq!(entries[1].get("selected_original_hex").text(), "6e6577");
+    assert_eq!(entries[2].get("reason").text(), "TRAIL_EXPORT_SOURCE_BYTE_LIMIT");
+    assert_eq!(pack.get("coverage").get("verification_bytes_admitted").number(), 14);
+    assert_eq!(pack.get("coverage").get("source_bytes_read").number(), 14);
+}
+
+#[test]
+fn duplicate_archive_digests_share_a_route_but_every_supplied_file_is_validated() {
+    let f = Fixture::new(); let archive = f.archive("first.fcbs", b"a.rs", b"abc");
+    assert_eq!(invoke(&f.add(&archive, 0, 3), || false).0, EXIT_OK);
+    let copy = f.0.join("renamed-copy.fcbs"); fs::copy(&archive, &copy).unwrap();
+    let destination = f.0.join("duplicate.json");
+    assert_eq!(invoke(&f.export_many(&f.trail(), &[&archive, &copy], &destination), || false).0, EXIT_OK);
+    let pack = parse(&fs::read(destination).unwrap()).unwrap();
+    assert_eq!(pack.get("archives").array().len(), 1);
+    assert_eq!(pack.get("archive_validation").get("supplied_archives").number(), 2);
+    assert_eq!(pack.get("archive_validation").get("duplicate_archives").number(), 1);
+    assert_eq!(pack.get("archive_validation").get("validation_bytes_read").number(), fs::metadata(&archive).unwrap().len() * 2);
+    assert_eq!(pack.get("coverage").get("source_bytes_read").number(), 3);
+
+    let mut corrupt = fs::read(&copy).unwrap(); let last = corrupt.len() - 1; corrupt[last] ^= 1;
+    fs::write(&copy, corrupt).unwrap();
+    let rejected = f.0.join("corrupt-extra-archive.json");
+    let (exit, receipt) = invoke(&f.export_many(&f.trail(), &[&archive, &copy], &rejected), || false);
+    assert_eq!(exit, EXIT_ERROR); assert_eq!(receipt.get("effect").text(), "none");
+    assert!(!rejected.exists(), "a bad explicit archive must not be treated as an omitted archive");
+}
+
+#[test]
+fn aggregate_archive_validation_and_archive_count_refuse_before_output_creation() {
+    let f = Fixture::new(); let (old, new, trail) = f.mixed_trail();
+    let admitted = fs::metadata(&old).unwrap().len() + fs::metadata(&new).unwrap().len() + 2;
+    let rejected = f.0.join("validation-over-limit.json");
+    let mut args = f.export_many(&trail, &[&old, &new], &rejected);
+    args.extend(["--max-validation-bytes".into(), (admitted - 1).to_string().into()]);
+    let (exit, receipt) = invoke(&args, || false);
+    assert_eq!(exit, EXIT_ERROR); assert_eq!(receipt.get("effect").text(), "none");
+    assert_eq!(receipt.get("error").get("code").text(), "TRAIL_EXPORT_VALIDATION_BYTE_LIMIT");
+    assert!(!rejected.exists());
+    let exact = f.0.join("validation-exact-limit.json");
+    let mut args = f.export_many(&trail, &[&old, &new], &exact);
+    args.extend(["--max-validation-bytes".into(), admitted.to_string().into()]);
+    assert_eq!(invoke(&args, || false).0, EXIT_OK);
+
+    let too_many = f.0.join("too-many-archives.json");
+    let (exit, receipt) = invoke(&f.export_many(&trail, &[&old; 9], &too_many), || false);
+    assert_eq!(exit, EXIT_ERROR); assert_eq!(receipt.get("error").get("code").text(), "TRAIL_EXPORT_ARCHIVE_LIMIT");
+    assert!(!too_many.exists());
+}
+
+#[test]
+fn retained_archive_directories_share_one_admission_ceiling() {
+    let f = Fixture::new();
+    // Source payloads are empty; the pressure comes from retained membership
+    // directories, which must not get a fresh 64 MiB allowance per archive.
+    let paths: Vec<_> = (0..65_536).map(|ordinal| format!("{ordinal:05}.rs")).collect();
+    let entries: Vec<_> = paths.iter().map(|path| SnapshotEntry { path: path.as_bytes(),
+        observed_bytes: 0, data: SnapshotData::Captured(b"") }).collect();
+    let owner = ArenaOwnerId::new(1).unwrap();
+    let budget = ResourceBudget::new(owner, ByteLength::new(16 * 1024 * 1024)).unwrap();
+    let mut archives = Vec::new();
+    for ordinal in 0..4 {
+        let encoded = SnapshotBytes::encode(owner, true, &format!("directory-fixture-{ordinal}"), &entries,
+            SnapshotLimits::default(), &budget, ResourceAllocationId::new(1).unwrap(), || false).unwrap();
+        let destination = f.0.join(format!("directory-{ordinal}.fcbs"));
+        fs::write(&destination, encoded.bytes()).unwrap(); archives.push(destination);
+    }
+    let mut add = f.add(&archives[0], 0, 0); add[4] = "00000.rs".into();
+    assert_eq!(invoke(&add, || false).0, EXIT_OK);
+    let permitted = f.0.join("three-directories.json");
+    assert_eq!(invoke(&f.export_many(&f.trail(), &[&archives[0], &archives[1], &archives[2]], &permitted), || false).0, EXIT_OK);
+    let pack = parse(&fs::read(permitted).unwrap()).unwrap();
+    let counters = pack.get("archive_validation");
+    assert_eq!(counters.get("distinct_archives").number(), 3);
+    assert!(counters.get("peak_directory_bytes").number() <= counters.get("max_directory_bytes").number());
+    let refused = f.0.join("four-directories.json");
+    let (exit, receipt) = invoke(&f.export_many(&f.trail(),
+        &[&archives[0], &archives[1], &archives[2], &archives[3]], &refused), || false);
+    assert_eq!(exit, EXIT_ERROR); assert_eq!(receipt.get("effect").text(), "none");
+    assert_eq!(receipt.get("error").get("code").text(), "SNAPSHOT_RESOURCE_DENIED");
+    assert!(!refused.exists());
+}
+
+#[test]
+fn actual_binary_exports_both_captures_and_multi_archive_cancellation_preserves_effects() {
+    let f = Fixture::new(); let (old, new, trail) = f.mixed_trail();
+    let destination = f.0.join("binary-mixed.json");
+    let exported = Command::new(env!("CARGO_BIN_EXE_fcb"))
+        .args(f.export_many(&trail, &[&new, &old], &destination)).output().unwrap();
+    assert_eq!(exported.status.code(), Some(EXIT_OK as i32));
+    let pack = parse(&fs::read(&destination).unwrap()).unwrap();
+    assert!(pack.get("complete").flag());
+    assert_eq!(pack.get("entries").array()[0].get("selected_original_hex").text(), "6f6c64");
+    assert_eq!(pack.get("entries").array()[1].get("selected_original_hex").text(), "6e6577");
+    let before = fs::read(&destination).unwrap();
+    assert_eq!(invoke(&f.export_many(&trail, &[&old, &new], &destination), || false).0, EXIT_ERROR);
+    assert_eq!(fs::read(destination).unwrap(), before);
+
+    let untouched = f.0.join("mixed-untouched.json");
+    let (exit, receipt) = invoke(&f.export_many(&trail, &[&old, &new], &untouched), || true);
+    assert_eq!(exit, EXIT_CANCELED); assert_eq!(receipt.get("effect").text(), "none"); assert!(!untouched.exists());
+    let created = f.0.join("mixed-created.json");
+    let (exit, receipt) = invoke(&f.export_many(&trail, &[&old, &new], &created), || created.exists());
+    assert_eq!(exit, EXIT_CANCELED); assert_eq!(receipt.get("effect").text(), "destination-created-incomplete");
+    assert_eq!(fs::metadata(created).unwrap().len(), 0);
+    let written = f.0.join("mixed-written.json");
+    let (exit, receipt) = invoke(&f.export_many(&trail, &[&old, &new], &written),
+        || fs::metadata(&written).is_ok_and(|m| m.len() > 0));
+    assert_eq!(exit, EXIT_CANCELED); assert_eq!(receipt.get("effect").text(), "complete-file-sync-unconfirmed");
+    assert!(parse(&fs::read(written).unwrap()).unwrap().get("complete").flag());
 }
