@@ -97,12 +97,20 @@ history. The existing **Atlas Back/Forward** controls still navigate camera
 locations within one map.
 
 Use **Landmarks → Save current view…** to name a folder, its file filter and
-its map position. The menu can keep up to **32 landmarks in this window**;
-choose a name to return, or use **Remove landmark** to remove it. Landmarks
-and folder history last for this project session. Closing or replacing the
-project, replacing its access grant, or successfully changing its discovery
-policy clears them. A same-policy project refresh preserves them. They are
-not saved across application launches and do not grant access to a stored path.
+its map position. The menu keeps up to **32 landmarks** for the project and
+discovery policy; choose a name to return, or use **Remove landmark** to remove
+it. Accepted folder moves, landmark edits and settled map positions save
+automatically. **Landmarks → Save current view now** explicitly saves the
+current view. Folder history and landmarks survive project closure and later
+application launches.
+
+Reopening the project restores its saved folder, filter and map position after
+current project access is accepted. A startup file choice or newer map/filter
+interaction takes precedence; **Landmarks → Return to saved view** remains
+available to apply the saved map explicitly. Discovery policies keep separate
+records. Replacing a root or access grant clears the old in-memory routes
+before restoration under the newly opened project. Saved paths remain locators
+and never grant source access.
 
 A return prepares its bounded folder catalog and layout under the original
 project root. The current map, Back/Forward routes and independent source
@@ -118,12 +126,24 @@ Files stays open if it owns a reader. Choose **Show text atlas** to see the
 accepted destination; deferred camera restoration waits for usable geometry.
 
 History retains at most 128 previous/forward destinations and no catalog or
-source payloads. This implements explicit semantic return navigation and
-session landmarks. Automatic precision-triggered focus islands and durable
-workspace restoration remain separate work. The production regression sources
-are in `AtlasFolderNavigationTests.swift` and `AtlasCameraTests.swift`, with
-`test_swiftui_folder_navigation.sh` and `test_swiftui_camera.sh` entry points.
-Independent executable and physical-Mac verification remain pending.
+source payloads. Personal navigation is stored separately from derived caches,
+bound to the original root bytes and discovery policy. The store admits up to
+16 root/policy records, 2 MiB per record and 64 MiB overall, with a previous
+accepted generation retained. Unusually large histories can remain usable in
+the current window even when they exceed persistence admission.
+
+Another window's newer save is preserved. **Reload saved views…** explicitly
+reloads that record after reviewing replacement of this window's unsaved views;
+**Retry saving** is available after retryable failures. Corrupt current or prior
+records are kept intact and block overwrite. A missing or inaccessible saved
+folder preserves the current map and source reader for an explicit retry.
+
+The production regression sources are in `AtlasFolderNavigationTests.swift`,
+`AtlasFolderPersistenceTests.swift` and `AtlasCameraTests.swift`, with
+`test_swiftui_folder_navigation.sh`, `test_swiftui_folder_persistence.sh` and
+`test_swiftui_camera.sh` entry points. Independent executable and physical-Mac
+verification remain pending. Automatic precision-triggered focus islands and
+complete multi-pane workspace restoration remain separate work.
 
 ## City view
 

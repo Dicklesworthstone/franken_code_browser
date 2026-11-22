@@ -1266,7 +1266,7 @@ struct AtlasSearchPresentation: Sendable {
 }
 
 /// File-type selection shared by atlas membership and search admission.
-enum AtlasFileScope: String, CaseIterable, Identifiable {
+enum AtlasFileScope: String, CaseIterable, Identifiable, Sendable {
     case all = "All files", markdown = "Markdown", python = "Python", rust = "Rust", custom = "Extension…"
     var id: String { rawValue }
     func searchScope(custom: String = "") throws -> AtlasSearchFileScope {

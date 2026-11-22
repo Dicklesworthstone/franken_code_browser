@@ -185,6 +185,43 @@ import Foundation
             "opening the same saved place does not destroy Forward")
     }
 
+    static func savedSnapshotRoundTripAndValidation() throws {
+        var navigation = AtlasFolderNavigation()
+        let root = place(), a = place("docs"), b = place("src")
+        for destination in [root, a, b] { visit(destination, &navigation) }
+        let back = navigation.back()!
+        precondition(navigation.commit(back, resolved: back.target))
+        let landmark = try navigation.addLandmark(label: "Documentation", destination: a)
+        let pending = navigation.forward()!
+        let snapshot = navigation.snapshot()
+        navigation.reset()
+        try navigation.restore(snapshot)
+        precondition(navigation.current == a && navigation.back()?.target == root
+            && navigation.forward()?.target == b && navigation.landmarks.first?.id == landmark)
+        precondition(!navigation.accepts(pending), "restoring values never revives an old move token")
+        let latest = place("docs", anchor: AtlasParcelCameraAnchor(relativeX: 0.4, relativeY: 0.7, zoomFactor: 2)!)
+        let captured = navigation.snapshot(current: latest)
+        precondition(captured.history.current == latest && navigation.current == a,
+            "saving the latest camera does not mutate a pending navigation transaction")
+        let retained = navigation.snapshot()
+        reject("a history without a current position is malformed") {
+            try navigation.restore(.init(history: .init(current: nil, previous: [root], following: []), landmarks: []))
+        }
+        reject("duplicate landmark identities cannot be loaded") {
+            try navigation.restore(.init(history: snapshot.history,
+                landmarks: [snapshot.landmarks[0], snapshot.landmarks[0]]))
+        }
+        reject("saved labels must already satisfy normal landmark admission") {
+            try navigation.restore(.init(history: snapshot.history,
+                landmarks: [.init(id: UUID(), label: "  untrimmed  ", destination: a)]))
+        }
+        reject("stored history cannot exceed the live shared bound") {
+            try navigation.restore(.init(history: .init(current: a,
+                previous: Array(repeating: root, count: 129), following: []), landmarks: []))
+        }
+        precondition(navigation.snapshot() == retained, "refused restore cannot replace an accepted history")
+    }
+
     static func main() throws {
         transactionalOriginAndRoundTrip()
         failureCancellationAndBranching()
@@ -193,6 +230,7 @@ import Foundation
         try rawIdentityAndValidation()
         try boundedNamedLandmarks()
         boundedHistoryAndNoOpVisit()
-        print("7 folder navigation regression groups passed")
+        try savedSnapshotRoundTripAndValidation()
+        print("8 folder navigation regression groups passed")
     }
 }

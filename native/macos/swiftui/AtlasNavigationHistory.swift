@@ -6,6 +6,12 @@ import Foundation
 /// Owners store source/layout-relative anchors, never handles, pages or source payload.
 struct AtlasNavigationHistory<Position: Equatable> {
     enum Direction { case visit, back, forward }
+    struct Snapshot: Equatable {
+        let current: Position?
+        let previous: [Position]
+        let following: [Position]
+    }
+    enum SnapshotError: Error { case invalidHistory }
     struct Move {
         let target: Position
         fileprivate let revision: UUID
@@ -22,6 +28,21 @@ struct AtlasNavigationHistory<Position: Equatable> {
     var canForward: Bool { !following.isEmpty }
 
     init(capacity: Int = 128) { self.capacity = min(128, max(0, capacity)) }
+
+    func snapshot(current: Position? = nil) -> Snapshot {
+        Snapshot(current: current ?? self.current, previous: previous, following: following)
+    }
+
+    /// Only value anchors are restored. Pending requests keep their old revision
+    /// and cannot become valid against a reopened history.
+    mutating func restore(_ snapshot: Snapshot) throws {
+        guard snapshot.previous.count + snapshot.following.count <= capacity,
+              snapshot.current != nil || (snapshot.previous.isEmpty && snapshot.following.isEmpty) else {
+            throw SnapshotError.invalidHistory
+        }
+        current = snapshot.current; previous = snapshot.previous; following = snapshot.following
+        revision = UUID()
+    }
 
     func visit(_ position: Position) -> Move {
         Move(target: position, revision: revision, direction: .visit)
@@ -80,3 +101,5 @@ struct AtlasNavigationHistory<Position: Equatable> {
         revision = UUID()
     }
 }
+
+extension AtlasNavigationHistory.Snapshot: Sendable where Position: Sendable {}

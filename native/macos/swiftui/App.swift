@@ -282,6 +282,19 @@ private struct AtlasPreparedProjectRefresh: Sendable {
 }
 
 @MainActor struct ContentView: View {
+    private struct SavedAtlasViews {
+        let snapshot: AtlasFolderNavigation.Snapshot?
+        let window, project: UUID
+        let root: String
+        let policy: AtlasDiscoveryPolicy
+        let browser, access: ObjectIdentifier?
+        let presentationRevision: UUID
+        let destination: AtlasFolderDestination?
+        let scale, targetScale, offsetX, offsetY: Double
+        let fileScope: AtlasFileScope
+        let extensions: [UInt8]
+        let automaticallyReturn: Bool
+    }
 #if FCB_APP_STORE
     @State private var root = ""
     @State private var rootAccess: AppStoreRootAccess?
@@ -397,6 +410,11 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     @State private var atlasScopeLabel = "All"
     @State private var atlasDirectoryTarget: AtlasDirectoryFocus?
     @State private var atlasFolderNavigation = AtlasFolderNavigation()
+    @State private var atlasFolderPersistence = AtlasFolderPersistence()
+    @State private var atlasSavedDestination: AtlasFolderDestination?
+    @State private var atlasDeferredSavedViews: SavedAtlasViews?
+    @State private var atlasFolderViewsReady = false
+    @State private var showsAtlasViewsReload = false
     @State private var atlasRestoredScope: (revision: UUID, destination: AtlasFolderDestination)?
     @State private var atlasLandmarkDraft: (window: UUID, destination: AtlasFolderDestination)?
     @State private var atlasLandmarkName = ""
@@ -718,7 +736,13 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             Button("Save", action: saveAtlasLandmark)
             Button("Cancel", role: .cancel) { atlasLandmarkDraft = nil }
         } message: {
-            Text("Keep this folder, file filter and map position in this window. Landmarks last until you close or replace the project.")
+            Text("Keep this folder, file filter and map position on this Mac. Saved views reopen after this project grants access again.")
+        }
+        .alert("Reload saved atlas views?", isPresented: $showsAtlasViewsReload) {
+            Button("Reload", role: .destructive) { loadSavedAtlasViews(restoreCurrent: true) }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("Replace this window’s folder history and landmarks with the last saved version. Unsaved changes in this window will be discarded.")
         }
         .sheet(isPresented: $nativeOpen.showsReader) {
             if let presentation = nativeOpen.presentationID {
@@ -788,6 +812,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             AtlasNativeOpenRouting.shared.flush(createWindow: false)
         }
         .onDisappear {
+            persistAtlasFolderNavigation()
+            atlasFolderPersistence.close()
             projectViewActive = false
             nativeOpen.close()
             liveRefresh.close()
@@ -828,6 +854,23 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             searchCoordinator = nil
             workspaceSearch?.refresh()
             workspaceSearch = nil
+        }
+        .onChange(of: atlasLayoutPending) { _, pending in
+            if !pending { applySavedAtlasViews() }
+        }
+        .onChange(of: projectOpening.isPreparing) { _, preparing in
+            if !preparing { applySavedAtlasViews() }
+        }
+#if FCB_APP_STORE
+        .onChange(of: rootAccessLoader.isLoading) { _, loading in
+            if !loading { applySavedAtlasViews() }
+        }
+#endif
+        .onChange(of: camera.isAnimating) { _, animating in
+            if !animating && !camera.isDragging { persistAtlasFolderNavigation() }
+        }
+        .onChange(of: camera.isDragging) { _, dragging in
+            if !dragging && !camera.isAnimating { persistAtlasFolderNavigation() }
         }
         .onChange(of: showsCatalog) { _, showing in
             if showing { atlasResidency.suspend() }
@@ -1401,7 +1444,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
 
     private var canChangeAtlasDirectory: Bool {
         projectViewActive && !loadingProject && !projectOpening.isPreparing && !projectRefresh.isRefreshing
-            && !atlasLayoutPending && projectOpening.canBrowse && !projectBrowser.closed
+            && !atlasLayoutPending && !atlasFolderPersistence.isLoading && atlasDeferredSavedViews == nil
+            && projectOpening.canBrowse && !projectBrowser.closed
             && browserProject == loadGeneration && projectBrowser.root.utf8.elementsEqual(root.utf8)
     }
 
@@ -1420,9 +1464,143 @@ private struct AtlasPreparedProjectRefresh: Sendable {
 
     private func resetAtlasFolderNavigation() {
         atlasFolderNavigation.reset()
+        atlasSavedDestination = nil
+        atlasDeferredSavedViews = nil
+        atlasFolderViewsReady = false
+        showsAtlasViewsReload = false
         atlasRestoredScope = nil
         atlasLandmarkDraft = nil
         showsAtlasLandmarkName = false
+    }
+
+    /// Personal view records never reopen a project or confer source access.
+    /// Load only after its current browser/grant has opened, then resolve every
+    /// destination through the ordinary catalog/layout transaction.
+    private func loadSavedAtlasViews(restoreCurrent: Bool) {
+        guard projectViewActive, projectOpening.canBrowse, !projectBrowser.closed,
+              browserProject == loadGeneration, projectBrowser.root.utf8.elementsEqual(root.utf8) else { return }
+        let browser = projectBrowser, window = projectViewIdentity, project = loadGeneration
+        let requestedRoot = root, policy = browser.discoveryPolicy
+        let originalScope = fileScope, originalExtensions = Array(customExtensions.utf8)
+        let originalRevision = atlasRevision, originalDestination = currentAtlasDestination()
+        let originalScale = camera.scale, originalTargetScale = camera.targetScale
+        let originalOffsetX = camera.offsetX, originalOffsetY = camera.offsetY
+        let cameraWasIdle = !camera.isDragging && !camera.isAnimating
+        let accessIdentity: ObjectIdentifier?
+#if FCB_APP_STORE
+        guard !rootAccessLoader.isLoading, let access = rootAccess,
+              access.url.path.utf8.elementsEqual(requestedRoot.utf8),
+              browser.rootAccessIdentity == ObjectIdentifier(access) else { return }
+        accessIdentity = ObjectIdentifier(access)
+#else
+        accessIdentity = nil
+#endif
+        atlasDeferredSavedViews = nil
+        atlasFolderViewsReady = false
+        atlasFolderPersistence.open(root: requestedRoot, policy: policy.rawValue) { snapshot in
+            guard projectViewActive, projectViewIdentity == window, loadGeneration == project,
+                  projectBrowser === browser, !browser.closed, projectOpening.canBrowse,
+                  browser.discoveryPolicy == policy, root.utf8.elementsEqual(requestedRoot.utf8) else { return }
+            // Input can still move the visible camera while personal state
+            // loads. A late disk reply must not override that newer intent.
+            let presentationUnchanged = atlasRevision == originalRevision
+                && currentAtlasDestination() == originalDestination
+                && camera.scale == originalScale && camera.targetScale == originalTargetScale
+                && camera.offsetX == originalOffsetX && camera.offsetY == originalOffsetY
+                && cameraWasIdle && !camera.isDragging && !camera.isAnimating
+            let filtersUnchanged = fileScope == originalScope && Array(customExtensions.utf8) == originalExtensions
+            // One bounded value waits for an already-entered layout to commit
+            // or cancel. Restoring history now would retire its valid move token.
+            atlasDeferredSavedViews = SavedAtlasViews(snapshot: snapshot, window: window, project: project,
+                root: requestedRoot, policy: policy, browser: ObjectIdentifier(browser), access: accessIdentity,
+                presentationRevision: originalRevision, destination: originalDestination,
+                scale: originalScale, targetScale: originalTargetScale, offsetX: originalOffsetX, offsetY: originalOffsetY,
+                fileScope: originalScope, extensions: originalExtensions,
+                automaticallyReturn: restoreCurrent && filtersUnchanged && presentationUnchanged
+                    && !atlasLayoutPending && !projectOpening.isPreparing)
+            applySavedAtlasViews()
+        }
+    }
+
+    private func applySavedAtlasViews() {
+        guard let saved = atlasDeferredSavedViews else { return }
+        guard projectViewActive, projectViewIdentity == saved.window, loadGeneration == saved.project,
+              ObjectIdentifier(projectBrowser) == saved.browser, !projectBrowser.closed,
+              projectOpening.canBrowse, browserProject == saved.project,
+              projectBrowser.discoveryPolicy == saved.policy,
+              root.utf8.elementsEqual(saved.root.utf8),
+              projectBrowser.root.utf8.elementsEqual(saved.root.utf8) else {
+            atlasDeferredSavedViews = nil
+            return
+        }
+        guard !atlasLayoutPending, !projectOpening.isPreparing, !projectRefresh.isRefreshing else { return }
+#if FCB_APP_STORE
+        guard !rootAccessLoader.isLoading else { return }
+        guard rootAccess.map(ObjectIdentifier.init) == saved.access,
+              projectBrowser.rootAccessIdentity == saved.access,
+              rootAccess?.url.path.utf8.elementsEqual(saved.root.utf8) == true else {
+            atlasDeferredSavedViews = nil
+            return
+        }
+#else
+        guard saved.access == nil else { atlasDeferredSavedViews = nil; return }
+#endif
+        // Capture the accepted visible place before touching loaded history.
+        // A canceled filter layout still displays its previously accepted scope.
+        let visible = currentAtlasDestination()
+        let returnAutomatically = saved.automaticallyReturn && saved.snapshot?.history.current != nil
+            && saved.presentationRevision == atlasRevision && saved.destination == visible
+            && saved.scale == camera.scale && saved.targetScale == camera.targetScale
+            && saved.offsetX == camera.offsetX && saved.offsetY == camera.offsetY
+            && saved.fileScope == fileScope && saved.extensions == Array(customExtensions.utf8)
+            && !camera.isDragging && !camera.isAnimating
+        var restored = atlasFolderNavigation
+        do {
+            if let snapshot = saved.snapshot { try restored.restore(snapshot) }
+            else { restored.reset() }
+        } catch {
+            atlasDeferredSavedViews = nil
+            status = "Saved atlas navigation is invalid. Its stored data has been preserved."
+            return
+        }
+        if !returnAutomatically, let visible { restored.rebaseCurrent(visible) }
+        atlasFolderNavigation = restored
+        atlasSavedDestination = saved.snapshot?.history.current
+        atlasDeferredSavedViews = nil
+        atlasFolderViewsReady = true
+        if returnAutomatically {
+            restoreSavedAtlasDestination()
+        } else if atlasSavedDestination != nil {
+            status = "Saved landmarks and folder history restored. Use Landmarks → Return to saved view to restore its map position, or Save current view now to keep this map."
+        } else if hasMetadataAtlas {
+            persistAtlasFolderNavigation()
+        }
+    }
+
+    private func restoreSavedAtlasDestination() {
+        guard let destination = atlasSavedDestination, canChangeAtlasDirectory else { return }
+        let move = atlasFolderNavigation.visit(destination)
+        requestAtlasDestination(destination, project: loadGeneration, move: move)
+    }
+
+    private func saveCurrentAtlasView() {
+        guard canChangeAtlasDirectory, hasMetadataAtlas, !hasRetainedAtlas, !showsCity,
+              atlasFolderViewsReady, atlasFolderPersistence.canSave,
+              let visible = currentAtlasDestination() else { return }
+        // Explicit adoption replaces only the deferred current-map target; named
+        // landmarks and both history directions remain available.
+        atlasSavedDestination = nil
+        atlasFolderNavigation.rebaseCurrent(visible)
+        persistAtlasFolderNavigation()
+    }
+
+    private func persistAtlasFolderNavigation() {
+        guard projectViewActive, projectOpening.canBrowse, !projectBrowser.closed,
+              atlasFolderViewsReady, atlasDeferredSavedViews == nil, !hasRetainedAtlas,
+              atlasFolderPersistence.matches(root: root, policy: projectBrowser.discoveryPolicy.rawValue),
+              atlasFolderPersistence.canSave else { return }
+        atlasFolderPersistence.save(atlasFolderNavigation.snapshot(
+            current: atlasSavedDestination ?? currentAtlasDestination()))
     }
 
     /// A place is a directory/filter plus a position relative to one current
@@ -1519,7 +1697,9 @@ private struct AtlasPreparedProjectRefresh: Sendable {
               projectViewActive, projectOpening.canBrowse else { return }
         do {
             _ = try atlasFolderNavigation.addLandmark(label: atlasLandmarkName, destination: draft.destination)
-            status = "Atlas landmark saved in this window. Use Landmarks to return to its folder and map position."
+            persistAtlasFolderNavigation()
+            status = "Atlas landmark added. Use Landmarks to return to its folder and map position."
+                + (atlasFolderViewsReady && atlasFolderPersistence.canSave ? "" : " It remains in this window; saved views are currently unavailable.")
         } catch {
             status = "The landmark was not saved. Use a short, nonempty name without control characters; this window can keep 32 landmarks."
         }
@@ -1560,7 +1740,17 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                     Button("Save current view…") { beginAtlasLandmark(project: project, revision: revision) }
                         .disabled(!canChangeAtlasDirectory || !hasMetadataAtlas || hasRetainedAtlas || showsCity
                             || atlasFolderNavigation.landmarks.count >= 32)
-                    Text("Landmarks in this window")
+                    Button("Save current view now", action: saveCurrentAtlasView)
+                        .disabled(!canChangeAtlasDirectory || !atlasFolderViewsReady || !atlasFolderPersistence.canSave
+                            || !hasMetadataAtlas || hasRetainedAtlas || showsCity)
+                    if atlasSavedDestination != nil {
+                        Button("Return to saved view", action: restoreSavedAtlasDestination)
+                            .disabled(!canChangeAtlasDirectory)
+                    }
+                    Button("Reload saved views…") { showsAtlasViewsReload = true }
+                        .disabled(!canChangeAtlasDirectory || atlasFolderPersistence.isSaving)
+                    Divider()
+                    Text("Atlas landmarks")
                     ForEach(atlasFolderNavigation.landmarks) { landmark in
                         Button(landmark.label) { openAtlasLandmark(landmark.id, project: project, revision: revision) }
                             .disabled(!canChangeAtlasDirectory)
@@ -1572,12 +1762,13 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                                 Button(landmark.label) {
                                     guard project == loadGeneration, revision == atlasRevision else { return }
                                     _ = atlasFolderNavigation.removeLandmark(id: landmark.id)
+                                    persistAtlasFolderNavigation()
                                 }
                             }
                         }
                     }
                 } label: { Label("Landmarks", systemImage: "mappin.and.ellipse") }
-                    .help("Save and revisit up to 32 named atlas locations in this project window")
+                    .help("Save and revisit up to 32 named atlas locations on this Mac")
                 if let parent = directory.parent {
                     Button("Up one folder") {
                         guard atlasRevision == revision, atlasDirectory == directory else { return }
@@ -1601,6 +1792,21 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                     Button("Cancel focus", action: cancelAtlasDirectory)
                 }
             }.padding(10).background(.bar)
+            if !atlasFolderPersistence.notice.isEmpty || atlasDeferredSavedViews != nil {
+                HStack(spacing: 8) {
+                    if atlasFolderPersistence.isLoading || atlasFolderPersistence.isSaving || atlasDeferredSavedViews != nil {
+                        ProgressView().controlSize(.small)
+                    }
+                    Text(atlasDeferredSavedViews == nil ? atlasFolderPersistence.notice
+                        : "Saved views are ready. Finishing the current map change before restoring navigation.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if atlasFolderPersistence.hasUnsavedChanges && atlasFolderPersistence.canSave
+                        && !atlasFolderPersistence.isSaving {
+                        Button("Retry saving") { atlasFolderPersistence.retrySave() }
+                    }
+                }.padding(.horizontal, 10).padding(.bottom, 6)
+            }
         }
     }
 
@@ -1616,6 +1822,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     /// unattended refresh must wait instead of dismissing an active workflow.
     private var liveRefreshContextReady: Bool {
         guard projectViewActive, !loadingProject, !projectOpening.isPreparing,
+              !atlasFolderPersistence.isLoading, atlasDeferredSavedViews == nil,
               !atlasLayoutPending, projectOpening.canBrowse, !projectBrowser.closed, !projectBrowser.busy,
               browserProject == loadGeneration, projectBrowser.root.utf8.elementsEqual(root.utf8),
               (try? fileScope.searchScope(custom: customExtensions)) != nil,
@@ -2297,6 +2504,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     @discardableResult private func requestProjectRefresh(automatic: AtlasProjectChangeTicket? = nil,
         discoveryPolicy: AtlasDiscoveryPolicy? = nil) -> Bool {
         guard projectViewActive, !projectRefresh.isRefreshing, !loadingProject,
+              !atlasFolderPersistence.isLoading, atlasDeferredSavedViews == nil,
               !projectOpening.isPreparing, !atlasLayoutPending,
               projectOpening.canBrowse, !projectBrowser.closed,
               browserProject == loadGeneration, projectBrowser.root.utf8.elementsEqual(root.utf8) else { return false }
@@ -2385,6 +2593,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         guard candidate.accessIdentity == nil else { return false }
 #endif
         let preservesFolderSession = previous.discoveryPolicy == candidate.browser.discoveryPolicy
+        let outgoingFolderView = preservesFolderSession ? nil
+            : atlasFolderNavigation.snapshot(current: atlasSavedDestination ?? currentAtlasDestination())
         var replacementOpening = candidate.opening
         if let atlas {
             guard atlas.layout.root.utf8.elementsEqual(candidate.root.utf8),
@@ -2395,6 +2605,10 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                     hasOpenableFiles: !atlas.files.isEmpty),
                   atlasResidency.install(atlas.layout, accessLease: accessLease,
                     sourceCacheHandle: projectCache?.sourceHandle ?? 0, cacheLease: projectCache) else { return false }
+        }
+        if let outgoingFolderView {
+            if atlasFolderViewsReady { atlasFolderPersistence.save(outgoingFolderView) }
+            atlasFolderPersistence.close()
         }
         snapshotExport.cancel()
         closeObservedReader()
@@ -2464,12 +2678,16 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             more: info.more, omissions: info.omissionCount)
         status = atlas?.notice ?? candidate.browser.notice
         if !query.isEmpty { runSearch(debounce: true) }
+        if preservesFolderSession { persistAtlasFolderNavigation() }
+        else { loadSavedAtlasViews(restoreCurrent: true) }
         return true
     }
 
     /// Initial project opening performs only the bounded metadata operation.
     /// Text capture/highlighting/raster preparation is a subsequent action.
     private func replaceProject() {
+        persistAtlasFolderNavigation()
+        atlasFolderPersistence.close()
         liveRefresh.close()
         automaticRefreshProject = nil
         projectRefresh.cancel()
@@ -2587,6 +2805,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         // The explicit single-component filename is independent of metadata
         // page limits, discovery ignores and presentation filters. Its reader
         // captures under this established root using the normal native checks.
+        let restoreSavedCurrent = !AtlasFileStartup.isPending
+        loadSavedAtlasViews(restoreCurrent: restoreSavedCurrent)
         if AtlasFileStartup.isPending { openStartupFile() }
     }
 
@@ -2765,6 +2985,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             var acceptedNavigation = atlasFolderNavigation
             guard acceptedNavigation.commit(move, resolved: resolved), restoreAtlasPresentation(resolved) else { return }
             atlasFolderNavigation = acceptedNavigation
+            atlasSavedDestination = nil
             addedFilesFocusRevision = nil
             atlasPreservesNavigation = true
             showsCity = false
@@ -2772,6 +2993,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 + (destination.anchorRawPath != nil && resolved.anchorRawPath == nil
                     ? " The saved file is not in this catalog; showing the folder overview." : "")
                 + (showsCatalog ? " Choose Show text atlas to view this location." : "")
+            persistAtlasFolderNavigation()
             return
         }
         let browser = projectBrowser, requestedRoot = root, previousDirectory = atlasDirectory
@@ -2918,6 +3140,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         }
         if replacementCatalog != nil { projectOpening = acceptedOpening }
         atlasFolderNavigation = acceptedNavigation
+        atlasSavedDestination = nil
         invalidateVisibleSearchScope()
         retainedAtlasRevision = nil
         atlasPreservesNavigation = false
@@ -2945,6 +3168,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         updateCatalogFilter()
         refreshResidentSearchOverlay(rebindingCurrentReport: hadCurrentSearch)
         if folderMove != nil, !query.isEmpty { runSearch(debounce: true) }
+        persistAtlasFolderNavigation()
         return true
     }
 
@@ -3631,6 +3855,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
 
 #if FCB_APP_STORE
     private func activateProject(_ access: AppStoreRootAccess) {
+        persistAtlasFolderNavigation()
+        atlasFolderPersistence.close()
         nativeOpen.closeReader()
         // Replacing the native grant revokes this window's pin deliveries even
         // when the newly authorized folder happens to have the same path.
@@ -3670,6 +3896,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     }
 #else
     private func setRoot(_ newRoot: String) {
+        persistAtlasFolderNavigation()
+        atlasFolderPersistence.close()
         nativeOpen.closeReader()
         projectChanges.close()
         root = newRoot

@@ -3,7 +3,7 @@ import Foundation
 /// A place in the current project session. Identity is the original root-relative
 /// directory and optional parcel path, never a response-local ID or source capture.
 /// The owner binds this value to its current root/grant and discovery policy.
-struct AtlasFolderDestination: Equatable {
+struct AtlasFolderDestination: Equatable, Sendable {
     enum ValidationError: Error { case invalidScope, invalidAnchor }
     let directory: AtlasDirectoryFocus
     let fileScope: AtlasFileScope
@@ -37,7 +37,7 @@ struct AtlasFolderDestination: Equatable {
     }
 }
 
-/// Session-only semantic navigation. Preparing a move stages the latest camera
+/// Transactional semantic navigation. Preparing a move stages the latest camera
 /// origin in a copy; canceled/failed work cannot consume Back or discard Forward.
 /// Only the owner of the accepted root, catalog and layout may commit a proposal.
 struct AtlasFolderNavigation {
@@ -47,10 +47,14 @@ struct AtlasFolderNavigation {
         fileprivate let staged: AtlasNavigationHistory<AtlasFolderDestination>
         fileprivate let proposal: AtlasNavigationHistory<AtlasFolderDestination>.Move
     }
-    struct Landmark: Identifiable, Equatable {
+    struct Landmark: Identifiable, Equatable, Sendable {
         let id: UUID
         let label: String
         let destination: AtlasFolderDestination
+    }
+    struct Snapshot: Equatable, Sendable {
+        let history: AtlasNavigationHistory<AtlasFolderDestination>.Snapshot
+        let landmarks: [Landmark]
     }
     enum LandmarkError: Error { case invalidLabel, limit, missing }
     static let maximumLandmarks = 32
@@ -68,6 +72,28 @@ struct AtlasFolderNavigation {
     init(historyCapacity: Int = 128, landmarkCapacity: Int = 32) {
         history = AtlasNavigationHistory(capacity: historyCapacity)
         self.landmarkCapacity = min(Self.maximumLandmarks, max(0, landmarkCapacity))
+    }
+
+    func snapshot(current: AtlasFolderDestination? = nil) -> Snapshot {
+        Snapshot(history: history.snapshot(current: current), landmarks: landmarks)
+    }
+
+    /// A decoded personal view grants no source authority. The host must open
+    /// its root again and resolve the saved destination against a fresh catalog.
+    mutating func restore(_ snapshot: Snapshot) throws {
+        guard snapshot.landmarks.count <= landmarkCapacity,
+              Set(snapshot.landmarks.map(\.id)).count == snapshot.landmarks.count else {
+            throw LandmarkError.limit
+        }
+        for landmark in snapshot.landmarks {
+            guard try Self.validatedLabel(landmark.label).utf8.elementsEqual(landmark.label.utf8) else {
+                throw LandmarkError.invalidLabel
+            }
+        }
+        var restored = history
+        try restored.restore(snapshot.history)
+        history = restored; landmarks = snapshot.landmarks
+        revision = UUID()
     }
 
     func visit(_ destination: AtlasFolderDestination, from origin: AtlasFolderDestination? = nil) -> Move {
@@ -112,7 +138,7 @@ struct AtlasFolderNavigation {
     }
 
     /// Project close, root/grant replacement or discovery-policy replacement
-    /// retires every route and landmark. Nothing is restored across app launches.
+    /// retires every in-memory route and landmark. Durable records are separate.
     mutating func reset(to destination: AtlasFolderDestination? = nil) {
         history.reset(to: destination)
         landmarks.removeAll(keepingCapacity: true)

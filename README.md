@@ -134,6 +134,14 @@ all their notes, including desks recovered without access to the source files.
 The pack preserves each absolute selection and its observation evidence. This source implementation awaits
 independent executable and physical-Mac verification.
 
+**Atlas folders and landmarks survive reopening.** Folder Back/Forward history,
+file filters, named landmarks and parcel-relative camera positions are saved
+for each project and discovery policy. Reopening resolves saved views through
+the current project's access and catalog. Newer navigation takes precedence,
+with an explicit return to the saved view; conflicting or corrupt records
+preserve the existing data. See [returning to atlas folders](native/macos/README.md#returning-to-atlas-folders).
+Independent native execution remains pending.
+
 **Saved indexes accelerate case-insensitive literal search.** Fresh index builds
 qualify ASCII source rows for bounded upper/lowercase trigram pruning. Unicode,
 UTF-16, legacy and uncovered records keep exact verified fallback scans, with
