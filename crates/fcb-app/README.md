@@ -897,6 +897,47 @@ cargo test --locked -p fcb-app --test whole_file_cli
 No compiled binary, execution receipt, signed artifact, native qualification or
 product gate closure is asserted by the presence of this implementation.
 
+## Attach a folder catalog to a Reading Desk
+
+`repo-open-scoped ROOT POLICY FILE_LIMIT SCOPE SCOPE_VALUE` attaches an
+explicitly bounded catalog before any source query or index build. Use
+`repo-open-scoped-hex` when `ROOT` is a raw native path encoded as hex.
+
+| Argument | Accepted values |
+| --- | --- |
+| `POLICY` | `repository-rules` or `include-excluded`. |
+| `FILE_LIMIT` | 1–20,000 catalog entries. |
+| `SCOPE` / `SCOPE_VALUE` | `workspace -`, or `directory` followed by raw project-relative directory bytes encoded as hex. |
+
+For example, `directory 737263` discovers `src` directly. Unrelated siblings
+do not spend that catalog's file allowance, so a late folder can be searched
+even when the whole-project catalog stops before reaching it. Directory paths
+admit 1–2,048 raw bytes and 1–31 nonempty components; non-UTF-8 names and literal
+Unix backslashes retain their identity. Absolute, dot and dot-dot components
+are refused.
+
+The original project root remains the grant and the basis for returned paths.
+Repository rules inherited through ancestor directories remain effective under
+`repository-rules`. `include-excluded` bypasses those rules and generated-file
+exclusions while retaining confinement, regular-file admission and the existing
+independent exclusions for FCB's own artifacts. Discovery receipts identify
+the actual directory, policy and coverage; a complete folder catalog does not
+claim complete coverage of the entire project.
+
+Use the returned repository token for subsequent text, expression, structural,
+filename and index commands. A successfully admitted replacement gets a new
+token; failed or canceled admission keeps the previous repository and token.
+A delivery failure after acceptance does not roll back that new attachment.
+Readers already imported into the Desk keep their captured bytes across
+replacement and detachment. Attaching a catalog does not change the Desk
+revision or add root authority to a checkpoint.
+
+The existing `repo-open` and `repo-open-hex` retain their 4,096-entry workspace
+catalog and repository-rules defaults. Query scopes narrow whichever catalog
+is attached. Capturing and verification retain their own independent budgets.
+Rust hosts can select the same behavior through
+`DeskRepository::open_with_policy` and `open_directory_with_policy`.
+
 ## Search and count text in a live Reading Desk
 
 A repository attached with `repo-open` supports scoped literal and expression

@@ -6,7 +6,8 @@
 //! the independent desk, so detachment cannot invalidate bookmarks or history.
 
 use super::{Failure, DeskSession, HostResponse, PathBuf, number, count, hex, raw_path};
-use crate::host::{atlas_session::AtlasSessionOptions, atlas_search::{AtlasSearchOptions, AtlasIndexOptions},
+use crate::host::{atlas_session::{AtlasSessionOptions, MAX_ATLAS_DIRECTORY_BYTES, MAX_ATLAS_SESSION_FILES,
+        directory_path}, catalog_session::CatalogDiscoveryPolicy, atlas_search::{AtlasSearchOptions, AtlasIndexOptions},
     atlas_paths::{AtlasPathOptions, PathCase, PathMatchMode}, desk::repository::DeskRepository};
 use crate::host::atlas_search::{AtlasSearchScope, AtlasSearchPathKind, AtlasStructureMode,
     AtlasStructureOptions, AtlasIndexedStructureOptions, MAX_SEARCH_SCOPE_PATH_BYTES};
@@ -15,7 +16,20 @@ use crate::output::{Output, OutputError};
 use crate::{EXIT_OK, EXIT_PARTIAL};
 pub(super) use crate::host::desk::repository::DeskRepositoryError;
 
-pub(super) const WORK_HELP: &str = "\nIncremental repository work (no background runtime):\n\
+pub(super) const WORK_HELP: &str = "\nExplicit repository discovery:\n\
+  repo-open-scoped ROOT POLICY FILE_LIMIT SCOPE SCOPE_VALUE\n\
+  repo-open-scoped-hex ROOT_PATH_HEX POLICY FILE_LIMIT SCOPE SCOPE_VALUE\n\
+POLICY is repository-rules or include-excluded; FILE_LIMIT is 1..20000.\n\
+SCOPE is workspace with -, or directory with raw relative-path hex (1..2048 bytes).\n\
+Directory discovery starts there before spending its independent file allowance;\n\
+the original root grant, inherited rules and project-relative source paths remain.\n\
+include-excluded reads no rule files; symlink and special-object refusal remains.\n\
+Receipts distinguish discovery_scope from query scope. A complete folder catalog\n\
+does not claim whole-project coverage. Failed/canceled candidates keep the old\n\
+token and readers. Acceptance assigns the request ID as token; delivery failure\n\
+after acceptance does not roll back attachment. Legacy repo-open\n\
+keeps repository rules and the 4096-file cap. Replacing/detaching preserves readers.\n\
+\nIncremental repository work (no background runtime):\n\
   repo-work TOKEN | repo-progress TOKEN QUERY_GEN\n\
   repo-begin TOKEN QUERY_GEN LIMIT SOURCE_BYTES TEXT\n\
   repo-begin-text-hex TOKEN QUERY_GEN LIMIT SOURCE_BYTES UTF8_TEXT_HEX\n\
@@ -119,14 +133,41 @@ impl RepositoryCommands {
     pub(super) fn execute(&mut self, desk: &mut DeskSession, expected: u64, attempt: u64,
         command: &str, args: &[&str], canceled: &mut impl FnMut() -> bool) -> Result<HostResponse, Failure> {
         match (command, args) {
-            ("repo-open" | "repo-open-hex", [path]) => {
-                let path = if command == "repo-open-hex" { raw_path(path)? } else { PathBuf::from(*path) };
+            ("repo-open" | "repo-open-hex" | "repo-open-scoped" | "repo-open-scoped-hex", args) => {
+                let (path, policy, options, directory) = match (command, args) {
+                    ("repo-open" | "repo-open-hex", [path]) =>
+                        (*path, CatalogDiscoveryPolicy::RepositoryRules, AtlasSessionOptions::default(), None),
+                    ("repo-open-scoped" | "repo-open-scoped-hex", [path, policy, files, scope, value]) => {
+                        let policy = match *policy {
+                            "repository-rules" => CatalogDiscoveryPolicy::RepositoryRules,
+                            "include-excluded" => CatalogDiscoveryPolicy::IncludeExcluded,
+                            _ => return Err(Failure::Protocol("DESK_REPOSITORY_POLICY")),
+                        };
+                        let max_files = count(files)?;
+                        if !(1..=MAX_ATLAS_SESSION_FILES).contains(&max_files) {
+                            return Err(Failure::Protocol("DESK_REPOSITORY_FILE_LIMIT"));
+                        }
+                        let directory = match (*scope, *value) {
+                            ("workspace", "-") => None,
+                            ("directory", value) => Some(directory_path(&hex(value, MAX_ATLAS_DIRECTORY_BYTES)?)
+                                .map_err(DeskRepositoryError::from)?),
+                            _ => return Err(Failure::Protocol("DESK_REPOSITORY_SCOPE")),
+                        };
+                        (*path, policy, AtlasSessionOptions { max_files, ..Default::default() }, directory)
+                    }
+                    _ => return Err(Failure::Protocol("DESK_REPOSITORY_COMMAND_SYNTAX")),
+                };
+                let path = if command.ends_with("-hex") { raw_path(path)? } else { PathBuf::from(path) };
                 // Stdio request IDs never repeat, including unsuccessful opens.
                 // The existing desk has one owner; repository owners are disjoint
                 // and checked against integer exhaustion, not recycled ordinals.
                 let owner = desk.model().owner().get().checked_add(attempt)
                     .and_then(|n| fcb::ArenaOwnerId::new(n).ok()).ok_or(Failure::Protocol("DESK_REPOSITORY_IDENTITY_EXHAUSTED"))?;
-                let mut candidate = DeskRepository::open(owner, &path, AtlasSessionOptions::default(), &mut *canceled)?;
+                let mut candidate = match directory {
+                    Some(directory) => DeskRepository::open_directory_with_policy(owner, &path, directory,
+                        options, policy, &mut *canceled)?,
+                    None => DeskRepository::open_with_policy(owner, &path, options, policy, &mut *canceled)?,
+                };
                 let response = candidate.info(&mut *canceled)?;
                 self.current = Some((attempt, candidate));
                 Ok(response)

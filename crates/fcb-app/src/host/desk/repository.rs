@@ -15,6 +15,7 @@ mod paths;
 pub use paths::RepositoryPathOpen;
 
 use std::{mem::size_of, path::Path};
+use fcb::source::path::NormalizedPath;
 use super::{DeskSession, DeskSessionError, DeskChange, DeskError,
     ArenaOwnerId, FileId, SourceRevision, ByteRange,
     ByteLength, ResourceAllocationId, ResourceBudget, ResourceLease, HostResponse};
@@ -22,6 +23,7 @@ use crate::{AppError, EXIT_OK};
 use crate::host::atlas_session::{AtlasSession, AtlasSessionError, AtlasSessionOptions};
 use crate::host::atlas_search::{RetainedAtlasSearch, AtlasSearchError, AtlasSearchOptions, AtlasDeskError};
 use crate::host::atlas_paths::{RetainedAtlasPaths, AtlasPathError};
+use crate::host::catalog_session::CatalogDiscoveryPolicy;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeskRepositoryError {
@@ -90,7 +92,27 @@ pub struct DeskRepository {
     _lease: ResourceLease,
 }
 impl DeskRepository {
+    /// Preserve whole-workspace discovery under repository rules for existing hosts.
     pub fn open(owner: ArenaOwnerId, root: &Path, options: AtlasSessionOptions,
+        canceled: impl FnMut() -> bool) -> Result<Self, DeskRepositoryError> {
+        Self::open_with_policy(owner, root, options, CatalogDiscoveryPolicy::RepositoryRules, canceled)
+    }
+    /// Freeze an explicitly selected discovery policy without changing source authority.
+    /// Replacing a repository is a host transaction; a failed candidate owns no desk state.
+    pub fn open_with_policy(owner: ArenaOwnerId, root: &Path, options: AtlasSessionOptions,
+        policy: CatalogDiscoveryPolicy, canceled: impl FnMut() -> bool) -> Result<Self, DeskRepositoryError> {
+        Self::open_scoped(owner, root, None, options, policy, canceled)
+    }
+    /// Discover the selected directory before spending its independent metadata cap.
+    /// The original project grant and project-relative source paths remain authoritative.
+    /// Use atlas_session::directory_path to admit raw native directory components.
+    pub fn open_directory_with_policy(owner: ArenaOwnerId, root: &Path, directory: NormalizedPath,
+        options: AtlasSessionOptions, policy: CatalogDiscoveryPolicy,
+        canceled: impl FnMut() -> bool) -> Result<Self, DeskRepositoryError> {
+        Self::open_scoped(owner, root, Some(directory), options, policy, canceled)
+    }
+    fn open_scoped(owner: ArenaOwnerId, root: &Path, directory: Option<NormalizedPath>,
+        options: AtlasSessionOptions, policy: CatalogDiscoveryPolicy,
         mut canceled: impl FnMut() -> bool) -> Result<Self, DeskRepositoryError> {
         check(&mut canceled)?;
         let budget = ResourceBudget::new(owner, ByteLength::new((size_of::<Self>() + 4096) as u64))
@@ -98,7 +120,11 @@ impl DeskRepository {
         let lease = budget.try_reserve_managed(owner,
             ResourceAllocationId::new(1).map_err(|_| AppError::Admission)?,
             ByteLength::new(size_of::<Self>() as u64)).map_err(|_| AppError::Admission)?;
-        let atlas = AtlasSession::open(owner, root, options, &mut canceled)?;
+        let atlas = match directory {
+            Some(directory) => AtlasSession::open_directory_with_policy(owner, root, directory,
+                options, policy, &mut canceled)?,
+            None => AtlasSession::open_with_policy(owner, root, options, policy, &mut canceled)?,
+        };
         let search = RetainedAtlasSearch::new(&atlas)?;
         let paths = RetainedAtlasPaths::new(&atlas)?;
         check(&mut canceled)?;
