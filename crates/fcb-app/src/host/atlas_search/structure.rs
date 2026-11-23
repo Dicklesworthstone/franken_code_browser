@@ -74,6 +74,14 @@ impl AtlasIndexedStructureOptions {
     }
 }
 
+/// A bounded occurrence window within an unchanged captured query scope.
+/// Offsets count matches, independently of the metadata rows retained here.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AtlasResultWindow {
+    pub result_offset: u64,
+    pub count_all_matches: bool,
+}
+
 pub(super) struct StructureQuery {
     mode: AtlasStructureMode,
     name_mode: SymbolNameMode,
@@ -83,8 +91,27 @@ pub(super) struct StructureQuery {
     metadata_omitted: usize,
     unsupported_files: usize,
     extraction_limited_files: usize,
+    window: Option<AtlasResultWindow>,
+    window_capacity: usize,
 }
 impl StructureQuery {
+    pub(super) fn encode_window(&self, out: &mut Output, matches: u64)
+        -> Result<(), AtlasSearchError> {
+        let Some(window) = self.window else { return Ok(()); };
+        // Metadata omissions consume their occurrence position. Advancing only
+        // by retained rows would repeat hits or strand an all-omitted window.
+        let covered = matches.saturating_sub(window.result_offset).min(self.window_capacity as u64);
+        let end = window.result_offset.checked_add(covered).ok_or(AtlasSearchError::IdentityExhausted)?;
+        let more = matches > end;
+        out.literal(",\"result_offset\":")?; out.integer(window.result_offset)?;
+        out.literal(",\"skipped_matches\":")?; out.integer(matches.min(window.result_offset))?;
+        out.literal(",\"window_matches\":")?; out.integer(covered)?;
+        out.literal(",\"has_more_matches\":")?; out.boolean(more)?;
+        out.literal(",\"next_match_offset\":")?;
+        if more && covered != 0 { out.integer(end)?; } else { out.literal("null")?; }
+        Ok(())
+    }
+
     pub(super) fn encode(&self, out: &mut Output) -> Result<(), AtlasSearchError> {
         out.literal(",\"mode\":")?;
         out.quoted(match self.mode { AtlasStructureMode::Symbols => "symbol-name",
@@ -120,6 +147,7 @@ pub(super) struct StructureRow {
     kind: &'static str,
     language: &'static str,
     candidate_id: u64,
+    occurrence_id: Option<u64>,
     heading_slug: Option<String>,
     evidence: ByteRange,
     level: &'static str,
@@ -130,6 +158,9 @@ impl StructureRow {
         out.literal(",\"kind\":")?; out.quoted(self.kind)?;
         out.literal(",\"language\":")?; out.quoted(self.language)?;
         out.literal(",\"candidate_id\":")?; out.integer(self.candidate_id)?;
+        if let Some(id) = self.occurrence_id {
+            out.literal(",\"occurrence_id\":")?; out.integer(id)?;
+        }
         out.literal(",\"heading_slug\":")?;
         match &self.heading_slug { Some(slug) => out.quoted(slug)?, None => out.literal("null")? }
         out.literal(",\"evidence_range\":")?; out.range(self.evidence)?;
@@ -156,7 +187,7 @@ impl RetainedAtlasSearch {
     pub fn begin_structure(&mut self, atlas: &AtlasSession, generation: u64, needle: &str,
         scope: AtlasSearchScope, options: AtlasStructureOptions,
         canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
-        self.begin_structure_inner(atlas, generation, needle, scope, options, None, canceled)
+        self.begin_structure_inner(atlas, generation, needle, scope, options, None, None, canceled)
     }
 
     /// Search selected captured sources without reopening any live path. Name
@@ -173,20 +204,43 @@ impl RetainedAtlasSearch {
             max_source_bytes: MAX_ATLAS_SEARCH_SOURCE_BYTES };
         self.begin_structure_inner(atlas, generation, needle, scope,
             AtlasStructureOptions { mode: options.mode, name_mode: options.name_mode, limits },
-            Some((index_generation, options.max_scan_bytes)), canceled)
+            Some((index_generation, options.max_scan_bytes)), None, canceled)
+    }
+
+    /// Retain a later structural result window over the same immutable captured
+    /// sources. Skips do not allocate rows or source witnesses. Counting may
+    /// finish over all admitted captures while this window remains truncated;
+    /// extractor limits and missing captures still prevent complete coverage.
+    /// Admission and replacement preserve the existing accepted query until
+    /// ordinary step() calls publish a successful terminal candidate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_indexed_structure_window(&mut self, atlas: &AtlasSession, generation: u64,
+        index_generation: u64, needle: &str, scope: AtlasSearchScope,
+        options: AtlasIndexedStructureOptions, window: AtlasResultWindow,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
+        let limits = AtlasSearchOptions { max_matches: options.max_matches,
+            max_files: MAX_ATLAS_SEARCH_FILES, max_file_bytes: options.mode.source_limit(),
+            max_source_bytes: MAX_ATLAS_SEARCH_SOURCE_BYTES };
+        self.begin_structure_inner(atlas, generation, needle, scope,
+            AtlasStructureOptions { mode: options.mode, name_mode: options.name_mode, limits },
+            Some((index_generation, options.max_scan_bytes)), Some(window), canceled)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn begin_structure_inner(&mut self, atlas: &AtlasSession, generation: u64, needle: &str,
         scope: AtlasSearchScope, mut options: AtlasStructureOptions,
-        indexed: Option<(u64, u64)>, mut canceled: impl FnMut() -> bool)
+        indexed: Option<(u64, u64)>, window: Option<AtlasResultWindow>, mut canceled: impl FnMut() -> bool)
         -> Result<HostResponse, AtlasSearchError> {
         self.validate(atlas)?;
         // The text-only lowercase option cannot silently change or mislabel
         // the existing case-sensitive symbol/heading-name contract.
         if !scope.case_sensitive() { return Err(AtlasSearchError::InvalidScope); }
         self.attempt(generation)?;
-        options.limits.validate()?;
+        let count_all_matches = window.is_some_and(|window| window.count_all_matches);
+        if count_all_matches { options.limits.validate_counted()?; } else { options.limits.validate()?; }
+        if window.is_some() && indexed.is_none() {
+            return Err(AtlasSearchError::InvalidLimits);
+        }
         if let Some((index_generation, max_scan_bytes)) = indexed {
             if max_scan_bytes > MAX_ATLAS_SEARCH_SOURCE_BYTES as u64 { return Err(AtlasSearchError::InvalidLimits); }
             match self.index_generation() {
@@ -217,11 +271,15 @@ impl RetainedAtlasSearch {
         // covers retained captures and the in-flight capture copy. The extent
         // and reference decoder keep their own separate managed reservations.
         // Preserve the existing symbol/heading envelopes unchanged.
-        let (live_source_charge, metadata_limit) = if options.mode == AtlasStructureMode::Occurrences {
+        let (live_source_charge, mut metadata_limit) = if options.mode == AtlasStructureMode::Occurrences {
             (options.limits.max_source_bytes.checked_add(options.limits.max_file_bytes)
                 .ok_or(AppError::Admission)?,
              options.limits.max_matches.checked_mul(needle.len()).ok_or(AppError::Admission)?)
         } else { (2 * options.limits.max_source_bytes, MAX_ATLAS_STRUCTURE_METADATA_BYTES) };
+        if window.is_some() {
+            metadata_limit = metadata_limit.min(options.limits.max_matches
+                .checked_mul(2 * MAX_ATLAS_STRUCTURE_NAME_BYTES).ok_or(AppError::Admission)?);
+        }
         // Shared capture pins are charged to the snapshot too, so retiring or
         // replacing the index cannot release the accepted reader's admission.
         let source_charge = if indexed.is_some() { usize::try_from(self.indexed_source_bytes())
@@ -252,13 +310,14 @@ impl RetainedAtlasSearch {
         let snapshot = Snapshot { generation, needle: copy_text(needle)?, expression: None,
             structure: Some(StructureQuery { mode: options.mode, name_mode: options.name_mode,
                 source_limit: options.limits.max_file_bytes, metadata_limit, metadata_bytes: 0, metadata_omitted: 0,
-                unsupported_files: 0, extraction_limited_files: 0 }),
+                unsupported_files: 0, extraction_limited_files: 0, window,
+                window_capacity: options.limits.max_matches }),
             structure_rows: reserve(options.limits.max_matches)?, files: reserve(capacity)?,
             scope, scope_files, scope_region, eligible_files,
             hits: reserve(options.limits.max_matches)?, diagnostics,
             matched_texts: Vec::new(), matched_text_capacity: 0,
             examined: unavailable, scanned: 0, unavailable, pending,
-            matches_seen: 0, matching_files: 0, source_bytes_read: 0, read_calls: 0, retained_bytes: 0, count_all_matches: false,
+            matches_seen: 0, matching_files: 0, source_bytes_read: 0, read_calls: 0, retained_bytes: 0, count_all_matches,
             truncated: false, complete: false, stop_reason: None, step_count: 0,
             last_step_files: 0, last_step_bytes: 0, last_step_calls: 0, index_usage, _lease: lease };
         let command = if indexed.is_some() { "begin-indexed-structure" } else { "begin-structure" };
@@ -383,13 +442,22 @@ impl RetainedAtlasSearch {
             AtlasStructureMode::Occurrences => {
                 let generation = QueryGeneration::new(owner, candidate.generation)
                     .map_err(|_| AtlasSearchError::IdentityExhausted)?;
-                // The shared engine counts one unstored lookahead occurrence.
-                // A zero remaining allowance still probes later files, so an
-                // exactly-full inventory can finish complete after negatives.
-                let remaining = work.options.limits.max_matches.checked_sub(candidate.hits.len())
+                // Count and skip in the shared engine, without allocating the
+                // discarded prefix or imposing its row cap on observed totals.
+                // A non-counting query still probes one real later occurrence.
+                let before_matches = candidate.matches_seen;
+                let window = candidate.structure.as_ref().ok_or(AtlasSearchError::WrongAtlas)?.window;
+                let (skip, used) = match window {
+                    Some(window) => (window.result_offset.saturating_sub(before_matches),
+                        before_matches.saturating_sub(window.result_offset)
+                            .min(work.options.limits.max_matches as u64) as usize),
+                    None => (0, candidate.hits.len()),
+                };
+                let remaining = work.options.limits.max_matches.checked_sub(used)
                     .ok_or(AtlasSearchError::WrongAtlas)?;
-                let references = match CapturedReferences::build(capture.bytes(), *capture.request(),
-                    generation, &candidate.needle, None, remaining, &self.budget, work.extract_id,
+                let references = match CapturedReferences::build_window(capture.bytes(), *capture.request(),
+                    generation, &candidate.needle, None, remaining, skip, candidate.count_all_matches,
+                    &self.budget, work.extract_id,
                     || canceled() || atlas.validate_active().is_err()) {
                     Ok(references) => references,
                     Err(ReferenceError::Canceled) => return Err(AtlasSearchError::Canceled),
@@ -403,14 +471,15 @@ impl RetainedAtlasSearch {
                 for occurrence in references.candidates() {
                     check(canceled)?;
                     let selected = occurrence.original_range();
-                    if !append_row(candidate, work, file, revision, node, capture.bytes().len(), selected,
-                        selected, references.name(), "identifier-occurrence", "text", occurrence.id(), None)? { break; }
+                    let occurrence_id = before_matches.checked_add(skip)
+                        .and_then(|n| n.checked_add(occurrence.id())).ok_or(AtlasSearchError::IdentityExhausted)?;
+                    if !retain_row(candidate, work, file, revision, node, capture.bytes().len(), selected,
+                        selected, references.name(), "identifier-occurrence", "text", occurrence.id(),
+                        occurrence_id, None)? { break; }
                 }
-                if references.output_limited() {
-                    candidate.matches_seen = candidate.matches_seen.checked_add(1)
-                        .ok_or(AtlasSearchError::IdentityExhausted)?;
-                    candidate.truncated = true;
-                }
+                candidate.matches_seen = before_matches.checked_add(references.total_matches_counted() as u64)
+                    .ok_or(AtlasSearchError::IdentityExhausted)?;
+                if references.output_limited() { candidate.truncated = true; }
             }
             AtlasStructureMode::Headings => {
                 let document = match DocumentReader::prepare(&capture,
@@ -479,7 +548,25 @@ fn append_row(candidate: &mut Snapshot, work: &StructureWork, file: FileId,
     evidence: ByteRange, name: &str, kind: &'static str, language: &'static str,
     candidate_id: u64, slug: Option<&str>) -> Result<bool, AtlasSearchError> {
     candidate.matches_seen = candidate.matches_seen.checked_add(1).ok_or(AtlasSearchError::IdentityExhausted)?;
-    if candidate.hits.len() == work.options.limits.max_matches {
+    let occurrence_id = candidate.matches_seen;
+    retain_row(candidate, work, file, revision, node, source_bytes, selected, evidence,
+        name, kind, language, candidate_id, occurrence_id, slug)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn retain_row(candidate: &mut Snapshot, work: &StructureWork, file: FileId,
+    revision: SourceRevision, node: AtlasNodeId, source_bytes: usize, selected: ByteRange,
+    evidence: ByteRange, name: &str, kind: &'static str, language: &'static str,
+    candidate_id: u64, occurrence_id: u64, slug: Option<&str>) -> Result<bool, AtlasSearchError> {
+    let window = candidate.structure.as_ref().ok_or(AtlasSearchError::WrongAtlas)?.window;
+    if let Some(window) = window {
+        if occurrence_id <= window.result_offset { return Ok(true); }
+        // Subtraction also admits a full-width offset without offset + cap
+        // overflow. No retained row can ever have an overflowing global ID.
+        if occurrence_id - window.result_offset > work.options.limits.max_matches as u64 {
+            candidate.truncated = true; return Ok(candidate.count_all_matches);
+        }
+    } else if candidate.hits.len() == work.options.limits.max_matches {
         candidate.truncated = true; return Ok(false);
     }
     let query = candidate.structure.as_mut().ok_or(AtlasSearchError::WrongAtlas)?;
@@ -496,6 +583,7 @@ fn append_row(candidate: &mut Snapshot, work: &StructureWork, file: FileId,
         query.metadata_omitted += 1; return Ok(true);
     }
     let row = StructureRow { name: copy_text(name)?, kind, language, candidate_id,
+        occurrence_id: window.map(|_| occurrence_id),
         heading_slug: slug.map(copy_text).transpose()?, evidence, level: work.options.mode.realized() };
     query.metadata_bytes += bytes;
     candidate.structure_rows.push(row);
@@ -520,21 +608,29 @@ fn examine_file(query: &mut Snapshot, work: &mut StructureWork) {
 fn update_coverage(atlas: &AtlasSession, query: &mut Snapshot, work: &StructureWork) {
     query.pending = query.eligible_files - query.examined;
     query.source_bytes_read = work.io.bytes; query.read_calls = work.io.calls;
+    // Skipped rows and omitted metadata make the retained window truncated,
+    // without proving that extraction stopped early. Only a genuine lookahead
+    // beyond this window stops bounded non-counting extraction.
+    let window = query.structure.as_ref().and_then(|structure| structure.window);
+    let window_limited = window.map_or(query.truncated, |window|
+        query.matches_seen.saturating_sub(window.result_offset) > work.options.limits.max_matches as u64);
+    let stop_on_matches = window_limited && !query.count_all_matches;
+    if window.is_some() { query.truncated = query.matches_seen > query.hits.len() as u64; }
     query.stop_reason = if let Some(indexed) = &work.indexed {
         if let Some(usage) = query.index_usage.as_mut() {
             usage.record_structure_work(query.scanned, indexed.scanned_bytes);
         }
         if query.stop_reason == Some(AtlasSearchStop::VerificationByteLimit) {
             query.stop_reason
-        } else if query.truncated { Some(AtlasSearchStop::MatchLimit) }
+        } else if stop_on_matches { Some(AtlasSearchStop::MatchLimit) }
         else if indexed.cursor == indexed.files.len() {
             Some(if query.pending == 0 { AtlasSearchStop::AllFilesExamined }
                 else if query.pending == indexed.outside_capture_scope { AtlasSearchStop::CaptureScope }
                 else { indexed.capture_stop })
         } else { None }
     } else if query.pending == 0 {
-        Some(if query.truncated { AtlasSearchStop::MatchLimit } else { AtlasSearchStop::AllFilesExamined })
-    } else if query.truncated {
+        Some(if stop_on_matches { AtlasSearchStop::MatchLimit } else { AtlasSearchStop::AllFilesExamined })
+    } else if stop_on_matches {
         // Reaching capacity alone is not evidence of another match. Continue
         // bounded extraction through later negative files until append_row
         // observes a real extra result, just as occurrence mode does.
@@ -543,5 +639,6 @@ fn update_coverage(atlas: &AtlasSession, query: &mut Snapshot, work: &StructureW
     else if work.io.bytes >= work.options.limits.max_source_bytes as u64 { Some(AtlasSearchStop::SourceByteLimit) }
     else { None };
     query.complete = query.stop_reason.is_some() && atlas.atlas().discovery_complete()
-        && query.scope_region.is_none_or(|region| region.missing == 0) && query.pending == 0 && query.unavailable == 0 && !query.truncated;
+        && query.scope_region.is_none_or(|region| region.missing == 0) && query.pending == 0 && query.unavailable == 0
+        && !stop_on_matches;
 }

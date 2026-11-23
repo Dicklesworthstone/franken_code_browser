@@ -27,7 +27,7 @@ pub use scope::{AtlasSearchScope, AtlasSearchPathKind, MAX_SEARCH_SCOPE_TOKENS, 
     MAX_SEARCH_SCOPE_LIST_BYTES, MAX_SEARCH_SCOPE_PATH_BYTES, MAX_SEARCH_REGION_FILES, MAX_SEARCH_REGION_WIRE_BYTES};
 pub(crate) use scope::RegionCoverage;
 mod structure;
-pub use structure::{AtlasStructureMode, AtlasStructureOptions, AtlasIndexedStructureOptions, MAX_ATLAS_STRUCTURE_METADATA_BYTES,
+pub use structure::{AtlasStructureMode, AtlasStructureOptions, AtlasIndexedStructureOptions, AtlasResultWindow, MAX_ATLAS_STRUCTURE_METADATA_BYTES,
     MAX_ATLAS_STRUCTURE_NAME_BYTES};
 use structure::{StructureQuery, StructureRow};
 mod text_matching;
@@ -491,7 +491,8 @@ fn summary(out: &mut Output, atlas: &AtlasSession, snapshot: &Snapshot) -> Resul
         else if snapshot.index_usage.is_some() { "retained-ephemeral-index" } else { "live-capture-scan" })?;
     if let Some(usage) = &snapshot.index_usage {
         usage.encode(out)?;
-        if snapshot.structure.is_none() { usage.encode_window(out, snapshot.matches_seen, snapshot.hits.len())?; }
+        if let Some(structure) = &snapshot.structure { structure.encode_window(out, snapshot.matches_seen)?; }
+        else { usage.encode_window(out, snapshot.matches_seen, snapshot.hits.len())?; }
     }
     if let Some(expression) = &snapshot.expression { expression.encode(out, &snapshot.needle)?; }
     else if let Some(structure) = &snapshot.structure { structure.encode(out)?; }

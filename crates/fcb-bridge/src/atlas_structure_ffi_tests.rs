@@ -18,6 +18,10 @@ fn structural_query_signature_and_public_header_match() {
         *const c_char, *const c_char, u64, *const c_char, u64, u64) -> *mut c_char
         = fcb_atlas_structure_indexed_begin;
     assert_eq!(header.matches("fcb_atlas_structure_indexed_begin(").count(), 1);
+    let _: unsafe extern "C" fn(u64, u64, u64, u64, u64, *const c_char,
+        *const c_char, *const c_char, u64, *const c_char, u64, u64, u64, u64) -> *mut c_char
+        = fcb_atlas_structure_indexed_begin_window;
+    assert_eq!(header.matches("fcb_atlas_structure_indexed_begin_window(").count(), 1);
     assert!(header.contains("retained-capture-structure"));
 }
 
@@ -260,4 +264,93 @@ fn c_indexed_structure_validates_modes_limits_and_cancels_without_losing_accepte
         Some(cancel_after_entry), std::ptr::from_mut(&mut polls).cast()) };
     assert!(canceled.is_null()); assert!(polls > 1);
     assert_eq!(integer(&take(fcb_atlas_search_page(fixture.handle, 2, 0, 100)), "retained_hits"), 1);
+}
+
+#[test]
+fn c_structural_windows_reach_late_utf16_occurrences_from_the_original_capture() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let utf16: Vec<_> = "\u{feff}".encode_utf16().chain("needle\n".repeat(5005).encode_utf16())
+        .flat_map(u16::to_le_bytes).collect();
+    let mut fixture = Fixture::new(&[("src/repeated.txt", &utf16), ("other.txt", b"needle")]);
+    let prepared = take(fcb_atlas_index_prepare(fixture.handle, 1, 100,
+        1024 * 1024, 32 * 1024 * 1024, 0));
+    assert!(prepared.contains("\"capture_complete\":true"), "{prepared}");
+    fs::write(fixture.root.join("src/repeated.txt"), b"replacement").unwrap();
+    let needle = CString::new("needle").unwrap();
+    let directory = CString::new("src").unwrap();
+    let null = std::ptr::null();
+    let begin = take(unsafe { fcb_atlas_structure_indexed_begin_window(fixture.handle, 2, 1,
+        4, 0, needle.as_ptr(), null, null, 1, directory.as_ptr(), 1, 4500, 3, 32 * 1024 * 1024) });
+    assert!(begin.contains("\"status\":\"ok\""), "{begin}");
+    assert_eq!(integer(&begin, "result_offset"), 4500);
+    assert_eq!(integer(&begin, "source_bytes_read"), 0);
+    let page = finish(fixture.handle, 2);
+    for (field, expected) in [("matches_seen", 5005), ("retained_hits", 3),
+        ("skipped_matches", 4500), ("window_matches", 3), ("next_match_offset", 4503),
+        ("occurrence_id", 4501), ("eligible_files", 1), ("source_bytes_read", 0), ("read_calls", 0)] {
+        assert_eq!(integer(&page, field), expected, "{field}: {page}");
+    }
+    for expected in ["\"has_more_matches\":true", "\"search_complete\":true",
+        "\"match_count_complete\":true", "\"semantic_complete\":false",
+        "\"original_range\":{\"start\":\"63002\",\"end\":\"63014\"}"] {
+        assert!(page.contains(expected), "missing {expected}: {page}");
+    }
+    let reader = fcb_reader_create(); assert_ne!(reader, 0);
+    assert!(take(fcb_atlas_search_open_reader(fixture.handle, reader, 2, 1))
+        .contains("\"source_reopened\":false"));
+    // A canceled later window leaves the accepted page and reader intact.
+    let next = take(unsafe { fcb_atlas_structure_indexed_begin_window(fixture.handle, 3, 1,
+        4, 0, needle.as_ptr(), null, null, 1, directory.as_ptr(), 1, 4503, 3, 32 * 1024 * 1024) });
+    assert!(next.contains("\"status\":\"ok\""), "{next}");
+    let mut polls = 0u64;
+    let canceled = unsafe { fcb_atlas_search_step_cancelable(fixture.handle, 3,
+        Some(cancel_after_entry), std::ptr::from_mut(&mut polls).cast()) };
+    assert!(canceled.is_null()); assert!(polls > 1);
+    assert_eq!(integer(&take(fcb_atlas_search_page(fixture.handle, 2, 0, 100)), "result_offset"), 4500);
+    fixture.close();
+    assert!(take(fcb_reader_copy_range(reader, 63002, 63014))
+        .contains("\"original_hex\":\"6e006500650064006c006500\""));
+    assert_eq!(fcb_reader_close(reader), 1);
+}
+
+#[test]
+fn c_structural_windows_validate_inputs_and_full_width_offsets_without_losing_results() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new(&[("source.txt", b"needle needle needle")]);
+    take(fcb_atlas_index_prepare(fixture.handle, 1, 100, 1024, 1024, 0));
+    let needle = CString::new("needle").unwrap();
+    let null = std::ptr::null();
+    let begin = |generation, mode, name_mode, text, counted, offset, maximum, bytes| {
+        take(unsafe { fcb_atlas_structure_indexed_begin_window(fixture.handle, generation, 1,
+            mode, name_mode, text, null, null, 0, null, counted, offset, maximum, bytes) })
+    };
+    assert!(begin(2, 4, 0, needle.as_ptr(), 0, 1, 1, 1024).contains("\"status\":\"ok\""));
+    assert_eq!(integer(&finish(fixture.handle, 2), "occurrence_id"), 2);
+    for (mode, name_mode, counted) in [(3, 0, 0), (4, 3, 0), (4, 0, 2)] {
+        assert!(begin(3, mode, name_mode, needle.as_ptr(), counted, 1, 1, 1024)
+            .contains("INVALID_ARGUMENT"));
+    }
+    let unterminated = [b'x' as c_char; 1025];
+    let malformed = [0xffu8, 0];
+    for text in [null, unterminated.as_ptr(), malformed.as_ptr().cast()] {
+        assert!(begin(3, 4, 0, text, 0, 1, 1, 1024).contains("INVALID_ARGUMENT"));
+    }
+    assert_eq!(integer(&take(fcb_atlas_search_page(fixture.handle, 2, 0, 100)), "result_offset"), 1);
+    // A full-width offset is accepted as an ordinal, never narrowed or added
+    // unchecked to a row cap. It yields an empty, fully counted window.
+    assert!(begin(3, 4, 0, needle.as_ptr(), 1, u64::MAX, 1, 1024).contains("\"status\":\"ok\""));
+    let past_end = finish(fixture.handle, 3);
+    assert_eq!(integer(&past_end, "result_offset"), u64::MAX);
+    assert_eq!(integer(&past_end, "matches_seen"), 3);
+    assert_eq!(integer(&past_end, "skipped_matches"), 3);
+    assert_eq!(integer(&past_end, "retained_hits"), 0);
+    assert!(past_end.contains("\"search_complete\":true"), "{past_end}");
+    assert!(past_end.contains("\"has_more_matches\":false"), "{past_end}");
+    assert!(past_end.contains("\"next_match_offset\":null"), "{past_end}");
+    assert!(begin(4, 4, 0, needle.as_ptr(), 1, 1, 1, 0).contains("\"status\":\"ok\""));
+    let limited = finish(fixture.handle, 4);
+    assert!(limited.contains("\"stop_reason\":\"verification-byte-limit\""), "{limited}");
+    assert!(limited.contains("\"search_complete\":false"), "{limited}");
+    assert_eq!(integer(&limited, "pending_files"), 1);
+    assert_eq!(integer(&limited, "source_bytes_read"), 0);
 }

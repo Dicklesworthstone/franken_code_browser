@@ -79,6 +79,7 @@ pub struct CapturedReferences<'source> {
     candidates: Vec<ReferenceCandidate>,
     counted: usize,
     limited: bool,
+    count_complete: bool,
     _lease: ResourceLease,
 }
 impl<'source> CapturedReferences<'source> {
@@ -101,6 +102,20 @@ impl<'source> CapturedReferences<'source> {
     pub fn build_page(source: &'source [u8], request: CaptureRequest, generation: QueryGeneration,
         name: &str, encoding: Option<DetectedEncoding>, max_items: usize, skip_matches: u64,
         budget: &ResourceBudget, allocation: ResourceAllocationId,
+        canceled: impl FnMut() -> bool) -> Result<Self, ReferenceError> {
+        Self::build_window(source, request, generation, name, encoding, max_items, skip_matches,
+            false, budget, allocation, canceled)
+    }
+
+    /// Count qualified occurrences independently of the retained result window.
+    /// Skipped and later occurrences consume matching work, not row storage.
+    /// With `count_all_matches`, a successful call validates and scans the whole
+    /// capture even when zero rows were requested. Without it, retain the
+    /// existing one-lookahead behavior. Candidate IDs remain window-local.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_window(source: &'source [u8], request: CaptureRequest, generation: QueryGeneration,
+        name: &str, encoding: Option<DetectedEncoding>, max_items: usize, skip_matches: u64,
+        count_all_matches: bool, budget: &ResourceBudget, allocation: ResourceAllocationId,
         mut canceled: impl FnMut() -> bool) -> Result<Self, ReferenceError> {
         if generation.owner() != request.file().owner() { return Err(ReferenceError::OwnerMismatch); }
         if request.range().is_some() { return Err(ReferenceError::InvalidEvidence); }
@@ -151,20 +166,24 @@ impl<'source> CapturedReferences<'source> {
             if cursor.push(scalar) {
                 counted += 1;
                 if counted as u64 > skip_matches {
-                    if candidates.len() == max_items { limited = true; break; }
-                    let decoded_range = DecodedUtf8Range::new(DecodedUtf8Offset::new(start as u64),
-                        DecodedUtf8Offset::new(offset as u64)).map_err(|_| ReferenceError::InvalidEvidence)?;
-                    let original_range = map.decoded_utf8_range_to_byte_range(decoded_range)
-                        .map_err(|_| ReferenceError::InvalidEvidence)?;
-                    candidates.push(ReferenceCandidate { id: candidates.len() as u64 + 1,
-                        original_range, decoded_range, line: token_line });
+                    if candidates.len() == max_items {
+                        limited = true;
+                        if !count_all_matches { break; }
+                    } else {
+                        let decoded_range = DecodedUtf8Range::new(DecodedUtf8Offset::new(start as u64),
+                            DecodedUtf8Offset::new(offset as u64)).map_err(|_| ReferenceError::InvalidEvidence)?;
+                        let original_range = map.decoded_utf8_range_to_byte_range(decoded_range)
+                            .map_err(|_| ReferenceError::InvalidEvidence)?;
+                        candidates.push(ReferenceCandidate { id: candidates.len() as u64 + 1,
+                            original_range, decoded_range, line: token_line });
+                    }
                 }
             }
             if scalar == '\n' { line += 1; }
         }
         if canceled() { return Err(ReferenceError::Canceled); }
         Ok(Self { source, request, generation, encoding, name: owned_name, candidates,
-            counted, limited, _lease: lease })
+            counted, limited, count_complete: count_all_matches || !limited, _lease: lease })
     }
 
     pub const fn file(&self) -> FileId { self.request.file() }
@@ -173,13 +192,16 @@ impl<'source> CapturedReferences<'source> {
     pub const fn encoding(&self) -> DetectedEncoding { self.encoding }
     pub fn name(&self) -> &str { &self.name }
     pub fn candidates(&self) -> &[ReferenceCandidate] { &self.candidates }
-    /// Observed occurrences, including at most one unstored lookahead. This is
-    /// not an exhaustive count when output_limited() is true.
+    /// Observed occurrences, including skipped matches. Legacy builders count
+    /// at most one unstored lookahead; an explicit counting window scans to EOF.
+    /// Consult is_complete(), separately from output_limited(), for exact totals.
     pub const fn total_matches_counted(&self) -> usize { self.counted }
+    /// At least one occurrence follows the retained window. Counting can be
+    /// complete while later rows remain omitted from this bounded collection.
     pub const fn output_limited(&self) -> bool { self.limited }
     /// Completeness applies only to the declared whole-token text policy, never
     /// compiler references or the containing repository's membership.
-    pub const fn is_complete(&self) -> bool { !self.limited }
+    pub const fn is_complete(&self) -> bool { self.count_complete }
     pub fn candidate(&self, id: u64) -> Option<&ReferenceCandidate> {
         let index = usize::try_from(id.checked_sub(1)?).ok()?;
         self.candidates.get(index)
@@ -262,6 +284,68 @@ mod tests {
         assert_eq!(refs.candidates()[0].line(), 3);
         assert_eq!(refs.candidates()[0].original_range().start().get(), 8);
         assert_eq!(refs.source_bytes(1).unwrap(), b"foo");
+    }
+
+    #[test]
+    fn counted_windows_pass_the_row_cap_and_preserve_utf16_source_coordinates() {
+        for little in [true, false] {
+            let text = format!("\u{feff}😀\n{}", "foo\r\n".repeat(5003));
+            let bytes: Vec<_> = text.encode_utf16()
+                .flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect();
+            let expected: Vec<_> = "foo".encode_utf16()
+                .flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect();
+            let budget = ResourceBudget::new(owner(), ByteLength::new(256 * 1024 * 1024)).unwrap();
+            let refs = CapturedReferences::build_window(&bytes,
+                CaptureRequest::new(file(), revision()).unwrap(), generation(), "foo", None,
+                2, 5000, true, &budget, ResourceAllocationId::new(1).unwrap(), || false).unwrap();
+            assert_eq!(refs.total_matches_counted(), 5003);
+            assert_eq!(refs.candidates().len(), 2);
+            assert!(refs.is_complete() && refs.output_limited());
+            for (ordinal, candidate) in refs.candidates().iter().enumerate() {
+                assert_eq!(candidate.id(), ordinal as u64 + 1);
+                assert_eq!(candidate.line(), 5002 + ordinal as u64);
+                assert_eq!(candidate.original_range().start().get(), 50_008 + ordinal as u64 * 10);
+                assert_eq!(candidate.original_range().end().get(), 50_014 + ordinal as u64 * 10);
+                assert_eq!(refs.source_bytes(candidate.id()).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn counted_zero_storage_and_full_width_offsets_still_observe_all_matches() {
+        let budget = ResourceBudget::new(owner(), ByteLength::new(1024 * 1024)).unwrap();
+        for offset in [0, u64::MAX] {
+            let refs = CapturedReferences::build_window(b"foo foo foo",
+                CaptureRequest::new(file(), revision()).unwrap(), generation(), "foo", None,
+                0, offset, true, &budget, ResourceAllocationId::new(1).unwrap(), || false).unwrap();
+            assert!(refs.is_complete());
+            assert!(refs.candidates().is_empty());
+            assert_eq!(refs.total_matches_counted(), 3);
+            assert_eq!(refs.output_limited(), offset == 0);
+        }
+    }
+
+    #[test]
+    fn counted_tail_cancellation_releases_admission_and_malformed_tails_are_rejected() {
+        let bytes = "foo ".repeat(5000);
+        let budget = ResourceBudget::new(owner(), ByteLength::new(32 * 1024 * 1024)).unwrap();
+        let request = CaptureRequest::new(file(), revision()).unwrap();
+        let allocation = ResourceAllocationId::new(1).unwrap();
+        let mut polls = 0;
+        let canceled = CapturedReferences::build_window(bytes.as_bytes(), request, generation(),
+            "foo", None, 1, 0, true, &budget, allocation, || { polls += 1; polls == 3 });
+        assert!(matches!(canceled, Err(ReferenceError::Canceled)));
+        assert_eq!(polls, 3);
+        let refs = CapturedReferences::build_window(bytes.as_bytes(), request, generation(),
+            "foo", None, 1, 0, true, &budget, allocation, || false).unwrap();
+        assert_eq!(refs.total_matches_counted(), 5000);
+        assert!(refs.is_complete());
+        drop(refs);
+        for offset in [0, u64::MAX] {
+            assert!(matches!(CapturedReferences::build_window(b"foo foo\xff", request, generation(),
+                "foo", None, 0, offset, true, &budget, allocation, || false),
+                Err(ReferenceError::UnsupportedEncoding)));
+        }
     }
 
     #[test]

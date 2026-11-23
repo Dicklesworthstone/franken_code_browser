@@ -8,7 +8,7 @@ use fcb::ArenaOwnerId;
 use fcb::search::SymbolNameMode;
 use fcb_app::host::atlas_session::{AtlasSession, AtlasSessionOptions};
 use fcb_app::host::atlas_search::{AtlasIndexOptions, AtlasIndexedStructureOptions,
-    AtlasSearchError, AtlasSearchPathKind, AtlasSearchScope, AtlasSearchStop,
+    AtlasResultWindow, AtlasSearchError, AtlasSearchPathKind, AtlasSearchScope, AtlasSearchStop,
     AtlasStructureMode, RetainedAtlasSearch};
 
 struct Fixture(PathBuf);
@@ -56,6 +56,152 @@ fn finish(search: &mut RetainedAtlasSearch, atlas: &AtlasSession, generation: u6
 }
 fn count(json: &str, field: &str, expected: u64) {
     assert!(json.contains(&format!("\"{field}\":\"{expected}\"")), "{field}={expected}: {json}");
+}
+
+#[test]
+fn later_windows_reach_every_structural_mode_in_both_utf16_encodings_without_live_reads() {
+    for (mode, name, prelude, line) in [
+        (AtlasStructureMode::Symbols, "source.rs", "// 😀\n", "fn needle() {}\n"),
+        (AtlasStructureMode::Headings, "README.md", "😀\n\n", "# needle\n\n"),
+        (AtlasStructureMode::Occurrences, "source.txt", "😀\n", "needle\n"),
+    ] {
+        for little in [true, false] {
+            let text = format!("\u{feff}{prelude}{}", line.repeat(1003));
+            let source: Vec<_> = text.encode_utf16()
+                .flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect();
+            let fixture = Fixture::new(&[(name, &source)]);
+            let atlas = fixture.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
+            search.prepare_index(&atlas, 1, index_options(), || false).unwrap();
+            fs::write(fixture.0.join(name), b"the live path has changed").unwrap();
+            let mut settings = options(mode); settings.max_matches = 1000;
+            search.begin_indexed_structure_window(&atlas, 2, 1, "needle", AtlasSearchScope::all(),
+                settings, AtlasResultWindow { result_offset: 0, count_all_matches: true }, || false).unwrap();
+            let first = finish(&mut search, &atlas, 2);
+            count(&first, "matches_seen", 1003); count(&first, "retained_hits", 1000);
+            count(&first, "window_matches", 1000); count(&first, "next_match_offset", 1000);
+            count(&first, "occurrence_id", 1);
+            for fragment in ["\"search_complete\":true", "\"match_count_complete\":true",
+                "\"count_all_matches\":true", "\"truncated\":true", "\"has_more_matches\":true"] {
+                assert!(first.contains(fragment), "{fragment}: {first}");
+            }
+            let original = search.hit(&atlas, 2, 1).unwrap();
+            search.begin_indexed_structure_window(&atlas, 3, 1, "needle", AtlasSearchScope::all(),
+                settings, AtlasResultWindow { result_offset: 1000, count_all_matches: true }, || false).unwrap();
+            let later = finish(&mut search, &atlas, 3);
+            count(&later, "matches_seen", 1003); count(&later, "retained_hits", 3);
+            count(&later, "skipped_matches", 1000); count(&later, "window_matches", 3);
+            for id in [1001, 1002, 1003] { count(&later, "occurrence_id", id); }
+            assert!(later.contains("\"has_more_matches\":false"));
+            assert!(later.contains("\"next_match_offset\":null"));
+            assert!(later.contains("\"search_complete\":true"));
+            let hit = search.hit(&atlas, 3, 1).unwrap();
+            let skipped_bytes = 1000 * line.encode_utf16().count() as u64 * 2;
+            assert_eq!(hit.original_range.start().get(), original.original_range.start().get() + skipped_bytes);
+            assert_eq!(hit.original_range.end().get(), original.original_range.end().get() + skipped_bytes);
+            assert_eq!(hit.revision.get(), 1);
+            search.clear_index(&atlas, 4, || false).unwrap();
+            let (reader, receipt) = search.open_reader(&atlas, ArenaOwnerId::new(31623).unwrap(),
+                3, 1, || false).unwrap();
+            assert_eq!(reader.capture().bytes(), source);
+            assert!(receipt.as_str().contains("\"source_reopened\":false"));
+        }
+    }
+}
+
+#[test]
+fn scoped_windows_count_skipped_files_and_continue_after_exact_capacity() {
+    let fixture = Fixture::new(&[("excluded.txt", b"needle needle needle needle"),
+        ("src/a.txt", b"needle needle"), ("src/b.txt", b"prefix needle needle"),
+        ("src/c.txt", b"needle_suffix")]);
+    let atlas = fixture.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
+    search.prepare_index(&atlas, 1, index_options(), || false).unwrap();
+    let scope = || AtlasSearchScope::all().with_path(AtlasSearchPathKind::Directory, "src").unwrap();
+    let mut settings = options(AtlasStructureMode::Occurrences); settings.max_matches = 1;
+    search.begin_indexed_structure_window(&atlas, 2, 1, "needle", scope(), settings,
+        AtlasResultWindow { result_offset: 2, count_all_matches: true }, || false).unwrap();
+    let counted = finish(&mut search, &atlas, 2);
+    count(&counted, "eligible_files", 3); count(&counted, "excluded_files", 1);
+    count(&counted, "matches_seen", 4); count(&counted, "matching_files", 2);
+    count(&counted, "retained_matching_files", 1); count(&counted, "retained_hits", 1);
+    count(&counted, "next_match_offset", 3); count(&counted, "occurrence_id", 3);
+    assert_eq!(search.hit(&atlas, 2, 1).unwrap().original_range.start().get(), 7);
+    assert!(counted.contains("\"search_complete\":true"));
+    search.begin_indexed_structure_window(&atlas, 3, 1, "needle", scope(), settings,
+        AtlasResultWindow { result_offset: 2, count_all_matches: false }, || false).unwrap();
+    let bounded = finish(&mut search, &atlas, 3);
+    count(&bounded, "matches_seen", 4); count(&bounded, "pending_files", 1);
+    assert!(bounded.contains("\"stop_reason\":\"match-limit\""));
+    assert!(bounded.contains("\"search_complete\":false"));
+    search.begin_indexed_structure_window(&atlas, 4, 1, "needle", scope(), settings,
+        AtlasResultWindow { result_offset: 3, count_all_matches: false }, || false).unwrap();
+    let final_window = finish(&mut search, &atlas, 4);
+    count(&final_window, "matches_seen", 4); count(&final_window, "pending_files", 0);
+    count(&final_window, "occurrence_id", 4); count(&final_window, "retained_hits", 1);
+    assert!(final_window.contains("\"search_complete\":true"));
+    assert!(final_window.contains("\"truncated\":true"));
+    assert!(final_window.contains("\"has_more_matches\":false"));
+    search.begin_indexed_structure_window(&atlas, 5, 1, "needle", scope(), settings,
+        AtlasResultWindow { result_offset: u64::MAX, count_all_matches: false }, || false).unwrap();
+    let beyond = finish(&mut search, &atlas, 5);
+    count(&beyond, "result_offset", u64::MAX); count(&beyond, "skipped_matches", 4);
+    count(&beyond, "matches_seen", 4); count(&beyond, "window_matches", 0);
+    count(&beyond, "retained_hits", 0); count(&beyond, "retained_matching_files", 0);
+    assert!(beyond.contains("\"search_complete\":true"));
+    assert!(beyond.contains("\"has_more_matches\":false"));
+    settings.max_matches = 0;
+    search.begin_indexed_structure_window(&atlas, 6, 1, "needle", scope(), settings,
+        AtlasResultWindow { result_offset: 0, count_all_matches: true }, || false).unwrap();
+    let count_only = finish(&mut search, &atlas, 6);
+    count(&count_only, "matches_seen", 4); count(&count_only, "matching_files", 2);
+    count(&count_only, "retained_hits", 0); count(&count_only, "retained_source_bytes", 0);
+    assert!(count_only.contains("\"search_complete\":true"));
+    assert!(count_only.contains("\"has_more_matches\":true"));
+    assert!(count_only.contains("\"next_match_offset\":null"));
+}
+
+#[test]
+fn omitted_metadata_advances_the_structural_window_without_repeating_later_rows() {
+    let source = format!("# {}\n\n# A\n\n# Another\n", "A".repeat(4097));
+    let fixture = Fixture::new(&[("README.md", source.as_bytes())]);
+    let atlas = fixture.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
+    search.prepare_index(&atlas, 1, index_options(), || false).unwrap();
+    let mut settings = options(AtlasStructureMode::Headings);
+    settings.name_mode = SymbolNameMode::Prefix; settings.max_matches = 1;
+    search.begin_indexed_structure_window(&atlas, 2, 1, "A", AtlasSearchScope::all(), settings,
+        AtlasResultWindow { result_offset: 0, count_all_matches: true }, || false).unwrap();
+    let omitted = finish(&mut search, &atlas, 2);
+    count(&omitted, "matches_seen", 3); count(&omitted, "retained_hits", 0);
+    count(&omitted, "window_matches", 1); count(&omitted, "structure_metadata_omitted", 1);
+    count(&omitted, "next_match_offset", 1); count(&omitted, "retained_source_bytes", 0);
+    assert!(omitted.contains("\"search_complete\":false"));
+    search.begin_indexed_structure_window(&atlas, 3, 1, "A", AtlasSearchScope::all(), settings,
+        AtlasResultWindow { result_offset: 1, count_all_matches: true }, || false).unwrap();
+    let later = finish(&mut search, &atlas, 3);
+    count(&later, "matches_seen", 3); count(&later, "retained_hits", 1);
+    count(&later, "structure_metadata_omitted", 0); count(&later, "next_match_offset", 2);
+    count(&later, "occurrence_id", 2);
+    assert!(later.contains("\"name\":\"A\""));
+    assert!(later.contains("\"search_complete\":true"));
+}
+
+#[test]
+fn counting_a_later_window_keeps_extractor_item_limits_explicitly_partial() {
+    // Stay inside the independent source-line guard to reach the item guard.
+    let source = "fn a() {} ".repeat(4100);
+    let fixture = Fixture::new(&[("source.rs", source.as_bytes())]);
+    let atlas = fixture.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
+    search.prepare_index(&atlas, 1, index_options(), || false).unwrap();
+    let mut settings = options(AtlasStructureMode::Symbols); settings.max_matches = 2;
+    search.begin_indexed_structure_window(&atlas, 2, 1, "a", AtlasSearchScope::all(), settings,
+        AtlasResultWindow { result_offset: 4095, count_all_matches: true }, || false).unwrap();
+    let page = finish(&mut search, &atlas, 2);
+    count(&page, "matches_seen", 4096); count(&page, "retained_hits", 1);
+    count(&page, "occurrence_id", 4096); count(&page, "extraction_limited_files", 1);
+    count(&page, "unavailable_files", 1); count(&page, "pending_files", 0);
+    assert!(page.contains("STRUCTURE_EXTRACTION_ITEM_LIMIT"));
+    assert!(page.contains("\"count_all_matches\":true"));
+    assert!(page.contains("\"search_complete\":false"));
+    assert!(page.contains("\"match_count_complete\":false"));
 }
 
 #[test]
@@ -189,6 +335,13 @@ fn extractor_caps_bad_encoding_and_work_budget_produce_truthful_partial_coverage
         assert!(page.contains(refusal), "{refusal}: {page}");
     }
     assert!(page.contains("\"search_complete\":false"));
+    search.begin_indexed_structure_window(&atlas, 4, 1, "needle", AtlasSearchScope::all(),
+        options(AtlasStructureMode::Symbols), AtlasResultWindow {
+            result_offset: 0, count_all_matches: true }, || false).unwrap();
+    let counted = finish(&mut search, &atlas, 4);
+    count(&counted, "matches_seen", 1); count(&counted, "unavailable_files", 3);
+    assert!(counted.contains("\"count_all_matches\":true"));
+    assert!(counted.contains("\"match_count_complete\":false"));
 }
 
 #[test]

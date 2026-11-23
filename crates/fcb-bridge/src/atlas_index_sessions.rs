@@ -2,7 +2,7 @@
 
 //! Dispatch only. Index preparation and queries share the registered atlas,
 //! cancellation epoch, resource owner and captured-reader activation route.
-use fcb_app::host::atlas_search::{AtlasIndexOptions, AtlasIndexedStructureOptions};
+use fcb_app::host::atlas_search::{AtlasIndexOptions, AtlasIndexedStructureOptions, AtlasResultWindow};
 use super::*;
 
 pub(crate) enum IndexCommand<'a> {
@@ -32,6 +32,8 @@ pub(crate) enum IndexCommand<'a> {
         result_offset: u64, max_matches: usize, max_scan_bytes: u64 },
     BeginStructure { generation: u64, index_generation: u64, needle: &'a str,
         scope: &'a AtlasSearchScope, options: AtlasIndexedStructureOptions },
+    BeginStructureWindow { generation: u64, index_generation: u64, needle: &'a str,
+        scope: &'a AtlasSearchScope, options: AtlasIndexedStructureOptions, window: AtlasResultWindow },
     Clear { generation: u64 },
 }
 impl AtlasSessions {
@@ -82,6 +84,9 @@ impl AtlasSessions {
             IndexCommand::BeginStructure { generation, index_generation, needle, scope, options } =>
                 session.search.begin_indexed_structure(&session.atlas, generation, index_generation,
                     needle, scope.clone(), options, &mut stop),
+            IndexCommand::BeginStructureWindow { generation, index_generation, needle, scope, options, window } =>
+                session.search.begin_indexed_structure_window(&session.atlas, generation, index_generation,
+                    needle, scope.clone(), options, window, &mut stop),
             IndexCommand::Clear { generation } => session.search.clear_index(&session.atlas, generation, &mut stop),
         };
         // Epoch cancellation invalidates all paused atlas work. A terminal

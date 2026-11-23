@@ -93,6 +93,34 @@ char *fcb_atlas_structure_indexed_begin(uint64_t handle, uint64_t generation,
     uint64_t path_kind, const char *path, uint64_t max_matches,
     uint64_t max_scan_bytes);
 
+/* Admit a later Symbols, Headings or Occurrences window over the same immutable
+ * index. All mode, scope, source, scan and row limits above still apply.
+ * count_all_matches: 0=stop after bounded lookahead, 1=count all admitted matches.
+ * result_offset: zero-based matching occurrence ordinal, NOT a retained-row
+ * page offset. Skipped occurrences consume extraction work but no row storage.
+ * Every request uses a fresh query generation; an old accepted query remains
+ * usable until a replacement is accepted. No live path is reopened.
+ *
+ * Receipts add result_offset, skipped_matches, window_matches, has_more_matches
+ * and next_match_offset, with canonical decimal strings for integers. Each
+ * retained structure.occurrence_id is its one-based ordinal in the selected
+ * captured-source query. hit_id stays local to query_generation for activation.
+ * window_matches counts ordinals covered even when metadata limits omit rows;
+ * next_match_offset advances past those omissions instead of looping on them.
+ * Total matches, retained rows, truncation and extraction coverage are separate.
+ * Counting every admitted match does not certify compiler semantics, incomplete
+ * source membership or an extractor-limited file. Follow search_in_progress to
+ * termination, then use the ordinary search_page/overlay/open_reader calls.
+ *
+ * needle must be readable through NUL or 1025 bytes, whichever comes first.
+ * Other pointer and response ownership contracts match indexed_begin above.
+ */
+char *fcb_atlas_structure_indexed_begin_window(uint64_t handle, uint64_t generation,
+    uint64_t index_generation, uint64_t mode, uint64_t name_mode,
+    const char *needle, const char *extensions, const char *filenames,
+    uint64_t path_kind, const char *path, uint64_t count_all_matches,
+    uint64_t result_offset, uint64_t max_matches, uint64_t max_scan_bytes);
+
 #ifdef __cplusplus
 }
 #endif
