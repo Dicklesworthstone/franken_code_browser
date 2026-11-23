@@ -24,7 +24,7 @@
 //! observation; it cannot silently replace the bytes behind an older hit.
 
 mod lines;
-mod position;
+pub(crate) mod position;
 mod search;
 mod selection;
 pub use lines::{MAX_OBSERVED_READER_LINES, MAX_OBSERVED_READER_LINE_READ_CALLS,

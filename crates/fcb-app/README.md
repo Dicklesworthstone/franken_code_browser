@@ -216,6 +216,46 @@ App Store builds require their native picker and do not advertise command-line
 file/line access. The launch receipt confirms submission only; native builds,
 physical-Mac activation and independent RCH verification remain pending.
 
+## Typed line and column navigation
+
+```sh
+fcb read /absolute/path/to/main.rs --line 120 --column 9 --json
+fcb read /absolute/path/to/main.rs --line 120 --column 9 --column-kind utf16 --json
+fcb open /absolute/path/to/main.rs --line 120 --column 9 --column-kind utf8 --json
+```
+
+Column navigation uses the same bounded forward scanner as the native
+observed reader. It finds a one-based physical line and logical column while
+retaining only bounded context, so a long line or file need not fit in a
+whole-file capture. `--column-kind scalar` is the default; `utf16` counts
+UTF-16 code units and `utf8` counts decoded UTF-8 bytes. BOMs do not count
+toward columns, tabs count as one unit, and a content-end caret is valid.
+An interior Unicode scalar or surrogate position is refused rather than rounded.
+These coordinates do not claim grapheme, visual-column or shaped-caret semantics.
+
+The default context limit is 64 KiB; `--bytes` accepts 4 through 262144 in
+column mode. The default prefix scan allowance is 256 MiB, configurable with
+`--max-scan-bytes` up to 1 TiB, with a separate 131072-read-call bound.
+`--encoding auto|utf8|utf16le|utf16be` controls decoding. Auto detects
+UTF-8/BOM UTF-16 from the same observation. `--column` cannot combine with
+`--lines`; human `open` retains its existing native file/line launch grammar.
+
+The `read-position` JSON receipt includes the original byte offset, typed
+column, decoded offset within the displayed window, captured and visible ranges,
+scan/read counters and exact original bytes as hex. The selected bytes come
+from the same forward pass that resolved the position, without rereading the
+live file. Metadata consistency is reported as an observation, not an atomic
+whole-file snapshot. Original ranges and the decoded caret are checked through
+the shared extent reader before output.
+
+Exit 0 means the point and its context were resolved. Exit 1 reports a missing
+physical line or logical column; exit 3 means an allowance ended before exact
+resolution/context, and makes no missing-position claim. Invalid coordinates
+return exit 2 and cancellation returns 130. A final line terminator adds no
+phantom line. Regression sources cover encodings, every scalar boundary,
+oversized lines, malformed arguments, cancellation and interrupted output;
+independent strict-RCH execution remains pending.
+
 ## Whole-file streaming search
 
 `search FILE --whole-file` scans one open regular file continuously from byte

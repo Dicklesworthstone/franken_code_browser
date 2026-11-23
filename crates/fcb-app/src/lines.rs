@@ -4,6 +4,8 @@
 //! bytes are retained during the same forward scan that establishes their line
 //! numbers; they are never re-read from a possibly changed live source.
 
+mod position;
+
 use std::{ffi::OsString, fs::Metadata, io::{self, Read, Write}, path::PathBuf};
 use fcb::{ArenaOwnerId, BrowserSession, ByteLength, ByteOffset, ByteRange};
 use fcb::search::{CaptureRequest, ExtentReadStats, ObservedExtent, ResourceAllocationId, ResourceBudget};
@@ -15,6 +17,7 @@ use crate::{AppError, SCHEMA, EXIT_OK, EXIT_NO_MATCH, EXIT_PARTIAL, EXIT_ERROR,
 use crate::args::{self, ArgumentError, Encoding};
 use crate::output::{Output, MAX_RESPONSE_BYTES};
 use crate::input;
+use crate::host::reader::ReaderColumnKind;
 
 const BUFFER_BYTES: usize = 16 * 1024;
 const MAX_READ_CALLS: u64 = 131_072;
@@ -22,10 +25,17 @@ const HELP: &str = "Line-number source reading\n\n\
   fcb read-lines FILE [--line N] [--lines N] [--json]\n\
   fcb read FILE --line N [--lines N] [--json]\n\
   fcb open FILE --line N [--lines N] --json\n\
+  fcb read FILE --line N --column N [--column-kind scalar|utf16|utf8] [--json]\n\
+  --column N                 One-based logical column; returns bounded context\n\
+  --column-kind KIND         Unicode scalar (default), UTF-16 unit, decoded UTF-8 byte\n\
   --bytes N                  Maximum retained selection (default 65536, max 262144)\n\
   --max-scan-bytes N          Prefix scan allowance (default 268435456, max 1 TiB)\n\
   --encoding auto|utf8|utf16le|utf16be\n\
 Defaults: line 1, 20 lines. Counts are one-based, canonical unsigned decimals.\n\
+Column mode uses the same forward scanner as the native large-file reader.\n\
+It cannot combine with --lines; --bytes must be at least 4. Tabs count as one\n\
+unit, BOMs do not count as columns, and interior scalar/surrogate positions fail.\n\
+Coordinates are logical source positions, not grapheme or visual columns.\n\
 CR, LF, and CRLF terminate lines; a final terminator adds no phantom line.\n\
 Original terminators and bytes are preserved. A BOM belongs to line 1.\n\
 A short final window is complete only after EOF. A budget limit is partial,\n\
@@ -34,7 +44,7 @@ Exit: 0 resolved, 1 missing at EOF, 2 error, 3 budget-limited, 130 canceled.\n\
 Implemented-unqualified; independent Rust/RCH verification remains pending.\n";
 
 fn takes_value(arg: &str) -> bool {
-    matches!(arg, "--line" | "--lines" | "--offset" | "--bytes" | "--limit" |
+    matches!(arg, "--line" | "--lines" | "--column" | "--column-kind" | "--offset" | "--bytes" | "--limit" |
         "--encoding" | "--max-scan-bytes" | "--text" | "--raw-hex" | "--query" |
         "--path" | "--max-files" | "--max-file-bytes" | "--max-total-bytes")
 }
@@ -47,7 +57,7 @@ pub(crate) fn requested(args: &[OsString]) -> bool {
     while cursor < args.len().min(args::MAX_ARGUMENTS + 1) {
         let arg = &args[cursor]; cursor += 1;
         if arg == "--" { break; }
-        if arg == "--line" || arg == "--lines" { return true; }
+        if arg == "--line" || arg == "--lines" || arg == "--column" || arg == "--column-kind" { return true; }
         if arg.to_str().is_some_and(takes_value) { cursor += 1; }
     }
     false
@@ -68,6 +78,7 @@ fn json_requested(args: &[OsString]) -> bool {
 struct Request {
     first: LineNumber, count: u64, max_bytes: usize, max_scan: u64,
     encoding: Encoding, path: Option<PathBuf>, json: bool, help: bool,
+    column: Option<u64>, column_kind: ReaderColumnKind,
 }
 
 fn parse(argv: &[OsString]) -> Result<Request, ArgumentError> {
@@ -80,7 +91,8 @@ fn parse(argv: &[OsString]) -> Result<Request, ArgumentError> {
     }
     let mut request = Request { first: LineNumber::new(1).expect("nonzero line"), count: 20,
         max_bytes: 65_536, max_scan: 256 * 1024 * 1024, encoding: Encoding::Auto,
-        path: None, json: false, help: false };
+        path: None, json: false, help: false,
+        column: None, column_kind: ReaderColumnKind::UnicodeScalar };
     let mut cursor = 1;
     let mut positional = false;
     let mut seen = 0u16;
@@ -92,6 +104,7 @@ fn parse(argv: &[OsString]) -> Result<Request, ArgumentError> {
             let bit = match option {
                 "--json" => 1, "--line" => 2, "--lines" => 4, "--bytes" => 8,
                 "--max-scan-bytes" => 16, "--encoding" => 32, "--help" | "-h" => 64,
+                "--column" => 128, "--column-kind" => 256,
                 _ => return Err(ArgumentError::UnknownOption),
             };
             if seen & bit != 0 { return Err(ArgumentError::DuplicateOption); }
@@ -102,6 +115,17 @@ fn parse(argv: &[OsString]) -> Result<Request, ArgumentError> {
             cursor += 1;
             match option {
                 "--line" => request.first = LineNumber::new(args::decimal(value)?).map_err(|_| ArgumentError::InvalidNumber)?,
+                "--column" => {
+                    let column = args::decimal(value)?;
+                    if column == 0 { return Err(ArgumentError::InvalidNumber); }
+                    request.column = Some(column);
+                }
+                "--column-kind" => request.column_kind = match value {
+                    "scalar" => ReaderColumnKind::UnicodeScalar,
+                    "utf16" => ReaderColumnKind::Utf16CodeUnit,
+                    "utf8" => ReaderColumnKind::DecodedUtf8Byte,
+                    _ => return Err(ArgumentError::IncompatibleOptions),
+                },
                 "--lines" => {
                     let count = args::decimal(value)?;
                     if !(1..=4096).contains(&count) { return Err(ArgumentError::Limit); }
@@ -130,7 +154,13 @@ fn parse(argv: &[OsString]) -> Result<Request, ArgumentError> {
             request.path = Some(PathBuf::from(arg));
         }
     }
-    request.first.get().checked_add(request.count - 1).ok_or(ArgumentError::InvalidNumber)?;
+    if request.column.is_some() {
+        if seen & 4 != 0 { return Err(ArgumentError::IncompatibleOptions); }
+        if request.max_bytes < 4 { return Err(ArgumentError::Limit); }
+    } else {
+        if seen & 256 != 0 { return Err(ArgumentError::IncompatibleOptions); }
+        request.first.get().checked_add(request.count - 1).ok_or(ArgumentError::InvalidNumber)?;
+    }
     if request.help {
         if request.path.is_some() || seen & !(1 | 64) != 0 { return Err(ArgumentError::IncompatibleOptions); }
     } else if request.path.is_none() { return Err(ArgumentError::MissingSource); }
@@ -159,6 +189,7 @@ pub(crate) fn run(argv: &[OsString], stdout: &mut impl Write, stderr: &mut impl 
             return Ok(EXIT_OK);
         }
         if argv.first().is_some_and(|arg| arg == "open") && !request.json { return Err(AppError::GuiUnavailable); }
+        if request.column.is_some() { return position::execute(&request, &mut out, &budget, &mut canceled); }
         execute(&request, &mut out, &budget, &mut canceled)
     });
     let result = if canceled() && result.is_ok() { Err(AppError::Canceled) } else { result };
@@ -435,7 +466,8 @@ mod tests {
     fn argv(values: &[&str]) -> Vec<OsString> { values.iter().map(OsString::from).collect() }
     fn request(first: u64, count: u64) -> Request {
         Request { first: LineNumber::new(first).unwrap(), count, max_bytes: 65_536,
-            max_scan: 1024 * 1024, encoding: Encoding::Auto, path: None, json: true, help: false }
+            max_scan: 1024 * 1024, encoding: Encoding::Auto, path: None, json: true, help: false,
+            column: None, column_kind: ReaderColumnKind::UnicodeScalar }
     }
     fn budget() -> ResourceBudget { ResourceBudget::new(owner(), ByteLength::new(MANAGED_BYTES)).unwrap() }
     fn exact_bytes(result: &Scan) -> &[u8] {

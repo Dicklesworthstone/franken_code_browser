@@ -12,7 +12,7 @@ use fcb::search::{CaptureRequest, ExtentReadStats, ExtentText, ExtentWindowReque
 use fcb::source::{DetectedEncoding, position::{LineColumnError, LineColumnScanner,
     LineColumnStatus, MAX_POSITION_STEP_BYTES}};
 use fcb_core::ResourceLease;
-use crate::{AppError, lines::same_metadata, output::Output};
+use crate::{AppError, args::Encoding, lines::same_metadata, output::Output};
 use super::super::reader::ReaderColumnKind;
 use super::{HostResponse, Observation, ObservedReaderEncoding, ObservedReaderError,
     ObservedReaderSession, MAX_OBSERVED_READER_LINE_READ_CALLS,
@@ -69,7 +69,11 @@ impl ObservedReaderSession {
         let [selected_id, workspace_id, extent_id] = self.allocations()?;
         let before = self.search_file.metadata().map_err(|_| AppError::Io)?;
         let request = PositionRequest { line, column, kind, max_bytes, max_scan_bytes,
-            max_read_calls: MAX_OBSERVED_READER_LINE_READ_CALLS, encoding };
+            max_read_calls: MAX_OBSERVED_READER_LINE_READ_CALLS, encoding: match encoding {
+                ObservedReaderEncoding::Utf8 => Encoding::Utf8,
+                ObservedReaderEncoding::Utf16Le => Encoding::Utf16Le,
+                ObservedReaderEncoding::Utf16Be => Encoding::Utf16Be,
+            } };
         let mut source = super::lines::PositionedReader { file: &self.search_file, offset: 0 };
         let mut io = ExtentReadStats::default();
         let scanned = scan_position(&mut source, request, &self.budget, self.owner(),
@@ -116,17 +120,19 @@ impl ObservedReaderSession {
 }
 
 #[derive(Clone, Copy)]
-struct PositionRequest {
-    line: u64, column: u64, kind: ReaderColumnKind, max_bytes: usize,
-    max_scan_bytes: u64, max_read_calls: u64, encoding: ObservedReaderEncoding,
+pub(crate) struct PositionRequest {
+    pub line: u64, pub column: u64, pub kind: ReaderColumnKind, pub max_bytes: usize,
+    pub max_scan_bytes: u64, pub max_read_calls: u64, pub encoding: Encoding,
 }
-struct PositionScan {
-    selected: Vec<u8>,
-    capture_start: u64,
-    visible: ByteRange,
-    original_offset: u64,
-    line_start: u64,
-    scanned_input_bytes: u64,
+pub(crate) struct PositionScan {
+    pub selected: Vec<u8>,
+    pub capture_start: u64,
+    pub visible: ByteRange,
+    pub original_offset: u64,
+    pub line_start: u64,
+    pub scanned_input_bytes: u64,
+    pub encoding: DetectedEncoding,
+    pub reached_eof: bool,
     _selected: ResourceLease,
 }
 
@@ -235,9 +241,12 @@ fn read(reader: &mut impl Read, buffer: &mut [u8], io: &mut ExtentReadStats,
     }
 }
 
-fn scan_position(reader: &mut impl Read, request: PositionRequest, budget: &ResourceBudget,
+pub(crate) fn scan_position(reader: &mut impl Read, request: PositionRequest, budget: &ResourceBudget,
     owner: ArenaOwnerId, allocations: [ResourceAllocationId; 2], io: &mut ExtentReadStats,
     canceled: &mut impl FnMut() -> bool) -> Result<PositionScan, ObservedReaderError> {
+    if !(4..=MAX_OBSERVED_READER_WINDOW_BYTES).contains(&request.max_bytes) {
+        return Err(ObservedReaderError::InvalidLimits);
+    }
     let capacity = request.max_bytes.checked_add(8).ok_or(AppError::Admission)?;
     let history_capacity = (request.max_bytes - 4) / 2 + 8;
     let selected_lease = budget.try_reserve_managed(owner, allocations[0], ByteLength::new(capacity as u64))
@@ -262,10 +271,11 @@ fn scan_position(reader: &mut impl Read, request: PositionRequest, budget: &Reso
         }
     }
     let encoding = match request.encoding {
-        ObservedReaderEncoding::Utf8 => DetectedEncoding::Utf8 {
+        Encoding::Auto => fcb::source::detect_encoding(&prefix[..filled]),
+        Encoding::Utf8 => DetectedEncoding::Utf8 {
             has_bom: prefix[..filled].starts_with(&[0xef, 0xbb, 0xbf]) },
-        ObservedReaderEncoding::Utf16Le => DetectedEncoding::Utf16Le,
-        ObservedReaderEncoding::Utf16Be => DetectedEncoding::Utf16Be,
+        Encoding::Utf16Le => DetectedEncoding::Utf16Le,
+        Encoding::Utf16Be => DetectedEncoding::Utf16Be,
     };
     let mut cursor = LineColumnScanner::new(request.line, request.column, request.kind, encoding)
         .map_err(scanner_error)?;
@@ -296,7 +306,8 @@ fn scan_position(reader: &mut impl Read, request: PositionRequest, budget: &Reso
                         visible: range(window.visible_start, window.visible_end.min(io.bytes_read))?,
                         original_offset: window.original_offset,
                         line_start: cursor.selected_line_start().ok_or(ObservedReaderError::InvalidRange)?.get(),
-                        scanned_input_bytes: cursor.bytes_scanned(), _selected: selected_lease });
+                        scanned_input_bytes: cursor.bytes_scanned(), encoding, reached_eof: eof,
+                        _selected: selected_lease });
                 }
                 wanted = window.capture_end - io.bytes_read;
             }
@@ -373,7 +384,7 @@ mod tests {
     fn request() -> PositionRequest {
         PositionRequest { line: 1, column: 1, kind: ReaderColumnKind::UnicodeScalar,
             max_bytes: 8, max_scan_bytes: 1024, max_read_calls: 1024,
-            encoding: ObservedReaderEncoding::Utf8 }
+            encoding: Encoding::Utf8 }
     }
     fn run(reader: &mut impl Read, request: PositionRequest, canceled: &mut impl FnMut() -> bool)
         -> (Result<PositionScan, ObservedReaderError>, ExtentReadStats) {
@@ -384,17 +395,17 @@ mod tests {
             [ResourceAllocationId::new(1).unwrap(), ResourceAllocationId::new(2).unwrap()], &mut io, canceled);
         (result, io)
     }
-    fn encode(text: &str, encoding: ObservedReaderEncoding) -> Vec<u8> {
+    fn encode(text: &str, encoding: Encoding) -> Vec<u8> {
         match encoding {
-            ObservedReaderEncoding::Utf8 => text.as_bytes().to_vec(),
-            ObservedReaderEncoding::Utf16Le => text.encode_utf16().flat_map(u16::to_le_bytes).collect(),
-            ObservedReaderEncoding::Utf16Be => text.encode_utf16().flat_map(u16::to_be_bytes).collect(),
+            Encoding::Utf8 | Encoding::Auto => text.as_bytes().to_vec(),
+            Encoding::Utf16Le => text.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+            Encoding::Utf16Be => text.encode_utf16().flat_map(u16::to_be_bytes).collect(),
         }
     }
 
     #[test]
     fn one_byte_reads_retain_the_original_context_across_bom_crlf_and_surrogate_splits() {
-        for encoding in [ObservedReaderEncoding::Utf8, ObservedReaderEncoding::Utf16Le, ObservedReaderEncoding::Utf16Be] {
+        for encoding in [Encoding::Utf8, Encoding::Utf16Le, Encoding::Utf16Be] {
             let prefix = format!("\u{feff}first\r\n{}", "x".repeat(127));
             let bytes = encode(&format!("{prefix}🦀target\r\nlast"), encoding);
             let expected = encode(&format!("{prefix}🦀"), encoding).len() as u64;

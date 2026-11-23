@@ -16,6 +16,8 @@ const HELP: &str = "FrankenCodeBrowser — bounded headless source tools\n\n\
   fcb doctor [--json]                 Static capability report; no scans/repairs\n\
   fcb inspect FILE [--json]           Metadata only; no source payload read\n\
   fcb read FILE [--json]              Decode a bounded source window\n\
+  fcb read FILE --line N --column N [--column-kind scalar|utf16|utf8] [--json]\n\
+                                     Bounded logical position context; read-lines --help\n\
   fcb open FILE --json                Same headless reading operation\n\
   fcb search FILE --text TEXT [--ignore-case] [--count-all] [--json]\n\
   fcb search FILE --raw-hex HEX [--count-all] [--json]\n\
