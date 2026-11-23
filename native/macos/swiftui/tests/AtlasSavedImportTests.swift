@@ -28,8 +28,8 @@ private final class SavedImportFixture: @unchecked Sendable {
         ["projection": "lexical-source-imports", "relationship_kind": "lexical-import",
          "evidence_precision": "exact-import-source-range", "resolution_domain": "declared-catalog-candidates",
          "compiler_resolved": false, "semantic_complete": false,
-         "extractor": "franken-markdown-d6fbd1d5/import-statements-v7",
-         "extraction_policy": "rust-use-tree-js-literal-loads-python-cpp-go-java-v7", "resolver": "fcb-closed-catalog-imports-v9"]
+         "extractor": "franken-markdown-d6fbd1d5/import-statements-v8",
+         "extraction_policy": "rust-use-tree-js-literal-loads-python-cpp-go-java-v8", "resolver": "fcb-closed-catalog-imports-v10"]
     }
     func link(_ id: UInt64) -> [String: Any] {
         let target = base.members[id == 1 ? 3 : 4]
@@ -515,6 +515,64 @@ private final class SavedImportFixture: @unchecked Sendable {
         }
     }
 
+    private static func rustPathModuleWire(_ f: SavedImportFixture, identity: AtlasSavedIdentity) throws {
+        let decode: ([String: Any]) throws -> AtlasSavedImports = {
+            try AtlasSavedImports.decode(f.base.encode($0), identity: identity, generation: 1,
+                direction: .all, member: nil, start: 0, limit: 64)
+        }
+        var value = f.page(identity.owner, generation: 1)
+        let destination = "platform/custom.rs", prefix = "#[path = \""
+        let declaration = prefix + destination + "\"]\npub mod child;"
+        var rows = value["links"] as! [[String: Any]]
+        for i in rows.indices {
+            rows[i]["language"] = "rust"; rows[i]["lexical_import_kind"] = "rust-path-module"
+            rows[i]["destination"] = destination; rows[i]["resolution_basis"] = "rust-path-attribute-candidate"
+            rows[i]["source_path"] = f.base.path(Array("src/lib.rs".utf8), "src/lib.rs")
+            rows[i]["target_path"] = f.base.path(Array("src/platform/custom.rs".utf8), "src/platform/custom.rs")
+            rows[i]["evidence_range"] = ["start": "0", "end": String(declaration.utf8.count)]
+            rows[i]["specifier_range"] = ["start": String(prefix.utf8.count),
+                "end": String(prefix.utf8.count + destination.utf8.count)]
+        }
+        value["links"] = rows
+        let page = try decode(value), link = page.links[0], unavailable = page.links[1]
+        precondition(link.canOpenTarget && !unavailable.canOpenTarget
+            && link.kind == "rust-path-module" && link.language == "rust"
+            && link.label == "Rust path module declaration"
+            && link.resolutionBasis == "rust-path-attribute-candidate"
+            && link.destination == destination && link.targetPath?.bytes == Array("src/platform/custom.rs".utf8)
+            && link.evidence.start == 0 && link.evidence.end == UInt64(declaration.utf8.count)
+            && link.specifier.start == UInt64(prefix.utf8.count)
+            && link.specifier.end == UInt64(prefix.utf8.count + destination.utf8.count)
+            && unavailable.targetMember == 4 && unavailable.targetDigest == nil,
+            "Saved path modules retain exact attribute/declaration ranges and unavailable target identity")
+
+        for (language, kind) in [("rust", "rust-module"), ("rust", "rust-use"),
+            ("python", "python-from"), ("javascript", "javascript-import"), ("typescript", "rust-path-module")] {
+            var bad = value, changed = rows
+            changed[0]["language"] = language; changed[0]["lexical_import_kind"] = kind
+            bad["links"] = changed; reject { _ = try decode(bad) }
+        }
+        for basis in ["rust-module-file-candidate", "rust-use-module-file-candidate",
+            "exact-relative-path", "unique-relative-module-candidate"] {
+            var bad = value, changed = rows
+            changed[0]["resolution_basis"] = basis; bad["links"] = changed
+            reject { _ = try decode(bad) }
+        }
+        for resolution in ["missing", "ambiguous", "external", "unresolved"] {
+            var bad = value, changed = rows
+            changed[0]["resolution"] = resolution
+            for key in ["target_member", "target_file_id", "target_path", "target_revision", "target_digest", "target_bytes"] {
+                changed[0][key] = NSNull()
+            }
+            bad["links"] = changed; reject { _ = try decode(bad) }
+        }
+        for (key, old) in [("extractor", "franken-markdown-d6fbd1d5/import-statements-v7"),
+            ("extraction_policy", "rust-use-tree-js-literal-loads-python-cpp-go-java-v7"),
+            ("resolver", "fcb-closed-catalog-imports-v9")] {
+            var bad = value; bad[key] = old; reject { _ = try decode(bad) }
+        }
+    }
+
     @MainActor static func main() async throws {
         let f = SavedImportFixture()
         let browser = AtlasSavedRepositoryModel(transport: f.transport)
@@ -528,6 +586,7 @@ private final class SavedImportFixture: @unchecked Sendable {
         let accepted = try decode(f.page(identity.owner, generation: 1))
         try cppWire(f, identity: identity)
         try typescriptSourceWire(f, identity: identity)
+        try rustPathModuleWire(f, identity: identity)
         try goWire(f, identity: identity)
         try javaWire(f, identity: identity)
         try pythonAbsoluteWire(f, identity: identity)

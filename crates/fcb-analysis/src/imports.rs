@@ -33,8 +33,8 @@ pub const MAX_IMPORT_ITEMS: usize = 4096;
 pub const MAX_IMPORT_SPECIFIER_BYTES: usize = 1024;
 const MAX_STATEMENT_TERMINALS: usize = 1024;
 const MAX_STATEMENT_BYTES: usize = 16 * 1024;
-pub const IMPORT_EXTRACTOR: &str = "franken-markdown-d6fbd1d5/import-statements-v7";
-pub const IMPORT_POLICY: &str = "rust-use-tree-js-literal-loads-python-cpp-go-java-v7";
+pub const IMPORT_EXTRACTOR: &str = "franken-markdown-d6fbd1d5/import-statements-v8";
+pub const IMPORT_POLICY: &str = "rust-use-tree-js-literal-loads-python-cpp-go-java-v8";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImportLanguage { Rust, JavaScript, TypeScript, Jsx, Tsx, Python, Cpp, Go, Java }
@@ -61,12 +61,13 @@ impl ImportLanguage {
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ImportKind { RustModule, RustUse, JavaScriptImport, JavaScriptExport,
+pub enum ImportKind { RustModule, RustPathModule, RustUse, JavaScriptImport, JavaScriptExport,
     JavaScriptRequire, JavaScriptDynamicImport, PythonImport, PythonFrom,
     CppQuotedInclude, CppAngleInclude, CppComputedInclude, GoImport, JavaImport, JavaStaticImport }
 impl ImportKind {
     pub const fn name(self) -> &'static str {
-        match self { Self::RustModule => "rust-module", Self::RustUse => "rust-use",
+        match self { Self::RustModule => "rust-module", Self::RustPathModule => "rust-path-module",
+            Self::RustUse => "rust-use",
             Self::JavaScriptImport => "javascript-import", Self::JavaScriptExport => "javascript-export",
             Self::JavaScriptRequire => "javascript-require", Self::JavaScriptDynamicImport => "javascript-dynamic-import",
             Self::PythonImport => "python-import", Self::PythonFrom => "python-from",

@@ -602,6 +602,71 @@ import Foundation
         }
     }
 
+    private static func rustPathModuleWire(_ index: AtlasPreparedIndex) throws {
+        var value = ProjectLinksFixture.importPage(owner: index.basis.owner,
+            generation: 1, command: "imports-page")
+        let declaration = "#[path = \"platform/custom.rs\"]\npub mod child;"
+        let span = UInt64(declaration.utf8.count)
+        var rows = value["links"] as! [[String: Any]]
+        for i in rows.indices {
+            rows[i]["language"] = "rust"; rows[i]["lexical_import_kind"] = "rust-path-module"
+            rows[i]["destination"] = "platform/custom.rs"
+            rows[i]["resolution_basis"] = "rust-path-attribute-candidate"
+            rows[i]["source_path"] = ProjectLinksFixture.path("src/lib.rs")
+            rows[i]["target_path"] = ProjectLinksFixture.path("src/platform/custom.rs")
+            let start = UInt64(11) + UInt64(i) * span
+            rows[i]["evidence_range"] = ["start": String(start), "end": String(start + span)]
+        }
+        value["links"] = rows
+        let link = try decode(value, index: index).links[0]
+        precondition(link.canOpenTarget && link.importEvidence?.kind == "rust-path-module"
+            && link.importEvidence?.resolutionBasis == "rust-path-attribute-candidate"
+            && link.destination == "platform/custom.rs"
+            && link.target?.path.bytes == Array("src/platform/custom.rs".utf8)
+            && link.evidenceRange.start == 11 && link.evidenceRange.end == 11 + span
+            && link.evidenceLabel.contains("Rust path module declaration")
+            && link.evidenceLabel.contains("not compiler resolved"),
+            "Path attributes retain their exact declaration span and named catalog target")
+
+        for resolution in ["unavailable", "uncaptured", "outside-capture-scope"] {
+            var unavailable = value, changed = rows
+            for i in changed.indices {
+                changed[i]["resolution"] = resolution
+                for key in ["target_revision", "target_sha256", "target_bytes"] { changed[i][key] = NSNull() }
+            }
+            unavailable["links"] = changed
+            let retained = try decode(unavailable, index: index).links[0]
+            precondition(!retained.canOpenTarget && retained.targetFile == 4
+                && retained.targetPath?.bytes == Array("src/platform/custom.rs".utf8)
+                && retained.importEvidence?.resolutionBasis == "rust-path-attribute-candidate")
+        }
+        for (language, kind) in [("rust", "rust-module"), ("rust", "rust-use"),
+            ("python", "python-from"), ("javascript", "javascript-import"), ("typescript", "rust-path-module")] {
+            var bad = value, changed = rows
+            changed[0]["language"] = language; changed[0]["lexical_import_kind"] = kind
+            bad["links"] = changed; refuse(bad, index: index)
+        }
+        for basis in ["rust-module-file-candidate", "rust-use-module-file-candidate",
+            "exact-relative-path", "unique-relative-module-candidate"] {
+            var bad = value, changed = rows
+            changed[0]["resolution_basis"] = basis; bad["links"] = changed
+            refuse(bad, index: index)
+        }
+        for resolution in ["missing", "ambiguous", "external", "unresolved"] {
+            var bad = value, changed = rows
+            changed[0]["resolution"] = resolution
+            for key in ["target_file_id", "target_path", "target_revision", "target_sha256", "target_bytes"] {
+                changed[0][key] = NSNull()
+            }
+            bad["links"] = changed; refuse(bad, index: index)
+        }
+        for (key, old) in [("extractor", "franken-markdown-d6fbd1d5/import-statements-v7"),
+            ("extraction_policy", "rust-use-tree-js-literal-loads-python-cpp-go-java-v7"),
+            ("resolver", "fcb-closed-catalog-imports-v9")] {
+            var bad = value; bad[key] = old; refuse(bad, index: index)
+        }
+    }
+
     @MainActor static func main() async throws {
         let fixture = ProjectLinksFixture(includesImports: true), index = try await prepared(fixture)
         try ProjectLinksGeometryTests.run(index, projection: .imports)
@@ -613,6 +678,7 @@ import Foundation
         try javascriptLoadWire(index)
         try typescriptSourceWire(index)
         try rustUseWire(index)
+        try rustPathModuleWire(index)
         let live = ProjectLinksFixture(includesImports: true)
         let model = AtlasProjectLinksModel(root: "/project", transport: live.transport)
         precondition(model.availableProjections == [.documentation, .imports])

@@ -16,10 +16,13 @@ impl Statements<'_> {
         // file. Nested inline modules and macro bodies likewise lack a modeled
         // module context, even when a leaf begins with an explicit qualifier.
         let mut overrides = false;
+        let mut conditional_source = false;
         for i in 0..self.tokens.len() {
             if i & 255 == 0 { check(canceled)?; }
             overrides |= self.word(i) == "#" && self.word(i + 1) == "["
                 && matches!(self.word(i + 2), "path" | "cfg_attr");
+            conditional_source |= self.word(i) == "#" && self.word(i + 1) == "!"
+                && self.word(i + 2) == "[" && matches!(self.word(i + 3), "cfg" | "cfg_attr");
         }
         let mut depth = 0usize;
         let mut i = 0;
@@ -34,8 +37,17 @@ impl Statements<'_> {
                 if self.word(semicolon) == ";" && (raw || identifier(self.word(i + 1))) {
                     let start = self.tokens[i + 1].start; let end = self.tokens[name_end].end;
                     let text = self.text;
-                    self.add(ImportKind::RustModule, self.tokens[i].start, self.tokens[semicolon].end,
-                        start, end, &text[start..end], depth == 0 && !overrides)?;
+                    if let Some((attribute, literal_start, literal_end, literal_allowed)) = self.rust_path_attribute(i, semicolon) {
+                        let name = self.word(name_end);
+                        let name_allowed = if raw { !matches!(name, "crate" | "self" | "super" | "Self" | "_") }
+                            else { self.tokens[name_end].kind != Tok::Keyword && !matches!(name, "Self" | "_") };
+                        self.add(ImportKind::RustPathModule, attribute, self.tokens[semicolon].end,
+                            literal_start, literal_end, &text[literal_start..literal_end],
+                            depth == 0 && !conditional_source && literal_allowed && name_allowed)?;
+                    } else {
+                        self.add(ImportKind::RustModule, self.tokens[i].start, self.tokens[semicolon].end,
+                            start, end, &text[start..end], depth == 0 && !overrides)?;
+                    }
                     i = semicolon + 1; continue;
                 }
             }
@@ -81,6 +93,37 @@ impl Statements<'_> {
             i += 1;
         }
         Ok(())
+    }
+
+    // Inspect only the upstream string terminal and this fixed attribute/item
+    // shape. A preceding attribute, computed argument, unsupported visibility,
+    // or raw string is deliberately not reinterpreted. Comments remain part of
+    // the original attribute-through-semicolon evidence, never of the path.
+    fn rust_path_attribute(&self, module: usize, semicolon: usize) -> Option<(usize, usize, usize, bool)> {
+        let before = if module >= 1 && self.keyword(module - 1, "pub") {
+            module - 1
+        } else if module >= 4 && self.keyword(module - 4, "pub")
+            && self.word(module - 3) == "(" && self.word(module - 1) == ")"
+            && matches!(self.word(module - 2), "crate" | "self" | "super") {
+            module - 4
+        } else { module };
+        let attribute = before.checked_sub(6)?;
+        if self.word(attribute) != "#" || self.word(attribute + 1) != "["
+            || self.word(attribute + 2) != "path" || self.word(attribute + 3) != "="
+            || self.word(attribute + 5) != "]"
+            || (attribute != 0 && !matches!(self.word(attribute - 1), ";" | "}")) {
+            return None;
+        }
+        let literal = self.tokens[attribute + 4];
+        let spelling = literal.text(self.text);
+        if literal.kind != Tok::Str || spelling.len() < 3
+            || !spelling.starts_with('"') || !spelling.ends_with('"') {
+            return None;
+        }
+        let start = literal.start + 1; let end = literal.end - 1;
+        let allowed = !self.text[start..end].chars().any(|c| c == '\\' || c == '"' || c.is_control())
+            && self.tokens[semicolon].end - self.tokens[attribute].start <= MAX_STATEMENT_BYTES;
+        Some((self.tokens[attribute].start, start, end, allowed))
     }
 
     fn rust_raw_tail(&self, at: usize) -> bool {

@@ -277,6 +277,13 @@ usable, including after repeated failed attempts. **Reload view** reuses the
 accepted inventory without reparsing or losing the current page. Regression
 fixtures cover both documentation and imports; native execution remains pending.
 
+**Explicit Rust module paths navigate captured source.** A supported top-level
+`#[path = "platform/custom.rs"] mod child;` opens the exact catalogued file relative
+to its declaring source, including flat modules and saved repositories. The
+attribute and path retain exact original-byte evidence. Conditional attributes,
+macros and unsupported spellings stay unresolved; no Cargo or compiler inference
+is introduced. Native and executable regression verification remain pending.
+
 **TypeScript imports can navigate from emitted extensions to captured source.**
 In TypeScript and TSX files, a relative import such as `./worker.js` can open a
 unique captured `worker.ts`, `worker.tsx`, or `worker.d.ts` when the exact written

@@ -1698,9 +1698,19 @@ ancestor and path-component traversal. It stops at automatic-target boundaries
 such as `src/bin`, `tests`, `examples` and `benches`. Bare/external imports,
 unknown roots, unsupported module spellings and exhausted limits retain readable
 evidence without a guessed target. Custom Cargo layouts, conditional compilation,
-re-exports and `#[path]` resolution require stronger evidence than this policy
-provides. The same navigation policy applies to saved archive members without
-reopening a working tree.
+and re-exports require stronger evidence than this policy provides.
+
+A single top-level `#[path = "platform/custom.rs"] mod child;` now offers an
+explicit source-file candidate, including `pub` and `pub(crate/self/super)`
+visibility. Its target is relative to the source file's directory, including
+flat modules such as `src/parent.rs`; no stem directory or extension is guessed.
+The row retains the complete attribute-through-semicolon evidence and exact
+literal path bytes, with UTF-8 and UTF-16 mappings. Confined `../` components,
+Unicode filenames and native catalog ancestors preserve their bytes. Conditional
+or chained attributes, computed/raw/escaped strings, nested scopes and macros
+remain unresolved. An explicit path does not authorize conventional module/use
+guesses elsewhere in that file. The same navigation policy applies to saved
+archive members without reopening a working tree.
 
 Python navigation uses an explicit catalog policy. `from .worker import Tool`
 looks for the unique `worker.py` or `worker/__init__.py` candidate beside the

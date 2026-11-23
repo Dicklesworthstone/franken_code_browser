@@ -56,7 +56,9 @@ impl<T> ImportResolution<T> {
 /// a top-level external mod. Eligible qualified use leaves navigate conventional
 /// module files through the bounded policy in `rust`; a remaining item suffix
 /// is explicitly a module-prefix candidate, never a definition location.
-/// Attributes and unmodeled source scopes remain unresolved. Multiple matching
+/// A single supported top-level #[path] attribute admits only its exact
+/// source-directory-relative catalog file. Other attributes and unmodeled
+/// source scopes remain unresolved. Multiple matching
 /// paths are ambiguous even if a callback maps them to the same target identity.
 /// No extension preference is inferred.
 /// Python relative module candidates use leading dots to climb the source
@@ -89,6 +91,9 @@ pub fn resolve_import<T: Copy + Eq>(
     }
     if fact.kind() == ImportKind::RustUse {
         return rust::resolve_use(source_path, fact, &mut lookup);
+    }
+    if fact.kind() == ImportKind::RustPathModule {
+        return rust::resolve_path_module(source_path, fact, &mut lookup);
     }
     if matches!(fact.kind(), ImportKind::CppQuotedInclude | ImportKind::CppAngleInclude | ImportKind::CppComputedInclude) {
         return cpp_include(source_path, fact, &mut lookup);

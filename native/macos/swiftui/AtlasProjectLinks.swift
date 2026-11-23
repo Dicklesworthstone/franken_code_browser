@@ -141,9 +141,9 @@ struct AtlasProjectImportEvidence: Equatable, Sendable {
         guard try w.text("projection") == "lexical-source-imports",
               try w.text("relationship_kind") == "lexical-import",
               try w.text("evidence_precision") == "exact-import-source-range",
-              try w.text("extractor") == "franken-markdown-d6fbd1d5/import-statements-v7",
-              try w.text("resolver") == "fcb-closed-catalog-imports-v9",
-              try w.text("extraction_policy") == "rust-use-tree-js-literal-loads-python-cpp-go-java-v7",
+              try w.text("extractor") == "franken-markdown-d6fbd1d5/import-statements-v8",
+              try w.text("resolver") == "fcb-closed-catalog-imports-v10",
+              try w.text("extraction_policy") == "rust-use-tree-js-literal-loads-python-cpp-go-java-v8",
               try !w.flag("compiler_resolved"), try !w.flag("semantic_complete") else {
             throw AtlasProjectLinksError.invalidResponse
         }
@@ -153,7 +153,7 @@ struct AtlasProjectImportEvidence: Equatable, Sendable {
         resolutionBasis = try w.text("resolution_basis")
         let kinds: [String]
         switch language {
-        case "rust": kinds = ["rust-module", "rust-use"]
+        case "rust": kinds = ["rust-module", "rust-use", "rust-path-module"]
         case "python": kinds = ["python-import", "python-from"]
         case "go": kinds = ["go-import"]
         case "java": kinds = ["java-import", "java-static-import"]
@@ -163,13 +163,19 @@ struct AtlasProjectImportEvidence: Equatable, Sendable {
         default: throw AtlasProjectLinksError.invalidResponse
         }
         guard kinds.contains(kind),
-              ["exact-relative-path", "unique-relative-module-candidate", "typescript-source-extension-candidate", "rust-module-file-candidate",
+              ["exact-relative-path", "unique-relative-module-candidate", "typescript-source-extension-candidate", "rust-path-attribute-candidate", "rust-module-file-candidate",
                "rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "ambiguous-rust-crate-root",
                "python-relative-module-candidate", "python-absolute-module-candidate", "cpp-source-relative-include-candidate",
                "go-module-package-file-candidate", "go-module-context-unavailable", "go-nested-module-boundary",
                "java-source-file-candidate", "java-enclosing-type-candidate", "unresolved-java-wildcard",
                "unresolved-cpp-include", "unresolved-rust-use", "external-specifier",
                "unsupported-specifier", "no-catalog-target", "ambiguous-catalog-target"].contains(resolutionBasis) else {
+            throw AtlasProjectLinksError.invalidResponse
+        }
+        if resolutionBasis == "rust-path-attribute-candidate" && (language != "rust" || kind != "rust-path-module") {
+            throw AtlasProjectLinksError.invalidResponse
+        }
+        if kind == "rust-path-module" && !["rust-path-attribute-candidate", "no-catalog-target", "unsupported-specifier"].contains(resolutionBasis) {
             throw AtlasProjectLinksError.invalidResponse
         }
         if ["rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "ambiguous-rust-crate-root"]
@@ -221,6 +227,7 @@ struct AtlasProjectImportEvidence: Equatable, Sendable {
         let statement: String
         switch kind {
         case "rust-module": statement = "Rust module declaration"
+        case "rust-path-module": statement = "Rust path module declaration"
         case "rust-use": statement = "Rust use statement"
         case "python-import": statement = "Python import statement"
         case "python-from": statement = "Python from-import statement"
@@ -362,7 +369,7 @@ struct AtlasProjectLink: Identifiable, Sendable, Equatable, Decodable {
             let allowed: [String]
             switch resolution {
             case "captured", "unavailable", "uncaptured", "outside-capture-scope":
-                allowed = ["exact-relative-path", "unique-relative-module-candidate", "typescript-source-extension-candidate", "rust-module-file-candidate",
+                allowed = ["exact-relative-path", "unique-relative-module-candidate", "typescript-source-extension-candidate", "rust-path-attribute-candidate", "rust-module-file-candidate",
                     "rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "python-relative-module-candidate",
                     "python-absolute-module-candidate",
                     "cpp-source-relative-include-candidate", "go-module-package-file-candidate",

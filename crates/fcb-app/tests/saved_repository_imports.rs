@@ -44,6 +44,58 @@ fn utf16(text: &str, big: bool) -> Vec<u8> {
 }
 
 #[test]
+fn saved_rust_path_modules_preserve_utf16_attribute_evidence_and_offline_readers() {
+    let statement = "#[path = \"platform/custom.rs\"] pub(crate) mod child;";
+    let target = b"pub const VALUE: usize = 7;\n";
+    for big in [false, true] {
+        let source = utf16(&format!("// \u{1f980} captured Rust\r\n{statement}\r\n"), big);
+        let f = Fixture::new(&[entry(b"src/parent.rs", &source), entry(b"src/platform/custom.rs", target)], true);
+        let mut saved = f.open(58140 + u64::from(big) * 10);
+        let page = prepare(&mut saved, 1);
+        assert!(page.get("imports_complete").flag());
+        let row = link(&page, b"src/parent.rs", "platform/custom.rs");
+        assert_eq!(row.get("lexical_import_kind").text(), "rust-path-module");
+        assert_eq!(row.get("resolution_basis").text(), "rust-path-attribute-candidate");
+        assert_eq!(range(&source, row.get("evidence_range")), &utf16(statement, big)[2..]);
+        assert_eq!(range(&source, row.get("specifier_range")), &utf16("platform/custom.rs", big)[2..]);
+        assert_eq!(row.get("target_path").get("hex").text(), hex(b"src/platform/custom.rs"));
+        let before = reads(&mut saved);
+        let incoming = json(&saved.import_page(1, Some(row.get("target_member").number()),
+            Direction::Incoming, 0, 64, || false).unwrap());
+        assert_eq!(incoming.get("links").array(), page.get("links").array());
+        assert_eq!(reads(&mut saved), before);
+        let id = row.get("link_id").number();
+        let (mut evidence, receipt) = saved.open_import_reader(owner(58141 + u64::from(big) * 10),
+            1, id, Side::Evidence, || false).unwrap();
+        assert_eq!(json(&receipt).get("selection"), row.get("evidence_range"));
+        let (mut reader, receipt) = saved.open_import_reader(owner(58142 + u64::from(big) * 10),
+            1, id, Side::Target, || false).unwrap();
+        assert_eq!(json(&receipt).get("source_digest").text(), Sha256::digest(target).to_hex());
+        assert!(!json(&receipt).get("live_source_reopened").flag());
+        saved.clear_imports(2, || false).unwrap(); drop(saved);
+        fs::rename(&f.path, f.root.join("moved-rust-path.fcbs")).unwrap();
+        assert_eq!(copy_all(&mut evidence).get("original_hex").text(), hex(&source));
+        assert_eq!(copy_all(&mut reader).get("original_hex").text(), hex(target));
+    }
+}
+
+#[test]
+fn saved_rust_path_targets_preserve_unavailable_and_missing_evidence() {
+    let source = b"#[path = \"unavailable.rs\"] mod unavailable;\n#[path = \"missing.rs\"] mod missing;\n";
+    let f = Fixture::new(&[entry(b"main.rs", source), SnapshotEntry { path: b"unavailable.rs", observed_bytes: 50,
+        data: SnapshotData::Unavailable("READ_DENIED") }], true);
+    let mut saved = f.open(58160);
+    let page = prepare(&mut saved, 1);
+    for (destination, resolution, basis) in [("unavailable.rs", "unavailable", "rust-path-attribute-candidate"),
+        ("missing.rs", "missing", "no-catalog-target")] {
+        let row = link(&page, b"main.rs", destination);
+        assert_eq!(row.get("resolution").text(), resolution);
+        assert_eq!(row.get("resolution_basis").text(), basis);
+        assert!(saved.open_import_reader(owner(58161), 1, row.get("link_id").number(), Side::Target, || false).is_err());
+    }
+}
+
+#[test]
 fn saved_typescript_extension_candidates_keep_utf16_evidence_and_offline_readers() {
     let statement = "import { value } from './child.js';";
     let target = b"export const value: number = 7;\n";
@@ -325,7 +377,7 @@ fn saved_rust_use_tree_pages_preserve_leaf_identity_and_original_utf16_evidence(
         let result = prepare(&mut saved, 1);
         assert!(result.get("imports_complete").flag());
         assert_eq!(result.get("links_seen").number(), 5);
-        assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v9");
+        assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v10");
         let rows = result.get("links").array();
         for (index, (destination, spelling)) in [
             ("crate::shared", "self"), ("crate::shared::Thing", "Thing"),
@@ -408,8 +460,8 @@ fn shared_language_extractors_publish_exact_occurrences_and_metadata_only_revers
     assert_eq!(result.get("import_generation").number(), 7);
     assert_eq!(result.get("projection").text(), "lexical-source-imports");
     assert_eq!(result.get("evidence_precision").text(), "exact-import-source-range");
-    assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v9");
-    assert_eq!(result.get("extraction_policy").text(), "rust-use-tree-js-literal-loads-python-cpp-go-java-v7");
+    assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v10");
+    assert_eq!(result.get("extraction_policy").text(), "rust-use-tree-js-literal-loads-python-cpp-go-java-v8");
     assert_eq!(result.get("completeness_scope").text(), "parsed-source-imports-in-saved-manifest");
     assert!(!result.get("compiler_resolved").flag());
     assert!(!result.get("semantic_complete").flag());

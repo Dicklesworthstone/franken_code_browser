@@ -20,6 +20,59 @@ use fcb_app::host::{HostResponse, atlas_session::{AtlasSession, AtlasSessionOpti
 use support::{Json, parse};
 
 #[test]
+fn explicit_rust_module_paths_navigate_exact_retained_sources() {
+    let statement = b"#[path = \"platform/custom.rs\"] pub(crate) mod child;";
+    let source = [b"// captured module\n".as_slice(), statement, b"\n"].concat();
+    let target = b"pub const VALUE: usize = 7;\n";
+    let mut f = Fixture::raw(&[(b"src/\xff/parent.rs", &source), (b"src/\xff/platform/custom.rs", target)]);
+    f.build(1); let page = f.prepare(1, 1);
+    assert!(page.get("relationships_complete").flag());
+    assert_eq!(page.get("links_seen").number(), 1);
+    let row = link(&page, b"src/\xff/parent.rs", "platform/custom.rs");
+    assert_eq!(row.get("lexical_import_kind").text(), "rust-path-module");
+    assert_eq!(row.get("resolution_basis").text(), "rust-path-attribute-candidate");
+    assert_eq!(range(row.get("evidence_range"), &source), statement);
+    assert_eq!(range(row.get("specifier_range"), &source), b"platform/custom.rs");
+    assert_eq!(row.get("target_path").get("hex").text(), hex(b"src/\xff/platform/custom.rs"));
+    let incoming = f.page(1, Direction::Incoming, Some(b"src/\xff/platform/custom.rs"), 0, 64);
+    assert_eq!(incoming.get("links").array(), page.get("links").array());
+    assert_eq!(incoming.get("source_bytes_read").number(), 0);
+    fs::write(f.root.join(OsStr::from_bytes(b"src/\xff/parent.rs")), b"mod replacement;").unwrap();
+    fs::write(f.root.join(OsStr::from_bytes(b"src/\xff/platform/custom.rs")), b"replacement").unwrap();
+    let id = row.get("link_id").number();
+    let (evidence, receipt) = f.search.open_import_reader(&f.atlas, owner(73180), 1, id, Side::Evidence, || false).unwrap();
+    assert_eq!(json(&receipt).get("relationship"), row);
+    let (reader, receipt) = f.search.open_import_reader(&f.atlas, owner(73181), 1, id, Side::Target, || false).unwrap();
+    let receipt = json(&receipt);
+    assert_eq!(receipt.get("source_sha256").text(), Sha256::digest(target).to_hex());
+    assert!(!receipt.get("source_reopened").flag()); assert!(!receipt.get("compiler_resolved").flag());
+    f.search.clear_index(&f.atlas, 2, || false).unwrap();
+    assert_eq!(evidence.capture().bytes(), source);
+    assert_eq!(reader.capture().bytes(), target);
+}
+
+#[test]
+fn explicit_rust_module_paths_withhold_conditional_missing_and_escaping_targets() {
+    let source = b"#[path = \"../outside.rs\"] mod escape;\n\
+        #[path = \"missing.rs\"] mod missing;\n\
+        #[cfg(test)] #[path = \"child.rs\"] mod conditional;\n\
+        #[path = \"child.rs\"] mod supported;\n";
+    let mut f = Fixture::new(&[("main.rs", source), ("child.rs", b"pub const VALUE: usize = 7;"),
+        ("missing.rs.rs", b"pub const VALUE: usize = 9;")]);
+    f.build(1); let page = f.prepare(1, 1);
+    for (destination, resolution) in [("../outside.rs", "unresolved"), ("missing.rs", "missing"), ("conditional", "unresolved")] {
+        let row = link(&page, b"main.rs", destination);
+        assert_eq!(row.get("resolution").text(), resolution);
+        assert_eq!(row.get("target_file_id"), &Json::Null);
+        assert!(f.search.open_import_reader(&f.atlas, owner(73182), 1,
+            row.get("link_id").number(), Side::Target, || false).is_err());
+    }
+    let supported = link(&page, b"main.rs", "child.rs");
+    assert_eq!(supported.get("resolution").text(), "captured");
+    assert_eq!(supported.get("resolution_basis").text(), "rust-path-attribute-candidate");
+}
+
+#[test]
 fn typescript_emitted_extensions_navigate_retained_sources_and_reverse_links() {
     let source = b"import { value } from './child.js';\nexport { value } from './child.js';\n";
     let child = b"export const value: number = 7;\n";
@@ -144,9 +197,9 @@ fn coverage(page: &Json) {
     assert_eq!(page.get("evidence_precision").text(), "exact-import-source-range");
     assert_eq!(page.get("relationship_kind").text(), "lexical-import");
     assert_eq!(page.get("resolution_domain").text(), "declared-catalog-candidates");
-    assert_eq!(page.get("extractor").text(), "franken-markdown-d6fbd1d5/import-statements-v7");
-    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v9");
-    assert_eq!(page.get("extraction_policy").text(), "rust-use-tree-js-literal-loads-python-cpp-go-java-v7");
+    assert_eq!(page.get("extractor").text(), "franken-markdown-d6fbd1d5/import-statements-v8");
+    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v10");
+    assert_eq!(page.get("extraction_policy").text(), "rust-use-tree-js-literal-loads-python-cpp-go-java-v8");
     assert!(!page.get("compiler_resolved").flag()); assert!(!page.get("semantic_complete").flag());
     assert_eq!(page.get("source_files").number(), page.get("captured_source_files").number()
         + page.get("capture_unavailable_source_files").number() + page.get("outside_capture_scope_source_files").number()
@@ -907,7 +960,7 @@ fn python_relative_imports_share_incoming_navigation_and_exact_retained_readers(
     let page = f.prepare(1, 1);
     assert!(page.get("relationships_complete").flag(), "{page:?}");
     assert_eq!(page.get("retained_links").number(), 5);
-    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v9");
+    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v10");
 
     let row = link(&page, b"pkg/main.py", ".worker");
     assert_eq!(row.get("language").text(), "python");
