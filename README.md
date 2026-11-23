@@ -223,11 +223,16 @@ paths; unsubmitted note-editor drafts remain protected separately. See
 opt-in, storage limits and pending native verification.
 
 **Captured workspace search reaches later matches.** With **Captured index**
-enabled, Text and Expression searches offer **Previous results** and **Next
-results** beyond the first 1,000 hits. Every window uses the same retained
-captures and exact query scope, with bounded witnesses, separate total counts
-and explicit partial coverage. The accepted results and reader survive canceled
-or failed replacements. See [later result windows](native/macos/README.md#later-result-windows-in-a-captured-index).
+enabled, Text, Expression, Symbols, Headings and Occurrences searches offer
+**Previous results** and **Next results** beyond the first 1,000 hits. Every
+window uses the same retained captures, exact query scope and name-matching
+mode, with bounded witnesses, separate total counts and explicit partial
+coverage. Structural windows skip matching ordinals without retaining the
+earlier rows; **Count all matches** can finish counting while keeping only the
+selected window. Extractor limits and missing captures remain visible, and
+lexical counts never claim compiler semantics. The accepted results and reader
+survive canceled or failed replacements. See
+[later result windows](native/macos/README.md#later-result-windows-in-a-captured-index).
 Executable and physical-Mac verification remain pending.
 
 **Project relationships keep your reading place.** Documentation links and

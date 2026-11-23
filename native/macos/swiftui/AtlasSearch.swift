@@ -285,6 +285,9 @@ struct AtlasSearchStructure: Hashable, Sendable {
     let candidate: UInt64
     let headingSlug: String?
     let evidenceStart, evidenceEnd: UInt64
+    /// One-based match ordinal across the frozen captured-index query. Legacy
+    /// and live extraction do not provide a cross-window occurrence identity.
+    var occurrence: UInt64? = nil
     var mode: AtlasSearchMode {
         evidence == AtlasSearchMode.occurrences.evidence ? .occurrences : (headingSlug == nil ? .symbols : .headings)
     }
@@ -298,6 +301,7 @@ struct AtlasSearchStructure: Hashable, Sendable {
             && a.language == b.language && a.evidence == b.evidence && a.candidate == b.candidate
             && AtlasSearchText.sameActualText(a.headingSlug, b.headingSlug)
             && a.evidenceStart == b.evidenceStart && a.evidenceEnd == b.evidenceEnd
+            && a.occurrence == b.occurrence
     }
     func hash(into hasher: inout Hasher) {
         hasher.combine(name.utf8.count)
@@ -306,6 +310,7 @@ struct AtlasSearchStructure: Hashable, Sendable {
         hasher.combine(headingSlug != nil)
         if let headingSlug { for byte in headingSlug.utf8 { hasher.combine(byte) } }
         hasher.combine(evidenceStart); hasher.combine(evidenceEnd)
+        hasher.combine(occurrence)
     }
 }
 
@@ -425,9 +430,9 @@ struct AtlasSearchReport: Sendable {
             noun = caseSensitive ? (nounCount == 1 ? "exact match" : "exact matches")
                 : (nounCount == 1 ? "case-insensitive match" : "case-insensitive matches")
         case .expression: noun = nounCount == 1 ? "expression match" : "expression matches"
-        case .symbols: noun = count == 1 ? "symbol candidate" : "symbol candidates"
-        case .headings: noun = count == 1 ? "heading" : "headings"
-        case .occurrences: noun = count == 1 ? "whole-token occurrence" : "whole-token occurrences"
+        case .symbols: noun = nounCount == 1 ? "symbol candidate" : "symbol candidates"
+        case .headings: noun = nounCount == 1 ? "heading" : "headings"
+        case .occurrences: noun = nounCount == 1 ? "whole-token occurrence" : "whole-token occurrences"
         }
         let qualification = mode == .symbols
             ? " Heuristic declaration candidates; compiler resolution and reference completeness are not claimed."
@@ -443,8 +448,18 @@ struct AtlasSearchReport: Sendable {
             var result = "\(found); \(shown)."
             if !complete {
                 result += " Search coverage is partial."
-                if unavailableFiles > 0 { result += " \(unavailableFiles) unavailable files." }
-                if unsupportedFiles > 0 { result += " \(unsupportedFiles) unsupported text files." }
+                if let coverage = structureCoverage {
+                    if unavailableFiles > 0 { result += " \(unavailableFiles) files with unavailable or incomplete analysis." }
+                    if coverage.unsupportedFiles > 0 {
+                        let reason = mode == .occurrences ? "files with unsupported text encoding" : "unsupported languages"
+                        result += " \(coverage.unsupportedFiles) \(reason) within that total."
+                    }
+                    if coverage.extractionLimitedFiles > 0 { result += " \(coverage.extractionLimitedFiles) files reached extraction limits." }
+                    if coverage.metadataOmitted > 0 { result += " \(coverage.metadataOmitted) matching results omitted by metadata limits." }
+                } else {
+                    if unavailableFiles > 0 { result += " \(unavailableFiles) unavailable files." }
+                    if unsupportedFiles > 0 { result += " \(unsupportedFiles) unsupported text files." }
+                }
             }
             if window.hasMore { result += " Next results opens the following window from these same captures." }
             return result + qualification
@@ -759,6 +774,7 @@ struct AtlasSearchResultWindowSource: Sendable {
     let fileScope: AtlasSearchFileScope
     let pathScope: AtlasSearchPathScope
     let mode: AtlasSearchMode
+    let nameMode: AtlasSearchNameMode
     let caseSensitive, countAllMatches: Bool
     let discoveryPolicy: AtlasDiscoveryPolicy
     let catalogScope: AtlasSearchCatalogScope
@@ -766,6 +782,7 @@ struct AtlasSearchResultWindowSource: Sendable {
     init(index: UUID, input: AtlasSearchInput, countAllMatches: Bool) {
         self.index = index; root = input.root; query = input.query
         fileScope = input.fileScope; pathScope = input.pathScope; mode = input.mode
+        nameMode = input.nameMode
         caseSensitive = input.caseSensitive; self.countAllMatches = countAllMatches
         discoveryPolicy = input.discoveryPolicy
         catalogScope = input.catalogScope
@@ -773,6 +790,7 @@ struct AtlasSearchResultWindowSource: Sendable {
     func matches(_ input: AtlasSearchInput, countAllMatches: Bool) -> Bool {
         root.utf8.elementsEqual(input.root.utf8) && query.utf8.elementsEqual(input.query.utf8)
             && fileScope == input.fileScope && pathScope == input.pathScope && mode == input.mode
+            && nameMode == input.nameMode
             && caseSensitive == input.caseSensitive && self.countAllMatches == countAllMatches
             && discoveryPolicy == input.discoveryPolicy && catalogScope == input.catalogScope
     }
@@ -790,6 +808,10 @@ struct AtlasSearchResultWindow: Sendable {
     let retained: Int
     let hasMore: Bool
     let nextOffset: UInt64?
+    /// Structural metadata limits can omit rows inside a covered window. The
+    /// following request advances by match ordinals, not by displayed rows.
+    var covered: UInt64? = nil
+    var coveredMatches: UInt64 { covered ?? UInt64(retained) }
 
     var previous: AtlasSearchResultWindowRequest? {
         guard offset > 0 else { return nil }
@@ -797,10 +819,13 @@ struct AtlasSearchResultWindow: Sendable {
             offset: offset > Self.capacity ? offset - Self.capacity : 0)
     }
     var next: AtlasSearchResultWindowRequest? {
-        guard hasMore, let nextOffset, retained > 0, nextOffset > offset else { return nil }
+        guard hasMore, let nextOffset, coveredMatches > 0, nextOffset > offset else { return nil }
         return AtlasSearchResultWindowRequest(source: source, offset: nextOffset)
     }
     var rangeLabel: String {
+        if coveredMatches > UInt64(retained) {
+            return "showing \(retained) retained matches from matches \(offset + 1)–\(offset + coveredMatches)"
+        }
         guard retained > 0 else { return "no retained matches in this window" }
         return "showing matches \(offset + 1)–\(offset + UInt64(retained))"
     }
@@ -821,7 +846,7 @@ struct AtlasSearchInput: Sendable {
     let discoveryPolicy: AtlasDiscoveryPolicy
     let catalogScope: AtlasSearchCatalogScope
     let resultWindow: AtlasSearchResultWindowRequest?
-    var countsLiveMatches: Bool { countAllMatches ?? (mode == .text && caseSensitive) }
+    var countsLiveMatches: Bool { mode.isTextual && (countAllMatches ?? (mode == .text && caseSensitive)) }
     func countsIndexedMatches(supportsCounting: Bool) -> Bool {
         countAllMatches ?? (mode == .text && caseSensitive && supportsCounting)
     }
@@ -846,12 +871,12 @@ struct AtlasSearchInput: Sendable {
         self.mode = mode
         self.nameMode = mode.effectiveNameMode(nameMode)
         self.caseSensitive = mode.isTextual ? caseSensitive : true
-        self.countAllMatches = mode.isTextual ? countAllMatches : false
+        self.countAllMatches = countAllMatches
         self.discoveryPolicy = discoveryPolicy
         self.catalogScope = catalogScope
         self.resultWindow = resultWindow
         if let resultWindow {
-            guard mode.isTextual, resultWindow.offset <= 32 * 1024 * 1024,
+            guard resultWindow.offset <= 32 * 1024 * 1024,
                   resultWindow.source.matches(self,
                     countAllMatches: self.countAllMatches ?? resultWindow.source.countAllMatches) else {
                 throw AtlasSearchError.invalidRequest

@@ -616,7 +616,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
 
     private var wantsCapturedIndex: Bool { useCapturedIndex }
     private var effectiveSearchCaseSensitive: Bool { !searchMode.isTextual || searchCaseSensitive }
-    private var effectiveSearchCountAllMatches: Bool { searchMode.isTextual && searchCountAllMatches }
+    private var effectiveSearchCountAllMatches: Bool { (searchMode.isTextual || wantsCapturedIndex) && searchCountAllMatches }
     private var overlayIsCurrent: Bool {
         !hasRetainedAtlas && searchIsCurrent && overlayContentRevision == atlasResidency.contentRevision
     }
@@ -1207,6 +1207,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                     .disabled(loadingProject || root.isEmpty)
                     .help("When off, compare using Unicode lowercase. Results retain the original source spelling and byte ranges.")
                     .padding(.horizontal, 10).padding(.top, 6)
+            }
+            if searchMode.isTextual || wantsCapturedIndex {
                 Toggle("Count all matches", isOn: $searchCountAllMatches)
                     .toggleStyle(.checkbox)
                     .font(.caption)

@@ -1435,8 +1435,10 @@ exhaustive total while retaining only the first 1,000 selectable matches.
 Eligible files outside the captured scope, unavailable captures and verification
 limits still leave the count explicitly partial. Turn counting off to stop when
 an additional match proves the navigation-row limit was exceeded. Changing the
-choice starts a fresh query; structural modes keep their separate bounded-result
-contracts. Live capture and index preparation admit at most 4,096 files, 1 MiB per file and 32 MiB of
+choice starts a fresh query. Symbols, Headings and Occurrences also offer counting
+when **Captured index** is enabled, within their declared extraction policy and
+source limits. Live structural queries keep their bounded-result contracts.
+Live capture and index preparation admit at most 4,096 files, 1 MiB per file and 32 MiB of
 aggregate source-read work. A prepared index additionally admits at most 2,097,152 grams;
 files without usable gram coverage use retained-source verification. Each
 expression has a separate **256 MiB verification-work budget**, shared across
@@ -1460,17 +1462,32 @@ verification remain pending.
 ### Later result windows in a captured index
 
 With **Captured index** enabled, **Previous results** and **Next results** reach
-matches after the first 1,000 for Text and Expression searches. The sidebar
+matches after the first 1,000 for Text, Expression, Symbols, Headings and
+Occurrences searches. The sidebar
 shows the current ordinal range separately from the total count and coverage.
 Each window keeps at most 1,000 exact source witnesses, while a completed count
 can include every match in the admitted captures.
 
 Changing windows verifies the same immutable captures with the same query,
-case choice, counting choice, file types and location scope. It performs no
+case choice, name-matching mode, counting choice, file types and location scope. It performs no
 additional source reads. Skipped matches still consume the verification-work
 budget, so a far window can remain partial when that budget is exhausted.
 Next is available only when the engine has actually observed a later match;
 an absent Next button does not make partial coverage complete.
+
+Structural windows skip matching ordinals without retaining earlier rows.
+**Count all matches** continues through admitted sources after the selected
+window fills, so a complete count can accompany truncated row storage. Each
+retained structural result carries its global match ordinal as well as the
+query-local ID used for activation. Oversized names or other metadata omissions
+consume their ordinal positions; Next can advance even when that window retains
+no selectable rows. The summary reports those omissions and incomplete coverage.
+
+Symbols remain heuristic declarations, Headings use the shared Markdown parser,
+and Occurrences remain whole-token text candidates, including comments and
+literals. Counting does not remove per-file extractor limits or recover sources
+outside the captured scope. Those conditions keep coverage explicitly partial;
+none of these totals claims compiler reference resolution.
 
 The accepted rows and current reader stay available while a later window is
 prepared. A failed or canceled replacement preserves them. Refresh, a changed
@@ -1481,6 +1498,7 @@ a different occurrence with the same local row number.
 
 The shared engine, host, C ABI, native worker and transport have regression
 sources for later windows, overlapping matches, UTF-16, expression predicates,
+all three structural modes, metadata omissions, independent counting,
 cancellation, scope changes and retained reader ownership. Executable Rust/Swift
 and physical-Mac verification remain pending.
 

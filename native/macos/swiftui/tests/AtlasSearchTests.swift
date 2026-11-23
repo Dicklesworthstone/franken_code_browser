@@ -456,8 +456,8 @@ import Foundation
         check(countedExpression.countsLiveMatches && countedExpression.countsIndexedMatches(supportsCounting: true),
             "Expressions and Unicode lowercase text can request full counts")
         let structuralCount = try AtlasSearchInput(root: "/project", query: "name", mode: .symbols, countAllMatches: true)
-        check(!structuralCount.countsLiveMatches && !structuralCount.countsIndexedMatches(supportsCounting: true),
-            "Inactive text count preference cannot alter structural searches")
+        check(!structuralCount.countsLiveMatches && structuralCount.countsIndexedMatches(supportsCounting: true),
+            "Captured structural windows can count exhaustively while live extraction stays bounded")
         let countedContext = AtlasSearchContext(root: "/project", query: "x", loadGeneration: UUID(),
             atlasRevision: UUID(), scope: "all", customExtensions: "", countAllMatches: true)
         var boundedContext = countedContext; boundedContext.countAllMatches = false

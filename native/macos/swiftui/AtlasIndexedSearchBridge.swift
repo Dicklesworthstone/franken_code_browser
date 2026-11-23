@@ -64,6 +64,11 @@ private func indexedWindowQueryBegin(_ h: UInt64, _ g: UInt64, _ index: UInt64,
     _ h: UInt64, _ g: UInt64, _ index: UInt64, _ mode: UInt64, _ nameMode: UInt64,
     _ text: UnsafePointer<CChar>?, _ extensions: UnsafePointer<CChar>?, _ filenames: UnsafePointer<CChar>?,
     _ pathKind: UInt64, _ path: UnsafePointer<CChar>?, _ hits: UInt64, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_atlas_structure_indexed_begin_window") private func indexedStructureWindowQueryBegin(
+    _ h: UInt64, _ g: UInt64, _ index: UInt64, _ mode: UInt64, _ nameMode: UInt64,
+    _ text: UnsafePointer<CChar>?, _ extensions: UnsafePointer<CChar>?, _ filenames: UnsafePointer<CChar>?,
+    _ pathKind: UInt64, _ path: UnsafePointer<CChar>?, _ countAll: UInt64, _ skip: UInt64,
+    _ hits: UInt64, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_index_open_reader") private func indexedReader(_ h: UInt64, _ reader: UInt64,
     _ index: UInt64, _ file: UInt64, _ revision: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_close") private func indexedClose(_ h: UInt64) -> UInt8
@@ -158,6 +163,17 @@ extension AtlasIndexedSearchTransport {
                         kind, path, caseSensitive ? 1 : 0, expression ? 1 : 0, countAll ? 1 : 0,
                         skip, AtlasSearchResultWindow.capacity,
                         expression ? AtlasSearchExpression.scanLimit : 32 * 1024 * 1024))
+                }
+            }
+        }
+    }, structureWindowQueryBegin: { h, g, index, mode, nameMode, query, scope, pathScope, countAll, skip in
+        guard !mode.isTextual, skip <= 32 * 1024 * 1024 else { throw AtlasSearchError.invalidRequest }
+        return try query.withCString { text in
+            try scope.withCStrings { extensions, filenames in
+                try pathScope.withCString { kind, path in
+                    try take(indexedStructureWindowQueryBegin(h, g, index, mode.code, mode.effectiveNameMode(nameMode).code,
+                        text, extensions, filenames, kind, path, countAll ? 1 : 0, skip,
+                        AtlasSearchResultWindow.capacity, 32 * 1024 * 1024))
                 }
             }
         }

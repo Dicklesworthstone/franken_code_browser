@@ -8,15 +8,17 @@ import Foundation
         precondition(value(), label); checks += 1
     }
     private static func firstInput(countAll: Bool = true, mode: AtlasSearchMode = .text,
-                                   caseSensitive: Bool = true) throws -> AtlasSearchInput {
+                                   caseSensitive: Bool = true,
+                                   nameMode: AtlasSearchNameMode = .contains) throws -> AtlasSearchInput {
         try AtlasSearchInput(root: "/repo", query: "x", mode: mode,
-            caseSensitive: caseSensitive, countAllMatches: countAll)
+            nameMode: nameMode, caseSensitive: caseSensitive, countAllMatches: countAll)
     }
     private static func input(_ request: AtlasSearchResultWindowRequest) throws -> AtlasSearchInput {
         let source = request.source
         return try AtlasSearchInput(root: source.root, query: source.query, fileScope: source.fileScope,
-            pathScope: source.pathScope, mode: source.mode, caseSensitive: source.caseSensitive,
-            countAllMatches: source.countAllMatches, discoveryPolicy: source.discoveryPolicy, resultWindow: request)
+            pathScope: source.pathScope, mode: source.mode, nameMode: source.nameMode, caseSensitive: source.caseSensitive,
+            countAllMatches: source.countAllMatches, discoveryPolicy: source.discoveryPolicy,
+            catalogScope: source.catalogScope, resultWindow: request)
     }
     private static func run(_ worker: AtlasIndexedSearch, _ input: AtlasSearchInput,
                             grant: AnyObject? = nil, flag: AtlasSearchCancellation = AtlasSearchCancellation(),
@@ -215,6 +217,143 @@ import Foundation
                 "Known following matches stay navigable without upgrading partial membership to complete")
             let legacy = try run(AtlasIndexedSearch(transport: IndexedFixture().countedTransport), firstInput())
             check(legacy.resultWindow == nil, "Older transports keep usable bounded results without unsupported continuation")
+        }
+        for mode in [AtlasSearchMode.symbols, .headings, .occurrences] {
+            let f = fixture(), worker = AtlasIndexedSearch(transport: f.structuralWindowTransport)
+            let first = try run(worker, firstInput(mode: mode, nameMode: .prefix))
+            check(first.complete && first.matchCountComplete && first.truncated && first.matchesSeen == 3025
+                && first.hits.count == 1000 && first.hits.first?.structure?.occurrence == 1,
+                "Counted \(mode.rawValue) retains the first bounded evidence window and the complete total")
+            let selected = first.capture!.target(first.hits[0])!
+            let next = try run(worker, input(first.resultWindow!.next!))
+            check(next.hits.first?.structure?.occurrence == 1001 && next.hits.last?.structure?.occurrence == 2000
+                && next.resultWindow?.next?.offset == 2000 && next.resultWindow?.previous?.offset == 0,
+                "Later \(mode.rawValue) windows preserve global occurrence identities and bounded row IDs")
+            check(next.hits.first?.id == 0 && first.capture?.target(next.hits[0]) == nil
+                && next.capture?.target(first.hits[0]) == nil && first.streamID != next.streamID,
+                "Window-local structural row IDs cannot alias another window's source evidence")
+            let back = try run(worker, input(next.resultWindow!.previous!))
+            check(back.hits.first?.structure == first.hits.first?.structure
+                && back.nameMode == mode.effectiveNameMode(.prefix),
+                "Previous restores identical evidence with the frozen structural name policy")
+            _ = try selected.openReader(100)
+            check(f.count("create:") == 1 && f.count("build-step:") == 1 && f.count("source:") == 1,
+                "Structural windows and previously selected readers use the original captures")
+            let beyond = AtlasSearchResultWindowRequest(source: first.resultWindow!.source, offset: 4000)
+            let empty = try run(worker, input(beyond))
+            check(empty.complete && empty.hits.isEmpty && empty.matchesSeen == 3025
+                && empty.resultWindow?.coveredMatches == 0 && empty.resultWindow?.next == nil,
+                "A structural window past the total is explicitly empty")
+            if mode.supportsNameMatching {
+                do {
+                    _ = try AtlasSearchInput(root: "/repo", query: "x", mode: mode, nameMode: .exact,
+                        countAllMatches: true, resultWindow: first.resultWindow!.next!)
+                    preconditionFailure("Structural continuation changed its name policy")
+                } catch AtlasSearchError.invalidRequest { checks += 1 }
+            }
+        }
+        do {
+            let f = fixture(count: 9001)
+            f.configure { $0.captureBytes = 32768; $0.encoding = "utf16le" }
+            let worker = AtlasIndexedSearch(transport: f.structuralWindowTransport)
+            let first = try run(worker, firstInput(mode: .occurrences))
+            let later = AtlasSearchResultWindowRequest(source: first.resultWindow!.source, offset: 9000)
+            let last = try run(worker, input(later))
+            check(first.matchesSeen == 9001 && first.matchCountComplete && last.hits.count == 1
+                && last.hits[0].structure?.occurrence == 9001 && last.hits[0].start == 18000
+                && last.hits[0].end == 18002 && last.resultWindow?.next == nil,
+                "Counted occurrences can cross the former per-file extraction ceiling with original UTF-16 ranges")
+            let reader = try last.capture!.target(last.hits[0])!.openReader(100)
+            check(reader.contains("utf16le"), "A later occurrence opens its immutable original encoding")
+        }
+        do {
+            let f = fixture(count: 2001), worker = AtlasIndexedSearch(transport: f.structuralWindowTransport)
+            let first = try run(worker, firstInput(countAll: false, mode: .headings))
+            check(!first.complete && !first.matchCountComplete && first.matchesSeen == 1001
+                && first.resultWindow?.next?.offset == 1000,
+                "Noncounted structural windows stop after a verified lookahead")
+            let middle = try run(worker, input(first.resultWindow!.next!))
+            let last = try run(worker, input(middle.resultWindow!.next!))
+            check(last.complete && last.hits.count == 1 && last.hits[0].structure?.occurrence == 2001
+                && last.summary.contains("2001 headings") && last.summary.contains("2001–2001"),
+                "The final bounded structural window can prove completion and report the full observed total")
+        }
+        for omitted in [7, 1000] {
+            let f = fixture()
+            f.configure { $0.structureMetadataOmitted = omitted }
+            let worker = AtlasIndexedSearch(transport: f.structuralWindowTransport)
+            let first = try run(worker, firstInput(mode: .symbols))
+            check(!first.complete && !first.matchCountComplete && first.hits.count == 1000 - omitted
+                && first.resultWindow?.coveredMatches == 1000 && first.resultWindow?.next?.offset == 1000
+                && first.summary.contains("matching results omitted by metadata limits"),
+                "Structural metadata omissions stay partial and advance by covered matches, including empty row windows")
+            let second = try run(worker, input(first.resultWindow!.next!))
+            check(second.resultWindow?.offset == 1000 && second.resultWindow?.next?.offset == 2000
+                && (second.hits.first?.structure?.occurrence ?? 0) == (omitted == 1000 ? 0 : UInt64(1001 + omitted)),
+                "Omitted metadata cannot repeat a prior structural window or trap Next on the same offset")
+        }
+        do {
+            let f = fixture(files: 2), worker = AtlasIndexedSearch(transport: f.structuralWindowTransport)
+            let accepted = try run(worker, firstInput(mode: .symbols))
+            let selected = accepted.capture!.target(accepted.hits[0])!
+            let flag = AtlasSearchCancellation()
+            do {
+                _ = try run(worker, input(accepted.resultWindow!.next!), flag: flag) { report in
+                    if !report.hits.isEmpty { flag.cancel() }
+                }
+                preconditionFailure("Canceled structural window was delivered")
+            } catch AtlasSearchError.canceled { checks += 1 }
+            _ = try selected.openReader(100)
+            let retry = try run(worker, input(accepted.resultWindow!.next!))
+            check(retry.hits.first?.structure?.occurrence == 1001 && accepted.hits.first?.structure?.occurrence == 1
+                && f.count("create:") == 1 && f.count("build-step:") == 2,
+                "Canceling a structural continuation preserves accepted results and reader authority without recapture")
+        }
+        for defect in ["covered", "missing-covered", "omitted", "missing-occurrence", "zero-occurrence",
+                       "past-window", "duplicate", "name-mode", "count-policy", "metadata-drift"] {
+            let f = fixture(), worker = AtlasIndexedSearch(transport: f.structuralWindowTransport)
+            let accepted = try run(worker, firstInput(mode: .symbols))
+            f.patch { phase, original in
+                var wire = original
+                guard ["query-begin", "query-step", "page"].contains(phase) else { return wire }
+                switch defect {
+                case "covered": wire["window_matches"] = "1001"
+                case "missing-covered": wire.removeValue(forKey: "window_matches")
+                case "omitted": wire["structure_metadata_omitted"] = "1"
+                case "name-mode": wire["name_mode"] = "exact"
+                case "count-policy": wire["count_all_matches"] = false
+                default:
+                    guard var rows = wire["hits"] as? [[String: Any]], !rows.isEmpty else { return wire }
+                    let at = defect == "duplicate" ? 1 : 0
+                    var structure = rows[at]["structure"] as! [String: Any]
+                    switch defect {
+                    case "missing-occurrence": structure.removeValue(forKey: "occurrence_id")
+                    case "zero-occurrence": structure["occurrence_id"] = "0"
+                    case "past-window": structure["occurrence_id"] = "2001"
+                    case "duplicate": structure["occurrence_id"] = (rows[0]["structure"] as! [String: Any])["occurrence_id"]
+                    default: if phase == "page" { structure["occurrence_id"] = "1001" }
+                    }
+                    rows[at]["structure"] = structure; wire["hits"] = rows
+                }
+                return wire
+            }
+            do { _ = try run(worker, input(accepted.resultWindow!.next!))
+                preconditionFailure("Invalid structural window accepted: " + defect) }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
+            f.patch { _, wire in wire }
+            _ = try accepted.capture!.target(accepted.hits[0])!.openReader(100)
+            check(accepted.resultWindow?.offset == 0 && accepted.hits[0].structure?.occurrence == 1,
+                "Rejected structural \(defect) reply preserves accepted evidence and reader ownership")
+        }
+        do {
+            let f = IndexedFixture(), worker = AtlasIndexedSearch(transport: f.structuralTransport)
+            do { _ = try run(worker, firstInput(mode: .symbols))
+                preconditionFailure("Legacy structural transport discarded explicit counting") }
+            catch AtlasSearchError.unsupportedCounting { checks += 1 }
+            check(f.count("create:") == 0, "Unsupported structural counting fails before discovery or capture")
+            let legacy = try run(worker, firstInput(countAll: false, mode: .symbols))
+            check(legacy.complete && legacy.resultWindow == nil && legacy.hits.first?.structure?.occurrence == nil,
+                "Legacy structural transports retain their existing bounded evidence contract")
         }
         print("AtlasIndexedResultWindowTests: \(checks) checks passed")
     }

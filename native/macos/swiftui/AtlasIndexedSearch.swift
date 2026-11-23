@@ -36,6 +36,10 @@ struct AtlasIndexedSearchTransport: Sendable {
     /// index. The Bool arguments are case-sensitive, expression and count-all.
     var windowQueryBegin: (@Sendable (UInt64, UInt64, UInt64, String, AtlasSearchFileScope,
         AtlasSearchPathScope, Bool, Bool, Bool, UInt64) throws -> String?)? = nil
+    /// Structural result windows retain extractor evidence and matching policy
+    /// while borrowing the same immutable captures as the first result window.
+    var structureWindowQueryBegin: (@Sendable (UInt64, UInt64, UInt64, AtlasSearchMode, AtlasSearchNameMode,
+        String, AtlasSearchFileScope, AtlasSearchPathScope, Bool, UInt64) throws -> String?)? = nil
     /// Legacy openers retain repository-rules defaults; explicit opt-in must
     /// never silently reuse their narrower discovery universe.
     var openWithPolicy: (@Sendable (UInt64, String, AtlasDiscoveryPolicy, AtlasSearchCancellation) throws -> String?)? = nil
@@ -162,7 +166,8 @@ final class AtlasIndexedSearch: @unchecked Sendable {
         guard input.discoveryPolicy == .repositoryRules || transport.hasPolicyOpener(for: input.catalogScope) else {
             throw AtlasSearchError.unsupportedDiscoveryPolicy
         }
-        let usesWindows = input.mode.isTextual && transport.windowQueryBegin != nil
+        let usesWindows = input.mode.isTextual ? transport.windowQueryBegin != nil
+            : transport.structureWindowQueryBegin != nil
         let resultOffset: UInt64? = usesWindows ? (input.resultWindow?.offset ?? 0) : nil
         let countAllMatches = input.countsIndexedMatches(
             supportsCounting: transport.countedQueryBegin != nil || usesWindows)
@@ -172,7 +177,8 @@ final class AtlasIndexedSearch: @unchecked Sendable {
             }
         }
         if !input.mode.isTextual {
-            guard transport.structureQueryBegin != nil else { throw AtlasSearchError.unavailable }
+            guard usesWindows || transport.structureQueryBegin != nil else { throw AtlasSearchError.unavailable }
+            guard !countAllMatches || usesWindows else { throw AtlasSearchError.unsupportedCounting }
         } else if usesWindows {
             // This single capability admits every textual query policy.
         } else if countAllMatches {
@@ -217,6 +223,10 @@ final class AtlasIndexedSearch: @unchecked Sendable {
             try check(cancellation)
             let began = try owner.call { handle -> String? in
                 if !input.mode.isTextual {
+                    if let window = transport.structureWindowQueryBegin {
+                        return try window(handle, generation, basis.index, input.mode, input.nameMode,
+                            query, scope, pathScope, countAllMatches, resultOffset ?? 0)
+                    }
                     guard let structure = transport.structureQueryBegin else { throw AtlasSearchError.unavailable }
                     return try structure(handle, generation, basis.index, input.mode, input.nameMode, query, scope, pathScope)
                 }
@@ -276,7 +286,7 @@ final class AtlasIndexedSearch: @unchecked Sendable {
                     AtlasSearchResultWindow(source: AtlasSearchResultWindowSource(index: session.id,
                         input: input, countAllMatches: countAllMatches),
                         offset: receipt.offset, skipped: receipt.skipped, retained: state.retained,
-                        hasMore: receipt.hasMore, nextOffset: receipt.next)
+                        hasMore: receipt.hasMore, nextOffset: receipt.next, covered: receipt.covered)
                 } : nil
                 let report = AtlasSearchReport(hits: result.hits.map(\.hit), complete: state.complete,
                     truncated: state.truncated, unavailableFiles: state.unavailable,

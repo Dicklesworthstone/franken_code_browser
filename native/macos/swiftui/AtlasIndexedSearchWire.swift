@@ -235,7 +235,8 @@ enum AtlasIndexedStructure {
         return try AtlasSearchStructure(name: value.text("name"), kind: value.text("kind"),
             language: value.text("language"), evidence: value.text("evidence_level"),
             candidate: value.number("candidate_id"), headingSlug: value.optionalText("heading_slug"),
-            evidenceStart: range.number("start"), evidenceEnd: range.number("end"))
+            evidenceStart: range.number("start"), evidenceEnd: range.number("end"),
+            occurrence: value.optionalNumber("occurrence_id"))
     }
 
     static func accepts(_ hit: SearchHit, mode: AtlasSearchMode, needle: String) -> Bool {
@@ -269,7 +270,7 @@ enum AtlasIndexedStructure {
 
     static func coverage(_ w: AtlasIndexWire, mode: AtlasSearchMode, nameMode: AtlasSearchNameMode,
                          scanned: Int, examined: Int, unavailable: Int, retained: Int,
-                         matches: UInt64) throws -> AtlasSearchStructureCoverage? {
+                         matches: UInt64, window: AtlasIndexedResultWindow?) throws -> AtlasSearchStructureCoverage? {
         if mode == .occurrences {
             guard nameMode == .exact, try w.flag("includes_comments_and_literals"),
                   try !w.flag("compiler_resolved"),
@@ -302,30 +303,40 @@ enum AtlasIndexedStructure {
         guard coverage.fileByteLimit == mode.structureFileByteLimit,
               coverage.unsupportedFiles + coverage.extractionLimitedFiles <= unavailable,
               coverage.unsupportedFiles + scanned <= examined,
-              coverage.metadataOmitted == 0 || unavailable > 0,
-              matches <= 4096 * 4096,
-              matches <= UInt64(retained + coverage.metadataOmitted + 1) else { throw AtlasIndexWire.invalid() }
+              coverage.metadataOmitted == 0 || unavailable > 0 else { throw AtlasIndexWire.invalid() }
+        if let window {
+            guard window.covered == UInt64(retained + coverage.metadataOmitted) else { throw AtlasIndexWire.invalid() }
+        } else {
+            guard matches <= 4096 * 4096,
+                  matches <= UInt64(retained + coverage.metadataOmitted + 1) else { throw AtlasIndexWire.invalid() }
+        }
         return coverage
     }
 }
 
 struct AtlasIndexedResultWindow: Equatable {
-    let offset, skipped: UInt64
+    let offset, skipped, covered: UInt64
     let hasMore: Bool
     let next: UInt64?
 
-    init(_ w: AtlasIndexWire, expected: UInt64, matches: UInt64, retained: Int) throws {
+    init(_ w: AtlasIndexWire, expected: UInt64, matches: UInt64, retained: Int, structural: Bool) throws {
         offset = try w.number("result_offset")
         skipped = try w.number("skipped_matches")
         hasMore = try w.flag("has_more_matches")
         next = try w.optionalNumber("next_match_offset")
-        let (end, overflow) = offset.addingReportingOverflow(UInt64(retained))
+        if structural { covered = try w.number("window_matches") }
+        else {
+            guard try w.absent(["window_matches"]) else { throw AtlasIndexWire.invalid() }
+            covered = UInt64(retained)
+        }
+        let (end, overflow) = offset.addingReportingOverflow(covered)
         guard offset == expected, offset <= 32 * 1024 * 1024, !overflow,
               w.fields.contains(AtlasIndexWire.Key("next_match_offset")),
               skipped == min(offset, matches),
-              UInt64(retained) == min(AtlasSearchResultWindow.capacity, matches - skipped),
+              UInt64(retained) <= covered,
+              covered == min(AtlasSearchResultWindow.capacity, matches - skipped),
               hasMore == (matches > end),
-              next == (hasMore && retained > 0 ? end : nil) else { throw AtlasIndexWire.invalid() }
+              next == (hasMore && covered > 0 ? end : nil) else { throw AtlasIndexWire.invalid() }
     }
 }
 
@@ -352,7 +363,7 @@ struct AtlasIndexedQueryPage {
          command: String) throws {
         let w = try AtlasIndexWire.decode(json)
         try basis.validate(w, command: command)
-        guard mode.isTextual || (caseSensitive && !countAllMatches) else { throw AtlasIndexWire.invalid() }
+        guard mode.isTextual || (caseSensitive && (!countAllMatches || resultOffset != nil)) else { throw AtlasIndexWire.invalid() }
         let kind = try w.optionalText("search_scope")
         try pathScope.validateEcho(kind: w.optionalText("scope_path_kind"),
             path: w.optionalText("scope_path"), hex: w.optionalText("scope_path_hex"),
@@ -398,13 +409,13 @@ struct AtlasIndexedQueryPage {
         let matches = try w.number("matches_seen"), verification = try w.number("verification_source_bytes")
         let running = try w.flag("search_in_progress"), complete = try w.flag("search_complete")
         let truncated = try w.flag("truncated"), stop = try w.optionalText("stop_reason")
-        let windowFields = ["result_offset", "skipped_matches", "has_more_matches", "next_match_offset"]
+        let windowFields = ["result_offset", "skipped_matches", "window_matches", "has_more_matches", "next_match_offset"]
         let hasWindow = windowFields.contains { w.fields.contains(AtlasIndexWire.Key($0)) }
         let resultWindow: AtlasIndexedResultWindow?
         if hasWindow || resultOffset != nil {
-            guard mode.isTextual else { throw AtlasIndexWire.invalid() }
+            guard mode.isTextual || resultOffset != nil else { throw AtlasIndexWire.invalid() }
             resultWindow = try AtlasIndexedResultWindow(w, expected: resultOffset ?? 0,
-                matches: matches, retained: retained)
+                matches: matches, retained: retained, structural: !mode.isTextual)
             guard matches <= basis.sourceBytes, truncated == (matches > UInt64(retained)) else { throw AtlasIndexWire.invalid() }
         } else { resultWindow = nil }
         let hasCountReceipt = w.fields.contains(AtlasIndexWire.Key("count_all_matches"))
@@ -450,7 +461,7 @@ struct AtlasIndexedQueryPage {
         }
         let structureCoverage = try AtlasIndexedStructure.coverage(w, mode: mode,
             nameMode: nameMode, scanned: scanned, examined: examined - captureUnavailable,
-            unavailable: unavailable - captureUnavailable, retained: retained, matches: matches)
+            unavailable: unavailable - captureUnavailable, retained: retained, matches: matches, window: resultWindow)
         if let stop, !["all-files-examined", "file-limit", "source-byte-limit", "capture-scope", "match-limit", "verification-byte-limit"].contains(stop) {
             throw AtlasIndexWire.invalid()
         }
@@ -458,8 +469,7 @@ struct AtlasIndexedQueryPage {
             guard pending > 0, basis.captureScope.excludedFiles > 0 else { throw AtlasIndexWire.invalid() }
         }
         if countAllMatches {
-            guard mode.isTextual,
-                  matches <= basis.sourceBytes, truncated == (matches > UInt64(retained)),
+            guard matches <= basis.sourceBytes, truncated == (matches > UInt64(retained)),
                   stop != "match-limit" else { throw AtlasIndexWire.invalid() }
         }
         if complete {
@@ -469,7 +479,7 @@ struct AtlasIndexedQueryPage {
                 guard matchCountComplete, stop == "all-files-examined" else { throw AtlasIndexWire.invalid() }
             } else if let resultWindow {
                 guard stop == "all-files-examined", !resultWindow.hasMore,
-                      matches == resultWindow.skipped + UInt64(retained) else { throw AtlasIndexWire.invalid() }
+                      matches == resultWindow.skipped + resultWindow.covered else { throw AtlasIndexWire.invalid() }
             } else {
                 guard !truncated, matches == UInt64(retained) else { throw AtlasIndexWire.invalid() }
             }
@@ -481,6 +491,17 @@ struct AtlasIndexedQueryPage {
             }
         }
         hits = try w.rows("hits", limit: command == "page" ? 128 : 64)
+        if !mode.isTextual {
+            for row in hits {
+                if let resultWindow {
+                    guard let occurrence = row.hit.structure?.occurrence,
+                          occurrence > resultWindow.offset,
+                          occurrence <= resultWindow.offset + resultWindow.covered else { throw AtlasIndexWire.invalid() }
+                } else {
+                    guard row.hit.structure?.occurrence == nil else { throw AtlasIndexWire.invalid() }
+                }
+            }
+        }
         guard hits.allSatisfy({ scope.admitsRawPath($0.rawPathBytes) && pathScope.admitsRawPath($0.rawPathBytes)
             && basis.captureScope.fileScope.admitsRawPath($0.rawPathBytes)
             && basis.captureScope.pathScope.admitsRawPath($0.rawPathBytes)
@@ -523,6 +544,7 @@ struct AtlasIndexedAccumulator {
                   n.verificationBytes >= p.verificationBytes else { throw AtlasIndexWire.invalid() }
             if let window = n.resultWindow, let previous = p.resultWindow {
                 guard window.offset == previous.offset, window.skipped >= previous.skipped,
+                      window.covered >= previous.covered,
                       !previous.hasMore || window.hasMore else { throw AtlasIndexWire.invalid() }
             } else if n.resultWindow != nil || p.resultWindow != nil { throw AtlasIndexWire.invalid() }
             if let expression = n.expression, let previous = p.expression {
@@ -554,6 +576,10 @@ struct AtlasIndexedAccumulator {
                 guard row.repeats(hits[at]) else { throw AtlasIndexWire.invalid() }
             } else {
                 guard at == hits.count, hits.count < 1000 else { throw AtlasIndexWire.invalid() }
+                if let occurrence = row.hit.structure?.occurrence,
+                   let previous = hits.last?.hit.structure?.occurrence {
+                    guard occurrence > previous else { throw AtlasIndexWire.invalid() }
+                }
                 if let previous = byFile[row.file] {
                     guard previous.revision == row.revision, previous.pathHex == row.pathHex,
                           previous.hit.captureSHA256 == row.hit.captureSHA256,

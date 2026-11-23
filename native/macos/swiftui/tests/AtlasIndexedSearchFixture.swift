@@ -12,6 +12,7 @@ final class IndexedFixture: @unchecked Sendable {
         var hitCount = 2
         var captureBytes = 4096
         var countedMatches: UInt64? = nil
+        var structureMetadataOmitted = 0
         var pathHex = "612e7273"
         var fileID: UInt64 = 1
         var digest = String(repeating: "a", count: 64)
@@ -168,6 +169,17 @@ final class IndexedFixture: @unchecked Sendable {
         return transport
     }
 
+    var structuralWindowTransport: AtlasIndexedSearchTransport {
+        var transport = structuralTransport
+        transport.structureWindowQueryBegin = { h, g, index, mode, nameMode, needle, scope, pathScope, countAll, skip in
+            precondition(index == 1 && !mode.isTextual)
+            return try self.response("query-begin", h, generation: g, needle: needle, scope: scope,
+                pathScope: pathScope, countAllMatches: countAll, resultOffset: skip,
+                structureMode: mode, nameMode: nameMode)
+        }
+        return transport
+    }
+
     private func response(_ phase: String, _ h: UInt64, generation: UInt64 = 1,
                           needle: String = "", start: Int = 0, reader: UInt64 = 100, sourceFile: UInt64 = 1,
                           scope: AtlasSearchFileScope = .all,
@@ -317,26 +329,32 @@ final class IndexedFixture: @unchecked Sendable {
             let configuredCount = examined > 0 ? (scoped ? c.scopedHitCount ?? c.hitCount : c.hitCount) : 0
             let observed = examined > 0 ? (c.countedMatches ?? UInt64(configuredCount)) : 0
             let matches: UInt64
-            let count: Int
+            let windowMatches: Int
             if let offset = s.resultOffset {
                 matches = s.countAllMatches ? observed : min(observed, offset + 1001)
-                count = Int(min(1000, matches - min(offset, matches)))
+                windowMatches = Int(min(1000, matches - min(offset, matches)))
             } else {
-                count = configuredCount
-                matches = s.countAllMatches && examined > 0 ? observed : UInt64(count)
+                windowMatches = configuredCount
+                matches = s.countAllMatches && examined > 0 ? observed : UInt64(windowMatches)
             }
-            let hasMore = s.resultOffset.map { matches > $0 + UInt64(count) } ?? false
+            let metadataOmitted = s.structureMode != nil && s.resultOffset != nil
+                ? min(c.structureMetadataOmitted, windowMatches) : 0
+            let count = windowMatches - metadataOmitted
+            let analysisUnavailable = metadataOmitted > 0 ? 1 : 0
+            let hasMore = s.resultOffset.map { matches > $0 + UInt64(windowMatches) } ?? false
             let stoppedAtWindow = s.resultOffset != nil && !s.countAllMatches && hasMore
             let running = phase == "query-begin" || (examined < available && !stoppedAtWindow)
             let complete = !running && !stoppedAtWindow && pending == 0 && unavailable == 0
+                && analysisUnavailable == 0
                 && (!s.pathScope.isVisible || c.captureVisibleMissing == 0) && c.discovery
             let first = phase == "page" ? start : 0, end = min(count, first + (phase == "page" ? 128 : 64))
             var rows: [[String: Any]] = []
             if first < end {
                 for n in first..<end {
-                    let width = s.structureMode != nil ? s.needle.utf8.count
-                        : (s.caseSensitive ? (s.expression == nil ? 1 : s.needle.utf8.count) : c.insensitiveRangeBytes)
-                    let position = Int(s.resultOffset ?? 0) + n
+                    let width = s.structureMode == .occurrences && c.encoding.hasPrefix("utf16")
+                        ? s.needle.utf16.count * 2 : (s.structureMode != nil ? s.needle.utf8.count
+                        : (s.caseSensitive ? (s.expression == nil ? 1 : s.needle.utf8.count) : c.insensitiveRangeBytes))
+                    let position = Int(s.resultOffset ?? 0) + n + metadataOmitted
                     let range: [String: String] = ["start": String(position * 2), "end": String(position * 2 + width)]
                     let path: [String: String] = ["encoding": "unix-bytes", "hex": c.pathHex, "display": "a.rs"]
                     var row: [String: Any] = ["hit_id": String(n + 1), "file_id": String(c.fileID), "source_revision": "1",
@@ -344,11 +362,13 @@ final class IndexedFixture: @unchecked Sendable {
                     if !s.caseSensitive { row["matched_text"] = c.insensitiveText }
                     else if s.expression != nil { row["matched_text"] = s.needle }
                     if let mode = s.structureMode {
-                        row["structure"] = ["name": s.needle,
+                        var structure: [String: Any] = ["name": s.needle,
                             "kind": mode == .headings ? "heading" : (mode == .occurrences ? "identifier-occurrence" : "function"),
                             "language": mode == .headings ? "markdown" : (mode == .occurrences ? "text" : "rust"),
                             "candidate_id": String(n + 1), "evidence_level": mode.evidence,
                             "heading_slug": mode == .headings ? "x-\(n + 1)" : NSNull(), "evidence_range": range]
+                        if s.resultOffset != nil { structure["occurrence_id"] = String(position + 1) }
+                        row["structure"] = structure
                     }
                     rows.append(row)
                 }
@@ -360,7 +380,7 @@ final class IndexedFixture: @unchecked Sendable {
                 "catalogued_files": String(c.files), "discovery_complete": c.discovery,
                 "examined_files": String(expressionExcluded + examined + unavailable), "scanned_files": String(scanned), "verified_files": String(scanned),
                 "skipped_by_index": String(skipped), "fallback_files": String(c.fallback || !s.caseSensitive ? scanned : 0),
-                "unavailable_files": String(unavailable), "pending_files": String(eligible - expressionExcluded - examined - unavailable),
+                "unavailable_files": String(unavailable + analysisUnavailable), "pending_files": String(eligible - expressionExcluded - examined - unavailable),
                 "retained_hits": String(count), "displayed_hits": String(count), "matches_seen": String(matches), "step_count": String(s.queryStep),
                 "verification_source_bytes": String(scanned == 0 ? 0 : min(c.captureBytes, totalBytes)), "source_bytes_read": "0", "read_calls": "0",
                 "search_in_progress": running, "search_complete": complete,
@@ -372,7 +392,8 @@ final class IndexedFixture: @unchecked Sendable {
                 value["result_offset"] = String(offset)
                 value["skipped_matches"] = String(min(offset, matches))
                 value["has_more_matches"] = hasMore
-                value["next_match_offset"] = hasMore && count > 0 ? String(offset + UInt64(count)) : NSNull()
+                value["next_match_offset"] = hasMore && windowMatches > 0 ? String(offset + UInt64(windowMatches)) : NSNull()
+                if s.structureMode != nil { value["window_matches"] = String(windowMatches) }
                 value["count_all_matches"] = s.countAllMatches
                 value["match_count_complete"] = complete
             }
@@ -385,9 +406,9 @@ final class IndexedFixture: @unchecked Sendable {
                 value["completeness_basis"] = "admitted-extraction-processing"
                 value["structure_file_byte_limit"] = String(mode.structureFileByteLimit)
                 value["unsupported_structure_files"] = "0"; value["extraction_limited_files"] = "0"
-                value["structure_metadata_omitted"] = "0"; value["structure_metadata_bytes"] = String(count * 128)
-                value["fallback_files"] = "0"; value["verification_source_bytes"] = String(scanned == 0 ? 0 : 4096 + (scanned - 1) * 100)
-                value["count_all_matches"] = false; value["match_count_complete"] = complete
+                value["structure_metadata_omitted"] = String(metadataOmitted); value["structure_metadata_bytes"] = String(count * 128)
+                value["fallback_files"] = "0"; value["verification_source_bytes"] = String(scanned == 0 ? 0 : c.captureBytes + (scanned - 1) * 100)
+                value["count_all_matches"] = s.countAllMatches; value["match_count_complete"] = complete
                 if mode == .occurrences {
                     value["includes_comments_and_literals"] = true; value["compiler_resolved"] = false
                     value["token_policy"] = AtlasSearchOccurrencePolicy.tokenPolicy
