@@ -94,6 +94,172 @@ private final class Calls: @unchecked Sendable {
                 maxItems: AtlasReferencePage.maxItems, retained: retained, matchesCounted: retained, limited: false),
             request: request, rows: rows, nextOffset: end < retained ? end : nil)
     }
+    // Counted engine receipts expose only the first page of each window. The
+    // fixture derives original-byte coordinates without allocating a prefix
+    // table or implementing token extraction in the native test.
+    private static func referenceWindowPage(identity: AtlasReaderIdentity, name: String,
+        total: UInt64, offset: UInt64, generation: UInt64, base: UInt64,
+        stride: UInt64, width: UInt64, complete: Bool = true, countAll: Bool = true,
+        ordinalAdjustment: UInt64 = 0) -> AtlasReferencePage {
+        let skipped = min(offset, total)
+        let retained = min(AtlasReferencePage.maxItems, total - skipped)
+        let count = min(AtlasReferencePageRequest.initial.limit, retained)
+        let more = total > offset + retained
+        let rows = (0..<Int(count)).map { index in
+            let ordinal = offset + UInt64(index) + 1
+            let start = base + (ordinal - 1) * stride
+            return AtlasReferenceOccurrence(id: UInt64(index) + 1,
+                range: AtlasOutlineRange(start: start, end: start + width), line: ordinal + 1,
+                occurrence: ordinal + ordinalAdjustment)
+        }
+        return AtlasReferencePage(id: UUID(),
+            inventory: AtlasReferenceInventory(identity: identity, generation: generation, name: name,
+                maxItems: AtlasReferencePage.maxItems, retained: retained, matchesCounted: total, limited: more,
+                window: AtlasReferenceWindow(request: .init(offset: offset, countAllMatches: countAll),
+                    skipped: skipped, countComplete: complete, rowsTruncated: total > retained,
+                    hasMore: more, nextOffset: more && retained > 0 ? offset + retained : nil)),
+            request: .initial, rows: rows, nextOffset: count < retained ? count : nil)
+    }
+
+    @MainActor private static func countedOccurrenceActivation() async throws {
+        let total: UInt64 = 5005
+        let name = "𐐀x"
+        for (encoding, base, stride, width) in [
+            ("utf8", UInt64(5), UInt64(6), UInt64(5)),
+            ("utf16le", 8, 8, 6), ("utf16be", 8, 8, 6)
+        ] {
+            let source = identity(bytes: base + total * stride, encoding: encoding)
+            for ordinal: UInt64 in [1, 64, 65, 4096, 4097, 5005] {
+                let start = base + (ordinal - 1) * stride
+                let hit = selected(needle: name, start: start, end: start + width,
+                    bytes: source.capturedBytes, mode: .occurrences)
+                var generation: UInt64 = 1
+                var offsets: [UInt64] = [], legacyPages = 0, reads = 0
+                let result = try await AtlasCapturedReader.activateOccurrence(hit, identity: source,
+                    prepare: { exact in
+                        check(exact.utf8.elementsEqual(name.utf8), "Counted activation keeps exact token spelling")
+                        return referenceWindowPage(identity: source, name: exact, total: total,
+                            offset: 0, generation: generation, base: base, stride: stride, width: width)
+                    }, nextPage: { _ in
+                        legacyPages += 1; throw AtlasReaderError.invalidResponse
+                    }, prepareWindow: { exact, offset in
+                        offsets.append(offset); generation += 1
+                        return referenceWindowPage(identity: source, name: exact, total: total,
+                            offset: offset, generation: generation, base: base, stride: stride, width: width)
+                    }, read: { target in reads += 1; return target })
+                check(result.page.occurrence.ordinal == ordinal && result.page.occurrence.id <= 64,
+                    "Later global occurrence binds to its bounded local row for " + encoding)
+                check(result.page.occurrence.range.start == start && result.page.occurrence.range.end == start + width,
+                    "UTF-8 and both UTF-16 encodings retain exact original-byte coordinates")
+                check(result.page.generation == generation && result.page.pageID == result.referencePage.id
+                    && result.target == result.page && result.history.isEmpty,
+                    "Only the final accepted window authorizes the selection")
+                check(result.referencePage.inventory.matchesCounted == total && reads == 1 && legacyPages == 0,
+                    "Exact count survives navigation without walking discarded local pages")
+                check(offsets.count < 20 && Set(offsets).count == offsets.count,
+                    "Ordinal search is bounded and does not repeat a window")
+                check((ordinal <= 64) == offsets.isEmpty, "Initial rows need no replacement inventory")
+            }
+        }
+
+        // A nearly full admitted source can contain far more than 4096 tiny
+        // tokens. No fixture or activation step retains their discarded prefix.
+        let largeTotal: UInt64 = 200_000
+        let largeSource = identity(bytes: 5 + largeTotal * 2, encoding: "utf8")
+        let largeStart = 5 + (largeTotal - 1) * 2
+        let largeHit = selected(needle: "z", start: largeStart, end: largeStart + 1,
+            bytes: largeSource.capturedBytes, mode: .occurrences)
+        var largeGeneration: UInt64 = 1, probes = 0
+        let large = try await AtlasCapturedReader.activateOccurrence(largeHit, identity: largeSource,
+            prepare: { exact in referenceWindowPage(identity: largeSource, name: exact, total: largeTotal,
+                offset: 0, generation: 1, base: 5, stride: 2, width: 1) },
+            nextPage: { _ in throw AtlasReaderError.invalidResponse },
+            prepareWindow: { exact, offset in
+                probes += 1; largeGeneration += 1
+                let page = referenceWindowPage(identity: largeSource, name: exact, total: largeTotal,
+                    offset: offset, generation: largeGeneration, base: 5, stride: 2, width: 1)
+                check(page.rows.count <= 64, "Each rank probe returns a bounded first page")
+                return page
+            }, read: { $0 })
+        check(large.page.occurrence.ordinal == largeTotal && probes < 20,
+            "Final occurrence in a large capture opens within the fixed replay allowance")
+
+        let source = identity(bytes: 5 + total * 6, encoding: "utf8")
+        let start = 5 + (total - 1) * 6
+        let hit = selected(needle: name, start: start, end: start + 5,
+            bytes: source.capturedBytes, mode: .occurrences)
+        let first = referenceWindowPage(identity: source, name: name, total: total,
+            offset: 0, generation: 1, base: 5, stride: 6, width: 5)
+        // Faults arrive only after a legitimate first receipt has established
+        // the source, total and namespace. None may issue an approximate read.
+        for fault in 0..<8 {
+            var reads = 0, probes = 0
+            do {
+                _ = try await AtlasCapturedReader.activateOccurrence(hit, identity: source,
+                    prepare: { _ in first }, nextPage: { _ in throw AtlasReaderError.invalidResponse },
+                    prepareWindow: { exact, offset in
+                        probes += 1
+                        return referenceWindowPage(
+                            identity: fault == 1 ? identity(revision: 2, bytes: source.capturedBytes, encoding: "utf8") : source,
+                            name: fault == 7 ? "other" : exact, total: fault == 2 ? total - 1 : total,
+                            offset: fault == 3 ? offset + 1 : offset, generation: fault == 0 ? 1 : 2,
+                            base: 5, stride: 6, width: 5, complete: fault != 4, countAll: fault != 5,
+                            ordinalAdjustment: fault == 6 ? 1 : 0)
+                    }, read: { _ in reads += 1; return "untrusted" })
+                preconditionFailure("Changed counted occurrence receipt accepted")
+            } catch AtlasReaderError.invalidResponse { checks += 1 }
+            check(probes == 1 && reads == 0, "Changed window/source/count/generation cannot authorize a read")
+        }
+
+        for count: UInt64 in [0, total] {
+            let gap = selected(needle: name, start: 10, end: 11,
+                bytes: source.capturedBytes, mode: .occurrences)
+            var reads = 0, generation: UInt64 = 1, probes = 0
+            do {
+                _ = try await AtlasCapturedReader.activateOccurrence(gap, identity: source,
+                    prepare: { exact in referenceWindowPage(identity: source, name: exact, total: count,
+                        offset: 0, generation: 1, base: 5, stride: 6, width: 5) },
+                    nextPage: { _ in throw AtlasReaderError.invalidResponse },
+                    prepareWindow: { exact, offset in
+                        generation += 1; probes += 1
+                        return referenceWindowPage(identity: source, name: exact, total: count,
+                            offset: offset, generation: generation, base: 5, stride: 6, width: 5)
+                    }, read: { _ in reads += 1; return "nearest row" })
+                preconditionFailure("A missing exact range selected a neighboring occurrence")
+            } catch AtlasReaderError.engine("CAPTURED_OCCURRENCE_UNAVAILABLE") { checks += 1 }
+            check(reads == 0 && probes == 0, "Zero totals and gaps between initial rows fail without approximation")
+        }
+
+        var downgradeReads = 0
+        do {
+            _ = try await AtlasCapturedReader.activateOccurrence(hit, identity: source,
+                prepare: { _ in referencePage(identity: source, name: name, ranges: [(start, start + 5)]) },
+                nextPage: { _ in first }, prepareWindow: { _, _ in first },
+                read: { _ in downgradeReads += 1; return "legacy fallback" })
+            preconditionFailure("An explicit counted capability silently accepted a legacy receipt")
+        } catch AtlasReaderError.invalidResponse { checks += 1 }
+        check(downgradeReads == 0, "Window authority cannot silently downgrade")
+
+        var current = true, staleReads = 0
+        var pendingOffset: UInt64 = 0
+        var continuation: CheckedContinuation<AtlasReferencePage, Never>?
+        let staleProbe = Task { @MainActor in
+            try await AtlasCapturedReader.activateOccurrence(hit, identity: source,
+                prepare: { _ in first }, nextPage: { _ in throw AtlasReaderError.invalidResponse },
+                prepareWindow: { _, offset in
+                    pendingOffset = offset
+                    return await withCheckedContinuation { continuation = $0 }
+                }, read: { _ in staleReads += 1; return "stale selection" }, isCurrent: { current })
+        }
+        while continuation == nil { await Task.yield() }
+        current = false
+        continuation!.resume(returning: referenceWindowPage(identity: source, name: name, total: total,
+            offset: pendingOffset, generation: 2, base: 5, stride: 6, width: 5))
+        do { _ = try await staleProbe.value; preconditionFailure("Superseded ordinal probe delivered") }
+        catch AtlasReaderError.canceled { checks += 1 }
+        check(staleReads == 0, "A completed late probe cannot outlive its original opening ticket")
+    }
+
     @MainActor private static func occurrenceActivation() async throws {
         // A substring search would spend all 4096 retained hits on these
         // identifier prefixes. The local whole-token inventory has one actual
@@ -423,6 +589,7 @@ private final class Calls: @unchecked Sendable {
     }
 
     @MainActor static func main() async throws {
+        try await countedOccurrenceActivation()
         try await occurrenceActivation()
         try await pagedTextActivation()
         try await pagedActivationRefusals()

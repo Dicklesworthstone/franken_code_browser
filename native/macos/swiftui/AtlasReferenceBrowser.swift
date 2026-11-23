@@ -34,7 +34,9 @@ import SwiftUI
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 if page.rows.isEmpty {
-                    Text("No whole-identifier occurrences in this retained capture.")
+                    Text(page.inventory.matchesCounted == 0
+                        ? "No whole-identifier occurrences in this retained capture."
+                        : "No occurrences in this result window.")
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
@@ -59,7 +61,7 @@ import SwiftUI
                             }
                             .buttonStyle(.plain)
                             .disabled(!model.referencesAreCurrent || model.busy)
-                            .accessibilityLabel("Open occurrence \(occurrence.id) of \(page.inventory.name), line \(occurrence.line)")
+                            .accessibilityLabel("Open occurrence \(occurrence.ordinal) of \(page.inventory.name), line \(occurrence.line)")
                             .help("Select this exact occurrence in the retained source; line numbers count LF boundaries")
                         }
                     }
@@ -68,11 +70,21 @@ import SwiftUI
                 HStack {
                     Button("Previous page", action: model.previousReferencePage)
                         .disabled(!model.canReferenceBack)
-                    Text("\(page.request.start + 1)...\(page.request.start + UInt64(page.rows.count))")
+                    Text("\(page.rows.first?.ordinal ?? 0)...\(page.rows.last?.ordinal ?? 0)")
                         .font(.caption).opacity(page.rows.isEmpty ? 0 : 1)
                     Spacer()
                     Button("Next page", action: model.nextReferencePage)
                         .disabled(!model.referencesAreCurrent || page.nextOffset == nil || model.busy)
+                }
+                if page.inventory.window != nil {
+                    HStack {
+                        Button("Previous results", action: model.previousReferenceWindow)
+                            .disabled(!model.canReferenceWindowBack)
+                        Spacer()
+                        Button("Next results", action: model.nextReferenceWindow)
+                            .disabled(!model.canReferenceWindowNext)
+                    }
+                    .help("Open another bounded set of occurrences from this same retained source.")
                 }
             } else {
                 Text(model.canFindReferences
@@ -85,7 +97,9 @@ import SwiftUI
                 Text(model.notice).font(.caption2).foregroundStyle(.secondary)
                     .textSelection(.enabled)
             }
-            Text("Searches this retained file only, up to 512 KiB and 4,096 occurrences. Line numbers count LF boundaries; exact byte ranges also work for CR-only source. Changing the identifier or refreshing the capture invalidates old targets.")
+            Text(model.supportsReferenceWindows
+                ? "Searches this retained file up to 512 KiB, counts every whole-token occurrence and retains up to 4,096 per result window. Line numbers count LF boundaries. Changing the identifier or refreshing the capture invalidates old targets."
+                : "Searches this retained file only, up to 512 KiB and 4,096 occurrences. Line numbers count LF boundaries; exact byte ranges also work for CR-only source. Changing the identifier or refreshing the capture invalidates old targets.")
                 .font(.caption2).foregroundStyle(.secondary)
         }
         .padding(12)

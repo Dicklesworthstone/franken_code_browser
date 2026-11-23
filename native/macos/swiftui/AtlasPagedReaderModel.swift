@@ -246,12 +246,19 @@ import Observation
         guard let page else { return false }
         return coordinator.supportsReferences && page.identity.capturedBytes <= AtlasReferencePage.sourceLimit
     }
+    var supportsReferenceWindows: Bool { coordinator.supportsReferenceWindows }
     var referencesAreCurrent: Bool {
         guard referenceRowsAuthorized, let referencePage else { return false }
         return referencePage.inventory.name.utf8.elementsEqual(referenceName.utf8)
             && page?.identity.matches(referencePage.inventory.identity) == true
     }
     var canReferenceBack: Bool { referencesAreCurrent && !referenceHistory.isEmpty && !busy }
+    var canReferenceWindowBack: Bool {
+        referencesAreCurrent && !busy && (referencePage?.inventory.window?.request.offset ?? 0) > 0
+    }
+    var canReferenceWindowNext: Bool {
+        referencesAreCurrent && !busy && referencePage?.inventory.window?.nextOffset != nil
+    }
     var referenceHex: String? {
         guard referencesAreCurrent, let selection = page?.referenceSelection,
               selection.target.pageID == referencePage?.id else { return nil }
@@ -259,7 +266,7 @@ import Observation
     }
     var referenceSelectionLabel: String? {
         guard referenceHex != nil, let target = page?.referenceSelection?.target else { return nil }
-        return "Identifier occurrence \(target.occurrence.id) · LF line \(target.occurrence.line)"
+        return "Identifier occurrence \(target.occurrence.ordinal) · LF line \(target.occurrence.line)"
     }
 
     /// A retained menu action must still name the displayed selection receipt.
@@ -682,6 +689,10 @@ import Observation
                         identity: opened.identity,
                         prepare: { try await coordinator.prepareReferences($0) },
                         nextPage: { try await coordinator.referencePage($0) },
+                        prepareWindow: coordinator.supportsReferenceWindows ? { name, offset in
+                            try await coordinator.prepareReferences(name,
+                                window: AtlasReferenceWindowRequest(offset: offset, countAllMatches: true))
+                        } : nil,
                         read: { try await coordinator.read(.reference($0)) },
                         isCurrent: {
                             operation == ticket && referenceName.utf8.elementsEqual(target.needle.utf8)
@@ -1157,16 +1168,37 @@ import Observation
         let name = referenceName
         do { try AtlasReferencePage.validateName(name) }
         catch { notice = "Enter one identifier, up to 1,024 UTF-8 bytes."; return }
+        let window = supportsReferenceWindows
+            ? AtlasReferenceWindowRequest(offset: 0, countAllMatches: true) : nil
+        loadReferenceWindow(name: name, request: window)
+    }
+    func nextReferenceWindow() {
+        guard canReferenceWindowNext, let inventory = referencePage?.inventory,
+              let window = inventory.window, let offset = window.nextOffset else { return }
+        loadReferenceWindow(name: inventory.name,
+            request: .init(offset: offset, countAllMatches: window.request.countAllMatches))
+    }
+    func previousReferenceWindow() {
+        guard canReferenceWindowBack, let inventory = referencePage?.inventory,
+              let window = inventory.window else { return }
+        let offset = window.request.offset > inventory.maxItems ? window.request.offset - inventory.maxItems : 0
+        loadReferenceWindow(name: inventory.name,
+            request: .init(offset: offset, countAllMatches: window.request.countAllMatches))
+    }
+    private func loadReferenceWindow(name: String, request: AtlasReferenceWindowRequest?) {
+        // Preserve the displayed source and prior rows while replacing the
+        // inventory. A response lost after foreign acceptance cannot safely
+        // restore the old generation's activation authority.
         referenceRowsAuthorized = false
-        referenceHistory = []
         let ticket = begin(references: true)
         notice = "Finding whole-identifier text occurrences in this capture…"
         task = Task {
             do {
-                let result = try await coordinator.prepareReferences(name)
+                let result = try await coordinator.prepareReferences(name, window: request)
                 guard operation == ticket, !Task.isCancelled,
                       referenceName.utf8.elementsEqual(name.utf8) else { return }
                 referencePage = result
+                referenceHistory = []
                 referenceRowsAuthorized = true
                 finish(ticket)
                 notice = result.summary

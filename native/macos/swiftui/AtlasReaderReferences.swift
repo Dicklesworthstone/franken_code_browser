@@ -6,6 +6,20 @@ struct AtlasReaderReferencesTransport: Sendable {
     let prepare: @Sendable (UInt64, UInt64, String, UInt64) -> String?
     let page: @Sendable (UInt64, UInt64, UInt64, UInt64) -> String?
     let reference: @Sendable (UInt64, UInt64, UInt64, UInt64) -> String?
+    /// Same retained source, with independent row storage and match counting.
+    var prepareWindow: (@Sendable (UInt64, UInt64, String, UInt64, Bool, UInt64) -> String?)? = nil
+}
+
+struct AtlasReferenceWindowRequest: Equatable, Sendable {
+    let offset: UInt64
+    let countAllMatches: Bool
+}
+
+struct AtlasReferenceWindow: Equatable, Sendable {
+    let request: AtlasReferenceWindowRequest
+    let skipped: UInt64
+    let countComplete, rowsTruncated, hasMore: Bool
+    let nextOffset: UInt64?
 }
 
 struct AtlasReferencePageRequest: Equatable, Sendable {
@@ -26,6 +40,9 @@ struct AtlasReferenceOccurrence: Equatable, Identifiable, Sendable {
     /// The engine counts LF boundaries, including CRLF. This is not a native
     /// wrapped row or a claim that CR-only lines use the same numbering.
     let line: UInt64
+    /// Global match ordinal; activation still uses the window-local `id`.
+    var occurrence: UInt64? = nil
+    var ordinal: UInt64 { occurrence ?? id }
 }
 
 /// IDs are local to one accepted source/name inventory. A page UUID prevents a
@@ -62,12 +79,15 @@ struct AtlasReferenceInventory: Sendable {
     let retained: UInt64
     let matchesCounted: UInt64
     let limited: Bool
+    var window: AtlasReferenceWindow? = nil
+
+    var countComplete: Bool { window?.countComplete ?? !limited }
 
     func matches(_ other: Self) -> Bool {
         identity.matches(other.identity) && generation == other.generation
             && name.utf8.elementsEqual(other.name.utf8) && maxItems == other.maxItems
             && retained == other.retained && matchesCounted == other.matchesCounted
-            && limited == other.limited
+            && limited == other.limited && window == other.window
     }
 }
 
@@ -99,6 +119,13 @@ struct AtlasReferencePage: Sendable {
     }
 
     var summary: String {
+        if let window = inventory.window {
+            let counts = window.countComplete ? "\(inventory.matchesCounted) whole-token occurrences"
+                : "At least \(inventory.matchesCounted) whole-token occurrences"
+            let shown = inventory.retained == 0 ? "no retained matches in this window"
+                : "matches \(window.request.offset + 1)–\(window.request.offset + inventory.retained) retained"
+            return "\(counts); \(shown). Includes comments and string literals; not compiler references."
+        }
         let counts = inventory.limited
             ? "At least \(inventory.matchesCounted) whole-token occurrences; \(inventory.retained) retained. More may exist."
             : "\(inventory.retained) whole-token occurrences in this retained source."
@@ -107,7 +134,8 @@ struct AtlasReferencePage: Sendable {
 
     static func decode(_ json: String?, info: AtlasReaderInfo, generation: UInt64,
         name: String, request: AtlasReferencePageRequest, preparing: Bool = false,
-        inventory: AtlasReferenceInventory? = nil, maxItems: UInt64 = AtlasReferencePage.maxItems) throws -> Self {
+        inventory: AtlasReferenceInventory? = nil, maxItems: UInt64 = AtlasReferencePage.maxItems,
+        window: AtlasReferenceWindowRequest? = nil) throws -> Self {
         try validateName(name)
         try request.validate()
         guard generation > 0, maxItems <= Self.maxItems else { throw AtlasReaderError.invalidInput }
@@ -127,13 +155,45 @@ struct AtlasReferencePage: Sendable {
                   AtlasReaderWire.integer(wire.max_source_bytes) == sourceLimit,
                   AtlasReaderWire.integer(wire.max_items) == maxItems,
                   let retained = AtlasReaderWire.integer(wire.retained_references), retained <= maxItems,
-                  let counted = AtlasReaderWire.integer(wire.matches_counted),
-                  wire.search_complete == !wire.output_limited, wire.count_complete == wire.search_complete,
+                  let counted = AtlasReaderWire.integer(wire.matches_counted), counted <= identity.capturedBytes,
+                  wire.count_complete == wire.search_complete,
                   request.start <= retained else { throw AtlasReaderError.invalidResponse }
-            if wire.output_limited {
-                guard retained == maxItems, counted == retained + 1 else { throw AtlasReaderError.invalidResponse }
+            let expectedWindow = window ?? inventory?.window?.request
+            let acceptedWindow: AtlasReferenceWindow?
+            if let expectedWindow {
+                guard let offsetText = wire.result_offset, let offset = AtlasReaderWire.integer(offsetText),
+                      offset == expectedWindow.offset, wire.count_all_matches == expectedWindow.countAllMatches,
+                      let skippedText = wire.skipped_matches, let skipped = AtlasReaderWire.integer(skippedText),
+                      skipped == min(offset, counted), retained == min(maxItems, counted - skipped),
+                      let truncated = wire.rows_truncated, truncated == (counted > retained),
+                      let more = wire.has_more_matches, wire.hasNextMatchField else {
+                    throw AtlasReaderError.invalidResponse
+                }
+                let (end, overflow) = offset.addingReportingOverflow(retained)
+                guard !overflow, more == (counted > end), wire.output_limited == more,
+                      wire.count_complete == (expectedWindow.countAllMatches || !more) else {
+                    throw AtlasReaderError.invalidResponse
+                }
+                let next = try wire.next_match_offset.map { text -> UInt64 in
+                    guard let value = AtlasReaderWire.integer(text) else { throw AtlasReaderError.invalidResponse }
+                    return value
+                }
+                guard next == (more && retained > 0 ? end : nil),
+                      expectedWindow.countAllMatches || !more || counted - skipped == retained + 1 else {
+                    throw AtlasReaderError.invalidResponse
+                }
+                acceptedWindow = AtlasReferenceWindow(request: expectedWindow, skipped: skipped,
+                    countComplete: wire.count_complete, rowsTruncated: truncated, hasMore: more, nextOffset: next)
             } else {
-                guard counted == retained else { throw AtlasReaderError.invalidResponse }
+                guard !wire.hasWindowFields, wire.search_complete == !wire.output_limited else {
+                    throw AtlasReaderError.invalidResponse
+                }
+                if wire.output_limited {
+                    guard retained == maxItems, counted == retained + 1 else { throw AtlasReaderError.invalidResponse }
+                } else {
+                    guard counted == retained else { throw AtlasReaderError.invalidResponse }
+                }
+                acceptedWindow = nil
             }
             if identity.encoding != "utf8" {
                 guard identity.capturedBytes >= 2, identity.capturedBytes % 2 == 0 else {
@@ -154,7 +214,8 @@ struct AtlasReferencePage: Sendable {
                 next = nil
             }
             let basis = AtlasReferenceInventory(identity: identity, generation: generation, name: name,
-                maxItems: maxItems, retained: retained, matchesCounted: counted, limited: wire.output_limited)
+                maxItems: maxItems, retained: retained, matchesCounted: counted, limited: wire.output_limited,
+                window: acceptedWindow)
             if let inventory, !inventory.matches(basis) { throw AtlasReaderError.invalidResponse }
             // Every exact occurrence has the same encoded byte width. Standard
             // String views provide that width without duplicating token policy
@@ -177,7 +238,16 @@ struct AtlasReferencePage: Sendable {
                     }
                 }
                 previousEnd = range.end; previousLine = line
-                return AtlasReferenceOccurrence(id: id, range: range, line: line)
+                let occurrence: UInt64?
+                if let window = acceptedWindow {
+                    guard let text = row.occurrence_id, let value = AtlasReaderWire.integer(text),
+                          value == window.request.offset + id else { throw AtlasReaderError.invalidResponse }
+                    occurrence = value
+                } else {
+                    guard row.occurrence_id == nil else { throw AtlasReaderError.invalidResponse }
+                    occurrence = nil
+                }
+                return AtlasReferenceOccurrence(id: id, range: range, line: line, occurrence: occurrence)
             }
             return Self(id: UUID(), inventory: basis, request: request, rows: rows, nextOffset: next)
         } catch let error as AtlasReaderError { throw error }
@@ -192,16 +262,21 @@ struct AtlasReferencePage: Sendable {
         let search_complete, count_complete, output_limited: Bool
         let references: [Row]
         let next_offset: String?
+        let result_offset, skipped_matches, next_match_offset: String?
+        let count_all_matches, rows_truncated, has_more_matches: Bool?
+        let hasNextMatchField, hasWindowFields: Bool
 
         struct Row: Decodable {
             let reference_id, line: String
             let original_range: AtlasReaderWire.Range
+            let occurrence_id: String?
         }
         enum CodingKeys: CodingKey {
             case reference_generation, name, name_case, selection_namespace, evidence_level,
                  line_semantics, max_source_bytes, max_items, retained_references, matches_counted,
                  includes_comments_and_literals, compiler_resolved, semantic_complete,
-                 search_complete, count_complete, output_limited, references, next_offset
+                 search_complete, count_complete, output_limited, references, next_offset,
+                 result_offset, skipped_matches, next_match_offset, count_all_matches, rows_truncated, has_more_matches
         }
         init(from decoder: Decoder) throws {
             header = try .init(from: decoder)
@@ -224,6 +299,15 @@ struct AtlasReferencePage: Sendable {
             output_limited = try c.decode(Bool.self, forKey: .output_limited)
             guard c.contains(.next_offset) else { throw AtlasReaderError.invalidResponse }
             next_offset = try c.decodeIfPresent(String.self, forKey: .next_offset)
+            result_offset = try c.decodeIfPresent(String.self, forKey: .result_offset)
+            skipped_matches = try c.decodeIfPresent(String.self, forKey: .skipped_matches)
+            next_match_offset = try c.decodeIfPresent(String.self, forKey: .next_match_offset)
+            count_all_matches = try c.decodeIfPresent(Bool.self, forKey: .count_all_matches)
+            rows_truncated = try c.decodeIfPresent(Bool.self, forKey: .rows_truncated)
+            has_more_matches = try c.decodeIfPresent(Bool.self, forKey: .has_more_matches)
+            hasNextMatchField = c.contains(.next_match_offset)
+            hasWindowFields = [CodingKeys.result_offset, .skipped_matches, .next_match_offset,
+                .count_all_matches, .rows_truncated, .has_more_matches].contains { c.contains($0) }
             var input = try c.nestedUnkeyedContainer(forKey: .references)
             if let count = input.count, count > 128 { throw AtlasReaderError.invalidResponse }
             var rows: [Row] = []

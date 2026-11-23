@@ -139,11 +139,14 @@ enum AtlasCapturedReader {
     /// reader. Substring Find can exhaust its result allowance on unrelated
     /// identifier prefixes before the selected token, so it cannot authorize
     /// an Occurrences result. No source is reopened and no token parser runs
-    /// in Swift. At most 4096 retained occurrence rows / 33 pages are visited.
+    /// in Swift. Legacy inventories visit at most 4096 rows / 33 pages. Counted
+    /// windows locate a later range through bounded ordinal probes instead of
+    /// loading every intervening occurrence into the native client.
     @MainActor static func activateOccurrence<Page: Sendable>(
         _ selected: AtlasSearchCapturedHit, identity: AtlasReaderIdentity,
         prepare: @MainActor (String) async throws -> AtlasReferencePage,
         nextPage: @MainActor (AtlasReferencePageRequest) async throws -> AtlasReferencePage,
+        prepareWindow: (@MainActor (String, UInt64) async throws -> AtlasReferencePage)? = nil,
         read: @MainActor (AtlasReferenceTarget) async throws -> Page,
         isCurrent: @MainActor () -> Bool = { true }
     ) async throws -> AtlasCapturedReferenceResult<Page> {
@@ -162,6 +165,11 @@ enum AtlasCapturedReader {
         try AtlasReferencePage.validateName(selected.needle)
         var current = try await prepare(selected.needle)
         try checkCurrent()
+        if let prepareWindow {
+            guard current.inventory.window != nil else { throw AtlasReaderError.invalidResponse }
+            return try await activateOccurrenceWindow(selected, identity: identity, first: current,
+                prepareWindow: prepareWindow, read: read, isCurrent: isCurrent)
+        }
         let inventory = current.inventory
         guard inventory.identity.matches(identity), inventory.generation > 0,
               inventory.name.utf8.elementsEqual(selected.needle.utf8),
@@ -204,6 +212,80 @@ enum AtlasCapturedReader {
             try checkCurrent()
         }
         throw AtlasReaderError.invalidResponse
+    }
+
+    /// Original ranges are strictly ordered whole-token occurrences. Narrow the
+    /// possible ordinal interval using validated first-page ranges; the shared
+    /// engine alone decides which bytes match. Each probe replays at most one
+    /// admitted capture, with the same fixed scan/page allowances as Find.
+    @MainActor private static func activateOccurrenceWindow<Page: Sendable>(
+        _ selected: AtlasSearchCapturedHit, identity: AtlasReaderIdentity, first: AtlasReferencePage,
+        prepareWindow: @MainActor (String, UInt64) async throws -> AtlasReferencePage,
+        read: @MainActor (AtlasReferenceTarget) async throws -> Page,
+        isCurrent: @MainActor () -> Bool
+    ) async throws -> AtlasCapturedReferenceResult<Page> {
+        @MainActor func checkCurrent() throws {
+            try Task.checkCancellation()
+            guard isCurrent() else { throw AtlasReaderError.canceled }
+        }
+        guard first.inventory.window?.request.offset == 0,
+              first.inventory.matchesCounted <= identity.capturedBytes,
+              identity.capturedBytes <= maximumActivationReplayBytes else { throw AtlasReaderError.invalidResponse }
+        let total = first.inventory.matchesCounted
+        var lower: UInt64 = 0, upper = total, offset: UInt64 = 0
+        var current = first, previousGeneration: UInt64 = 0
+        var remainingBytes = maximumActivationReplayBytes - identity.capturedBytes
+        for probe in 0..<maximumActivationPages {
+            try checkCurrent()
+            let inventory = current.inventory
+            guard inventory.identity.matches(identity), inventory.generation > previousGeneration,
+                  inventory.name.utf8.elementsEqual(selected.needle.utf8),
+                  inventory.maxItems == AtlasReferencePage.maxItems,
+                  inventory.matchesCounted == total, inventory.countComplete,
+                  let window = inventory.window, window.request.countAllMatches,
+                  window.request.offset == offset, offset <= total,
+                  window.skipped == offset, current.request == .initial,
+                  inventory.retained == min(AtlasReferencePage.maxItems, total - offset),
+                  UInt64(current.rows.count) == min(AtlasReferencePageRequest.initial.limit, inventory.retained),
+                  current.nextOffset == (UInt64(current.rows.count) < inventory.retained ? UInt64(current.rows.count) : nil)
+            else { throw AtlasReaderError.invalidResponse }
+            let windowEnd = offset + inventory.retained
+            guard inventory.limited == (total > windowEnd), window.hasMore == inventory.limited,
+                  window.rowsTruncated == (total > inventory.retained),
+                  window.nextOffset == (window.hasMore && inventory.retained > 0 ? windowEnd : nil) else {
+                throw AtlasReaderError.invalidResponse
+            }
+            var previousEnd: UInt64 = 0
+            for (index, row) in current.rows.enumerated() {
+                let id = UInt64(index) + 1
+                guard row.id == id, row.occurrence == offset + id,
+                      row.range.start >= previousEnd, row.range.start < row.range.end,
+                      row.range.end <= identity.capturedBytes else { throw AtlasReaderError.invalidResponse }
+                previousEnd = row.range.end
+            }
+            let matches = current.rows.filter { $0.range.start == selected.start && $0.range.end == selected.end }
+            if matches.count == 1, let row = matches.first, let target = current.target(id: row.id) {
+                let page = try await read(target)
+                try checkCurrent()
+                return AtlasCapturedReferenceResult(page: page, referencePage: current, target: target, history: [])
+            }
+            guard matches.isEmpty, let firstRow = current.rows.first, let lastRow = current.rows.last else {
+                throw AtlasReaderError.engine("CAPTURED_OCCURRENCE_UNAVAILABLE")
+            }
+            if selected.start < firstRow.range.start { upper = offset }
+            else if selected.start >= lastRow.range.end { lower = offset + UInt64(current.rows.count) }
+            else { throw AtlasReaderError.engine("CAPTURED_OCCURRENCE_UNAVAILABLE") }
+            guard lower < upper, probe + 1 < maximumActivationPages,
+                  identity.capturedBytes <= remainingBytes else {
+                throw AtlasReaderError.engine("CAPTURED_OCCURRENCE_UNAVAILABLE")
+            }
+            offset = lower + (upper - lower) / 2
+            previousGeneration = inventory.generation
+            remainingBytes -= identity.capturedBytes
+            try checkCurrent()
+            current = try await prepareWindow(selected.needle, offset)
+        }
+        throw AtlasReaderError.engine("CAPTURED_OCCURRENCE_UNAVAILABLE")
     }
 
 }

@@ -2828,17 +2828,30 @@ Occurrence line labels count LF boundaries, including CRLF. Original byte
 ranges remain exact for CR-only source as well.
 
 This service admits up to **512 KiB** of valid UTF-8 or BOM-marked UTF-16 source
-and identifiers of at most **1,024 UTF-8 bytes**. It retains at most **4,096
-occurrences**, returns the first 64 rows and pages through subsequent retained
-rows without rescanning. A limit reports an incomplete inventory and a lower
-bound on matches instead of presenting a truncated count as exhaustive. Files
-outside these bounds remain available through the ordinary source reader.
+and identifiers of at most **1,024 UTF-8 bytes**. The native reader counts all
+whole-token occurrences and retains up to **4,096 per result window**. It returns
+the first 64 rows and pages through the retained rows without rescanning.
+**Next results** and **Previous results** retrieve another window from the same
+capture; the exact total and global occurrence numbers stay separate from the
+window-local IDs used to activate and copy rows. A new window replays the bounded
+capture without allocating or retaining its skipped prefix. Legacy transports
+retain their capped inventory and report a lower bound when it is incomplete.
+Files outside the source/name bounds remain available through the ordinary reader.
+
+Opening an Occurrences result from workspace search can also reach matches past
+the first 4,096. The handoff narrows the possible occurrence ranks using ordered,
+validated original-byte ranges from counted windows, then selects only the exact
+requested range. It inspects at most 64 rows per probe, with fixed page and replay
+byte allowances; it does not re-open the live file or substitute a nearby match.
 Editing the identifier or starting a replacement search revokes old row actions;
-failed or canceled work preserves the accepted source page. Find, outline and
-occurrence queries have independent generations and selection identities.
+failed or canceled work preserves the displayed source and prior result rows,
+but leaves those rows inactive until a new inventory is accepted. Find, outline
+and occurrence queries have independent generations and selection identities.
 
 The Rust host and C-boundary suites cover exact-byte navigation, changed files,
-UTF-16, limits and cancellation. The portable decoder and model suites are wired
+UTF-16, counted windows beyond 5,000 matches, limits and cancellation. Native
+activation fixtures cover page/window boundaries, large occurrence totals,
+changed receipts and superseded probes. The portable decoder and model suites are wired
 through `swiftui/tests/test-reader-references.sh`; the supplied-reader suite also
 covers native reference-call marshaling. These are code-first additions awaiting
 the configured strict-RCH verification lane and physical-Mac qualification.

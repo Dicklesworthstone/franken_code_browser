@@ -58,6 +58,13 @@ Results include comments and strings and open their retained source with exact
 occurrence highlighting. See [workspace identifier occurrences](native/macos/README.md#workspace-identifier-occurrences)
 for encoding, coverage and capture limits.
 
+The retained reader's **Occurrences** tool now reports the complete match count
+and offers **Previous results** / **Next results** beyond its 4,096-row window.
+Later workspace occurrence hits also open their exact range in the same captured
+source, with bounded rank probes instead of retaining every preceding match.
+See [identifier occurrences in retained source](native/macos/README.md#identifier-occurrences-in-retained-source)
+for limits and pending executable verification.
+
 The current source also adds **Search large project files…** in the search sidebar.
 It progressively discovers and streams UTF-8 or BOM-marked UTF-16 files beyond
 ordinary capture limits and the atlas's 20,000-file ceiling, with a selectable

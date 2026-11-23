@@ -273,6 +273,7 @@ private final class AtlasReaderSession: @unchecked Sendable {
     }
     var supportsOutline: Bool { outlineTransport != nil }
     var supportsReferences: Bool { (session?.transport ?? transport).references != nil }
+    var supportsReferenceWindows: Bool { (session?.transport ?? transport).references?.prepareWindow != nil }
     var supportsDocument: Bool { documentTransport != nil }
     var supportsPosition: Bool { (session?.transport ?? transport).position != nil }
     var supportsTextSelection: Bool { (session?.transport ?? transport).textSelection != nil }
@@ -878,11 +879,14 @@ private final class AtlasReaderSession: @unchecked Sendable {
     /// outlines. Attempts never recycle generations, including canceled work.
     /// The old Rust inventory may survive a failed attempt, but it cannot regain
     /// native activation authority from an ambiguous canceled delivery.
-    func prepareReferences(_ name: String) async throws -> AtlasReferencePage {
+    func prepareReferences(_ name: String, window: AtlasReferenceWindowRequest? = nil) async throws -> AtlasReferencePage {
         guard let session, let info, let references = session.transport.references else {
             throw AtlasReaderError.unavailable
         }
         try AtlasReferencePage.validateName(name)
+        guard window == nil || references.prepareWindow != nil else { throw AtlasReaderError.unavailable }
+        let requestedWindow = window ?? (references.prepareWindow == nil ? nil
+            : AtlasReferenceWindowRequest(offset: 0, countAllMatches: true))
         guard info.identity.capturedBytes <= AtlasReferencePage.sourceLimit else {
             throw AtlasReaderError.engine("REFERENCE_SOURCE_LIMIT")
         }
@@ -895,9 +899,15 @@ private final class AtlasReaderSession: @unchecked Sendable {
         operation = ticket; cancellation = flag
         do {
             let page = try await io.perform(cancellation: flag, keepingAlive: [session]) {
-                try AtlasReferencePage.decode(
-                    references.prepare(session.handle, generation, name, AtlasReferencePage.maxItems),
-                    info: info, generation: generation, name: name, request: .initial, preparing: true)
+                let json: String?
+                if let requestedWindow, let prepare = references.prepareWindow {
+                    json = prepare(session.handle, generation, name, AtlasReferencePage.maxItems,
+                        requestedWindow.countAllMatches, requestedWindow.offset)
+                } else {
+                    json = references.prepare(session.handle, generation, name, AtlasReferencePage.maxItems)
+                }
+                return try AtlasReferencePage.decode(json, info: info, generation: generation, name: name,
+                    request: .initial, preparing: true, window: requestedWindow)
             }
             guard self.session === session, operation == ticket, !flag.isCanceled,
                   !Task.isCancelled else { throw AtlasReaderError.canceled }
