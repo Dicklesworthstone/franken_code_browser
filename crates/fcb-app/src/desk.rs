@@ -26,7 +26,8 @@ use fcb::{ByteLength, ByteOffset, ByteRange};
 use fcb::search::{LineNumber, ReadingTarget, ReadingWindowOptions, ResourceBudget};
 use fcb::ui::reading_panes::desk::{MAX_ANNOTATION_BODY_BYTES, MAX_BOOKMARK_LABEL_BYTES};
 use crate::{EXIT_OK, EXIT_ERROR, EXIT_PARTIAL, EXIT_CANCELED, owner, allocation};
-use crate::host::{HostResponse, desk::{DeskSession, DeskSessionError, DeskLimits, DeskCommand, DeskError}};
+use crate::host::{HostResponse, desk::{DeskSession, DeskSessionError, DeskLimits, DeskCommand, DeskError,
+    DeskFindMode, DeskFindOptions}};
 use crate::host::desk::persistence::{CheckpointIoError, CheckpointSaveEffect};
 use crate::host::desk::export::DeskSourcePackLimits;
 use crate::output::Output;
@@ -49,6 +50,8 @@ Commands (arguments separated by literal TABs, not spaces):\n\
   arrange PANE X Y WIDTH HEIGHT (finite logical coordinates)\n\
   find PANE QUERY_GEN LIMIT SCAN_BYTES TEXT\n\
   find-text-hex PANE QUERY_GEN LIMIT SCAN_BYTES UTF8_TEXT_HEX\n\
+  find-page PANE QUERY_GEN MODE CASE COUNT START_AFTER LIMIT SCAN_BYTES TEXT\n\
+  find-page-text-hex PANE QUERY_GEN MODE CASE COUNT START_AFTER LIMIT SCAN_BYTES UTF8_TEXT_HEX\n\
   hit PANE QUERY_GEN ZERO_BASED_HIT | clear-query QUERY_GEN\n\
   bookmark PANE LABEL | recall BOOKMARK | forget BOOKMARK\n\
   annotate PANE LABEL BODY | annotate-hex PANE LABEL_UTF8_HEX BODY_UTF8_HEX\n\
@@ -68,7 +71,25 @@ Commands (arguments separated by literal TABs, not spaces):\n\
 Copy returns original bytes as hex; it does not write the clipboard.\n\
 open reads one regular file (max 4 MiB), never a directory or implicit stdin.\n\
 Later operations use retained bytes even after a live file changes.\n\
-UTF-8/BOM UTF-16 windows use the shared reader. Pane Find uses exact literal text.\n\
+UTF-8/BOM UTF-16 windows and Find use the shared reader. find remains exact literal.\n\
+find-page MODE: literal | expression | identifier. CASE: sensitive | unicode-lowercase.\n\
+COUNT: bounded | count-all. Unicode lowercase is not full case folding/normalization.\n\
+Identifiers require sensitive case and find textual tokens, including comments and\n\
+strings; they do not establish compiler references. Expressions support phrases,\n\
+required terms and exclusions within the same capture. They always scan to EOF\n\
+before qualifying hits; partial expressions expose no tentative rows or count.\n\
+Pane labels do not authorize path/type/lang filters; those expressions are refused.\n\
+Regex syntax is not enabled. Needles/expressions are limited to 1024 UTF-8 bytes.\n\
+START_AFTER skips matching occurrences; LIMIT retains 0..4096 rows. A zero LIMIT\n\
+with count-all counts only; bounded mode instead tests for another occurrence.\n\
+Each window needs a fresh QUERY_GEN and replays retained bytes from byte zero;\n\
+SCAN_BYTES includes the skipped prefix. No page reopens a source path.\n\
+Responses separate scan/count completeness, omitted rows and known later matches.\n\
+has_more_matches=false proves the end only when search_complete=true. Omitted\n\
+earlier or later rows yield partial exit status even when the count is complete.\n\
+hit takes the accepted page's zero-based index and QUERY_GEN; occurrence_id is\n\
+one-based across the capture. Advance START_AFTER by the accepted retained_hits.\n\
+Failed/canceled replacements preserve old rows. Find preserves notes and selection.\n\
 Notes use the same exact anchors as bookmarks: 256-byte labels and 16 KiB UTF-8\n\
 bodies. Empty bodies are allowed; hex accepts multiline text, tabs and NUL.\n\
 Editing changes personal text only, preserving the capture and original range.\n\
@@ -313,9 +334,9 @@ fn execute(session: &mut DeskSession, attempt: u64, frame: &str,
     repository: &mut RepositoryCommands, documents: &mut DocumentCommands,
     comparisons: &mut ComparisonCommands, saved: &mut SavedCommands,
     code: &mut CodeCommands, readers: &mut ReadingCommands) -> Result<(HostResponse, bool), Failure> {
-    // Revision + command + at most ten scoped search arguments.
+    // Revision + command + at most eleven indexed-window arguments.
     // Keep framing fixed-size even for a hostile separator-heavy frame.
-    let mut fields = [""; 12]; let mut used = 0;
+    let mut fields = [""; 13]; let mut used = 0;
     for field in frame.split('\t') {
         if used == fields.len() { return Err(Failure::Protocol("DESK_FIELD_LIMIT")); }
         fields[used] = field; used += 1;
@@ -325,16 +346,21 @@ fn execute(session: &mut DeskSession, attempt: u64, frame: &str,
     if expected != session.model().revision() { return Err(DeskError::StaleRevision.into()); }
     let args = &fields[2..used];
     let command = fields[1];
-    // Only the new scoped commands need the two additional fields. Preserve
-    // the established framing bound for every existing protocol command.
-    if used > 10 && !matches!(command, "repo-begin-structure" | "repo-begin-structure-text-hex"
+    // Widen only commands whose grammar actually needs the extra fields.
+    // Legacy commands keep their established framing and rejection boundaries.
+    let field_limit = match command {
+        "repo-begin-indexed-matching-window" | "repo-begin-indexed-matching-window-text-hex"
+        | "repo-begin-indexed-expression-window" | "repo-begin-indexed-expression-window-text-hex" => 13,
+        "repo-begin-structure" | "repo-begin-structure-text-hex"
         | "repo-begin-indexed-structure" | "repo-begin-indexed-structure-text-hex"
         | "repo-begin-matching" | "repo-begin-matching-text-hex"
         | "repo-begin-expression" | "repo-begin-expression-text-hex"
         | "repo-begin-indexed-matching" | "repo-begin-indexed-matching-text-hex"
-        | "repo-begin-indexed-expression" | "repo-begin-indexed-expression-text-hex") {
-        return Err(Failure::Protocol("DESK_FIELD_LIMIT"));
-    }
+        | "repo-begin-indexed-expression" | "repo-begin-indexed-expression-text-hex" => 12,
+        "find-page" | "find-page-text-hex" => 11,
+        _ => 10,
+    };
+    if used > field_limit { return Err(Failure::Protocol("DESK_FIELD_LIMIT")); }
     if command.starts_with("repo-") {
         return Ok((repository.execute(session, expected, attempt, command, args, &mut *canceled)?, false));
     }
@@ -407,6 +433,30 @@ fn execute(session: &mut DeskSession, attempt: u64, frame: &str,
                 decoded.as_str()
             } else { text };
             return Ok((session.search(expected, pane(session, p)?, number(generation)?, needle, count(limit)?, number(bytes)?, &mut *canceled)?, false));
+        }
+        ("find-page" | "find-page-text-hex", [p, generation, mode, case, counting, after, limit, bytes, text]) => {
+            let mode = match *mode {
+                "literal" => DeskFindMode::Literal,
+                "expression" => DeskFindMode::Expression,
+                "identifier" => DeskFindMode::Identifier,
+                _ => return Err(Failure::Protocol("DESK_FIND_MODE")),
+            };
+            let case_sensitive = match *case {
+                "sensitive" => true, "unicode-lowercase" => false,
+                _ => return Err(Failure::Protocol("DESK_FIND_CASE")),
+            };
+            let count_all_matches = match *counting {
+                "bounded" => false, "count-all" => true,
+                _ => return Err(Failure::Protocol("DESK_FIND_COUNT")),
+            };
+            let decoded;
+            let needle = if command == "find-page-text-hex" {
+                decoded = String::from_utf8(hex(text, 1024)?).map_err(|_| Failure::Protocol("DESK_INVALID_TEXT"))?;
+                decoded.as_str()
+            } else { text };
+            let options = DeskFindOptions { mode, case_sensitive, count_all_matches, start_after: number(after)? };
+            return Ok((session.search_with_options(expected, pane(session, p)?, number(generation)?,
+                needle, count(limit)?, number(bytes)?, options, &mut *canceled)?, false));
         }
         ("hit", [p, generation, index]) => { session.activate_hit(expected, attempt, pane(session, p)?, number(generation)?, count(index)?, &mut *canceled)?; None }
         ("clear-query", [generation]) => { session.clear_query(number(generation)?)?; None }

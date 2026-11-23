@@ -10,9 +10,9 @@
 use std::{mem::size_of, path::Path};
 use fcb::{ArenaOwnerId, ByteLength, ByteOffset, ByteRange, FileId, QueryGeneration,
     SourceCapture, SourceRevision};
-use fcb::search::{CaptureRequest, ReaderError, ReaderLimits, ReaderSearch, ReadingSeekState,
+use fcb::search::{QueryError, ReaderError, ReaderLimits, ReadingSeekState,
     ReadingTarget, ReadingWindowOptions, ResourceAllocationId, ResourceBudget, StreamReadError,
-    StreamReadOptions, StreamReadState, StreamReadStep, StreamingHit, StreamingNeedle};
+    StreamingHit};
 use fcb::source::RawPath;
 use fcb_core::ResourceLease;
 pub use fcb::ui::reading_panes::desk::{DeskChange, DeskCommand, DeskError, DeskLimits,
@@ -22,6 +22,7 @@ use crate::{AppError, EXIT_OK, EXIT_PARTIAL, MANAGED_BYTES};
 use crate::output::{Output, OutputError, MAX_RESPONSE_BYTES};
 use super::{HostError, HostResponse, MAX_HOST_TEXT_BYTES};
 use super::observed_reader::ObservedReaderError;
+pub use search::{DeskFindMode, DeskFindOptions};
 
 pub const MAX_DESK_MATCHES: usize = 4096;
 pub const MAX_DESK_NEEDLE_BYTES: usize = 1024;
@@ -30,7 +31,8 @@ pub const MAX_DESK_COPY_BYTES: usize = 256 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeskSessionError {
     Desk(DeskError), Host(HostError), App(AppError), Reader(ReaderError),
-    Stream(StreamReadError), Output(OutputError), Observed(ObservedReaderError), MissingQuery, StaleQuery, MissingHit,
+    Stream(StreamReadError), Query(QueryError), Output(OutputError), Observed(ObservedReaderError),
+    MissingQuery, StaleQuery, MissingHit, ExpressionScopeUnsupported,
 }
 impl std::fmt::Display for DeskSessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -38,9 +40,10 @@ impl std::fmt::Display for DeskSessionError {
             Self::Desk(e) => write!(f, "{e}"), Self::Host(e) => write!(f, "{e}"),
             Self::App(e) => write!(f, "{e}"), Self::Reader(e) => write!(f, "{e}"),
             Self::Stream(e) => write!(f, "{e}"), Self::Output(e) => write!(f, "{e}"),
-            Self::Observed(e) => write!(f, "{e}"),
+            Self::Observed(e) => write!(f, "{e}"), Self::Query(e) => write!(f, "{e}"),
             Self::MissingQuery => f.write_str("DESK_NO_QUERY"), Self::StaleQuery => f.write_str("DESK_STALE_QUERY"),
             Self::MissingHit => f.write_str("DESK_MISSING_HIT"),
+            Self::ExpressionScopeUnsupported => f.write_str("DESK_EXPRESSION_SCOPE_UNSUPPORTED"),
         }
     }
 }
@@ -50,12 +53,14 @@ impl From<HostError> for DeskSessionError { fn from(e: HostError) -> Self { Self
 impl From<AppError> for DeskSessionError { fn from(e: AppError) -> Self { Self::App(e) } }
 impl From<ReaderError> for DeskSessionError { fn from(e: ReaderError) -> Self { Self::Reader(e) } }
 impl From<StreamReadError> for DeskSessionError { fn from(e: StreamReadError) -> Self { Self::Stream(e) } }
+impl From<QueryError> for DeskSessionError { fn from(e: QueryError) -> Self { Self::Query(e) } }
 impl From<OutputError> for DeskSessionError { fn from(e: OutputError) -> Self { Self::Output(e) } }
 impl From<ObservedReaderError> for DeskSessionError { fn from(e: ObservedReaderError) -> Self { Self::Observed(e) } }
 impl DeskSessionError {
     pub fn is_canceled(self) -> bool {
         match self {
-            Self::Desk(DeskError::Canceled) | Self::Reader(ReaderError::Canceled) => true,
+            Self::Desk(DeskError::Canceled) | Self::Reader(ReaderError::Canceled)
+                | Self::Query(QueryError::Canceled) => true,
             Self::App(e) | Self::Host(HostError::App(e)) => e.is_canceled(),
             Self::Observed(e) => e.is_canceled(),
             _ => false,
@@ -250,58 +255,11 @@ impl DeskSession {
 
     /// One bounded, exact literal query on one pane's immutable capture. A
     /// query replaces old rows only after its private response is complete.
+    /// Use search_with_options for expressions, identifiers, case and windows.
     pub fn search(&mut self, expected: u64, pane: DeskPaneId, generation: u64, needle: &str,
-        max_matches: usize, max_bytes: u64, mut canceled: impl FnMut() -> bool) -> Result<HostResponse, DeskSessionError> {
-        self.desk.location(pane, expected)?;
-        if generation == 0 || generation <= self.last_query_attempt { return Err(DeskSessionError::StaleQuery); }
-        if needle.is_empty() || needle.len() > MAX_DESK_NEEDLE_BYTES || max_matches > MAX_DESK_MATCHES {
-            return Err(DeskError::InvalidLimits.into());
-        }
-        self.last_query_attempt = generation;
-        check(&mut canceled)?;
-        let [view_id, pattern_id, worker_id, result_id] = self.ids()?;
-        let view = self.desk.view(pane, expected, view_id)?;
-        let source = view.source();
-        let request = CaptureRequest::new(source.file(), source.revision()).map_err(|_| DeskError::OwnerMismatch)?;
-        let pattern = StreamingNeedle::text(self.desk.owner(), needle, &self.budget, pattern_id)?;
-        let query_generation = QueryGeneration::new(self.desk.owner(), generation).map_err(|_| DeskError::IdentityExhausted)?;
-        let mut options = StreamReadOptions::new(query_generation);
-        options.max_matches = max_matches; options.max_bytes = max_bytes;
-        let mut scan = ReaderSearch::new(source.bytes(), request, ByteLength::new(source.bytes().len() as u64),
-            &pattern, options, &self.budget, worker_id)?;
-        while scan.state() == StreamReadState::Pending { scan.step(StreamReadStep::default(), query_generation, &mut canceled)?; }
-        let (_, report) = scan.finish()?;
-        if report.state() == StreamReadState::Canceled { return Err(DeskError::Canceled.into()); }
-        if let StreamReadState::Failed(e) = report.state() { return Err(e.into()); }
-        let lease = self.budget.try_reserve_managed(self.desk.owner(), result_id,
-            ByteLength::new((size_of::<AcceptedQuery>() + max_matches * size_of::<StreamingHit>() + 128) as u64))
-            .map_err(|_| AppError::Admission)?;
-        let mut hits = Vec::new();
-        hits.try_reserve_exact(max_matches).map_err(|_| AppError::Admission)?;
-        if hits.capacity() > max_matches { return Err(AppError::Admission.into()); }
-        hits.extend_from_slice(report.hits());
-        let mut out = self.output("find")?;
-        out.literal(",\"pane\":")?; out.integer(pane.get())?;
-        out.literal(",\"query_generation\":")?; out.integer(generation)?;
-        out.literal(",\"file_id\":")?; out.integer(source.file().get())?;
-        out.literal(",\"source_revision\":")?; out.integer(source.revision().get())?;
-        out.literal(",\"state\":")?; out.quoted(report.state().code())?;
-        out.literal(",\"search_complete\":")?; out.boolean(report.input_complete())?;
-        out.literal(",\"scanned_bytes\":")?; out.integer(report.stats().scanned_bytes)?;
-        out.literal(",\"matches_seen\":")?; out.integer(report.matches_seen())?;
-        out.literal(",\"hits\":[")?;
-        for (i, hit) in hits.iter().enumerate() {
-            if i > 0 { out.literal(",")?; }
-            out.literal("{\"hit\":")?; out.integer(i as u64)?;
-            out.literal(",\"original_range\":")?; out.range(hit.original_range())?; out.literal("}")?;
-        }
-        out.literal("]}\n")?;
-        let exit = if report.input_complete() { EXIT_OK } else { EXIT_PARTIAL };
-        let response = self.finish(out, exit, &mut canceled)?;
-        check(&mut canceled)?;
-        drop(report);
-        self.query = Some(AcceptedQuery { generation, source: view, hits, _lease: lease });
-        Ok(response)
+        max_matches: usize, max_bytes: u64, canceled: impl FnMut() -> bool) -> Result<HostResponse, DeskSessionError> {
+        self.search_with_options(expected, pane, generation, needle, max_matches,
+            max_bytes, DeskFindOptions::default(), canceled)
     }
     pub fn activate_hit(&mut self, expected: u64, attempt: u64, pane: DeskPaneId,
         generation: u64, hit: usize, canceled: impl FnMut() -> bool) -> Result<DeskChange, DeskSessionError> {
@@ -409,3 +367,6 @@ pub mod reading;
 
 /// Explicit exact-capture transfer into an independently owned full reader.
 pub mod reader;
+
+/// Bounded text modes and occurrence windows over retained source captures.
+pub mod search;

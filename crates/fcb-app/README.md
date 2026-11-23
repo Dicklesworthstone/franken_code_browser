@@ -1054,6 +1054,45 @@ Rust hosts can select the same behavior through
 `DeskRepository::open_with_policy`, `open_directory_with_policy` and
 `open_file_with_policy`.
 
+## Find within a retained Reading Desk pane
+
+`DeskSession::search_with_options` adds literal, expression and whole-token
+identifier Find over a pane's immutable UTF-8/BOM UTF-16 capture, including
+captures restored from checkpoints. The stdio interface exposes:
+
+```text
+find-page PANE QUERY_GEN MODE CASE COUNT START_AFTER LIMIT SCAN_BYTES TEXT
+find-page-text-hex PANE QUERY_GEN MODE CASE COUNT START_AFTER LIMIT SCAN_BYTES UTF8_TEXT_HEX
+```
+
+`MODE` is `literal`, `expression` or `identifier`; `CASE` is `sensitive` or
+`unicode-lowercase`; `COUNT` is `bounded` or `count-all`. Unicode lowercase
+does not claim full case folding or normalization. Identifier mode requires
+sensitive case and returns textual candidates, including comments and strings,
+without claiming compiler references. Expressions support phrases, required
+terms and exclusions. They publish qualified primary occurrences only after
+the full captured input has been scanned; a byte-limited expression exposes
+no tentative rows or count. Pane labels do not authorize path/type/language
+filters, so those expressions are refused.
+
+`START_AFTER` skips matching occurrences; each fresh query generation replays
+the retained bytes from zero under `SCAN_BYTES`. `LIMIT` retains at most 4096
+rows. Zero rows with `count-all` counts without navigable results. Each hit
+includes its page-local `hit` index, one-based whole-capture `occurrence_id`
+and exact original byte range. For a nonempty page with known later matches,
+advance `START_AFTER` by its `retained_hits`, retaining the same query and
+options and choosing a fresh generation.
+
+Responses distinguish `search_complete`, `match_count_complete`,
+`rows_truncated` and `has_more_matches`. A complete count can still return
+exit 3 because rows were omitted. No known later match proves the end only
+when scanning is complete. Existing `find`, `find-text-hex` and `search`
+retain literal defaults. Failed or canceled replacements preserve the
+accepted query; searching does not change selection, notes or reading history.
+No page reopens a source path. Regression sources cover exact encoded ranges,
+later windows, count-only results, late expression predicates, cancellation,
+offline restoration and protocol framing; independent execution is pending.
+
 ## Search and count text in a live Reading Desk
 
 A repository attached with `repo-open` supports scoped literal and expression
