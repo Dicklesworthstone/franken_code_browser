@@ -292,6 +292,81 @@ fn export_byte_and_scalar_limits_include_metadata_and_omit_whole_payloads() {
 }
 
 #[test]
+fn exported_selected_text_uses_capture_encoding_and_preserves_original_bytes() {
+    let text = "A🦀\0\r\n\t\"\\\u{feff}Z";
+    let mut big_endian = vec![0xfe, 0xff];
+    for unit in text.encode_utf16() { big_endian.extend_from_slice(&unit.to_be_bytes()); }
+    let mut utf8_bom = vec![0xef, 0xbb, 0xbf]; utf8_bom.extend_from_slice(text.as_bytes());
+    for (source, encoding, bom_omitted) in [
+        (text.as_bytes().to_vec(), "UTF-8", false),
+        (utf8_bom, "UTF-8 (BOM)", true),
+        (utf16(text), "UTF-16LE", true),
+        (big_endian, "UTF-16BE", true),
+    ] {
+        let f = Fixture::new(); let archive = f.archive("source.fcbs", b"a.rs", &source);
+        assert_eq!(invoke(&f.add(&archive, 0, source.len() as u64), || false).0, EXIT_OK);
+        let destination = f.0.join("text.json");
+        let (exit, receipt) = invoke(&f.export(&archive, &destination), || false);
+        assert_eq!(exit, EXIT_OK);
+        let bytes = fs::read(destination).unwrap(); let pack = parse(&bytes).unwrap();
+        let row = &pack.get("entries").array()[0];
+        assert_eq!(row.get("selected_text").text(), text);
+        assert_eq!(row.get("selected_text_status").text(), "exact");
+        assert_eq!(row.get("source_encoding").text(), encoding);
+        assert_eq!(row.get("selected_text_bom_omitted").flag(), bom_omitted);
+        let hex = source.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        assert_eq!(row.get("selected_original_hex").text(), hex);
+        assert_eq!(receipt.get("export_bytes").number(), bytes.len() as u64);
+        assert_eq!(receipt.get("export_characters").number(), std::str::from_utf8(&bytes).unwrap().chars().count() as u64);
+        assert!(pack.get("complete").flag());
+    }
+}
+
+#[test]
+fn malformed_and_split_selections_keep_exact_hex_with_an_explicit_text_refusal() {
+    for (source, start, end, status) in [
+        (b"a\xffb".as_slice(), 0, 3, "malformed-source"),
+        ("a🦀b".as_bytes(), 2, 5, "invalid-boundary"),
+    ] {
+        let f = Fixture::new(); let archive = f.archive("source.fcbs", b"a.rs", source);
+        assert_eq!(invoke(&f.add(&archive, start, end), || false).0, EXIT_OK);
+        let destination = f.0.join("raw.json");
+        assert_eq!(invoke(&f.export(&archive, &destination), || false).0, EXIT_OK);
+        let pack = parse(&fs::read(destination).unwrap()).unwrap();
+        let row = &pack.get("entries").array()[0];
+        assert!(matches!(row.get("selected_text"), Json::Null));
+        assert_eq!(row.get("selected_text_status").text(), status);
+        assert_eq!(row.get("selected_original_hex").text(), source[start as usize..end as usize]
+            .iter().map(|byte| format!("{byte:02x}")).collect::<String>());
+        assert!(pack.get("complete").flag(), "original-byte evidence is complete despite text refusal");
+    }
+}
+
+#[test]
+fn readable_text_budget_cannot_displace_later_original_evidence_or_notes() {
+    let f = Fixture::new(); let source = vec![b'x'; 4000];
+    let archive = f.archive("source.fcbs", b"a.rs", &source);
+    assert_eq!(invoke(&f.add(&archive, 0, source.len() as u64), || false).0, EXIT_OK);
+    let second = f.0.join("second.fcbt");
+    f.append(&archive, &f.trail(), &second, 0, source.len() as u64, "Revisit the same exact evidence");
+    let destination = f.0.join("bounded.json");
+    let mut args = f.export_many(&second, &[&archive], &destination);
+    args.extend(["--max-output-bytes".into(), "24000".into(), "--max-output-chars".into(), "24000".into()]);
+    let (exit, receipt) = invoke(&args, || false);
+    assert_eq!(exit, EXIT_OK); assert!(receipt.get("complete").flag());
+    let bytes = fs::read(destination).unwrap(); assert!(bytes.len() <= 24000);
+    let pack = parse(&bytes).unwrap(); let rows = pack.get("entries").array();
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        assert_eq!(row.get("selected_original_hex").text(), "78".repeat(source.len()));
+        assert_eq!(row.get("readiness").text(), "digest-verified");
+    }
+    assert!(rows.iter().any(|row| row.get("selected_text_status").text() == "output-budget"));
+    assert_eq!(rows[1].get("selection").get("rationale").text(), "Revisit the same exact evidence");
+    assert_eq!(pack.get("coverage").get("selected_original_bytes").number(), 8000);
+}
+
+#[test]
 fn zero_export_entry_limit_preserves_an_explicit_omitted_tail_without_payload_reads() {
     let f = Fixture::new(); let archive = f.archive("a.fcbs", b"a.rs", b"abc");
     assert_eq!(invoke(&f.add(&archive, 0, 3), || false).0, EXIT_OK);

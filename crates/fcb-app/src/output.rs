@@ -68,6 +68,12 @@ impl Output {
     }
     pub(crate) fn quoted(&mut self, text: &str) -> Result<(), OutputError> {
         self.append(b"\"")?;
+        self.quoted_fragment(text)?;
+        self.append(b"\"")
+    }
+    /// Append an already decoded fragment inside a JSON string. Streaming
+    /// callers own its quotes and reuse exactly the ordinary JSON escaping.
+    pub(crate) fn quoted_fragment(&mut self, text: &str) -> Result<(), OutputError> {
         for byte in text.bytes() {
             match byte {
                 b'"' => self.append(b"\\\"")?, b'\\' => self.append(b"\\\\")?,
@@ -76,7 +82,7 @@ impl Output {
                 _ => self.append(&[byte])?,
             }
         }
-        self.append(b"\"")
+        Ok(())
     }
     /// All integer-valued wire fields use canonical decimal strings, even small
     /// instances, so their type cannot change when a later value exceeds 2^53.

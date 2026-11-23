@@ -1296,7 +1296,7 @@ private final class AtlasSavedTrailArchiveAccess {
             : "this opened archive and \(additionalArchives.count) selected saved archives"
         let validation = additionalArchives.isEmpty ? "" :
             " The selected archives are fully validated before export, within a 256 MiB total archive-read limit."
-        panel.message = "Exports ordered notes, paths and up to \(selectedBytes) original source bytes from \(sources) as JSON. Unavailable selections retain their notes and reasons.\(validation) Source and notes may contain secrets; nothing is redacted or encrypted. Choose a new filename; existing files are never overwritten."
+        panel.message = "Exports ordered notes, paths and up to \(selectedBytes) original source bytes from \(sources) as JSON. Text selections include readable UTF-8 or UTF-16 text when decoding and output limits permit; exact original bytes remain available as hex. Unavailable selections retain their notes and reasons.\(validation) Source and notes may contain secrets; nothing is redacted or encrypted. Choose a new filename; existing files are never overwritten."
         panel.nameFieldStringValue = "ReadingTrail.source-pack.json"
         panel.canCreateDirectories = true
         guard panel.runModal() == .OK, let url = panel.url else { return }

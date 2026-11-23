@@ -1,16 +1,17 @@
 #![forbid(unsafe_code)]
 
-//! Source-specific JSON evidence packs, not a Markdown exporter or source
-//! decoder. Exact original selections remain byte hex, including malformed
-//! text and ranges inside a scalar. Scalar budgets count the serialized JSON
-//! representation, including escaped metadata, not characters in decoded code.
+//! Source-specific JSON evidence packs with optional exact decoded text.
+//! Original selections remain byte hex, including malformed text and ranges
+//! inside a scalar. Scalar budgets count the serialized JSON representation,
+//! including escaped metadata and source text, not characters in decoded code.
 
 use super::*;
 use fcb::search::trail::{TrailExportCursor, TrailExportLimits, TrailExportOutcome, TrailExportStats};
+use crate::source_pack_text::{self, TextError, TextSource, TextStatus};
 
 pub(crate) const PACK_SCHEMA: &str = "fcb.trail-source-pack/1";
 const ENTRY_METADATA_BYTES: usize = 512 * 1024;
-const ENTRY_OVERHEAD_RESERVE: usize = 256;
+const ENTRY_OVERHEAD_RESERVE: usize = 256 + source_pack_text::FIELDS_RESERVE;
 const TAIL_RESERVE: usize = 2048;
 pub(crate) mod archives;
 use archives::Archives;
@@ -30,12 +31,16 @@ pub(super) fn run(s: &Settings, view: TrailView<'_>, receipt: &mut Output,
     let mut metadata = Output::new(owner(), ENTRY_METADATA_BYTES, budget, allocation(211))?;
     let mut reserved_bytes = pack.as_bytes().len() + TAIL_RESERVE;
     let mut reserved_characters = scalars(pack.as_bytes())? + TAIL_RESERVE;
+    let mut selected_bytes_requested = 0u64;
     // All admitted notes and references remain visible even if source payloads
     // do not fit. Reserve their actual escaped encoding before payload loads.
     // If metadata itself cannot fit, refuse before creating any destination.
     for (ordinal, entry) in view.entries().take(s.limit).enumerate() {
         if canceled() { return Err(Failure::canceled()); }
-        metadata.clear(); entry_output(&mut metadata, entry?, ordinal)?;
+        let entry = entry?;
+        selected_bytes_requested = selected_bytes_requested.checked_add(entry.range.len().get())
+            .ok_or_else(|| Failure::new("TRAIL_EXPORT_OUTPUT_BYTE_LIMIT"))?;
+        metadata.clear(); entry_output(&mut metadata, entry, ordinal)?;
         reserved_bytes = reserved_bytes.checked_add(metadata.as_bytes().len() + ENTRY_OVERHEAD_RESERVE)
             .ok_or_else(|| Failure::new("TRAIL_EXPORT_METADATA_BYTE_LIMIT"))?;
         reserved_characters = reserved_characters.checked_add(scalars(metadata.as_bytes())? + ENTRY_OVERHEAD_RESERVE)
@@ -48,6 +53,15 @@ pub(super) fn run(s: &Settings, view: TrailView<'_>, receipt: &mut Output,
     // One original byte always needs exactly two ASCII hex scalars. JSON quotes
     // and every other byte are already covered by the provenance reservations.
     let selection_limit = (remaining_bytes.min(remaining_characters) / 2) as u64;
+    // Preserve admission for every original-byte selection that could fit.
+    // Optional text spends only the surplus after this upper bound, so an
+    // earlier readable entry cannot evict a later selection's exact evidence.
+    let hex_reserved = (selected_bytes_requested.min(selection_limit) * 2) as usize;
+    let mut text_bytes = remaining_bytes - hex_reserved;
+    let mut text_characters = remaining_characters - hex_reserved;
+    let _decode_lease = budget.try_reserve_managed(owner(), allocation(215),
+        ByteLength::new(source_pack_text::DECODE_SCRATCH_BYTES))
+        .map_err(|_| Failure::new("TRAIL_EXPORT_DECODE_ADMISSION"))?;
     let output_reason = if remaining_bytes <= remaining_characters {
         "TRAIL_EXPORT_OUTPUT_BYTE_LIMIT"
     } else { "TRAIL_EXPORT_OUTPUT_CHARACTER_LIMIT" };
@@ -75,6 +89,16 @@ pub(super) fn run(s: &Settings, view: TrailView<'_>, receipt: &mut Output,
         match reason { Some(reason) => pack.quoted(&reason)?, None => pack.literal("null")? }
         pack.literal(",\"selected_original_hex\":")?;
         match selected { Some(bytes) => source_hex(&mut pack, bytes, canceled)?, None => pack.literal("null")? }
+        match &item.outcome {
+            TrailExportOutcome::Verified(capture) => {
+                let text = source_pack_text::prepare(TextSource::complete(capture.bytes()), item.target.entry().range,
+                    text_bytes.saturating_add(4), text_characters.saturating_add(4), canceled).map_err(text_failure)?;
+                source_pack_text::write_fields(&mut pack, &text, canceled).map_err(text_failure)?;
+                text_bytes -= text.json_bytes().saturating_sub(4);
+                text_characters -= text.json_scalars().saturating_sub(4);
+            }
+            _ => source_pack_text::write_unavailable_fields(&mut pack, TextStatus::SourceUnavailable)?,
+        }
         pack.literal("}")?;
         // item drops here: the next repeated visit verifies anew with the same
         // bounded allocation slots, rather than retaining a trail-sized heap.
@@ -146,6 +170,7 @@ pub(crate) fn header_prefix(out: &mut Output, view: TrailView<'_>) -> Result<(),
     out.literal(",\"referenced_bytes_including_repeats\":")?; out.integer(view.reference_bytes())?;
     out.literal(",\"completeness_scope\":\"all-saved-trail-selections\",\"deduplication\":\"none-preserve-explicit-visits\"")?;
     out.literal(",\"source_representation\":\"original-bytes-lowercase-hex\",\"character_representation\":\"unicode-scalars-in-serialized-utf8-json\"")?;
+    out.literal(",\"selected_text_representation\":\"exact-unicode-when-decodable-and-budgeted\"")?;
     out.literal(",\"live_roots_accessed\":false,\"redacted\":false,\"payload_truncated\":false,\"archive\":")
 }
 
@@ -181,6 +206,13 @@ fn tail(out: &mut Output, stats: TrailExportStats, output_reason: &str) -> Resul
 }
 fn scalars(bytes: &[u8]) -> Result<usize, Failure> {
     Ok(std::str::from_utf8(bytes).map_err(|_| Failure::new("TRAIL_EXPORT_INVALID_JSON_TEXT"))?.chars().count())
+}
+fn text_failure(error: TextError) -> Failure {
+    match error {
+        TextError::Canceled => Failure::canceled(),
+        TextError::Decode => Failure::new("TRAIL_EXPORT_SOURCE_DECODE"),
+        TextError::Output(error) => error.into(),
+    }
 }
 fn source_hex(out: &mut Output, bytes: &[u8], canceled: &mut impl FnMut() -> bool) -> Result<(), Failure> {
     const HEX: &[u8; 16] = b"0123456789abcdef";

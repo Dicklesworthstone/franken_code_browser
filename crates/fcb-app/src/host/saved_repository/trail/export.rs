@@ -13,12 +13,14 @@ use fcb::search::{ResourceAllocationId, ResourceBudget};
 use fcb::search::paged_snapshot::PagedSnapshot;
 use fcb::search::trail::{TrailExportCursor, TrailExportLimits, TrailExportOutcome,
     TrailExportStats, TrailView, MAX_TRAIL_ITEMS};
+use fcb::source::detect_encoding;
 use fcb::store::{Sha256, Sha256Digest};
 use fcb_core::ResourceLease;
 use crate::{AppError, EXIT_CANCELED, EXIT_ERROR, EXIT_OK, EXIT_PARTIAL, input};
 use crate::host::HostResponse;
 use crate::host::desk::persistence::{publish_new_bytes, CheckpointIoError, CheckpointSaveEffect};
 use crate::output::{Output, OutputError, MAX_ENCODED_BYTES};
+use crate::source_pack_text::{self, TextError, TextSource, TextStatus};
 use crate::trail::{entry_output, export::{archive_output, coverage, header_prefix, PACK_SCHEMA,
     archives::{Archives, ArchiveSetError, MAX_ARCHIVES, MAX_VALIDATION_BYTES}}};
 use super::{SavedRepositorySession, SavedTrailError, SavedTrailWriteParent, check};
@@ -26,7 +28,7 @@ use super::{SavedRepositorySession, SavedTrailError, SavedTrailWriteParent, chec
 const RECEIPT_BYTES: usize = 256 * 1024;
 const MIXED_RECEIPT_BYTES: usize = 2 * 1024 * 1024;
 const METADATA_BYTES: usize = 512 * 1024;
-const ENTRY_RESERVE: usize = 512;
+const ENTRY_RESERVE: usize = 512 + source_pack_text::FIELDS_RESERVE;
 const TAIL_RESERVE: usize = 4096;
 
 /// Independent ceilings for visits, whole-member verification, selected bytes,
@@ -145,7 +147,7 @@ impl SavedRepositorySession {
         if !input::NATIVE_FILE_SUPPORTED { return Err(AppError::UnsupportedPlatform.into()); }
         let owner = self.owner();
         let archive_digest = self.archive_digest();
-        let [out_id, reply_id, path_id, pack_id, metadata_id, source_id, capture_id, archives_id] = self.allocations()?;
+        let [out_id, reply_id, path_id, pack_id, metadata_id, source_id, capture_id, archives_id, decode_id] = self.allocations()?;
         let _path = self.budget.try_reserve_managed(owner, path_id, ByteLength::new(64 * 1024))
             .map_err(|_| AppError::Admission)?;
         let destination = input::absolute(request.destination)?;
@@ -170,9 +172,12 @@ impl SavedRepositorySession {
             let mut metadata = Output::new(owner, METADATA_BYTES, &self.budget, metadata_id)?;
             let mut reserved_bytes = pack.as_bytes().len() + TAIL_RESERVE;
             let mut reserved_scalars = scalars(pack.as_bytes())? + TAIL_RESERVE;
+            let mut requested_selection_bytes = 0u64;
             for (ordinal, entry) in view.entries().take(request.limits.entries).enumerate() {
                 check(&mut canceled)?;
-                metadata.clear(); entry_output(&mut metadata, entry?, ordinal)?;
+                let entry = entry?;
+                requested_selection_bytes = requested_selection_bytes.saturating_add(entry.range.len().get());
+                metadata.clear(); entry_output(&mut metadata, entry, ordinal)?;
                 reserved_bytes = reserved_bytes.checked_add(metadata.as_bytes().len() + ENTRY_RESERVE)
                     .ok_or(SavedTrailError::InvalidLimits)?;
                 reserved_scalars = reserved_scalars.checked_add(scalars(metadata.as_bytes())? + ENTRY_RESERVE)
@@ -184,6 +189,18 @@ impl SavedRepositorySession {
                 .ok_or(SavedTrailError::InvalidLimits)?;
             let output_selection_limit = (remaining_bytes.min(remaining_scalars) / 2) as u64;
             let selected_limit = request.limits.selected_bytes.min(output_selection_limit);
+            // Text is an optional companion to the exact original bytes. Keep
+            // every later note and the maximum admitted hex payload reserved;
+            // an early readable selection cannot crowd them out. The sum of
+            // actual requested ranges avoids reserving a large hypothetical
+            // payload for a small trail whose configured allowance is high.
+            let hex_reserve = usize::try_from(requested_selection_bytes.min(selected_limit))
+                .ok().and_then(|n| n.checked_mul(2)).ok_or(SavedTrailError::InvalidLimits)?;
+            let mut text_bytes = remaining_bytes - hex_reserve;
+            let mut text_scalars = remaining_scalars - hex_reserve;
+            let _decode_scratch = self.budget.try_reserve_managed(owner, decode_id,
+                ByteLength::new(source_pack_text::DECODE_SCRATCH_BYTES))
+                .map_err(|_| AppError::Admission)?;
             let reason = if request.limits.selected_bytes <= output_selection_limit { "TRAIL_EXPORT_SELECTED_BYTE_LIMIT" }
                 else if remaining_bytes <= remaining_scalars { "TRAIL_EXPORT_OUTPUT_BYTE_LIMIT" }
                 else { "TRAIL_EXPORT_OUTPUT_CHARACTER_LIMIT" };
@@ -219,6 +236,17 @@ impl SavedRepositorySession {
                 if let Some(reason) = omission { pack.quoted(&reason)?; } else { pack.literal("null")?; }
                 pack.literal(",\"selected_original_hex\":")?;
                 if let Some(bytes) = bytes { source_hex(&mut pack, bytes, &mut canceled)?; } else { pack.literal("null")?; }
+                if let TrailExportOutcome::Verified(capture) = &item.outcome {
+                    let text = source_pack_text::prepare(TextSource { bytes: capture.bytes(),
+                        original_start: 0, encoding: detect_encoding(capture.bytes()) }, item.target.entry().range,
+                        text_bytes.saturating_add(4), text_scalars.saturating_add(4), &mut canceled)
+                        .map_err(text_error)?;
+                    text_bytes = text_bytes.saturating_sub(text.json_bytes().saturating_sub(4));
+                    text_scalars = text_scalars.saturating_sub(text.json_scalars().saturating_sub(4));
+                    source_pack_text::write_fields(&mut pack, &text, &mut canceled).map_err(text_error)?;
+                } else {
+                    source_pack_text::write_unavailable_fields(&mut pack, TextStatus::SourceUnavailable)?;
+                }
                 pack.literal("}")?;
             }
             pack.literal("],\"coverage\":")?; coverage(&mut pack, stats)?;
@@ -373,6 +401,13 @@ impl From<ArchiveSetError> for SavedTrailError {
 }
 fn scalars(bytes: &[u8]) -> Result<usize, SavedTrailError> {
     Ok(std::str::from_utf8(bytes).map_err(|_| SavedTrailError::InvalidLimits)?.chars().count())
+}
+fn text_error(error: TextError) -> SavedTrailError {
+    match error {
+        TextError::Canceled => super::super::SavedRepositoryError::Canceled.into(),
+        TextError::Decode => SavedTrailError::InvalidLimits,
+        TextError::Output(error) => error.into(),
+    }
 }
 fn source_hex(out: &mut Output, bytes: &[u8], canceled: &mut impl FnMut() -> bool)
     -> Result<(), SavedTrailError> {

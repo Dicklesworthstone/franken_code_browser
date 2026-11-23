@@ -33,7 +33,8 @@ fcb trail export TRAIL --archive ARCHIVE [--archive ANOTHER_ARCHIVE ...] --outpu
   Supply up to 8 archives; verified digests route saved visits, never names or argument order.\n\
   Archive directories share a 64 MiB admission limit; omitted archives remain unavailable.\n\
   Defaults: 128 entries, 32 MiB member verification, 4 MiB output, 4 Mi Unicode scalars.\n\
-  Exports original selected bytes as lossless hex with provenance and explicit omissions.\n\
+  Exports lossless original hex plus readable selected text when exact decoding and output budgets permit.\n\
+  Each selection retains provenance and explicit source/text omission status.\n\
   JSON packs contain selected source and user notes without redaction; only NEW_PACK is written.\n\
 Items are one-based. Ranges are half-open original bytes, never text columns.\n\
 Trails contain user notes and source references, not source payloads or access grants.\n";

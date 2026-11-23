@@ -67,6 +67,8 @@ fn retained_archive_export_preserves_exact_bytes_order_notes_and_unavailable_vis
     let rows = pack.get("entries").array(); assert_eq!(rows.len(), 5);
     for row in &rows[..2] {
         assert_eq!(row.get("selected_original_hex").text(), "61000a62");
+        assert_eq!(row.get("selected_text").text(), "a\0\nb");
+        assert_eq!(row.get("selected_text_status").text(), "exact");
         assert_eq!(row.get("selection").get("rationale").text(), "é\0λ — exact note");
         assert_eq!(row.get("selection").get("path").get("hex").text(), "7372632f7261772dff2e7273");
     }
@@ -74,6 +76,9 @@ fn retained_archive_export_preserves_exact_bytes_order_notes_and_unavailable_vis
     for row in &rows[3..] {
         assert_eq!(row.get("readiness").text(), "unavailable");
         assert_eq!(row.get("selected_original_hex"), &Json::Null);
+        assert_eq!(row.get("selected_text"), &Json::Null);
+        assert_eq!(row.get("selected_text_status").text(), "source-unavailable");
+        assert_eq!(row.get("source_encoding"), &Json::Null);
         assert!(!row.get("reason").text().is_empty());
     }
     assert_eq!(receipt.get("export_bytes").number(), bytes.len() as u64);
@@ -329,4 +334,164 @@ fn supplemental_export_cancellation_after_create_retains_effect_and_limit_prefli
         VALIDATION_BYTES + 1, || false), Err(SavedTrailError::InvalidLimits)));
     assert!(!refused.exists()); assert_eq!(read_bytes(&mut saved), before);
     assert_eq!(saved.trail_export_receipt(1, || false).unwrap().as_str(), response.as_str());
+}
+
+fn attach_readable_trail(f: &Fixture, saved: &mut SavedRepositorySession,
+    selections: &[(&[u8], &[u8], ByteRange, &str)]) -> SavedTrailWriteParent {
+    let entries: Vec<_> = selections.iter().map(|&(path, bytes, range, rationale)| TrailEntry {
+        archive: saved.archive_digest(), source: Sha256::digest(bytes),
+        source_length: bytes.len() as u64, path, range, rationale,
+    }).collect();
+    let budget = ResourceBudget::new(owner(63760), ByteLength::new(16 * 1024 * 1024)).unwrap();
+    let trail = TrailBytes::encode(owner(63760), "Readable exact source", None, &entries,
+        &budget, ResourceAllocationId::new(1).unwrap(), || false).unwrap();
+    let path = f.root.join("readable.fcbt");
+    fs::write(&path, trail.bytes()).unwrap();
+    saved.attach_trail(17, &path, || false).unwrap();
+    SavedTrailWriteParent { generation: 17, digest: trail.digest() }
+}
+
+fn utf16(text: &str, little_endian: bool) -> Vec<u8> {
+    let mut bytes = if little_endian { vec![0xff, 0xfe] } else { vec![0xfe, 0xff] };
+    for unit in text.encode_utf16() {
+        bytes.extend_from_slice(&if little_endian { unit.to_le_bytes() } else { unit.to_be_bytes() });
+    }
+    bytes
+}
+
+fn expected_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[test]
+fn readable_saved_trail_uses_full_capture_encoding_for_interior_selections() {
+    let text = "λ🦀\0\n\"\\";
+    let utf8 = format!("prefix:{text}:suffix").into_bytes();
+    let utf16_text = "α🦀\r\nz";
+    let le = utf16(utf16_text, true);
+    let be = utf16(utf16_text, false);
+    let bom_utf8 = "\u{feff}a\u{feff}z".as_bytes();
+    let f = Fixture::new(&[
+        entry(b"a.rs", &utf8), entry(b"b.txt", &le), entry(b"c.txt", &be), entry(b"d.txt", bom_utf8),
+    ], true);
+    let mut saved = f.open(63761);
+    let trail = attach_readable_trail(&f, &mut saved, &[
+        (b"a.rs", &utf8, range(7, 7 + text.len() as u64), "Exact UTF-8 selection"),
+        (b"b.txt", &le, range(4, 12), "Interior UTF-16LE selection without its BOM"),
+        (b"c.txt", &be, range(0, be.len() as u64), "Complete UTF-16BE source"),
+        (b"d.txt", bom_utf8, range(0, bom_utf8.len() as u64), "Only the initial BOM is omitted"),
+    ]);
+    // Readable text must use the same retained verified bytes as the hex,
+    // even after both original filenames cease to identify those artifacts.
+    fs::rename(&f.path, f.root.join("original.fcbs")).unwrap();
+    fs::write(&f.path, b"unrelated current archive").unwrap();
+    fs::write(f.root.join("readable.fcbt"), b"unrelated current trail").unwrap();
+    let destination = f.root.join("readable-pack.json");
+    let response = saved.export_trail(request(&destination, trail, 1), || false).unwrap();
+    assert_eq!(response.exit_code(), EXIT_OK);
+    let bytes = fs::read(&destination).unwrap();
+    let pack = parse(&bytes).unwrap();
+    assert_eq!(pack.get("source_representation").text(), "original-bytes-lowercase-hex");
+    assert_eq!(pack.get("selected_text_representation").text(), "exact-unicode-when-decodable-and-budgeted");
+    let rows = pack.get("entries").array();
+    let expected = [
+        (text, "UTF-8", false, &utf8[7..7 + text.len()]),
+        ("🦀\r\n", "UTF-16LE", false, &le[4..12]),
+        (utf16_text, "UTF-16BE", true, be.as_slice()),
+        ("a\u{feff}z", "UTF-8 (BOM)", true, bom_utf8),
+    ];
+    for (row, (text, encoding, omitted_bom, selected)) in rows.iter().zip(expected) {
+        assert_eq!(row.get("selected_text").text(), text);
+        assert_eq!(row.get("selected_text_status").text(), "exact");
+        assert_eq!(row.get("source_encoding").text(), encoding);
+        assert_eq!(row.get("selected_text_bom_omitted").flag(), omitted_bom);
+        assert_eq!(row.get("selected_original_hex").text(), expected_hex(selected));
+    }
+    let receipt = json(&response);
+    assert_eq!(receipt.get("member_bytes_read").number(), (utf8.len() + le.len() + be.len() + bom_utf8.len()) as u64);
+    assert_eq!(receipt.get("export_bytes").number(), bytes.len() as u64);
+    assert_eq!(receipt.get("export_characters").number(), std::str::from_utf8(&bytes).unwrap().chars().count() as u64);
+    assert!(receipt.get("coverage_complete").flag());
+    assert_eq!(saved.trail_export_receipt(1, || false).unwrap().as_str(), response.as_str());
+}
+
+#[test]
+fn undecodable_trail_selections_keep_exact_original_evidence_and_notes() {
+    let valid = "a🦀z".as_bytes();
+    let malformed = b"a\xffz";
+    let surrogate = [0xff, 0xfe, 0x00, 0xd8];
+    let replacement = "\u{fffd}".as_bytes();
+    let f = Fixture::new(&[
+        entry(b"a.txt", valid), entry(b"b.bin", malformed), entry(b"c.txt", &surrogate), entry(b"d.txt", replacement),
+    ], true);
+    let mut saved = f.open(63762);
+    let trail = attach_readable_trail(&f, &mut saved, &[
+        (b"a.txt", valid, range(1, 4), "Selection ends inside the crab"),
+        (b"b.bin", malformed, range(0, 3), "Malformed bytes are preserved"),
+        (b"c.txt", &surrogate, range(0, 4), "Unpaired UTF-16 surrogate"),
+        (b"d.txt", replacement, range(0, 3), "An actual replacement character is valid text"),
+        (b"a.txt", valid, range(1, 1), "A point bookmark has empty text"),
+    ]);
+    let destination = f.root.join("undecodable-pack.json");
+    let response = saved.export_trail(request(&destination, trail, 1), || false).unwrap();
+    assert_eq!(response.exit_code(), EXIT_OK, "all original selections remain complete");
+    let pack = parse(&fs::read(&destination).unwrap()).unwrap();
+    let rows = pack.get("entries").array();
+    for (index, (status, hex, note)) in [
+        ("invalid-boundary", "f09fa6", "Selection ends inside the crab"),
+        ("malformed-source", "61ff7a", "Malformed bytes are preserved"),
+        ("malformed-source", "fffe00d8", "Unpaired UTF-16 surrogate"),
+    ].into_iter().enumerate() {
+        let row = &rows[index];
+        assert_eq!(row.get("selected_text"), &Json::Null);
+        assert_eq!(row.get("selected_text_status").text(), status);
+        assert_eq!(row.get("selected_original_hex").text(), hex);
+        assert_eq!(row.get("selection").get("rationale").text(), note);
+        assert_eq!(row.get("readiness").text(), "digest-verified");
+    }
+    assert_eq!(rows[3].get("selected_text").text(), "\u{fffd}");
+    assert_eq!(rows[3].get("selected_text_status").text(), "exact");
+    assert_eq!(rows[4].get("selected_text").text(), "");
+    assert_eq!(rows[4].get("selected_original_hex").text(), "");
+    assert_eq!(rows[4].get("selected_text_status").text(), "exact");
+    assert!(pack.get("complete").flag());
+}
+
+#[test]
+fn optional_readable_text_cannot_consume_later_original_bytes_or_notes() {
+    // JSON escaping amplifies this readable selection sixfold. Its text cannot
+    // fit, but both original selections and the later readable text still do.
+    let escaped = vec![0u8; 4096];
+    let later = b"later evidence";
+    let f = Fixture::new(&[entry(b"a.txt", &escaped), entry(b"b.txt", later)], true);
+    let mut saved = f.open(63763);
+    let trail = attach_readable_trail(&f, &mut saved, &[
+        (b"a.txt", &escaped, range(0, escaped.len() as u64), "Keep every original NUL"),
+        (b"b.txt", later, range(0, later.len() as u64), "Later note é must survive"),
+    ]);
+    for (operation, output_bytes, output_scalars) in [
+        (1, 24 * 1024, 16 * 1024 * 1024),
+        (2, 16 * 1024 * 1024, 24 * 1024),
+    ] {
+        let destination = f.root.join(format!("readable-budget-{operation}.json"));
+        let response = saved.export_trail(SavedTrailExportRequest {
+            limits: SavedTrailExportLimits { output_bytes, output_scalars, ..Default::default() },
+            ..request(&destination, trail, operation)
+        }, || false).unwrap();
+        assert_eq!(response.exit_code(), EXIT_OK);
+        let bytes = fs::read(&destination).unwrap();
+        assert!(bytes.len() <= output_bytes);
+        assert!(std::str::from_utf8(&bytes).unwrap().chars().count() <= output_scalars);
+        let pack = parse(&bytes).unwrap();
+        let rows = pack.get("entries").array();
+        assert_eq!(rows[0].get("selected_text"), &Json::Null);
+        assert_eq!(rows[0].get("selected_text_status").text(), "output-budget");
+        assert_eq!(rows[0].get("selected_original_hex").text(), "00".repeat(escaped.len()));
+        assert_eq!(rows[1].get("selected_original_hex").text(), expected_hex(later));
+        assert_eq!(rows[1].get("selected_text").text(), "later evidence");
+        assert_eq!(rows[1].get("selected_text_status").text(), "exact");
+        assert_eq!(rows[1].get("selection").get("rationale").text(), "Later note é must survive");
+        assert!(pack.get("complete").flag());
+        assert_eq!(json(&response).get("coverage").get("verified_entries").number(), 2);
+    }
 }

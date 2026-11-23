@@ -16,6 +16,7 @@ mod stream_context;
 mod snapshot;
 mod snapshot_diff;
 mod trail;
+mod source_pack_text;
 mod symbols;
 mod lines;
 mod atlas;
