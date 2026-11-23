@@ -2,6 +2,8 @@ import Foundation
 import CoreGraphics
 import CoreText
 import Dispatch
+import AppKit
+import CryptoKit
 
 /// Resident preview limits are separate from the renderer's GPU/image limits
 /// and from an independently opened reader. At most one bounded preparation
@@ -62,13 +64,194 @@ enum AtlasViewportPreviewState: String, Sendable {
     }
 }
 
-/// The production transport performs only the existing Rust capture/highlight
-/// operation. The source cache owns no native documents or font state here.
+/// Source capture remains authoritative even when native artifacts are present.
+/// Injected transports opt into the additional immutable-artifact capability.
 struct AtlasViewportSourceTransport: Sendable {
     let load: @Sendable (String, UInt64, AtlasSearchCancellation) throws -> AtlasProjectSourcePacket?
+    var artifacts: AtlasViewportArtifactTransport? = nil
     static let live = Self(load: { path, handle, cancellation in
         try AtlasProjectWorker.source(path: path, handle: handle, cancellation: cancellation)
-    })
+    }, artifacts: .live)
+}
+
+struct AtlasViewportArtifactTransport: Sendable {
+    let environment: @Sendable (AtlasSearchCancellation) throws -> String
+    let load: @Sendable (UInt64, String, Int, AtlasSearchCancellation) throws -> Data?
+    let store: @Sendable (UInt64, String, Data, Bool, AtlasSearchCancellation) throws -> Bool
+    static let live = Self(environment: { try AtlasViewportFontEnvironment.shared.snapshot($0) },
+        load: { try AtlasProjectWorker.artifact(handle: $0, key: $1, limit: $2, cancellation: $3) },
+        store: { try AtlasProjectWorker.storeArtifact(handle: $0, key: $1, data: $2, repair: $3, cancellation: $4) })
+}
+
+/// Notification callbacks only advance a locked generation. Registry/file
+/// inspection runs on the viewport worker, never in the callback or main actor.
+private final class AtlasViewportFontEnvironment: @unchecked Sendable {
+    static let shared = AtlasViewportFontEnvironment()
+    private let lock = NSLock()
+    private var generation = UUID()
+    private var cached: (generation: UUID, value: String)?
+    private var observers: [(NotificationCenter, NSObjectProtocol)] = []
+    private init() {
+        let name = Notification.Name(kCTFontManagerRegisteredFontsChangedNotification as String)
+        for center in [NotificationCenter.default, DistributedNotificationCenter.default()] {
+            let observer = center.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in
+                guard let self else { return }
+                self.lock.lock(); self.generation = UUID(); self.cached = nil; self.lock.unlock()
+            }
+            observers.append((center, observer))
+        }
+    }
+    deinit { for (center, observer) in observers { center.removeObserver(observer) } }
+    func snapshot(_ cancellation: AtlasSearchCancellation) throws -> String {
+        guard !cancellation.isCanceled else { throw AtlasPreparationError.canceled }
+        lock.lock()
+        let requested = generation, previous = cached
+        lock.unlock()
+        if let previous, previous.generation == requested { return previous.value }
+        let registry = try AtlasProjectCache.nativeFontEnvironment(canceled: { cancellation.isCanceled })
+        var writer = AtlasBinaryWriter(byteLimit: 16_384)
+        try writer.string(registry)
+        try writer.string(ProcessInfo.processInfo.operatingSystemVersionString)
+        try writer.string(CTFontCopyPostScriptName(NSFont.monospacedSystemFont(ofSize: 13, weight: .regular) as CTFont) as String)
+        let value = SHA256.hash(data: writer.data).map { String(format: "%02x", $0) }.joined()
+        lock.lock()
+        let current = generation == requested
+        if current { cached = (requested, value) }
+        lock.unlock()
+        guard current, !cancellation.isCanceled else { throw AtlasPreparationError.canceled }
+        return value
+    }
+}
+
+struct AtlasViewportPreparation: Equatable, Sendable {
+    var glyphArchiveHit = false
+    var rasterArchiveHit = false
+    var shapedDocuments = 0
+    var rasterizedTiles = 0
+    var restoredColorLines = 0
+    var artifactsWritten = 0
+}
+
+/// One work item's native codec state. It is created and used only on the
+/// serial viewport worker, and owns no source/document after that item ends.
+private final class AtlasViewportArtifacts {
+    static let byteLimit = 16 * 1024 * 1024
+    // Rust may materialize a bounded 64 MiB artifact before the smaller native
+    // limit is checked. Allow both foreign/local copies and the existing 256 MiB
+    // physical-font table budget, separately from source/glyph/raster overlap.
+    static let scratchBytes = 384 * 1024 * 1024
+    let key: String
+    private let environment: String
+    private let handle: UInt64
+    private let transport: AtlasViewportArtifactTransport
+    private let cancellation: AtlasSearchCancellation
+    private let fonts: AtlasPreparedFonts
+    private var glyphRepair = false
+    private var glyphLoaded = false
+    private var rejectRelatedRasters = false
+    private(set) var receipt = AtlasViewportPreparation()
+
+    private func checkEnvelope(_ data: Data, marker: String, key: String) throws {
+        guard data.count <= Self.byteLimit else { throw AtlasPreparationError.limit }
+        var expected = AtlasBinaryWriter(byteLimit: 128)
+        try expected.string(marker); try expected.string(key)
+        guard data.starts(with: expected.data) else { throw AtlasPreparationError.invalid }
+    }
+
+    init?(root: String, path: String, sourceKey: [UInt8]?, handle: UInt64, workingBytes: Int,
+          transport: AtlasViewportArtifactTransport?, cancellation: AtlasSearchCancellation) {
+        guard handle != 0, let sourceKey, sourceKey.count == 32, let transport,
+              workingBytes <= AtlasViewportLimits.preparationBytes - Self.scratchBytes,
+              !cancellation.isCanceled,
+              let environment = try? transport.environment(cancellation), environment.utf8.count <= 16_384 else { return nil }
+        var writer = AtlasBinaryWriter(byteLimit: 64 * 1024)
+        do {
+            try writer.string("fcb-viewport-glyphs/1;" + AtlasProjectCache.layoutVersion)
+            try writer.string(root); try writer.string(path); try writer.bytes(Data(sourceKey)); try writer.string(environment)
+        } catch { return nil }
+        key = SHA256.hash(data: writer.data).map { String(format: "%02x", $0) }.joined()
+        self.environment = environment; self.handle = handle; self.transport = transport; self.cancellation = cancellation
+        fonts = AtlasPreparedFonts(canceled: { cancellation.isCanceled })
+    }
+
+    func loadGlyphs(path: String, capture: AtlasHighlightCapture, limits: AtlasViewportLimits) -> AtlasDocument? {
+        do {
+            guard !cancellation.isCanceled,
+                  let data = try transport.load(handle, key, Self.byteLimit, cancellation) else { return nil }
+            do {
+                try checkEnvelope(data, marker: "FCBPT5", key: key)
+                let restored = try AtlasDocumentArchive.decode(data, path: path, key: key, fonts: fonts,
+                    glyphLimit: limits.glyphs, pixelLimit: 0, runLimit: limits.runs, includeRasters: false,
+                    byteLimit: Self.byteLimit, captureRunLimit: AtlasViewportLimits.captureRuns, tileLimit: limits.tiles,
+                    expectedCapture: capture, canceled: { self.cancellation.isCanceled })
+                glyphLoaded = true; receipt.glyphArchiveHit = true
+                receipt.restoredColorLines = restored.restoredColorLineCount
+                return restored
+            } catch AtlasPreparationError.limit { rejectRelatedRasters = true; return nil }
+            catch AtlasPreparationError.canceled { return nil }
+            catch AtlasPreparationError.fontUnavailable { glyphRepair = true; rejectRelatedRasters = true; return nil }
+            catch { glyphRepair = true; rejectRelatedRasters = true; return nil }
+        } catch { return nil }
+    }
+
+    func saveGlyphs(_ document: AtlasDocument) {
+        guard !glyphLoaded, !cancellation.isCanceled, environmentIsCurrent() else { return }
+        do {
+            let data = try AtlasDocumentArchive.encode(document, key: key, fonts: fonts, includeRasters: false,
+                byteLimit: Self.byteLimit, canceled: { self.cancellation.isCanceled })
+            guard environmentIsCurrent() else { return }
+            if try transport.store(handle, key, data, glyphRepair, cancellation) { receipt.artifactsWritten += 1 }
+        } catch { /* Optional immutable cache publication never rejects source. */ }
+    }
+
+    func prepareRasters(_ tiles: [AtlasTextTile], pixelBudget: Int, perTile: Int,
+                        tileLimit: Int) -> Bool {
+        guard !tiles.isEmpty, !cancellation.isCanceled else { return false }
+        let sizes = tiles.map { $0.rasterSize(pixelBudget: perTile) }
+        guard let rasterKey = try? AtlasOverviewArchive.viewportKey(sourceKey: key, tiles: tiles, sizes: sizes,
+            pixelBudget: pixelBudget) else { return false }
+        var repair = glyphRepair
+        do {
+            if let data = try transport.load(handle, rasterKey, Self.byteLimit, cancellation) {
+                if !glyphLoaded || rejectRelatedRasters {
+                    // Only glyph rows validated against their physical font
+                    // tables authorize saved pixels. A cold rebuild can select
+                    // another fallback face despite an unchanged registry stamp.
+                    repair = true
+                } else {
+                    do {
+                        try checkEnvelope(data, marker: "FCBOV2", key: rasterKey)
+                        let images = try AtlasOverviewArchive.decodePixels(data, key: rasterKey, sizes: sizes,
+                            byteLimit: Self.byteLimit, pixelLimit: pixelBudget, tileLimit: tileLimit,
+                            canceled: { self.cancellation.isCanceled })
+                        guard !cancellation.isCanceled else { return false }
+                        for (tile, image) in zip(tiles, images) { tile.raster = image }
+                        receipt.rasterArchiveHit = true
+                        return true
+                    } catch AtlasPreparationError.limit { }
+                    catch AtlasPreparationError.canceled { return false }
+                    catch { repair = true }
+                }
+            }
+        } catch { }
+        guard !cancellation.isCanceled else { return false }
+        for tile in tiles {
+            guard !cancellation.isCanceled else { return false }
+            tile.prepareRaster(pixelBudget: perTile); receipt.rasterizedTiles += 1
+        }
+        do {
+            let data = try AtlasOverviewArchive.encodePixels(tiles, key: rasterKey, byteLimit: Self.byteLimit,
+                canceled: { self.cancellation.isCanceled })
+            guard environmentIsCurrent() else { return false }
+            if try transport.store(handle, rasterKey, data, repair, cancellation) { receipt.artifactsWritten += 1 }
+        } catch { }
+        return true
+    }
+
+    func environmentIsCurrent() -> Bool {
+        guard !cancellation.isCanceled, let current = try? transport.environment(cancellation) else { return false }
+        return current.utf8.elementsEqual(environment.utf8)
+    }
 }
 
 /// Native rendering adaptation on the existing viewport worker. A transport
@@ -99,10 +282,13 @@ final class AtlasViewportPreparedSource: @unchecked Sendable {
     let cost: AtlasViewportCost
     let cachedMarkdown: AtlasDocument?
     let markdownRequested: Bool
+    let preparation: AtlasViewportPreparation
     init(rawPath: [UInt8], base: AtlasDocument, document: AtlasDocument, cost: AtlasViewportCost,
-         cachedMarkdown: AtlasDocument? = nil, markdownRequested: Bool = false) {
+         cachedMarkdown: AtlasDocument? = nil, markdownRequested: Bool = false,
+         preparation: AtlasViewportPreparation = AtlasViewportPreparation()) {
         self.rawPath = rawPath; self.base = base; self.document = document; self.cost = cost
         self.cachedMarkdown = cachedMarkdown; self.markdownRequested = markdownRequested
+        self.preparation = preparation
     }
 }
 
@@ -165,6 +351,8 @@ final class AtlasViewportWorker: Sendable {
         }
         let base: AtlasDocument
         let reusedSource: Bool
+        var artifacts: AtlasViewportArtifacts?
+        var preparation = AtlasViewportPreparation()
         if let reuse = work.reuse, reuse.rawPath == work.entry.rawPath,
            reuse.base.source.path.utf8.elementsEqual(work.entry.rawPath) {
             base = reuse.base
@@ -198,36 +386,47 @@ final class AtlasViewportWorker: Sendable {
                 + AtlasViewportLimits.fileRasterPixels * 8 + 8 * 1024 * 1024
             guard working <= AtlasViewportLimits.preparationBytes else { return .refused(.readerOnly) }
             guard bytes <= work.limits.sourceBytes else { return .refused(.capacityLimited) }
-            guard let cold = AtlasDocument(path: path, capture: capture, glyphLimit: work.limits.glyphs,
-                runLimit: work.limits.runs, tileLimit: work.limits.tiles,
-                canceled: { work.cancellation.isCanceled }) else {
-                return work.cancellation.isCanceled ? .canceled : .refused(.readerOnly)
-            }
-            guard cold.tiles.count <= work.limits.tiles else { return .refused(.readerOnly) }
-            var tiles: [AtlasTextTile] = []
-            tiles.reserveCapacity(cold.tiles.count)
-            let bridgedSource = capture.text as NSString
-            for (part, tile) in cold.tiles.enumerated() {
+            artifacts = AtlasViewportArtifacts(root: work.root, path: path, sourceKey: packet.key,
+                handle: work.sourceCacheHandle, workingBytes: working, transport: transport.artifacts,
+                cancellation: work.cancellation)
+            guard !work.cancellation.isCanceled else { return .canceled }
+            if let restored = artifacts?.loadGlyphs(path: path, capture: capture, limits: work.limits) {
+                base = restored
+            } else {
                 guard !work.cancellation.isCanceled else { return .canceled }
-                guard let nativeHeader = tile.header,
-                      var header = AtlasPreparedLine(nativeHeader,
-                        source: (path as NSString).lastPathComponent + (part > 0 ? " · \(part + 1)" : "")) else {
-                    return .refused(.unavailable)
+                preparation.shapedDocuments += 1
+                guard let cold = AtlasDocument(path: path, capture: capture, glyphLimit: work.limits.glyphs,
+                    runLimit: work.limits.runs, tileLimit: work.limits.tiles,
+                    canceled: { work.cancellation.isCanceled }) else {
+                    return work.cancellation.isCanceled ? .canceled : .refused(.readerOnly)
                 }
-                if header.hasColorGlyphs { header.retainedColorLine = nativeHeader }
-                var rows: [AtlasPreparedLine] = []
-                rows.reserveCapacity(tile.lines.count)
-                for line in tile.lines {
+                guard cold.tiles.count <= work.limits.tiles else { return .refused(.readerOnly) }
+                var tiles: [AtlasTextTile] = []
+                tiles.reserveCapacity(cold.tiles.count)
+                let bridgedSource = capture.text as NSString
+                for (part, tile) in cold.tiles.enumerated() {
                     guard !work.cancellation.isCanceled else { return .canceled }
-                    guard var row = autoreleasepool(invoking: { AtlasPreparedLine(line, source: bridgedSource) }) else {
+                    guard let nativeHeader = tile.header,
+                          var header = AtlasPreparedLine(nativeHeader,
+                            source: (path as NSString).lastPathComponent + (part > 0 ? " · \(part + 1)" : "")) else {
                         return .refused(.unavailable)
                     }
-                    if row.hasColorGlyphs { row.retainedColorLine = line }
-                    rows.append(row)
+                    if header.hasColorGlyphs { header.retainedColorLine = nativeHeader }
+                    var rows: [AtlasPreparedLine] = []
+                    rows.reserveCapacity(tile.lines.count)
+                    for line in tile.lines {
+                        guard !work.cancellation.isCanceled else { return .canceled }
+                        guard var row = autoreleasepool(invoking: { AtlasPreparedLine(line, source: bridgedSource) }) else {
+                            return .refused(.unavailable)
+                        }
+                        if row.hasColorGlyphs { row.retainedColorLine = line }
+                        rows.append(row)
+                    }
+                    tiles.append(AtlasTextTile(path: path, preparedLines: rows, header: header, sourceRange: tile.sourceRange))
                 }
-                tiles.append(AtlasTextTile(path: path, preparedLines: rows, header: header, sourceRange: tile.sourceRange))
+                base = AtlasDocument(source: cold.source, capture: capture, tiles: tiles)
+                artifacts?.saveGlyphs(base)
             }
-            base = AtlasDocument(source: cold.source, capture: capture, tiles: tiles)
             // Force the only preparation-time lazy field before publication.
             _ = base.preparationCounts
         }
@@ -285,9 +484,16 @@ final class AtlasViewportWorker: Sendable {
                 refusal = .capacityLimited; return nil
             }
             let perTile = max(1, pixelBudget / max(1, display.count))
-            for tile in display {
-                guard !work.cancellation.isCanceled else { return nil }
-                tile.prepareRaster(pixelBudget: perTile)
+            // Only exact source glyphs use the persistent source raster key.
+            // Optional rich Markdown owns a different native presentation.
+            let restoredOrPrepared = presented.presentation == .source
+                && (artifacts?.prepareRasters(display, pixelBudget: pixelBudget, perTile: perTile,
+                    tileLimit: work.limits.tiles) ?? false)
+            if !restoredOrPrepared {
+                for tile in display {
+                    guard !work.cancellation.isCanceled else { return nil }
+                    tile.prepareRaster(pixelBudget: perTile); preparation.rasterizedTiles += 1
+                }
             }
             let pixels = display.reduce(0) { $0 + ($1.raster.map { $0.width * $0.height } ?? 0) }
             let cost = AtlasViewportCost(sourceBytes: sourceBytes, glyphs: counts.glyphs, runs: counts.runs,
@@ -308,6 +514,15 @@ final class AtlasViewportWorker: Sendable {
         let document = fitted.document, display = fitted.display, cost = fitted.cost
         _ = document.preparationCounts
         guard !work.cancellation.isCanceled else { return .canceled }
+        if let artifacts {
+            guard artifacts.environmentIsCurrent() else { return .canceled }
+            let cached = artifacts.receipt
+            preparation.glyphArchiveHit = cached.glyphArchiveHit
+            preparation.rasterArchiveHit = cached.rasterArchiveHit
+            preparation.rasterizedTiles += cached.rasterizedTiles
+            preparation.restoredColorLines = cached.restoredColorLines
+            preparation.artifactsWritten = cached.artifactsWritten
+        }
         func storage(_ tile: AtlasTextTile) -> Any {
             (tile.lines, tile.header, tile.preparedLines, tile.preparedHeader, tile.raster, tile.display)
         }
@@ -330,7 +545,7 @@ final class AtlasViewportWorker: Sendable {
         }
         return .prepared(AtlasViewportPreparedSource(rawPath: work.entry.rawPath, base: base,
             document: document, cost: cost, cachedMarkdown: cachedMarkdown,
-            markdownRequested: work.markdownRequested))
+            markdownRequested: work.markdownRequested, preparation: preparation))
     }
 
     private struct BoundedCapture: Decodable {

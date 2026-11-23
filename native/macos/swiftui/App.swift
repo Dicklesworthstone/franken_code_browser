@@ -2916,8 +2916,9 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         guard !cancellation.isCanceled, projectOpening.accepts(ticket),
               browserProject == ticket.project, projectBrowser.discoveryPolicy == discoveryPolicy,
               atlasDirectory == directory else { return }
-        // This cache owner supplies only Rust's highlighted-source cache. Its
-        // legacy hot document table never owns the viewport's evicted sources.
+        // The viewport worker borrows this owner for Rust source captures and
+        // immutable prepared glyph/pixel artifacts. Its legacy hot document
+        // table never retains the viewport's evicted source documents.
         if projectCache?.root.utf8.elementsEqual(requestedRoot.utf8) != true {
             projectCache = AtlasProjectCache.defaultDirectory(root: requestedRoot).map {
                 AtlasProjectCache(root: requestedRoot, cacheDirectory: $0)

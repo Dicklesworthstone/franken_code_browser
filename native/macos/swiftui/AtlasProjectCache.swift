@@ -69,13 +69,26 @@ final class AtlasProjectCache {
     }
 
     private static func fontEnvironment() -> String {
+        (try? nativeFontEnvironment(canceled: { false })) ?? UUID().uuidString
+    }
+
+    /// No instance state is read here. The viewport can capture this immutable
+    /// descriptor on its own worker without racing the main-actor hot cache.
+    static func nativeFontEnvironment(canceled: () -> Bool) throws -> String {
+        guard !canceled() else { throw AtlasPreparationError.canceled }
         var hash = SHA256()
-        let names = (CTFontManagerCopyAvailablePostScriptNames() as? [String] ?? []).sorted()
+        let available = CTFontManagerCopyAvailablePostScriptNames() as? [String] ?? []
+        guard available.count <= 16_384, available.allSatisfy({ $0.utf8.count <= 512 }) else { throw AtlasPreparationError.limit }
+        let names = available.sorted()
         hash.update(data: Data((names.joined(separator: "\u{0}") + Locale.preferredLanguages.joined(separator: "\u{0}")).utf8))
         // Registry/file metadata invalidates usual font installation changes;
         // actual used font tables are independently checked by artifact decode.
-        let urls = (CTFontManagerCopyAvailableFontURLs() as? [URL] ?? []).sorted { $0.path < $1.path }
+        let availableURLs = CTFontManagerCopyAvailableFontURLs() as? [URL] ?? []
+        guard availableURLs.count <= 16_384 else { throw AtlasPreparationError.limit }
+        let urls = availableURLs.sorted { $0.path < $1.path }
         for url in urls {
+            guard !canceled() else { throw AtlasPreparationError.canceled }
+            guard url.path.utf8.count <= 16_384 else { throw AtlasPreparationError.limit }
             let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
             let stamp = "\(url.path)\u{0}\(attrs?[.size] ?? "")\u{0}\(attrs?[.modificationDate] ?? "")\u{0}\(attrs?[.systemFileNumber] ?? "")"
             hash.update(data: Data(stamp.utf8))
@@ -321,6 +334,73 @@ final class AtlasProjectCache {
 }
 
 enum AtlasOverviewArchive {
+    /// Transparent viewport rasters preserve their exact premultiplied bytes.
+    /// The older opaque PNG archive remains the overview renderer's format.
+    static func viewportKey(sourceKey: String, tiles: [AtlasTextTile], sizes: [CGSize], pixelBudget: Int) throws -> String {
+        guard tiles.count == sizes.count, tiles.count <= 16_384, pixelBudget > 0 else { throw AtlasPreparationError.invalid }
+        var writer = AtlasBinaryWriter(byteLimit: 2 * 1024 * 1024)
+        try writer.string("fcb-viewport-rgba/1;balanced-source-rows;transparent-monokai;device-rgb;premultiplied-last")
+        try writer.string(sourceKey)
+        try writer.integer(UInt64(pixelBudget)); try writer.integer(UInt64(tiles.count))
+        for (tile, size) in zip(tiles, sizes) {
+            guard tile.sourceRange.location >= 0, tile.sourceRange.length >= 0 else { throw AtlasPreparationError.invalid }
+            try writer.integer(UInt64(tile.sourceRange.location)); try writer.integer(UInt64(tile.sourceRange.length))
+            try writer.integer(UInt64(tile.lineCount))
+            for value in [tile.rect.width, tile.rect.height, tile.height, size.width, size.height] { try writer.number(value) }
+        }
+        return SHA256.hash(data: writer.data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func encodePixels(_ tiles: [AtlasTextTile], key: String, byteLimit: Int,
+                             canceled: () -> Bool = { false }) throws -> Data {
+        var writer = AtlasBinaryWriter(byteLimit: byteLimit)
+        try writer.string("FCBOV2"); try writer.string(key); try writer.integer(UInt64(tiles.count))
+        for tile in tiles {
+            guard !canceled() else { throw AtlasPreparationError.canceled }
+            guard let image = tile.raster, let pixels = image.dataProvider?.data,
+                  image.bitsPerComponent == 8, image.bitsPerPixel == 32,
+                  image.bytesPerRow == image.width * 4,
+                  image.bitmapInfo.rawValue == CGImageAlphaInfo.premultipliedLast.rawValue,
+                  CFDataGetLength(pixels) == image.width * image.height * 4 else { throw AtlasPreparationError.invalid }
+            try writer.integer(UInt64(image.width)); try writer.integer(UInt64(image.height))
+            try writer.integer(image.bitmapInfo.rawValue)
+            try writer.integer(UInt64(CFDataGetLength(pixels))); try writer.bytes(pixels as Data)
+        }
+        return writer.data
+    }
+
+    static func decodePixels(_ data: Data, key: String, sizes: [CGSize], byteLimit: Int,
+                             pixelLimit: Int, tileLimit: Int, canceled: () -> Bool = { false }) throws -> [CGImage] {
+        guard !canceled() else { throw AtlasPreparationError.canceled }
+        guard data.count <= min(AtlasBinaryWriter.limit, byteLimit), pixelLimit >= 0,
+              pixelLimit <= 16 * 1024 * 1024, sizes.count <= tileLimit else { throw AtlasPreparationError.limit }
+        var reader = AtlasBinaryReader(data: data)
+        guard try reader.string(16) == "FCBOV2", try reader.string(64).utf8.elementsEqual(key.utf8),
+              try reader.count(min(16_384, tileLimit), stride: 28) == sizes.count else { throw AtlasPreparationError.invalid }
+        var result: [CGImage] = [], remaining = pixelLimit
+        for size in sizes {
+            guard !canceled() else { throw AtlasPreparationError.canceled }
+            let width: UInt64 = try reader.integer(), height: UInt64 = try reader.integer()
+            let bitmap: UInt32 = try reader.integer()
+            guard width > 0, width <= 648, height > 0, height <= UInt64(pixelLimit),
+                  size.width == Double(width), size.height == Double(height),
+                  width <= UInt64(remaining) / height,
+                  bitmap == CGImageAlphaInfo.premultipliedLast.rawValue else { throw AtlasPreparationError.invalid }
+            let pixels = Int(width * height), bytes = try reader.count(remaining * 4)
+            guard bytes == pixels * 4 else { throw AtlasPreparationError.invalid }
+            remaining -= pixels
+            let raw = try reader.bytes(bytes)
+            guard let provider = CGDataProvider(data: raw as CFData),
+                  let image = CGImage(width: Int(width), height: Int(height), bitsPerComponent: 8, bitsPerPixel: 32,
+                    bytesPerRow: Int(width) * 4, space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGBitmapInfo(rawValue: bitmap), provider: provider, decode: nil,
+                    shouldInterpolate: false, intent: .defaultIntent) else { throw AtlasPreparationError.invalid }
+            result.append(image)
+        }
+        guard reader.offset == data.count else { throw AtlasPreparationError.invalid }
+        return result
+    }
+
     static func key(sourceKey: String, tiles: [AtlasTextTile], sizes: [CGSize]) throws -> String {
         guard tiles.count == sizes.count else { throw AtlasPreparationError.invalid }
         var writer = AtlasBinaryWriter()
@@ -395,33 +475,41 @@ enum AtlasOverviewArchive {
 }
 
 enum AtlasDocumentArchive {
-    static func encode(_ document: AtlasDocument, key: String, fonts: AtlasPreparedFonts) throws -> Data {
-        var writer = AtlasBinaryWriter()
-        try writer.string("FCBPT4")
+    static func encode(_ document: AtlasDocument, key: String, fonts: AtlasPreparedFonts,
+                       includeRasters: Bool = true, byteLimit: Int = AtlasBinaryWriter.limit,
+                       canceled: () -> Bool = { false }) throws -> Data {
+        guard !canceled() else { throw AtlasPreparationError.canceled }
+        var writer = AtlasBinaryWriter(byteLimit: byteLimit)
+        // Original-tile rasters belong to the legacy archive. A viewport saves
+        // glyph rows independently of the subsequently fitted tile partition.
+        try writer.string(includeRasters ? "FCBPT4" : "FCBPT5")
         try writer.string(key)
         try writer.string(document.source.path)
         try writer.string(document.capture.text)
         try writer.integer(UInt64(document.capture.runs.count))
         for run in document.capture.runs {
+            guard !canceled() else { throw AtlasPreparationError.canceled }
             guard let start = UInt64(run.start), let length = UInt64(run.length) else { throw AtlasPreparationError.invalid }
             try writer.integer(start); try writer.integer(length); try writer.string(run.role)
         }
         try writer.integer(UInt64(document.tiles.count))
         var styles: [Data: UInt32] = [:]
         for (part, tile) in document.tiles.enumerated() {
+            guard !canceled() else { throw AtlasPreparationError.canceled }
             try writer.integer(UInt64(tile.sourceRange.location))
             try writer.integer(UInt64(tile.sourceRange.length))
             let title = (document.source.path as NSString).lastPathComponent + (part > 0 ? " · \(part + 1)" : "")
             let header = tile.preparedHeader ?? tile.header.flatMap { AtlasPreparedLine($0, source: title) }
             guard let header else { throw AtlasPreparationError.fontUnavailable("header run extraction") }
-            try line(header, into: &writer, fonts: fonts, styles: &styles)
+            try line(header, into: &writer, fonts: fonts, styles: &styles, canceled: canceled)
             try writer.integer(UInt64(tile.lineCount))
             for index in 0..<tile.lineCount {
                 guard let prepared = tile.preparedLines?[index] ?? AtlasPreparedLine(tile.lines[index], source: document.capture.text) else {
                     throw AtlasPreparationError.fontUnavailable("body run extraction index: \(index)")
                 }
-                try line(prepared, into: &writer, fonts: fonts, styles: &styles)
+                try line(prepared, into: &writer, fonts: fonts, styles: &styles, canceled: canceled)
             }
+            if !includeRasters { continue }
             guard let image = tile.raster, let pixels = image.dataProvider?.data else { throw AtlasPreparationError.invalid }
             guard image.bitsPerComponent == 8, image.bitsPerPixel == 32,
                   image.bytesPerRow == image.width * 4 else { throw AtlasPreparationError.invalid }
@@ -434,7 +522,9 @@ enum AtlasDocumentArchive {
     }
 
     private static func line(_ line: AtlasPreparedLine, into writer: inout AtlasBinaryWriter,
-                             fonts: AtlasPreparedFonts, styles: inout [Data: UInt32]) throws {
+                             fonts: AtlasPreparedFonts, styles: inout [Data: UInt32],
+                             canceled: () -> Bool) throws {
+        guard !canceled() else { throw AtlasPreparationError.canceled }
         guard line.sourceRange.location >= 0, line.sourceRange.length >= 0 else { throw AtlasPreparationError.invalid }
         try writer.integer(UInt64(line.sourceRange.location)); try writer.integer(UInt64(line.sourceRange.length))
         try writer.integer(UInt64(line.runs.count))
@@ -456,7 +546,9 @@ enum AtlasDocumentArchive {
             }
             guard run.glyphs.count == run.positions.count else { throw AtlasPreparationError.invalid }
             try writer.integer(UInt64(run.glyphs.count))
-            for (glyph, point) in zip(run.glyphs, run.positions) {
+            for (offset, pair) in zip(run.glyphs, run.positions).enumerated() {
+                if offset % 256 == 0, canceled() { throw AtlasPreparationError.canceled }
+                let (glyph, point) = pair
                 try writer.integer(glyph); try writer.number(point.x); try writer.number(point.y)
             }
         }
@@ -464,22 +556,39 @@ enum AtlasDocumentArchive {
 
     static func decode(_ data: Data, path: String, key: String, fonts: AtlasPreparedFonts,
                        glyphLimit: Int = 4 * 1024 * 1024, pixelLimit: Int = 16 * 1024 * 1024,
-                       runLimit: Int = 262144, onColorLineRestore: () -> Void = {}) throws -> AtlasDocument {
-        guard data.count <= AtlasBinaryWriter.limit else { throw AtlasPreparationError.limit }
+                       runLimit: Int = 262144, includeRasters: Bool = true,
+                       byteLimit: Int = AtlasBinaryWriter.limit, captureRunLimit: Int = 4 * 1024 * 1024,
+                       tileLimit: Int = 65536, expectedCapture: AtlasHighlightCapture? = nil,
+                       canceled: () -> Bool = { false }, onColorLineRestore: () -> Void = {}) throws -> AtlasDocument {
+        guard !canceled() else { throw AtlasPreparationError.canceled }
+        guard data.count <= min(AtlasBinaryWriter.limit, byteLimit), glyphLimit >= 0,
+              pixelLimit >= 0, runLimit >= 0 else { throw AtlasPreparationError.limit }
         var reader = AtlasBinaryReader(data: data)
-        guard try reader.string(16) == "FCBPT4", try reader.string(64) == key,
-              try reader.string(16384) == path else { throw AtlasPreparationError.invalid }
+        guard try reader.string(16) == (includeRasters ? "FCBPT4" : "FCBPT5"),
+              try reader.string(64).utf8.elementsEqual(key.utf8),
+              try reader.string(16384).utf8.elementsEqual(path.utf8) else { throw AtlasPreparationError.invalid }
         let text = try reader.string(4 * 1024 * 1024)
-        let runCount = try reader.count(4 * 1024 * 1024, stride: 24)
+        let runCount = try reader.count(min(4 * 1024 * 1024, captureRunLimit), stride: 24)
+        if let expectedCapture {
+            guard text.utf8.elementsEqual(expectedCapture.text.utf8),
+                  runCount == expectedCapture.runs.count else { throw AtlasPreparationError.invalid }
+        }
         var runs: [AtlasHighlightCapture.Run] = []
-        for _ in 0..<runCount {
+        for index in 0..<runCount {
+            guard !canceled() else { throw AtlasPreparationError.canceled }
             let start: UInt64 = try reader.integer(), length: UInt64 = try reader.integer()
-            runs.append(.init(start: String(start), length: String(length), role: try reader.string(32)))
+            let run = AtlasHighlightCapture.Run(start: String(start), length: String(length), role: try reader.string(32))
+            if let expectedCapture {
+                let expected = expectedCapture.runs[index]
+                guard run.start == expected.start, run.length == expected.length,
+                      run.role.utf8.elementsEqual(expected.role.utf8) else { throw AtlasPreparationError.invalid }
+            }
+            runs.append(run)
         }
         let capture = AtlasHighlightCapture(schema: "fcb.source-document/1", text: text, runs: runs)
         guard capture.validatedRuns() != nil else { throw AtlasPreparationError.invalid }
         let textLength = text.utf16.count
-        let tileCount = try reader.count(65536, stride: 32)
+        let tileCount = try reader.count(min(65536, tileLimit), stride: 32)
         var tiles: [AtlasTextTile] = []
         var cursor = 0
         var glyphsRemaining = glyphLimit
@@ -489,11 +598,13 @@ enum AtlasDocumentArchive {
         var restoredColorLineCount = 0
         var styles: [AtlasPreparedRun] = []
         for _ in 0..<tileCount {
+            guard !canceled() else { throw AtlasPreparationError.canceled }
             let start: UInt64 = try reader.integer(), length: UInt64 = try reader.integer()
             guard start == UInt64(cursor), length > 0, length <= UInt64(textLength - cursor) else {
                 throw AtlasPreparationError.invalid
             }
-            var header = try line(from: &reader, fonts: fonts, remaining: &glyphsRemaining, runsRemaining: &runsRemaining, styles: &styles)
+            var header = try line(from: &reader, fonts: fonts, remaining: &glyphsRemaining, runsRemaining: &runsRemaining,
+                styles: &styles, canceled: canceled)
             let title = (path as NSString).lastPathComponent + (tiles.count > 0 ? " · \(tiles.count + 1)" : "")
             guard header.sourceRange == NSRange(location: 0, length: title.utf16.count) else { throw AtlasPreparationError.invalid }
             if header.hasColorGlyphs {
@@ -512,7 +623,8 @@ enum AtlasDocumentArchive {
             var lines: [AtlasPreparedLine] = []
             var lineCursor = cursor
             for _ in 0..<count {
-                var prepared = try line(from: &reader, fonts: fonts, remaining: &glyphsRemaining, runsRemaining: &runsRemaining, styles: &styles)
+                var prepared = try line(from: &reader, fonts: fonts, remaining: &glyphsRemaining, runsRemaining: &runsRemaining,
+                    styles: &styles, canceled: canceled)
                 guard prepared.sourceRange.location == lineCursor, prepared.sourceRange.length > 0,
                       prepared.sourceRange.length <= cursor + Int(length) - lineCursor else { throw AtlasPreparationError.invalid }
                 lineCursor += prepared.sourceRange.length
@@ -534,6 +646,7 @@ enum AtlasDocumentArchive {
             let tile = AtlasTextTile(path: path, preparedLines: lines, header: header,
                 sourceRange: NSRange(location: cursor, length: Int(length)))
             cursor += Int(length)
+            if !includeRasters { tiles.append(tile); continue }
             let width: UInt64 = try reader.integer(), height: UInt64 = try reader.integer()
             let bitmap: UInt32 = try reader.integer()
             guard width > 0, width <= 648, height > 0, height <= 1302,
@@ -560,13 +673,15 @@ enum AtlasDocumentArchive {
 
     private static func line(from reader: inout AtlasBinaryReader, fonts: AtlasPreparedFonts,
                              remaining: inout Int, runsRemaining: inout Int,
-                             styles: inout [AtlasPreparedRun]) throws -> AtlasPreparedLine {
+                             styles: inout [AtlasPreparedRun], canceled: () -> Bool) throws -> AtlasPreparedLine {
+        guard !canceled() else { throw AtlasPreparationError.canceled }
         let start: UInt64 = try reader.integer(), length: UInt64 = try reader.integer()
         guard start <= 4 * 1024 * 1024, length <= 4 * 1024 * 1024 else { throw AtlasPreparationError.invalid }
         let count = try reader.count(min(16384, runsRemaining), stride: 12)
         runsRemaining -= count
         var runs: [AtlasPreparedRun] = []
         for _ in 0..<count {
+            guard !canceled() else { throw AtlasPreparationError.canceled }
             let index: UInt32 = try reader.integer()
             guard Int(index) <= styles.count, index < 4096 else { throw AtlasPreparationError.invalid }
             if Int(index) == styles.count {
@@ -587,7 +702,8 @@ enum AtlasDocumentArchive {
             remaining -= count
             var glyphs: [CGGlyph] = []; var positions: [CGPoint] = []
             glyphs.reserveCapacity(count); positions.reserveCapacity(count)
-            for _ in 0..<count {
+            for offset in 0..<count {
+                if offset % 256 == 0, canceled() { throw AtlasPreparationError.canceled }
                 let glyph: UInt16 = try reader.integer()
                 let x = try reader.number(), y = try reader.number()
                 guard abs(x) <= 1_000_000, abs(y) <= 1_000_000,

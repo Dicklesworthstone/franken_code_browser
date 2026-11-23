@@ -188,7 +188,7 @@ struct AtlasPreparedLine {
     }
 }
 
-enum AtlasPreparationError: Error { case invalid, limit, font
+enum AtlasPreparationError: Error { case invalid, limit, font, canceled
     case fontIdentity(expected: String, actual: String)
     case fontFingerprint(name: String, expected: String, candidates: [String])
     case fontUnavailable(String)
@@ -196,9 +196,11 @@ enum AtlasPreparationError: Error { case invalid, limit, font
 
 struct AtlasBinaryWriter {
     static let limit = 64 * 1024 * 1024
+    private let byteLimit: Int
     var data = Data()
+    init(byteLimit: Int = Self.limit) { self.byteLimit = max(0, min(Self.limit, byteLimit)) }
     mutating func bytes(_ bytes: Data) throws {
-        guard bytes.count <= Self.limit - data.count else { throw AtlasPreparationError.limit }
+        guard bytes.count <= byteLimit - data.count else { throw AtlasPreparationError.limit }
         data.append(bytes)
     }
     mutating func integer<T: FixedWidthInteger>(_ value: T) throws {
@@ -232,8 +234,10 @@ struct AtlasBinaryReader {
     mutating func count(_ maximum: Int, stride: Int = 1) throws -> Int {
         guard maximum >= 0, stride > 0 else { throw AtlasPreparationError.limit }
         let raw: UInt64 = try integer()
-        guard raw <= UInt64(maximum),
-              raw <= UInt64((data.count - offset) / stride) else { throw AtlasPreparationError.limit }
+        // Impossible wire lengths are corruption, while an otherwise bounded
+        // payload exceeding the caller's allowance is an optional budget miss.
+        guard raw <= UInt64((data.count - offset) / stride) else { throw AtlasPreparationError.invalid }
+        guard raw <= UInt64(maximum) else { throw AtlasPreparationError.limit }
         return Int(raw)
     }
     mutating func number() throws -> Double {
@@ -253,7 +257,14 @@ struct AtlasBinaryReader {
 final class AtlasPreparedFonts {
     private var restored: [Data: CTFont] = [:]
     private var encoded: [Data: Data] = [:]
+    private let fingerprintByteLimit: Int
+    private let canceled: () -> Bool
+    init(fingerprintByteLimit: Int = 256 * 1024 * 1024, canceled: @escaping () -> Bool = { false }) {
+        self.fingerprintByteLimit = max(0, min(256 * 1024 * 1024, fingerprintByteLimit))
+        self.canceled = canceled
+    }
     func fingerprint(_ font: CTFont) throws -> Data {
+        guard !canceled() else { throw AtlasPreparationError.canceled }
         let name = CTFontCopyPostScriptName(font) as String
         // CoreText can drop GDEF from its inventory after shaping a face.
         // The underlying graphics font retains the complete resource tables,
@@ -269,13 +280,14 @@ final class AtlasPreparedFonts {
             UInt32(truncatingIfNeeded: UInt(bitPattern: CFArrayGetValueAtIndex(tables, $0)))
         }
         for tag in tags.sorted() {
+            guard !canceled() else { throw AtlasPreparationError.canceled }
             guard let table = graphics.table(for: tag) else {
                 throw AtlasPreparationError.fontUnavailable("missing resource table: \(name), tag: \(tag)")
             }
             let data = table as Data
             // AppleColorEmoji carries a ~191 MB bitmap table on the tested OS.
             // This bounded font-validation allowance is separate from artifact size.
-            guard data.count <= 256 * 1024 * 1024 - total else {
+            guard data.count <= fingerprintByteLimit - total else {
                 throw AtlasPreparationError.fontUnavailable("font table budget: \(name), table bytes: \(data.count), prior: \(total)")
             }
             total += data.count
@@ -287,6 +299,7 @@ final class AtlasPreparedFonts {
     }
 
     func encode(_ font: CTFont, fallbackText: String) throws -> Data {
+        guard !canceled() else { throw AtlasPreparationError.canceled }
         var writer = AtlasBinaryWriter()
         try writer.string(CTFontCopyPostScriptName(font) as String)
         try writer.number(CTFontGetSize(font))
@@ -313,6 +326,7 @@ final class AtlasPreparedFonts {
     }
 
     func decode(_ data: Data) throws -> (font: CTFont, fallbackText: String) {
+        guard !canceled() else { throw AtlasPreparationError.canceled }
         var reader = AtlasBinaryReader(data: data)
         let name = try reader.string(512)
         let size = try reader.number()

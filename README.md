@@ -345,6 +345,13 @@ prepared text and retains Metal glyph resources. Camera movement projects existi
 than reparsing files on every frame. Source and search operations have explicit admission limits,
 partial-result states and identity checks.
 
+The live viewport worker now restores persistent prepared glyphs and fitted
+pixels for unchanged sources after reopening or eviction. It verifies the
+current source capture, fonts and layout dependencies before reuse and falls
+back to normal preparation on a cache miss or rejection. See
+[prepared viewport source cache](native/macos/README.md#prepared-viewport-source-cache)
+for admission limits and pending native verification.
+
 This is still a performance campaign, not a finished 120 Hz claim. Physical-Mac traces show that
 frame delivery and continuous zoom can stutter even when individual GPU draws are fast. See the
 [release qualification plan](LOCAL_QUALIFICATION_AND_RELEASE.md) for the proof needed before a

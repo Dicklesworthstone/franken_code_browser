@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdbool.h>
 
 /* Link-only foreign symbols. These tests inject immutable capture packets into
  * the actual native worker; none of these stubs pretends to discover or parse. */
@@ -32,6 +33,22 @@ char *fcb_source_document_cached_cancelable(uint64_t handle, const char *path, u
 uint8_t *fcb_source_cache_get(uint64_t handle, const char *key, uint64_t *length) {
     (void)handle; (void)key; *length = 0; return NULL;
 }
+uint64_t fcb_source_cache_open(const char *root) {
+    (void)root; assert(0 && "live cache opened during viewport artifact fixture"); return 0;
+}
+bool fcb_source_cache_close(uint64_t handle) { (void)handle; return false; }
+char *fcb_source_document_cached(uint64_t handle, const char *path, uint8_t *key) {
+    (void)handle; (void)path; (void)key; assert(0 && "legacy source capture used during viewport fixture"); return NULL;
+}
+bool fcb_source_cache_put(uint64_t handle, const char *key, const uint8_t *bytes, uint64_t length) {
+    (void)handle; (void)key; (void)bytes; (void)length;
+    assert(0 && "live artifact write used during viewport fixture"); return false;
+}
+bool fcb_source_cache_repair(uint64_t handle, const char *key, const uint8_t *bytes, uint64_t length) {
+    (void)handle; (void)key; (void)bytes; (void)length;
+    assert(0 && "live artifact repair used during viewport fixture"); return false;
+}
+char *fcb_source_cache_stats(uint64_t handle) { (void)handle; return NULL; }
 void fcb_source_cache_free(uint8_t *bytes, uint64_t length) { (void)length; free(bytes); }
 void fcb_free_string(char *value) { free(value); }
 char *fcb_text_parcel_positions(const char *const *paths, const double *areas, uint64_t count, double aspect) {

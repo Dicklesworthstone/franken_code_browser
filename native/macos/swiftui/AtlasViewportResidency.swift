@@ -332,6 +332,12 @@ struct AtlasViewportLayout: Sendable {
         return resident.prepared.document
     }
 
+    func preparation(forRawPath raw: [UInt8]) -> AtlasViewportPreparation? {
+        guard let id = rawIDs[raw], let resident = residents[id], resident.layoutRevision == layoutRevision,
+              resident.prepared.rawPath == raw else { return nil }
+        return resident.prepared.preparation
+    }
+
     private func setDemand(_ next: [UInt64]) {
         if wanted != next {
             for id in wanted where previewStates[id] == .queued || previewStates[id] == .capacityLimited { setState(id, .cold) }

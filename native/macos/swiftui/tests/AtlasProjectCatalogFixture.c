@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <stdbool.h>
 static char *response;
 static unsigned calls, allocated, freed;
 static uint64_t requested_policy, requested_directory_length;
@@ -62,3 +63,9 @@ uint8_t *fcb_source_cache_get(uint64_t h, const char *k, uint64_t *n) {
     (void)h; (void)k; (void)n; assert(0 && "artifact read during metadata open"); return NULL;
 }
 void fcb_source_cache_free(uint8_t *p, uint64_t n) { (void)p; (void)n; assert(0 && "artifact release during metadata open"); }
+bool fcb_source_cache_put(uint64_t h, const char *k, const uint8_t *p, uint64_t n) {
+    (void)h; (void)k; (void)p; (void)n; assert(0 && "artifact write during metadata open"); return false;
+}
+bool fcb_source_cache_repair(uint64_t h, const char *k, const uint8_t *p, uint64_t n) {
+    (void)h; (void)k; (void)p; (void)n; assert(0 && "artifact repair during metadata open"); return false;
+}

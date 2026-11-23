@@ -143,7 +143,14 @@ private final class ReleaseProbe {
         try await markdownProjectReplacementRejectsOldCandidate()
         try await markdownFallbackPreservesExactSource()
         try await markdownDemandIsVisibleOnly()
-        print("AtlasViewportResidency: 17 real worker/demand/placement/lifetime scenarios passed")
+        try await preparedArtifactsSurviveWarmReopen()
+        try await preparedArtifactsInvalidateExactDependencies()
+        try await preparedArtifactCorruptionAndCaptureMismatchFallBack()
+        try await preparedArtifactsReflowAndRasterBudgetAreDistinct()
+        try await preparedArtifactCancellationRetainsEnteredLease()
+        try await preparedFontChangeRejectsEnteredCandidate()
+        try await preparedCacheRefusalAndDecoderBudgetsPreserveSource()
+        print("AtlasViewportResidency: 24 real worker/demand/placement/lifetime/cache scenarios passed")
     }
 
     static func coldOverviewAndLateParcel() async throws {

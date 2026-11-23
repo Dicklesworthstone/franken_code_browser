@@ -19,8 +19,8 @@ clang -std=gnu11 -Wall -Wextra -Werror -c "$src/tests/AtlasViewportFixture.c" -o
 swiftc -swift-version 6 -warnings-as-errors \
     "$src/AtlasAppearance.swift" \
     "$out/Support.swift" "$src/AtlasProjectCatalog.swift" "$src/AtlasProjectWorker.swift" \
-    "$src/AtlasSource.swift" "$src/AtlasPreparedText.swift" "$src/AtlasDocument.swift" "$src/AtlasParcelLayout.swift" \
+    "$src/AtlasSource.swift" "$src/AtlasPreparedText.swift" "$src/AtlasDocument.swift" "$src/AtlasParcelLayout.swift" "$src/AtlasProjectCache.swift" \
     "$src/AtlasViewportWorker.swift" "$src/AtlasViewportResidency.swift" \
-    "$src/tests/AtlasViewportResidencyTests.swift" "$out/fixture.o" -o "$out/viewport-residency"
+    "$src/tests/AtlasViewportResidencyTests.swift" "$src/tests/AtlasViewportCacheTests.swift" "$out/fixture.o" -o "$out/viewport-residency"
 "$out/viewport-residency"
 printf 'Retained test artifacts: %s\n' "$out"

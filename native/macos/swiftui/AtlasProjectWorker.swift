@@ -17,6 +17,10 @@ private typealias ProjectPoll = @convention(c) (UnsafeMutableRawPointer?) -> Int
     _ poll: ProjectPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_source_cache_get") private func projectArtifact(
     _ handle: UInt64, _ key: UnsafePointer<CChar>, _ length: UnsafeMutablePointer<UInt64>) -> UnsafeMutablePointer<UInt8>?
+@_silgen_name("fcb_source_cache_put") private func projectPutArtifact(
+    _ handle: UInt64, _ key: UnsafePointer<CChar>, _ bytes: UnsafePointer<UInt8>, _ length: UInt64) -> Bool
+@_silgen_name("fcb_source_cache_repair") private func projectRepairArtifact(
+    _ handle: UInt64, _ key: UnsafePointer<CChar>, _ bytes: UnsafePointer<UInt8>, _ length: UInt64) -> Bool
 @_silgen_name("fcb_source_cache_free") private func projectFreeArtifact(_ pointer: UnsafeMutablePointer<UInt8>?, _ length: UInt64)
 @_silgen_name("fcb_free_string") private func projectFreeString(_ pointer: UnsafeMutablePointer<CChar>?)
 
@@ -123,6 +127,24 @@ enum AtlasProjectWorker {
         guard let pointer else { return nil }
         guard length <= UInt64(limit) else { throw AtlasProjectIOError.limit }
         return Data(bytes: pointer, count: Int(length))
+    }
+
+    static func storeArtifact(handle: UInt64, key: String, data: Data, repair: Bool,
+                              cancellation: AtlasSearchCancellation) throws -> Bool {
+        try check(cancellation)
+        guard handle != 0, key.utf8.count == 64, key.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
+              !data.isEmpty, data.count <= 64 * 1024 * 1024 else { throw AtlasProjectIOError.invalidRequest }
+        let saved = key.withCString { key in
+            data.withUnsafeBytes { bytes in
+                let pointer = bytes.bindMemory(to: UInt8.self).baseAddress!
+                return repair ? projectRepairArtifact(handle, key, pointer, UInt64(data.count))
+                    : projectPutArtifact(handle, key, pointer, UInt64(data.count))
+            }
+        }
+        // A foreign write already in flight can finish an immutable artifact;
+        // cancellation still suppresses the source/document publication.
+        try check(cancellation)
+        return saved
     }
 
     static func decodeCatalog(_ data: Data) throws -> [AtlasProjectFile] {

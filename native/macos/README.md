@@ -2310,6 +2310,39 @@ obsolete pending result.
 Source, host, C-boundary, native transport and model regression cases cover
 these routes. Executable and physical-Mac qualification remain pending.
 
+## Prepared viewport source cache
+
+Visible source parcels now use the persistent prepared-text cache from the live
+viewport worker. A reopened or evicted file first obtains the current validated
+Rust source capture, then can restore its native glyph rows and fitted raster
+pixels. A matching glyph archive avoids whole-document CoreText shaping; a
+matching raster archive avoids drawing the fitted tiles again. Color-glyph lines
+retain their existing bounded native reconstruction path.
+
+Glyph keys include the exact project root and relative path, source content key,
+prepared format and layout policy, operating system, and native font environment.
+Restoration also compares the complete source text and lexical runs with the
+current capture and validates the physical fonts. Fitted pixels have a separate
+key for their row partition, dimensions and pixel allowance, so a changed parcel
+can reuse glyphs while producing the appropriate new raster. Pixels are reused
+only after the associated glyph archive has been accepted.
+
+Cache reads, codec work and publication run on the existing serial viewport
+worker, under the source/cache owner lease and bounded preparation allowance.
+Each native artifact is limited to **16 MiB**; larger preparations bypass this
+optional cache. Corrupt or unavailable artifacts, denied writes and cache quotas
+fall back to source preparation. Cancellation and font-environment changes prevent
+an obsolete candidate from publishing. The existing resident document, glyph,
+run, tile, pixel and retirement limits still apply; the cache does not keep an
+extra collection of evicted source documents in memory.
+
+`swiftui/tests/test-viewport-residency.sh` includes real-codec worker scenarios
+for warm restoration, identical-length source edits, source/key mismatches,
+font changes, corrupt archives, refitted geometry, lower pixel budgets, denied
+writes, cancellation and owner lifetime. These are code-first additions awaiting
+strict-RCH execution and physical-Mac qualification; no measured startup or
+frame-rate improvement is claimed here.
+
 ## Appearance
 
 The **Appearance** menu offers **System**, **Light**, and **Dark**, plus an

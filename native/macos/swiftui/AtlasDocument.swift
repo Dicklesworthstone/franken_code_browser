@@ -311,11 +311,17 @@ final class AtlasTextTile {
         }
     }
 
-    func prepareRaster(pixelBudget: Int) {
+    func rasterSize(pixelBudget: Int) -> CGSize {
         let budget = max(1, pixelBudget)
         let scale = min(1, sqrt(Double(budget) / (Self.width * height)))
         let width = max(1, min(budget, Int(Self.width * scale)))
         let height = max(1, min(budget / width, Int(self.height * scale)))
+        return CGSize(width: width, height: height)
+    }
+
+    func prepareRaster(pixelBudget: Int) {
+        let size = rasterSize(pixelBudget: pixelBudget)
+        let width = Int(size.width), height = Int(size.height)
         guard let bitmap = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
             bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
