@@ -5,7 +5,8 @@
 //! are bounded TAB-separated UTF-8 with an LF terminator; native paths can use
 //! hex. Output is one complete versioned JSON object per request. No shell,
 //! source writes, implicit source stdin, asynchronous runtime or GUI is started.
-//! Checkpoint files are created only by an explicit save with a disclosure cap.
+//! Checkpoints and source packs require an explicit destination and source-byte
+//! disclosure cap. Terminal write effects survive response cancellation/failure.
 
 mod repository;
 use repository::RepositoryCommands;
@@ -27,6 +28,7 @@ use fcb::ui::reading_panes::desk::{MAX_ANNOTATION_BODY_BYTES, MAX_BOOKMARK_LABEL
 use crate::{EXIT_OK, EXIT_ERROR, EXIT_PARTIAL, EXIT_CANCELED, owner, allocation};
 use crate::host::{HostResponse, desk::{DeskSession, DeskSessionError, DeskLimits, DeskCommand, DeskError}};
 use crate::host::desk::persistence::{CheckpointIoError, CheckpointSaveEffect};
+use crate::host::desk::export::DeskSourcePackLimits;
 use crate::output::Output;
 
 const MAX_FRAME_BYTES: usize = 64 * 1024;
@@ -60,6 +62,8 @@ Commands (arguments separated by literal TABs, not spaces):\n\
   repo-find-text-hex TOKEN QUERY_GEN LIMIT SCAN_BYTES UTF8_TEXT_HEX\n\
   repo-page TOKEN QUERY_GEN OFFSET LIMIT | repo-hit TOKEN QUERY_GEN HIT_ID\n\
   save NEW_CHECKPOINT MAX_SOURCE_BYTES | save-hex NEW_PATH_HEX MAX_SOURCE_BYTES\n\
+  export NEW_PACK MAX_SOURCE_BYTES [MAX_OUTPUT_BYTES MAX_OUTPUT_SCALARS]\n\
+  export-hex NEW_PATH_HEX MAX_SOURCE_BYTES [MAX_OUTPUT_BYTES MAX_OUTPUT_SCALARS]\n\
   restore CHECKPOINT | restore-hex PATH_HEX\n\
 Copy returns original bytes as hex; it does not write the clipboard.\n\
 open reads one regular file (max 4 MiB), never a directory or implicit stdin.\n\
@@ -70,6 +74,15 @@ bodies. Empty bodies are allowed; hex accepts multiline text, tabs and NUL.\n\
 Editing changes personal text only, preserving the capture and original range.\n\
 Save includes ALL retained sources, labels and notes, unencrypted, up to the\n\
 explicit source-byte disclosure cap. Existing files are NEVER overwritten.\n\
+Export writes a JSON source pack with every saved note and only explicitly\n\
+bookmarked selections or saved observed passages, never an entire open pane.\n\
+Source and output limits can omit whole selections with reasons; all notes\n\
+must fit before creating the destination. Byte/scalar output limits default\n\
+to 16777216 each; provide both to override them (range 1..=16777216).\n\
+MAX_SOURCE_BYTES counts repeated selections separately; 0 exports notes only.\n\
+Packs include original-byte hex and exact readable text when decodable and\n\
+budgeted. They are unredacted, unencrypted and are not recovery checkpoints.\n\
+Export does not change the desk revision or reopen source files.\n\
 Restore replaces the desk only after validation, without reopening source paths.\n\
 Restored pane/bookmark/source IDs are fresh; read them from the returned state.\n\
 Search results are not restored. No autosave: quitting releases unsaved changes.\n\
@@ -83,7 +96,7 @@ the root preserves already opened desk captures.\n\
 Save includes activated desk captures, not all search hits or a live root grant.\n\
 No quotes/escapes/shell expansion. Hex permits tabs, newlines and non-UTF-8 paths.\n\
 Frames need LF; partial EOF, overlong frames and output failures stop the session.\n\
-A save receipt reports filesystem effects even on failure. Inspect any created\n\
+A save/export receipt reports filesystem effects even on failure. Inspect any created\n\
 destination before retrying; keep earlier checkpoints. Transport is not rollback.\n\
 Ordinary command errors preserve the session; responses expose accepted state.\n\
 ";
@@ -213,7 +226,7 @@ pub(crate) fn run(arguments: &[OsString], stdin: &mut impl Read, stdout: &mut im
             output.literal("}\n")
         })();
         // Once delivery starts, failure cannot be repaired by a second JSON
-        // object. A save that created a file MUST retain its final effect receipt
+        // object. A save/export that created a file MUST retain its effect receipt
         // even when cancellation races delivery; transport is never rollback.
         let mut delivery_canceled = false;
         let mut stop = || {
@@ -349,6 +362,19 @@ fn execute(session: &mut DeskSession, attempt: u64, frame: &str,
             let outcome = session.save_checkpoint(expected, &path, number(limit)?, &mut *canceled);
             *effect = outcome.effect();
             return Ok((session.checkpoint_save_response(&outcome)?, false));
+        }
+        ("export" | "export-hex", [path, source_bytes] | [path, source_bytes, _, _]) => {
+            let mut limits = DeskSourcePackLimits { source_bytes: number(source_bytes)?, ..Default::default() };
+            if let [_, _, bytes, scalars] = args {
+                limits.output_bytes = count(bytes)?;
+                limits.output_scalars = count(scalars)?;
+            }
+            let path = if command == "export-hex" { raw_path(path)? } else { PathBuf::from(*path) };
+            let outcome = session.export_source_pack(expected, &path, limits, &mut *canceled);
+            // Record the filesystem effect before fallible response encoding.
+            // Delivery failure or late cancellation cannot undo this export.
+            *effect = outcome.effect();
+            return Ok((session.source_pack_response(&outcome)?, false));
         }
         ("restore" | "restore-hex", [path]) => {
             let path = if command == "restore-hex" { raw_path(path)? } else { PathBuf::from(*path) };

@@ -1389,7 +1389,7 @@ readable; desks with no observed passages still emit 1.1. A failed or canceled
 restore leaves the accepted Desk intact.
 
 `DeskSession::export_source_pack` exports explicit bookmark selections and saved
-observed passages through the existing host/C/native destination workflow.
+observed passages through the host/C/native and stdio destination workflows.
 Complete-capture-only desks retain `fcb.desk-source-pack/1`; desks with observed
 passages emit `fcb.desk-source-pack/2`. Its typed observed entries carry absolute
 selected ranges, exact selected original bytes, full notes and the retained
@@ -1410,6 +1410,64 @@ Regression sources cover large offsets, UTF-8/BOM and both UTF-16 byte orders,
 malformed bytes, canceled transfers, shared retention, stale note versions,
 offline checkpoint recovery and real C/stdio boundaries. Executable verification
 remains pending in the independent strict-RCH lane.
+
+## Export Reading Desk source packs from the CLI
+
+`fcb desk --stdio` can write the same bounded source packs as the native Desk.
+Each command needs an explicit new destination and a maximum number of selected
+original source bytes to disclose. These are TAB-separated fields, terminated
+by LF:
+
+```text
+EXPECTED_REV<TAB>export<TAB>NEW_PACK<TAB>MAX_SOURCE_BYTES
+EXPECTED_REV<TAB>export<TAB>NEW_PACK<TAB>MAX_SOURCE_BYTES<TAB>MAX_OUTPUT_BYTES<TAB>MAX_OUTPUT_SCALARS
+EXPECTED_REV<TAB>export-hex<TAB>NEW_PATH_HEX<TAB>MAX_SOURCE_BYTES
+EXPECTED_REV<TAB>export-hex<TAB>NEW_PATH_HEX<TAB>MAX_SOURCE_BYTES<TAB>MAX_OUTPUT_BYTES<TAB>MAX_OUTPUT_SCALARS
+```
+
+`export-hex` accepts native path bytes as hexadecimal, including paths with tabs,
+newlines or invalid UTF-8. Numeric arguments use canonical unsigned decimal
+strings. Output limits default to 16 MiB each; overrides must supply both limits,
+each in `1..=16777216`. The scalar limit counts Unicode scalars in the complete
+serialized JSON, including escaping, metadata, notes and provenance. It is not a
+token estimate. A source cap of zero exports notes and provenance without source
+payloads; repeated selections count separately against the source cap.
+
+Export includes every saved bookmark and observed passage, preserving complete
+personal labels and note bodies. It discloses only explicit saved selections,
+never an entire open pane or surrounding observed extent. Each admitted selection
+has exact original-byte hex and, when decodable within the remaining output
+budget, exact readable text. An omitted selection retains its full note and an
+explicit reason. If the notes and required metadata cannot fit, the command
+refuses before creating a file. Packs are unredacted and unencrypted.
+
+For example, recover a checkpoint and export up to 1 MiB of selected original
+bytes within a 4 MiB serialized output budget:
+
+```sh
+printf '0\trestore\treading.fcbk\n1\texport\treading-pack.json\t1048576\t4194304\t4194304\n1\tquit\n' | fcb desk --stdio
+```
+
+Export preserves the accepted Desk revision and never reopens the source paths,
+including after checkpoint recovery. Existing destinations and symlinks are
+never overwritten. The `fcb.desk-stdio/1` response contains an export receipt in
+`result`, with the pack schema, actual bytes and scalars, SHA-256 digest, source
+coverage and filesystem effect. Exit status `3` reports a completed pack with
+omitted selections; its notes are still complete. Readable-text availability is
+reported separately from original-byte coverage.
+
+The outer response retains any file effect even when cancellation races receipt
+delivery. Cancellation during a write can leave an explicitly incomplete
+destination; a broken output stream stops the session and reports its known
+effect on stderr. Inspect an existing destination before retrying with a new
+name. Transport failure does not roll back the write or automatically replay a
+command. A source pack is for sharing selected evidence; `save`/`restore`
+checkpoints remain the format for recovering the entire Desk.
+
+`tests/desk_source_pack_cli.rs` covers retained bytes after live replacement,
+mixed complete/observed checkpoint recovery, native paths, exact quotas,
+malformed requests, no-overwrite behavior, cancellation and broken output.
+Executable verification remains pending the independent strict-RCH lane.
 
 ## Retained-reader expression Find
 
