@@ -545,6 +545,63 @@ import Foundation
         }
     }
 
+    private static func typescriptSourceWire(_ index: AtlasPreparedIndex) throws {
+        let original = ProjectLinksFixture.importPage(owner: index.basis.owner,
+            generation: 1, command: "imports-page")
+        for language in ["typescript", "tsx"] {
+            for kind in ["javascript-import", "javascript-export", "javascript-require", "javascript-dynamic-import"] {
+                var value = original, rows = original["links"] as! [[String: Any]]
+                for i in rows.indices {
+                    rows[i]["language"] = language; rows[i]["lexical_import_kind"] = kind
+                    rows[i]["destination"] = "./child.js"
+                    rows[i]["resolution_basis"] = "typescript-source-extension-candidate"
+                    rows[i]["source_path"] = ProjectLinksFixture.path(language == "tsx" ? "src/main.tsx" : "src/main.ts")
+                    rows[i]["target_path"] = ProjectLinksFixture.path("src/child.ts")
+                }
+                value["links"] = rows
+                let admitted = try decode(value, index: index).links[0]
+                precondition(admitted.canOpenTarget && admitted.importEvidence?.language == language
+                    && admitted.importEvidence?.kind == kind
+                    && admitted.target?.path.bytes == Array("src/child.ts".utf8)
+                    && admitted.evidenceLabel.contains("not compiler resolved"))
+
+                for resolution in ["unavailable", "uncaptured", "outside-capture-scope"] {
+                    var unavailable = value, changed = rows
+                    for i in changed.indices {
+                        changed[i]["resolution"] = resolution
+                        for key in ["target_revision", "target_sha256", "target_bytes"] { changed[i][key] = NSNull() }
+                    }
+                    unavailable["links"] = changed
+                    let retained = try decode(unavailable, index: index).links[0]
+                    precondition(!retained.canOpenTarget && retained.targetFile == 4
+                        && retained.targetPath?.bytes == Array("src/child.ts".utf8)
+                        && retained.importEvidence?.resolutionBasis == "typescript-source-extension-candidate",
+                        "Typed catalog candidates remain visible without inventing an available source capture")
+                }
+                for (wrongLanguage, wrongKind) in [("javascript", kind), ("jsx", kind), ("rust", "rust-use")] {
+                    var bad = value, changed = rows
+                    changed[0]["language"] = wrongLanguage; changed[0]["lexical_import_kind"] = wrongKind
+                    bad["links"] = changed; refuse(bad, index: index)
+                }
+                for wrongKind in ["rust-module", "python-from"] {
+                    var bad = value, changed = rows
+                    changed[0]["lexical_import_kind"] = wrongKind; bad["links"] = changed
+                    refuse(bad, index: index)
+                }
+                for resolution in ["missing", "ambiguous", "external", "unresolved"] {
+                    var bad = value, changed = rows
+                    changed[0]["resolution"] = resolution
+                    for key in ["target_file_id", "target_path", "target_revision", "target_sha256", "target_bytes"] {
+                        changed[0][key] = NSNull()
+                    }
+                    bad["links"] = changed; refuse(bad, index: index)
+                }
+                var old = value; old["resolver"] = "fcb-closed-catalog-imports-v8"
+                refuse(old, index: index)
+            }
+        }
+    }
+
     @MainActor static func main() async throws {
         let fixture = ProjectLinksFixture(includesImports: true), index = try await prepared(fixture)
         try ProjectLinksGeometryTests.run(index, projection: .imports)
@@ -554,6 +611,7 @@ import Foundation
         try goWire(index)
         try javaWire(index)
         try javascriptLoadWire(index)
+        try typescriptSourceWire(index)
         try rustUseWire(index)
         let live = ProjectLinksFixture(includesImports: true)
         let model = AtlasProjectLinksModel(root: "/project", transport: live.transport)
@@ -591,9 +649,11 @@ import Foundation
         precondition(model.page?.total == 70 && model.page?.generation == 1
             && live.log.filter { $0 == "imports-begin" }.count == 1)
         model.prepare(); await settled(model)
-        precondition(model.page?.generation == 2 && live.index.count("create:") == 1)
+        precondition(model.page?.generation == 1 && live.index.count("create:") == 1
+            && live.log.filter { $0 == "imports-begin" }.count == 1,
+            "Reloading imports retains its accepted backend generation without recapture or extraction")
         model.selectProjection(.documentation); await settled(model)
-        precondition(model.page?.generation == 1, "Rebuilding imports does not replace Markdown generation")
+        precondition(model.page?.generation == 1, "Reloading imports preserves the Markdown inventory")
 
         model.selectProjection(.imports); await settled(model)
         let accepted = model.page!
@@ -609,8 +669,42 @@ import Foundation
         } catch {}
         precondition(live.log.filter { $0 == "close-reader" }.count == closedBefore + 1 && evidence.reader.page?.start == 11)
         live.patch { _, value in value }
+
+        live.patch { phase, value in
+            var value = value
+            if phase == "imports-step", value["examined_source_files"] as? String == "2" {
+                value["relationship_generation"] = "999"
+            }
+            return value
+        }
+        for _ in 0..<2 {
+            model.prepare(refresh: true); await settled(model)
+            precondition(model.page?.id == accepted.id && model.page?.basis == accepted.basis
+                && model.projection == .imports && model.direction == .incoming
+                && model.selectedPath == Array("src/child.rs".utf8)
+                && model.canFollowDocumentLinks(from: documentReader),
+                "Repeated rejected import replacements preserve both accepted projection inventories")
+        }
+        live.patch { _, value in value }
+        live.pause("imports-step"); model.prepare(refresh: true)
+        let refreshDeadline = ProcessInfo.processInfo.systemUptime + 10
+        while !live.isBlocked && ProcessInfo.processInfo.systemUptime < refreshDeadline { await Task.yield() }
+        precondition(live.isBlocked && model.page?.id == accepted.id
+            && model.relationshipProgress?.projection == .imports,
+            "Import refresh progress must not replace accepted rows")
+        model.cancel(); live.gate.signal(); await settled(model)
+        precondition(model.page?.id == accepted.id && model.projection == .imports
+            && model.relationshipProgress == nil && model.canFollowDocumentLinks(from: documentReader))
+        let retainedTarget = try await model.open(accepted.links[0], from: accepted, side: .target,
+            readerTransport: live.readerTransport)
+        precondition(retainedTarget.reader.page?.start == 0,
+            "Failed and canceled import refreshes leave original catalog targets openable")
+        retainedTarget.reader.close()
+        let createsBeforeRefresh = live.index.count("create:")
         model.prepare(refresh: true); await settled(model)
-        precondition(model.page?.generation == 1 && live.index.count("create:") == 2)
+        precondition(model.page?.generation == 1 && model.page?.basis != accepted.basis
+            && live.index.count("create:") == createsBeforeRefresh + 1
+            && !model.canFollowDocumentLinks(from: documentReader))
         model.selectProjection(.documentation); await settled(model)
         precondition(model.page?.generation == 1 && live.log.filter { $0 == "begin" }.count == 2,
             "A new capture invalidates both projection inventories")
@@ -622,12 +716,16 @@ import Foundation
         let canceled = ProjectLinksFixture(includesImports: true)
         let canceledModel = AtlasProjectLinksModel(root: "/project", transport: canceled.transport)
         canceledModel.prepare(); await settled(canceledModel)
+        let retainedDocumentation = canceledModel.page!
         canceled.pause("imports-step"); canceledModel.selectProjection(.imports)
         let deadline = ProcessInfo.processInfo.systemUptime + 10
         while !canceled.isBlocked && ProcessInfo.processInfo.systemUptime < deadline { await Task.yield() }
-        precondition(canceled.isBlocked)
+        precondition(canceled.isBlocked && canceledModel.page?.id == retainedDocumentation.id
+            && canceledModel.projection == .documentation && canceledModel.relationshipProgress?.projection == .imports)
         canceledModel.cancel(); canceled.gate.signal(); await settled(canceledModel)
-        precondition(canceledModel.page == nil && canceledModel.hasPreparedSources)
+        precondition(canceledModel.page?.id == retainedDocumentation.id && canceledModel.hasPreparedSources
+            && canceledModel.projection == .documentation && canceledModel.relationshipProgress == nil,
+            "Canceling an unbuilt projection preserves the accepted projection and rows")
         canceledModel.selectProjection(.documentation); await settled(canceledModel)
         precondition(canceledModel.page?.generation == 1 && canceled.log.filter { $0 == "begin" }.count == 1)
         canceledModel.selectProjection(.imports); await settled(canceledModel)

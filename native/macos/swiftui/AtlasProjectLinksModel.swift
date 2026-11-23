@@ -7,6 +7,9 @@ import Observation
     let root: String
     private(set) var page: AtlasProjectLinksPage?
     private(set) var captureProgress: AtlasSearchReport?
+    /// Candidate receipts report progress without replacing accepted rows or
+    /// lending their generation to the displayed relationship inventory.
+    private(set) var relationshipProgress: AtlasProjectLinksPage?
     private(set) var selectedPath: [UInt8]?
     private(set) var direction: AtlasProjectLinkDirection
     private(set) var projection: AtlasProjectRelationshipProjection
@@ -16,6 +19,10 @@ import Observation
     var availableProjections: [AtlasProjectRelationshipProjection] { transport.imports == nil ? [.documentation] : [.documentation, .imports] }
     var canOperate: Bool { !busy && !closed }
     var hasPreparedSources: Bool { prepared != nil }
+    var hasAcceptedProjection: Bool {
+        guard let prepared, let accepted = acceptedPages[projection] else { return false }
+        return accepted.basis == prepared.basis
+    }
     var selectedPathDisplay: String {
         selectedPath.flatMap { try? AtlasProjectLinkPath(bytes: $0).display } ?? "Whole project"
     }
@@ -40,23 +47,34 @@ import Observation
     }
 
     func prepare(refresh: Bool = false) {
+        prepare(projection: projection, refresh: refresh)
+    }
+
+    private func prepare(projection: AtlasProjectRelationshipProjection, refresh: Bool) {
         guard canOperate else { return }
         guard availableProjections.contains(projection) else { notice = AtlasProjectLinksError.unavailable.message; return }
-        let projection = projection
-        if refresh {
-            prepared = nil; lastGenerations = [:]; acceptedPages = [:]
-            indexWorker = AtlasIndexedSearch(transport: transport.index)
+        if !refresh, let retained = acceptedPages[projection], let prepared,
+           retained.basis == prepared.basis {
+            // Source bytes and extraction policy are immutable. Reload the
+            // accepted inventory instead of destroying its backend generation
+            // with an identical rebuild whose terminal receipt could fail.
+            reload(projection: projection, retained: retained, index: prepared)
+            return
         }
-        let (generation, exhausted) = (lastGenerations[projection] ?? 0).addingReportingOverflow(1)
+        let candidateWorker = refresh ? AtlasIndexedSearch(transport: transport.index) : indexWorker
+        guard let worker = candidateWorker else {
+            notice = AtlasProjectLinksError.unavailable.message; return
+        }
+        let (generation, exhausted) = (refresh ? 0 : (lastGenerations[projection] ?? 0)).addingReportingOverflow(1)
         guard !exhausted else { notice = "The relationship identity is exhausted. Close this browser and open it again."; return }
-        lastGenerations[projection] = generation
-        acceptedPages.removeValue(forKey: projection)
-        // A replacement graph never lends an earlier row its new generation.
-        page = nil; captureProgress = nil
-        notice = prepared == nil ? "Capturing project sources within the existing file and byte limits…"
-            : "Rebuilding \(projection.noun) from the retained source index without rereading files…"
+        // A fresh capture has a fresh owner. Failed attempts against the
+        // current owner still consume their own generation before admission.
+        if !refresh { lastGenerations[projection] = generation }
+        let direction = direction, path = selectedPath
+        captureProgress = nil; relationshipProgress = nil
+        notice = refresh || prepared == nil ? "Capturing project sources within the existing file and byte limits…"
+            : "Building \(projection.noun) from the retained source index without rereading files…"
         perform { model, flag in
-            guard let worker = model.indexWorker else { throw AtlasProjectLinksError.unavailable }
             let root = model.root, access = model.access
             let mailbox = AtlasSearchProgressMailbox { [weak model] report in
                 guard let model, !model.closed, model.cancellation === flag, !flag.isCanceled else { return }
@@ -70,7 +88,11 @@ import Observation
                 }
             } catch { mailbox.close(); throw error }
             try model.accept(flag)
-            model.prepared = index; model.captureProgress = nil
+            // An initial completed capture remains useful after a canceled
+            // graph build. A refresh candidate never replaces the old owner
+            // until its terminal inventory and selected filter both validate.
+            if !refresh && model.prepared == nil { model.prepared = index }
+            model.captureProgress = nil
             let operations = try model.transport.operations(for: projection)
             var current = try await model.io.perform(cancellation: flag, keepingAlive: [index.owner]) {
                 try AtlasProjectLinksPage.decode(index.owner.call {
@@ -82,7 +104,7 @@ import Observation
                   current.coverage.retained == 0, current.coverage.linksSeen == 0,
                   current.coverage.diagnostics == 0, current.building else { throw AtlasProjectLinksError.invalidResponse }
             try model.accept(flag)
-            model.page = current
+            model.relationshipProgress = current
             while current.building {
                 let previous = current.coverage
                 let next = try await model.io.perform(cancellation: flag, keepingAlive: [index.owner]) {
@@ -93,47 +115,50 @@ import Observation
                     return next
                 }
                 try model.accept(flag)
-                current = next; model.page = next
+                current = next; model.relationshipProgress = next
             }
+            // A missing selected path is a failed replacement, not permission
+            // to widen the user's filter or replace it with an empty result.
+            if path != nil || direction != .all {
+                current = try await model.fetch(index, generation: generation, coverage: current.coverage,
+                    direction: direction, path: path, start: 0, flag: flag)
+            }
+            try model.accept(flag)
+            // One main-actor transaction publishes the exact owner, namespace,
+            // projection and filter represented by the newly accepted page.
+            if refresh {
+                model.acceptedPages = [:]
+                model.lastGenerations = [projection: generation]
+            }
+            model.indexWorker = worker; model.prepared = index
             model.acceptedPages[projection] = current
-            // Build receipts use All; apply the user's exact path only after a
-            // terminal graph has been accepted. Missing paths are explicit errors.
-            if model.selectedPath != nil || model.direction != .all {
-                let direction = model.direction, path = model.selectedPath
-                do {
-                    let filtered = try await model.fetch(index, generation: generation, coverage: current.coverage,
-                        direction: direction, path: path, start: 0, flag: flag)
-                    try model.accept(flag)
-                    model.page = filtered
-                } catch {
-                    // The accepted graph remains inspectable even when a path
-                    // belongs outside this bounded catalog. Do not claim zero.
-                    model.selectedPath = nil; model.direction = .all
-                    throw error
-                }
-            }
-            model.acceptedPages[projection] = model.page
-            model.notice = model.page?.summary ?? "Relationships are ready."
+            model.projection = projection; model.direction = direction; model.selectedPath = path
+            model.page = current; model.relationshipProgress = nil
+            model.notice = current.summary
         }
     }
 
-
     /// Switching projection reuses the frozen source index and its other
-    /// accepted inventory. A new page still has to validate its own generation.
+    /// accepted inventory. Keep the displayed projection until a new page has
+    /// validated: a failed switch must not strand the user's working browser.
     func selectProjection(_ projection: AtlasProjectRelationshipProjection) {
         guard canOperate, projection != self.projection, availableProjections.contains(projection) else { return }
-        self.projection = projection
-        page = nil; captureProgress = nil
-        guard let retained = acceptedPages[projection], let prepared, retained.basis == prepared.basis else {
-            prepare(); return
-        }
+        prepare(projection: projection, refresh: false)
+    }
+
+    private func reload(projection: AtlasProjectRelationshipProjection,
+                        retained: AtlasProjectLinksPage, index: AtlasPreparedIndex) {
         let direction = direction, path = selectedPath
+        let start = page?.projection == projection && page?.direction == direction
+            && page?.path?.bytes == path ? (page?.start ?? 0) : 0
+        notice = "Reloading the retained \(projection.noun) view without recapturing or reparsing sources…"
         perform { model, flag in
-            let next = try await model.fetch(prepared, generation: retained.generation, coverage: retained.coverage,
-                direction: direction, path: path, start: 0, flag: flag)
+            let next = try await model.fetch(index, generation: retained.generation, coverage: retained.coverage,
+                direction: direction, path: path, start: start, flag: flag)
             try model.accept(flag)
             model.page = next; model.acceptedPages[projection] = next
-            model.notice = next.summary
+            model.projection = projection
+            model.notice = "Retained view reloaded. Use Refresh sources to include file edits. " + next.summary
         }
     }
 
@@ -355,7 +380,7 @@ import Observation
     }
     func close() {
         guard !closed else { return }
-        closed = true; cancel(); page = nil; captureProgress = nil; acceptedPages = [:]
+        closed = true; cancel(); page = nil; captureProgress = nil; relationshipProgress = nil; acceptedPages = [:]
         if !busy { prepared = nil; indexWorker = nil }
     }
     private func accept(_ flag: AtlasSearchCancellation) throws {
@@ -369,14 +394,13 @@ import Observation
             do { try await operation(self, flag) }
             catch {
                 notice = Self.message(error)
-                // An unfinished graph cannot authorize later row activation.
-                if page?.building == true { page = nil }
+                if page != nil { notice += " Your previous relationship view is unchanged." }
             }
             finish()
         }
     }
     private func finish() {
-        busy = false; cancellation = nil; task = nil; captureProgress = nil
+        busy = false; cancellation = nil; task = nil; captureProgress = nil; relationshipProgress = nil
         if closed { prepared = nil; indexWorker = nil }
     }
     private static func message(_ error: Error) -> String {

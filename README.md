@@ -265,6 +265,13 @@ requests refuse them. Navigation reuses the captured source, performs no extra
 source reads, and does not claim a rendered-text hit highlight. Executable
 regression verification remains pending.
 
+**Relationship refresh preserves the working view.** Refresh builds and validates
+a separate source capture before replacing the accepted rows, filter and owner.
+Failure or cancellation leaves the existing view and captured document navigation
+usable, including after repeated failed attempts. **Reload view** reuses the
+accepted inventory without reparsing or losing the current page. Regression
+fixtures cover both documentation and imports; native execution remains pending.
+
 **TypeScript imports can navigate from emitted extensions to captured source.**
 In TypeScript and TSX files, a relative import such as `./worker.js` can open a
 unique captured `worker.ts`, `worker.tsx`, or `worker.d.ts` when the exact written

@@ -1556,11 +1556,18 @@ navigation, Markdown preview and rendered Find through the same retained reader,
 including after the project index or saved archive closes. Exact source copies
 keep their original byte order and spelling.
 
-**Rebuild links** reuses the prepared source captures. **Refresh sources**
-captures the current project again so file edits can affect the inventory.
-Already opened readers and pins retain their original bytes. Cancellation and
-replacement reject stale link responses; an old link identity cannot authorize
-an open against a replacement index.
+**Reload view** reloads the accepted relationship inventory from the same captured
+bytes and keeps the current page position. It performs no recapture or extraction.
+An unbuilt projection still offers **Build links** or **Build imports**.
+**Refresh sources** prepares a separate capture so file edits can affect the
+inventory. The current rows, exact filter, page position and document-link
+navigation remain accepted until the replacement capture, relationships and
+selected filter all validate. A failed or canceled refresh leaves that view
+usable; a disappeared selected path reports an error without widening the filter.
+Progress is shown separately from the accepted rows. Switching to an unbuilt
+projection also preserves the current projection if the build fails or is canceled.
+Already opened readers and pins retain their original bytes after a successful
+refresh; old link identities cannot authorize navigation against its new index.
 
 Host, registry, C-boundary and native regression fixtures accompany this
 workflow. They remain unexecuted in this code-first session; compilation and

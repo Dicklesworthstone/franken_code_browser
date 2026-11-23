@@ -11,6 +11,11 @@ import Foundation
         while model.busy && ProcessInfo.processInfo.systemUptime < deadline { await Task.yield() }
         precondition(!model.busy)
     }
+    @MainActor private static func until(_ done: () -> Bool) async {
+        let deadline = ProcessInfo.processInfo.systemUptime + 10
+        while !done() && ProcessInfo.processInfo.systemUptime < deadline { await Task.yield() }
+        precondition(done(), "Relationship replacement work did not drain")
+    }
     private static func prepared(_ fixture: ProjectLinksFixture) async throws -> AtlasPreparedIndex {
         let worker = AtlasIndexedSearch(transport: fixture.index.transport)
         let flag = AtlasSearchCancellation(), lease = AtlasSearchAccessLease(nil)
@@ -80,6 +85,105 @@ import Foundation
                 bad = receipt; bad["fragment_status"] = "resolved"; reject(bad)
             }
         }
+    }
+    @MainActor private static func replacementLifecycle() async throws {
+        let fixture = ProjectLinksFixture(), selected = Array("guide.md".utf8)
+        let model = AtlasProjectLinksModel(root: "/project", initialPath: selected,
+            direction: .incoming, transport: fixture.transport)
+        model.prepare(); await settled(model)
+        model.loadPage(start: 64); await settled(model)
+        let generation = model.page!.generation, basis = model.page!.basis
+        model.prepare(); await settled(model)
+        guard let retained = model.page else { preconditionFailure(model.notice) }
+        precondition(retained.start == 64 && retained.generation == generation && retained.basis == basis
+            && fixture.log.filter { $0 == "begin" }.count == 1
+            && fixture.log.filter { $0 == "step" }.count == 1 && fixture.index.count("create:") == 1,
+            "Reload keeps the current window and accepted graph without recapture or extraction")
+        let source = try await model.open(retained.links[0], from: retained, side: .evidence,
+            readerTransport: fixture.readerTransport, document: fixture.documentTransport)
+        source.reader.documentPreview.prepare(); await until { !source.reader.documentPreview.busy }
+        source.reader.documentPreview.prepareLinks(); await until { !source.reader.documentPreview.busy }
+        source.reader.documentPreview.nextLinks(); await until { !source.reader.documentPreview.busy }
+        guard let target = source.reader.documentPreview.links?.target(id: 65) else {
+            preconditionFailure(source.reader.documentPreview.notice)
+        }
+        @MainActor func unchanged(_ reason: String) {
+            precondition(model.page?.id == retained.id && model.page?.basis == basis
+                && model.page?.generation == generation && model.page?.start == 64
+                && model.projection == .documentation && model.direction == .incoming
+                && model.selectedPath == selected && model.hasPreparedSources && model.hasAcceptedProjection
+                && model.relationshipProgress == nil && model.canFollowDocumentLinks(from: source), reason)
+        }
+
+        // Invalid reload receipts never begin a new engine generation. Repeat
+        // the fault so a one-generation rollback cache cannot hide the defect.
+        fixture.patch { phase, value in
+            var value = value
+            if phase == "page" { value["relationship_generation"] = "999" }
+            return value
+        }
+        for _ in 0..<2 {
+            model.prepare(); await settled(model)
+            unchanged("A failed reload preserves the current page, owner, filter and document navigation")
+        }
+        fixture.patch { _, value in value }
+        precondition(fixture.log.filter { $0 == "begin" }.count == 1)
+
+        fixture.index.patch { phase, value in
+            var value = value
+            if phase == "build-step" { value["owner"] = "999" }
+            return value
+        }
+        model.prepare(refresh: true); await settled(model)
+        unchanged("A failed capture cannot replace the accepted relationship owner")
+        fixture.index.patch { _, value in value }
+
+        fixture.pause("step"); model.prepare(refresh: true)
+        await until { fixture.isBlocked }
+        precondition(model.page?.id == retained.id && model.page?.basis == basis
+            && model.relationshipProgress?.building == true && model.relationshipProgress?.basis != basis
+            && model.projection == .documentation && model.selectedPath == selected,
+            "A fresh candidate reports progress separately while the accepted view remains visible")
+        model.cancel(); fixture.gate.signal(); await settled(model)
+        unchanged("Canceling a replacement leaves the accepted owner and its exact filtered window usable")
+
+        fixture.patch { phase, value in
+            var value = value
+            if phase == "step" { value["relationship_generation"] = "999" }
+            return value
+        }
+        for _ in 0..<2 {
+            model.prepare(refresh: true); await settled(model)
+            unchanged("Repeated invalid terminal receipts must not evict the accepted backend generation")
+        }
+        fixture.patch { phase, value in
+            guard phase == "page" else { return value }
+            return ["schema": "fcb.atlas-links/1", "status": "error",
+                "error": ["code": "ATLAS_LINKS_PATH_NOT_FOUND"]]
+        }
+        model.prepare(refresh: true); await settled(model)
+        unchanged("A vanished selected path must not publish the candidate or widen the previous filter")
+        precondition(model.notice.contains("outside this captured atlas catalog"))
+        fixture.patch { _, value in value }
+
+        let linked = try await model.openDocumentLink(target, from: source,
+            readerTransport: fixture.readerTransport, document: fixture.documentTransport)
+        precondition(linked.link.sourceLink == 65 && linked.reader.page?.start == 34,
+            "The original reader can still follow its exact occurrence after every failed replacement")
+        unchanged("Following the retained link does not replace the visible relationship page")
+        linked.reader.close()
+
+        model.prepare(refresh: true); await settled(model)
+        guard let refreshed = model.page else { preconditionFailure(model.notice) }
+        precondition(refreshed.basis != basis && refreshed.generation == 1 && refreshed.start == 0
+            && refreshed.direction == .incoming && refreshed.path?.bytes == selected
+            && !model.canFollowDocumentLinks(from: source)
+            && source.reader.page?.text == ProjectLinksFixture.source(1),
+            "A successful refresh publishes the new owner/filter together while old readers retain their capture")
+        let destination = try await model.open(refreshed.links[0], from: refreshed, side: .target,
+            readerTransport: fixture.readerTransport)
+        precondition(destination.reader.page?.start == 34)
+        model.close(); source.reader.close(); destination.reader.close()
     }
     @MainActor static func main() async throws {
         let fixture = ProjectLinksFixture(), index = try await prepared(fixture)
@@ -263,7 +367,8 @@ import Foundation
         model.selectPath(Array("docs.md".utf8), direction: .outgoing); await settled(model)
         precondition(model.page?.direction == .outgoing && model.page?.path?.bytes == Array("docs.md".utf8))
         model.prepare(); await settled(model)
-        precondition(model.page?.generation == 2 && live.index.count("create:") == 1, "Rebuild reuses captured sources")
+        precondition(model.page?.generation == 1 && live.index.count("create:") == 1
+            && live.log.filter { $0 == "begin" }.count == 1, "Reload reuses the accepted relationship inventory")
         model.prepare(refresh: true); await settled(model)
         precondition(live.index.count("create:") == 2 && model.page?.generation == 1, "Refresh owns a fresh index and graph namespace")
         model.close()
@@ -304,6 +409,7 @@ import Foundation
         retiringModel.close(); retiring.gate.signal(); await settled(retiringModel)
         precondition(retiringModel.closed && retiringModel.page == nil && !retiringModel.hasPreparedSources,
             "Project/grant replacement revokes the surface before late foreign work can publish")
-        print("AtlasProjectLinksTests: prepare-only, bounded pages, provenance, captured readers and cancellation passed")
+        try await replacementLifecycle()
+        print("AtlasProjectLinksTests: prepare-only, bounded pages, retained navigation and transactional refresh passed")
     }
 }

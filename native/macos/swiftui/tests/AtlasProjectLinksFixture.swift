@@ -25,9 +25,11 @@ final class ProjectLinksFixture: @unchecked Sendable {
     private var documents: [UInt64: (generation: UInt64, width: UInt64)] = [:]
     private var events: [String] = []
     private var generations: [UInt64: UInt64] = [:]
+    private var acceptedGenerations: [UInt64: UInt64] = [:]
     private var readerFiles: [UInt64: UInt64] = [:]
     private var readerProjections: [UInt64: AtlasProjectRelationshipProjection] = [:]
     private var importGenerations: [UInt64: UInt64] = [:]
+    private var acceptedImportGenerations: [UInt64: UInt64] = [:]
     private var importSteps: [UInt64: Int] = [:]
     private var readerNext: UInt64 = 100
     private var paused: String?
@@ -136,6 +138,10 @@ final class ProjectLinksFixture: @unchecked Sendable {
         if wait { precondition(gate.wait(timeout: .now() + 10) == .success) }
         return Self.json(mutate(phase, value))
     }
+    private func accepts(_ generation: UInt64, owner: UInt64, imports: Bool = false) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return (imports ? acceptedImportGenerations[owner] : acceptedGenerations[owner]) == generation
+    }
     var transport: AtlasProjectLinksTransport {
         .init(index: index.transport, readerDomain: domain, begin: { owner, generation, index, _ in
             precondition(index == 1)
@@ -143,8 +149,18 @@ final class ProjectLinksFixture: @unchecked Sendable {
             precondition(generation > previous); self.generations[owner] = generation; self.lock.unlock()
             return self.call("begin", Self.page(owner: owner, generation: generation, command: "links-begin", running: true))
         }, step: { owner, generation, _ in
-            self.call("step", Self.page(owner: owner, generation: generation, command: "links-step"))
+            // The engine replaces its sole accepted generation before a host
+            // can decode the terminal receipt. A damaged receipt cannot roll
+            // the engine back, so native replacements must use a fresh owner.
+            self.lock.lock()
+            precondition(self.generations[owner] == generation)
+            self.acceptedGenerations[owner] = generation; self.lock.unlock()
+            return self.call("step", Self.page(owner: owner, generation: generation, command: "links-step"))
         }, page: { owner, generation, direction, hex, start, limit in
+            guard self.accepts(generation, owner: owner) else {
+                return self.call("page", ["schema": "fcb.atlas-links/1", "status": "error",
+                    "error": ["code": "ATLAS_LINKS_STALE_GENERATION"]])
+            }
             let names = self.includesImports ? ["docs.md", "guide.md", "src/lib.rs", "src/child.rs"] : ["docs.md", "guide.md"]
             let selected = names.first { Self.hex($0.utf8) == hex }
             if hex != nil && selected == nil {
@@ -155,6 +171,10 @@ final class ProjectLinksFixture: @unchecked Sendable {
             if let selected, let at = names.firstIndex(of: selected) { page["filter_file_id"] = String(at + 1) }
             return self.call("page", page)
         }, openReader: { owner, reader, generation, link, side in
+            guard self.accepts(generation, owner: owner) else {
+                return self.call("reader", ["schema": "fcb.atlas-links/1", "status": "error",
+                    "error": ["code": "ATLAS_LINKS_STALE_GENERATION"]])
+            }
             self.lock.lock(); self.readerFiles[reader] = side == .evidence ? 1 : 2; self.lock.unlock()
             return self.call("reader", Self.receipt(owner: owner, reader: reader, generation: generation, link: link, side: side))
         }, imports: includesImports ? importOperations : nil)
@@ -346,10 +366,15 @@ extension ProjectLinksFixture {
             precondition(self.importGenerations[owner] == generation)
             let next = (self.importSteps[owner] ?? 0) + 1
             self.importSteps[owner] = next
+            if next == 2 { self.acceptedImportGenerations[owner] = generation }
             self.lock.unlock()
             return self.call("imports-step", Self.importPage(owner: owner, generation: generation,
                 command: "imports-step", examined: next))
         }, page: { owner, generation, direction, hex, start, limit in
+            guard self.accepts(generation, owner: owner, imports: true) else {
+                return self.call("imports-page", ["schema": "fcb.atlas-imports/1", "status": "error",
+                    "error": ["code": "ATLAS_IMPORTS_STALE_GENERATION"]])
+            }
             let names = ["docs.md", "guide.md", "src/lib.rs", "src/child.rs"]
             let selected = names.first { Self.hex($0.utf8) == hex }
             if hex != nil && selected == nil {
@@ -361,6 +386,10 @@ extension ProjectLinksFixture {
             if let selected, let at = names.firstIndex(of: selected) { page["filter_file_id"] = String(at + 1) }
             return self.call("imports-page", page)
         }, openReader: { owner, reader, generation, link, side in
+            guard self.accepts(generation, owner: owner, imports: true) else {
+                return self.call("imports-reader", ["schema": "fcb.atlas-imports/1", "status": "error",
+                    "error": ["code": "ATLAS_IMPORTS_STALE_GENERATION"]])
+            }
             self.lock.lock()
             self.readerFiles[reader] = side == .evidence ? 1 : 2
             self.readerProjections[reader] = .imports

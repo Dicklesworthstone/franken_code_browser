@@ -51,6 +51,10 @@ import SwiftUI
         _pathInput = State(initialValue: presentation.initialPath.flatMap { String(bytes: $0, encoding: .utf8) } ?? "")
     }
     private var canOperate: Bool { model.canOperate && !history.busy }
+    private var prepareTitle: String {
+        model.hasAcceptedProjection ? "Reload view" : (model.hasPreparedSources
+            ? "Build \(model.projection.noun)" : "Capture and build \(model.projection.noun)")
+    }
     private var reader: AtlasProjectLinkReaderCapture? { history.current }
     private var pinGroup: String { "project-links:\(presentation.id.uuidString)" }
     private var previousPageStart: UInt64? {
@@ -64,6 +68,11 @@ import SwiftUI
             header
             filters
             if let progress = model.captureProgress, model.busy {
+                Text(progress.summary).font(.caption).foregroundStyle(.secondary)
+            }
+            if let progress = model.relationshipProgress, model.busy {
+                Label("Preparing \(progress.projection.noun)…", systemImage: "doc.text.magnifyingglass")
+                    .font(.caption.weight(.semibold))
                 Text(progress.summary).font(.caption).foregroundStyle(.secondary)
             }
             if let page = model.page {
@@ -110,12 +119,13 @@ import SwiftUI
             HStack {
                 Label("Project relationships", systemImage: "link").font(.title2.weight(.semibold))
                 Spacer()
-                Button(model.hasPreparedSources ? "Rebuild \(model.projection.noun)" : "Capture and build \(model.projection.noun)") {
+                Button(prepareTitle) {
                     readerNotice = ""; model.prepare()
                 }.disabled(!canOperate)
+                    .help("Build an unprepared inventory, or reload its accepted view from the same captured bytes. Use Refresh sources to include file edits.")
                 Button("Refresh sources") { readerNotice = ""; model.prepare(refresh: true) }
                     .disabled(!canOperate || !model.hasPreparedSources)
-                    .help("Capture current project sources again. Already opened readers and pins keep their previous captures.")
+                    .help("Capture current project sources again. The current view stays available if refresh fails or is canceled. Opened readers and pins keep their previous captures.")
                 Button("Done") { close(); dismiss() }.keyboardShortcut(.cancelAction)
             }
             Text(verbatim: presentation.root).font(.caption.monospaced()).lineLimit(2).textSelection(.enabled)
