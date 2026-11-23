@@ -234,10 +234,11 @@ impl<'query> Predicates<'query> {
             result.matches.clear();
             result.total_matches_counted = 0;
         }
-        if rejected && result.unsupported_files.is_empty()
-            && result.coverage != SearchCoverage::CanceledEarly {
-            result.coverage = SearchCoverage::Exhaustive;
-        } else if qualified && primary_limited && result.coverage == SearchCoverage::Exhaustive {
+        // Eligibility cannot upgrade the scanner's coverage. Raw-byte scans
+        // already finish exhaustively when an exclusion proves a negative;
+        // decoded scans must still validate their suffix. In particular, an
+        // observed exclusion does not erase a byte limit or cancellation.
+        if qualified && primary_limited && result.coverage == SearchCoverage::Exhaustive {
             result.coverage = SearchCoverage::TruncatedAtLimit { max_matches };
         }
     }

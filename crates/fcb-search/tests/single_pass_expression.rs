@@ -158,6 +158,102 @@ fn incomplete_predicates_never_publish_tentative_hits() {
 }
 
 #[test]
+fn observed_exclusions_do_not_complete_budget_limited_decoded_searches() {
+    let text = format!("needle needle required blocked {}🙂", "x".repeat(20_000));
+    let query = ParsedQuery::parse("needle required -blocked").unwrap();
+    for bytes in [text.as_bytes().to_vec(), utf16(&text, true), utf16(&text, false)] {
+        let source = capture(&bytes);
+        let document = SearchDocument::new(source.request().file(), "source.rs", &source);
+        for (case_sensitive, normalization) in [(true, UnicodeNormalization::Exact),
+            (false, UnicodeNormalization::Exact), (false, UnicodeNormalization::CaseFold)] {
+            for allowance in [64, 16_384, bytes.len() as u64 - 1] {
+                let mut opts = options().with_max_matches(1)
+                    .with_mode(SearchMode::DecodedText { case_sensitive, normalization });
+                opts.max_bytes_scanned = Some(allowance);
+                // The exclusion is in the admitted prefix in every encoding.
+                // The suffix still needs validation, including an allowance
+                // ending inside the final UTF-8 scalar or UTF-16 surrogate.
+                for counted in [false, true] {
+                    let ordinary = scan(&bytes, "needle required -blocked", &opts, counted);
+                    let window = CaptureQueryScanner::scan_document_window_with_cancel(
+                        &document, &query, &opts, 1, counted, || false).unwrap();
+                    for result in [ordinary, window] {
+                        assert_eq!(result.coverage,
+                            SearchCoverage::BudgetExhausted { bytes_scanned: allowance });
+                        assert_eq!(result.scanned_bytes, allowance);
+                        assert!(!result.is_complete());
+                        assert!(result.matches.is_empty());
+                        assert_eq!(result.match_count(), 0);
+                        assert!(result.unsupported_files.is_empty());
+                    }
+                }
+            }
+            let opts = options().with_mode(SearchMode::DecodedText { case_sensitive, normalization });
+            let complete = CaptureQueryScanner::scan_document_counting_with_cancel(
+                &document, &query, &opts, || false).unwrap();
+            assert!(complete.is_complete());
+            assert_eq!(complete.scanned_bytes, bytes.len() as u64);
+            assert!(complete.matches.is_empty());
+            assert_eq!(complete.match_count(), 0);
+        }
+    }
+}
+
+#[test]
+fn raw_exclusion_still_proves_a_negative_without_decoding_the_suffix() {
+    let mut bytes = format!("needle blocked {}", "x".repeat(20_000)).into_bytes();
+    bytes.push(0xff);
+    let mut opts = options().with_mode(SearchMode::RawBytes).with_max_matches(1);
+    opts.max_bytes_scanned = Some(64);
+    for counted in [false, true] {
+        let result = scan(&bytes, "needle -blocked", &opts, counted);
+        assert!(result.is_complete());
+        assert!(result.scanned_bytes <= 64 && result.scanned_bytes < bytes.len() as u64);
+        assert!(result.matches.is_empty());
+        assert_eq!(result.match_count(), 0);
+        assert!(result.unsupported_files.is_empty());
+    }
+}
+
+#[test]
+fn indexed_excluded_documents_keep_verification_budget_failure() {
+    let text = format!("needle blocked {}", "x".repeat(20_000));
+    let query = ParsedQuery::parse("needle -blocked").unwrap();
+    for bytes in [text.as_bytes().to_vec(), utf16(&text, true), utf16(&text, false)] {
+        let source = capture(&bytes);
+        let documents = [SearchDocument::new(source.request().file(), "source.rs", &source)];
+        for max_source_bytes_per_file in [0, 65_536] {
+            let manifest = SearchManifest::new(SearchManifestId::new(owner(), 1).unwrap(),
+                &documents, &[], MembershipState::Closed, ManifestLimits::default()).unwrap();
+            let index_budget = budget(8 * 1024 * 1024);
+            let index = EphemeralIndex::build(manifest, IndexLimits {
+                max_source_bytes_per_file, ..IndexLimits::default()
+            }, &index_budget, allocation(1), || false).unwrap();
+            let output_budget = budget(128 * 1024);
+            let mut opts = options().with_max_matches(1);
+            opts.max_bytes_scanned = Some(16_384);
+            for counted in [false, true] {
+                let report = if counted {
+                    index.search_counting(&query, opts.clone(), &output_budget, allocation(2), || false)
+                } else {
+                    index.search(&query, opts.clone(), &output_budget, allocation(2), || false)
+                }.unwrap();
+                assert!(report.is_terminal());
+                assert_eq!(report.examined_files(), 1);
+                assert_eq!(report.scan_attempts(), 1);
+                assert!(!report.is_complete());
+                let result = report.capture_results();
+                assert_eq!(result.coverage, SearchCoverage::BudgetExhausted { bytes_scanned: 16_384 });
+                assert_eq!(result.scanned_bytes, 16_384);
+                assert!(result.matches.is_empty());
+                assert_eq!(result.match_count(), 0);
+                assert!(result.unsupported_files.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
 fn malformed_suffix_invalidates_tentative_matches_even_after_row_storage_fills() {
     let mut bytes = format!("needle needle required {}", "x".repeat(40_000)).into_bytes();
     bytes.push(0xff);
