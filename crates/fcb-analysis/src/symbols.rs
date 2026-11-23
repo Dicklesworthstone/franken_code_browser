@@ -160,13 +160,7 @@ impl<'source> CapturedSymbols<'source> {
         }
         let text = map.decoded_text();
         if text.len() > MAX_SYMBOL_SOURCE_BYTES { return Err(SymbolError::SourceLimit); }
-        let line_count = text.bytes().filter(|&b| b == b'\n').count() + 1;
-        if line_count > MAX_LINES { return Err(SymbolError::ComplexityLimit); }
-        let mut line_starts = Vec::new();
-        line_starts.try_reserve_exact(line_count).map_err(|_| SymbolError::ResourceDenied)?;
-        if line_starts.capacity() > line_count { return Err(SymbolError::ResourceDenied); }
-        line_starts.push(0);
-        line_starts.extend(text.bytes().enumerate().filter_map(|(i, b)| (b == b'\n').then_some(i + 1)));
+        let line_starts = source_line_starts(text, &mut canceled)?;
         if canceled() { return Err(SymbolError::Canceled); }
         let (candidates, limited) = match language {
             SymbolLanguage::Rust => rust::extract(&map, &line_starts, max_items, &mut canceled)?,
@@ -223,6 +217,41 @@ impl<'source> CapturedSymbols<'source> {
             self.source.get(start..end).ok_or(SymbolError::InvalidEvidence)
         }).transpose()
     }
+}
+
+/// Decoded offsets for the same physical source lines as fcb-source's reader:
+/// LF, CRLF and bare CR terminate one line; a terminal delimiter does not create
+/// another line without a following byte. These are location receipts, not
+/// language statement boundaries, so lexer-specific CR guards remain in force.
+fn source_line_starts(text: &str, canceled: &mut impl FnMut() -> bool)
+    -> Result<Vec<usize>, SymbolError> {
+    // The outer admission already reserves MAX_LINES entries. No source can
+    // contain more nonempty physical-line records than decoded bytes.
+    let capacity = text.len().min(MAX_LINES);
+    let mut starts = Vec::new();
+    starts.try_reserve_exact(capacity).map_err(|_| SymbolError::ResourceDenied)?;
+    if starts.capacity() > capacity { return Err(SymbolError::ResourceDenied); }
+    let mut pending = true;
+    let mut previous_cr = false;
+    for (offset, byte) in text.bytes().enumerate() {
+        if offset % 1024 == 0 && canceled() { return Err(SymbolError::Canceled); }
+        if previous_cr {
+            previous_cr = false;
+            if byte == b'\n' { continue; }
+        }
+        if pending {
+            if starts.len() == MAX_LINES { return Err(SymbolError::ComplexityLimit); }
+            starts.push(offset);
+            pending = false;
+        }
+        match byte {
+            b'\r' => { pending = true; previous_cr = true; }
+            b'\n' => pending = true,
+            _ => {}
+        }
+    }
+    if canceled() { return Err(SymbolError::Canceled); }
+    Ok(starts)
 }
 
 fn mapped(map: &CaptureEncodingMap, start: u64, end: u64) -> Result<ByteRange, SymbolError> {
