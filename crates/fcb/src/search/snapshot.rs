@@ -13,7 +13,9 @@ use super::{CaptureRequest, CompleteCapture, EphemeralIndex, IndexError, IndexLi
     SearchManifest, SearchManifestId, SourceReader};
 use super::workspace::{WorkspaceCaptures, WorkspaceError};
 pub use fcb_store::snapshot::{SnapshotBytes, SnapshotData, SnapshotEntry, SnapshotError,
-    SnapshotLimits, SnapshotView, MAX_SNAPSHOT_BYTES};
+    SnapshotLimits, SnapshotView, SnapshotStreamError, SnapshotStreamStats, SnapshotStreamWriter,
+    SnapshotWriteSummary, MAX_SNAPSHOT_BYTES, MAX_PAGED_SNAPSHOT_FILE_BYTES,
+    MAX_PAGED_SNAPSHOT_SOURCE_BYTES, MAX_PAGED_SNAPSHOT_BYTES};
 pub use fcb_store::Sha256Digest;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -6,6 +6,10 @@
 //! All paths are root-relative native bytes; no host root pathname is persisted.
 //! Unavailable members remain members, distinct from captured empty files.
 
+pub mod streaming;
+pub use streaming::{SnapshotStreamError, SnapshotStreamStats, SnapshotStreamWriter,
+    SnapshotWriteSummary, MAX_SNAPSHOT_STREAM_CALLS, SNAPSHOT_STREAM_BYTES};
+
 use std::mem::size_of;
 use fcb_core::{ArenaOwnerId, ByteLength, ResourceAllocationId, ResourceBudget, ResourceLease};
 use crate::{EnvelopeLimits, EnvelopeReader, EnvelopeSchema, Sha256, Sha256Digest,
@@ -15,6 +19,11 @@ use crate::envelope::{ExactEnvelopeError, ExactEnvelopeWriter};
 pub const SNAPSHOT_SCHEMA: EnvelopeSchema = EnvelopeSchema::with_magic(*b"FCBS", 0x53524331, 1, 0);
 pub const MAX_SNAPSHOT_BYTES: usize = 80 * 1024 * 1024;
 pub const MAX_SNAPSHOT_FILES: usize = 65_536;
+/// The explicit file-backed profile. These limits do not enlarge the compact
+/// in-memory encoder/view or make allocation of a whole archive admissible.
+pub const MAX_PAGED_SNAPSHOT_FILE_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_PAGED_SNAPSHOT_SOURCE_BYTES: usize = 1024 * 1024 * 1024;
+pub const MAX_PAGED_SNAPSHOT_BYTES: usize = MAX_PAGED_SNAPSHOT_SOURCE_BYTES + 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SnapshotLimits {
@@ -33,6 +42,27 @@ impl Default for SnapshotLimits {
     }
 }
 impl SnapshotLimits {
+    /// Larger archives for streaming export and paged opening. A source capture
+    /// and its budget remain owned by the caller, one member at a time.
+    pub const fn paged() -> Self {
+        Self { max_files: MAX_SNAPSHOT_FILES, max_path_bytes: 2048,
+            max_total_path_bytes: 8 * 1024 * 1024,
+            max_file_bytes: MAX_PAGED_SNAPSHOT_FILE_BYTES,
+            max_source_bytes: MAX_PAGED_SNAPSHOT_SOURCE_BYTES,
+            max_document_bytes: MAX_PAGED_SNAPSHOT_BYTES }
+    }
+
+    pub(crate) fn validate_paged(self) -> Result<(), SnapshotError> {
+        if self.max_files > MAX_SNAPSHOT_FILES || self.max_path_bytes > 16_384
+            || self.max_document_bytes > MAX_PAGED_SNAPSHOT_BYTES || self.max_document_bytes < FRAME_LEN
+            || self.max_source_bytes > MAX_PAGED_SNAPSHOT_SOURCE_BYTES
+            || self.max_total_path_bytes > MAX_SNAPSHOT_BYTES
+            // Preserve explicitly configured members admitted by the original
+            // paged reader; the new standard profile uses the smaller 32 MiB.
+            || self.max_file_bytes > MAX_SNAPSHOT_BYTES { return Err(SnapshotError::Limit); }
+        Ok(())
+    }
+
     fn validate(self) -> Result<(), SnapshotError> {
         if self.max_files > MAX_SNAPSHOT_FILES || self.max_path_bytes > 16_384
             || self.max_document_bytes > MAX_SNAPSHOT_BYTES || self.max_document_bytes < FRAME_LEN

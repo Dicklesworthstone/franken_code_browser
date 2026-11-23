@@ -439,13 +439,19 @@ impl EnvelopeWriter {
 
 /// One canonical header implementation for growing and exactly sized writers.
 fn append_header(document: &mut Vec<u8>, schema: EnvelopeSchema, payload_len: u64) {
-    document.extend_from_slice(&schema.magic);
-    document.extend_from_slice(&schema.schema_id.to_le_bytes());
-    document.extend_from_slice(&schema.major.to_le_bytes());
-    document.extend_from_slice(&schema.minor.to_le_bytes());
-    document.extend_from_slice(&0u16.to_le_bytes()); // flags
-    document.extend_from_slice(&0u16.to_le_bytes()); // reserved
-    document.extend_from_slice(&payload_len.to_le_bytes());
+    document.extend_from_slice(&canonical_header(schema, payload_len));
+}
+
+/// Streaming writers use the same fixed header without allocating an envelope.
+pub(crate) fn canonical_header(schema: EnvelopeSchema, payload_len: u64) -> [u8; HEADER_LEN] {
+    let mut header = [0; HEADER_LEN];
+    header[..4].copy_from_slice(&schema.magic);
+    header[4..8].copy_from_slice(&schema.schema_id.to_le_bytes());
+    header[8..10].copy_from_slice(&schema.major.to_le_bytes());
+    header[10..12].copy_from_slice(&schema.minor.to_le_bytes());
+    // Flags and reserved bytes remain zero.
+    header[16..24].copy_from_slice(&payload_len.to_le_bytes());
+    header
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

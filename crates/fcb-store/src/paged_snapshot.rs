@@ -18,7 +18,7 @@ pub use catalog::{CatalogArtifact, CatalogError, PinnedCatalog};
 use std::{io::{self, Read, Seek, SeekFrom}, mem::size_of, ops::Range};
 use fcb_core::{ArenaOwnerId, ByteLength, ResourceAllocationId, ResourceBudget, ResourceLease};
 use crate::{Sha256, Sha256Digest, HEADER_LEN, CHECKSUM_LEN, FRAME_LEN};
-use crate::snapshot::{SnapshotLimits, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_FILES, SNAPSHOT_SCHEMA};
+use crate::snapshot::{SnapshotLimits, SNAPSHOT_SCHEMA};
 
 pub const SNAPSHOT_READ_BYTES: usize = 64 * 1024;
 pub const MAX_SNAPSHOT_READ_CALLS: u64 = 1_048_576;
@@ -333,11 +333,7 @@ impl<R: Read> Scan<'_, R> {
     }
 }
 fn validate_limits(l: SnapshotLimits) -> Result<(), PagedSnapshotError> {
-    if l.max_files > MAX_SNAPSHOT_FILES || l.max_path_bytes > 16_384
-        || l.max_document_bytes > MAX_SNAPSHOT_BYTES || l.max_document_bytes < FRAME_LEN
-        || l.max_source_bytes > MAX_SNAPSHOT_BYTES || l.max_total_path_bytes > MAX_SNAPSHOT_BYTES
-        || l.max_file_bytes > MAX_SNAPSHOT_BYTES { return Err(PagedSnapshotError::Limits); }
-    Ok(())
+    l.validate_paged().map_err(|_| PagedSnapshotError::Limits)
 }
 fn reserve<T>(count: usize) -> Result<Vec<T>, PagedSnapshotError> {
     let mut v = Vec::new(); v.try_reserve_exact(count).map_err(|_| PagedSnapshotError::ResourceDenied)?;
