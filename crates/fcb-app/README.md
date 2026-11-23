@@ -1176,6 +1176,39 @@ Rust hosts have the corresponding `DeskRepository::begin_query_scoped`,
 cover the public and stdio paths. These are code-first regression sources;
 independent strict-RCH execution remains pending.
 
+## Later captured-index windows in a Reading Desk
+
+Prepared Desk repository indexes now expose later occurrence windows through
+`DeskRepository::begin_indexed_window_scoped` and four stdio commands:
+
+```text
+repo-begin-indexed-matching-window TOKEN INDEX_GEN QUERY_GEN CASE COUNT OFFSET LIMIT VERIFY_BYTES SCOPE SCOPE_VALUE TEXT
+repo-begin-indexed-expression-window TOKEN INDEX_GEN QUERY_GEN CASE COUNT OFFSET LIMIT VERIFY_BYTES SCOPE SCOPE_VALUE EXPRESSION
+```
+
+Both commands also accept a `-text-hex` suffix. They reuse the index and
+the normal `repo-step`, `repo-page` and `repo-hit` lifecycle. `OFFSET` is a
+zero-based qualified occurrence offset across the indexed universe, distinct
+from `repo-page`'s row offset within the already retained window. This makes
+matches beyond the first 4096 reachable while retaining a bounded result page.
+
+Use `next_match_offset` with the same index, query, case policy and scope,
+choosing a fresh query generation. Skipped occurrences consume verification
+work but no retained-hit capacity; counts include those occurrences.
+Expressions qualify a complete captured file before its primary occurrences
+count toward the offset. Count-only windows have no navigable continuation.
+A null next offset after incomplete coverage does not prove that no later
+matches exist; verification limits remain separate from complete counts.
+
+Every window uses the indexed captures without reopening live source files.
+Activating a row preserves its exact source revision and bytes even if the
+live file changes. Imported readers and their bookmarks survive index clearing,
+detachment and checkpoint restoration. Pending, failed or canceled replacements
+preserve accepted rows. New regression sources cover late/overlapping UTF-8 and
+UTF-16 matches, full-width offsets, filters, cancellation, partial coverage,
+all four protocol variants and captured activation; strict-RCH execution remains
+pending.
+
 ## Search live repository structure in a Reading Desk
 
 A live repository attached with `repo-open` can search declaration names,

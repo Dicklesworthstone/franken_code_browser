@@ -183,6 +183,29 @@ impl DeskRepository {
             needle, scope, max_matches, max_scan_bytes, canceled)?)
     }
 
+    /// Retain a later occurrence window over the same explicitly prepared
+    /// captures. result_offset skips matches, not stored page rows; skipped
+    /// matches spend verification work but no hit/source-witness capacity.
+    /// Expression predicates qualify each complete capture before its primary
+    /// occurrences enter the offset or count. Literal text is never parsed.
+    ///
+    /// Each window needs a fresh query generation and the intended index,
+    /// scope, case policy and query. The normal step/page/open_hit lifecycle
+    /// applies, with no live-source reads. Page receipts separate result_offset,
+    /// skipped_matches, next_match_offset and total/count completeness; a null
+    /// next offset does not establish absence after a verification limit.
+    /// Canceled or failed replacements preserve the accepted window, and an
+    /// imported source survives later windows, index replacement or detachment.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_indexed_window_scoped(&mut self, generation: u64, index_generation: u64,
+        text: &str, scope: AtlasSearchScope, expression: bool, count_all_matches: bool,
+        result_offset: u64, max_matches: usize, max_scan_bytes: u64,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, DeskRepositoryError> {
+        Ok(self.search.begin_indexed_window_scoped(&self.atlas, generation, index_generation,
+            text, scope, expression, count_all_matches, result_offset, max_matches,
+            max_scan_bytes, canceled)?)
+    }
+
     /// Evaluate the shared expression parser/verifier against the named index's
     /// captures. A hit's source revision comes from its capture, not this query
     /// generation; subsequent desk activation never reopens the live path.

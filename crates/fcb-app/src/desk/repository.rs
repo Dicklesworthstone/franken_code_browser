@@ -56,6 +56,20 @@ SOURCE_BYTES is 1..33554432. VERIFY_BYTES is 0..33554432 for indexed literals,\n
 or 0..268435456 for expressions. Source capture remains capped at 32 MiB.\n\
 Expressions support phrases, conjunctions, exclusions, path: and lang: filters;\n\
 only expression commands parse operators. Regex is not qualified or enabled.\n\
+\nLater captured-index result windows:\n\
+  repo-begin-indexed-matching-window TOKEN INDEX_GEN QUERY_GEN CASE COUNT OFFSET LIMIT VERIFY_BYTES SCOPE SCOPE_VALUE TEXT\n\
+  repo-begin-indexed-expression-window TOKEN INDEX_GEN QUERY_GEN CASE COUNT OFFSET LIMIT VERIFY_BYTES SCOPE SCOPE_VALUE EXPRESSION\n\
+Both commands also accept a -text-hex suffix. OFFSET is a zero-based occurrence\n\
+offset, distinct from repo-page's row offset within the retained window.\n\
+Use next_match_offset with the same index, query and scope but a fresh QUERY_GEN.\n\
+Skipped matches consume verification work, not retained-hit capacity. Counts\n\
+include skipped occurrences; expressions qualify a file before counting them.\n\
+result_offset, skipped_matches, has_more_matches and next_match_offset accompany\n\
+the ordinary coverage/count fields. A null next offset after partial coverage\n\
+does not prove there are no later matches. LIMIT=0 requires count-all and has\n\
+no navigable continuation. Each window uses the exact indexed captures without\n\
+reopening live source. Pending/failed/canceled windows preserve accepted rows;\n\
+activate hits with their own query generation, never an earlier window's IDs.\n\
 \nStructural queries:\n\
   repo-begin-structure TOKEN QUERY_GEN MODE NAME_MODE LIMIT SOURCE_BYTES SCOPE SCOPE_VALUE TEXT\n\
   repo-begin-indexed-structure TOKEN INDEX_GEN QUERY_GEN MODE NAME_MODE LIMIT VERIFY_BYTES SCOPE SCOPE_VALUE TEXT\n\
@@ -290,6 +304,28 @@ impl RepositoryCommands {
                     (true, true) => repo.begin_indexed_expression_counted_scoped(generation, index, needle,
                         scope, limit, bytes, &mut *canceled)?,
                 };
+                self.progress_reply = repo.work_state().pending_query == Some(generation);
+                Ok(response)
+            }
+            ("repo-begin-indexed-matching-window" | "repo-begin-indexed-matching-window-text-hex"
+                | "repo-begin-indexed-expression-window" | "repo-begin-indexed-expression-window-text-hex",
+                [token, index, generation, case, counting, offset, limit, bytes, scope, scope_value, text]) => {
+                let scope = text_scope(scope, scope_value, case)?;
+                let count_all = count_all(counting)?;
+                let decoded;
+                let needle = if command.ends_with("text-hex") {
+                    decoded = String::from_utf8(hex(text, 1024)?).map_err(|_| Failure::Protocol("DESK_INVALID_TEXT"))?;
+                    decoded.as_str()
+                } else { text };
+                let generation = number(generation)?;
+                let index = number(index)?;
+                let offset = number(offset)?;
+                let limit = count(limit)?;
+                let bytes = number(bytes)?;
+                let repo = self.get(number(token)?)?;
+                let response = repo.begin_indexed_window_scoped(generation, index, needle, scope,
+                    command.starts_with("repo-begin-indexed-expression"), count_all, offset,
+                    limit, bytes, &mut *canceled)?;
                 self.progress_reply = repo.work_state().pending_query == Some(generation);
                 Ok(response)
             }
