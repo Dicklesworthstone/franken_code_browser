@@ -54,6 +54,7 @@ impl CaptureQueryScanner {
         mut canceled: impl FnMut() -> bool) -> Result<SearchResult, QueryError> {
         ReferenceScanOracle::scan_collection(&[], query, options)?;
         if doc.file_id != doc.capture.request().file() { return Err(QueryError::InvalidRange); }
+        crate::validate_whole_capture(doc.capture.request())?;
         if canceled() { return Ok(SearchResult::empty(SearchCoverage::CanceledEarly)); }
         if !ReferenceScanOracle::matches_path_filters(doc.path, &query.path_filters)
             || !ReferenceScanOracle::matches_lang_filters(doc.path, &query.lang_filters) {
@@ -105,6 +106,7 @@ impl CaptureQueryScanner {
         // metadata contracts without executing its per-term content scans.
         ReferenceScanOracle::scan_collection(&[], query, options)?;
         if doc.file_id != doc.capture.request().file() { return Err(QueryError::InvalidRange); }
+        crate::validate_whole_capture(doc.capture.request())?;
         if canceled() { return Ok(SearchResult::empty(SearchCoverage::CanceledEarly)); }
         if !ReferenceScanOracle::matches_path_filters(doc.path, &query.path_filters)
             || !ReferenceScanOracle::matches_lang_filters(doc.path, &query.lang_filters) {

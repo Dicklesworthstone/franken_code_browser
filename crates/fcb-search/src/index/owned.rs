@@ -66,7 +66,7 @@ impl EphemeralIndex<'_> {
         let mut path_bytes = 0usize;
         for doc in manifest.documents {
             check(&mut canceled)?;
-            if doc.capture.request().range().is_some() { return Err(IndexError::InvalidManifest); }
+            crate::validate_whole_capture(doc.capture.request())?;
             source_bytes = source_bytes.checked_add(doc.capture.bytes().len() as u64)
                 .ok_or(IndexError::LimitExceeded)?;
             path_bytes = path_bytes.checked_add(doc.path.len()).ok_or(IndexError::LimitExceeded)?;

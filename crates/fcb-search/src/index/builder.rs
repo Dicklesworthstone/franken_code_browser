@@ -68,7 +68,7 @@ impl OwnedIndexBuilder {
         mut canceled: impl FnMut() -> bool) -> Result<(), IndexError> {
         self.start_append(capture.request().file())?;
         check(&mut canceled)?;
-        if capture.request().range().is_some() { return Err(IndexError::InvalidManifest); }
+        crate::validate_whole_capture(capture.request())?;
         let source_bytes = self.index.source_bytes.checked_add(capture.bytes().len() as u64)
             .ok_or(IndexError::LimitExceeded)?;
         let path_bytes = self.path_bytes.checked_add(path.len()).ok_or(IndexError::LimitExceeded)?;

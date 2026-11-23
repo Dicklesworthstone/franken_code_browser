@@ -67,6 +67,9 @@ impl Default for ManifestLimits {
 /// Validated immutable membership. Paths are borrowed UTF-8 *search keys*, not
 /// native-path authority. FileId and the captured SourceRevision name hits.
 /// Native adapters retain their reversible raw paths separately.
+/// Every document must capture its whole file; completed range requests are
+/// rejected with `IndexError::Query(QueryError::PartialCapture)` before they can
+/// supply candidate exclusion or a complete result for this universe.
 ///
 /// `unavailable` contains eligible identities for which the host could not pin
 /// a capture. Both lists must be strictly FileId-sorted and disjoint. Exclusions
@@ -100,6 +103,7 @@ impl<'a> SearchManifest<'a> {
                 || previous.is_some_and(|last| last >= doc.file_id) {
                 return Err(IndexError::InvalidManifest);
             }
+            crate::validate_whole_capture(doc.capture.request())?;
             if doc.path.len() > limits.max_path_bytes { return Err(IndexError::LimitExceeded); }
             previous = Some(doc.file_id);
         }

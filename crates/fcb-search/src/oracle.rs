@@ -15,7 +15,9 @@ use crate::{
     SearchCoverage, SearchResult,
 };
 
-/// A document in the caller's immutable, authorized capture universe.
+/// A document in the caller's immutable, authorized whole-file capture universe.
+/// Scanners and manifest admission reject captures with an explicit request
+/// range, even when that range happens to start at byte zero.
 #[derive(Clone, Debug)]
 pub struct SearchDocument<'a> {
     pub file_id: FileId,
@@ -99,6 +101,7 @@ impl ReferenceScanOracle {
         if doc.file_id != doc.capture.request().file() {
             return Err(QueryError::InvalidRange);
         }
+        crate::validate_whole_capture(doc.capture.request())?;
         let mut result = SearchResult::empty(SearchCoverage::Exhaustive);
         if canceled() {
             result.coverage = SearchCoverage::CanceledEarly;

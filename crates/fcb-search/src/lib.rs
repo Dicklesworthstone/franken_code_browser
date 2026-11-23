@@ -7,6 +7,11 @@
 //! chunked captures or build source-sized transformed strings. Normalized search
 //! retains the existing, explicitly limited repertoire; this is not a claim of
 //! a newly qualified complete Unicode normalization implementation.
+//!
+//! Capture scans require a whole-file request. A completed range request still
+//! contains only that range, so it cannot supply whole-file offsets, decoding
+//! context or exhaustive coverage. Use the facade's `ExtentQuery` for explicit
+//! range searches with original-byte coordinates and scope-only completeness.
 
 mod capture;
 mod expression;
@@ -30,7 +35,7 @@ pub use oracle::{OracleMismatchError, ReferenceScanOracle, SearchDocument};
 pub use query::{LangFilterKind, ParsedQuery, PathFilterKind, MAX_QUERY_LEN, MAX_QUERY_TOKENS};
 
 use fcb_core::{ByteRange, DecodedUtf8Range, FileId, QueryGeneration, SourceRevision};
-use fcb_source::{ChunkedCapture, CompleteCapture, DetectedEncoding};
+use fcb_source::{CaptureRequest, ChunkedCapture, CompleteCapture, DetectedEncoding};
 #[cfg(test)]
 use fcb_core::DecodedUtf8Offset;
 #[cfg(test)]
@@ -46,6 +51,9 @@ pub enum QueryError {
     Canceled,
     UnsupportedEncoding,
     InvalidRange,
+    /// A whole-file scan received a capture of an explicit source range.
+    /// Use a range-aware extent query or obtain a whole-file capture.
+    PartialCapture,
     RegexUnqualified,
     SyntaxError,
 }
@@ -59,6 +67,7 @@ impl QueryError {
             Self::Canceled => "QUERY_CANCELED",
             Self::UnsupportedEncoding => "QUERY_UNSUPPORTED_ENCODING",
             Self::InvalidRange => "QUERY_INVALID_RANGE",
+            Self::PartialCapture => "QUERY_PARTIAL_CAPTURE",
             Self::RegexUnqualified => "QUERY_REGEX_UNQUALIFIED",
             Self::SyntaxError => "QUERY_SYNTAX_ERROR",
         }
@@ -192,6 +201,7 @@ impl DirectSourceScanner {
         canceled: impl FnMut() -> bool,
     ) -> Result<SearchResult, QueryError> {
         validate_needle(query.as_bytes())?;
+        validate_whole_capture(capture.request())?;
         let bytes = capture.bytes();
         let file = capture.request().file();
         let revision = capture.request().revision();
@@ -214,6 +224,7 @@ impl DirectSourceScanner {
         canceled: impl FnMut() -> bool,
     ) -> Result<SearchResult, QueryError> {
         validate_needle(query.as_bytes())?;
+        validate_whole_capture(capture.request())?;
         let bytes = capture.bytes();
         let file = capture.request().file();
         let revision = capture.request().revision();
@@ -240,6 +251,7 @@ impl DirectSourceScanner {
         canceled: impl FnMut() -> bool,
     ) -> Result<SearchResult, QueryError> {
         validate_needle(query.as_bytes())?;
+        validate_whole_capture(capture.request())?;
         let file = capture.request().file();
         let revision = capture.request().revision();
         let total = capture.total_length().get();
@@ -257,12 +269,22 @@ impl DirectSourceScanner {
     }
 
     /// Explicit raw-byte search; arbitrary byte needles are not decoded text.
+    /// The caller supplies the whole source beginning at byte zero. This API
+    /// has no range metadata and cannot validate or rebase a source subset.
     pub fn scan_raw_bytes(
         bytes: &[u8], file_id: FileId, revision: SourceRevision, needle: &[u8], options: &QueryOptions,
     ) -> Result<SearchResult, QueryError> {
         capture::scan_raw_chunks(std::iter::once(Ok(bytes)), bytes.len() as u64,
             file_id, revision, needle, options, || false)
     }
+}
+
+/// Completion of a requested range does not establish whole-file coverage.
+/// Even a range starting at zero and matching the payload length supplies no
+/// authoritative full-source length, and must retain its partial semantics.
+pub(crate) fn validate_whole_capture(request: &CaptureRequest) -> Result<(), QueryError> {
+    if request.range().is_some() { return Err(QueryError::PartialCapture); }
+    Ok(())
 }
 
 fn validate_needle(needle: &[u8]) -> Result<(), QueryError> {

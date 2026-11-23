@@ -112,6 +112,36 @@ fn missing_context_does_not_turn_boundary_fragments_into_exact_decoded_text() {
 }
 
 #[test]
+fn a_completed_range_uses_extent_search_without_claiming_whole_file_coverage() {
+    use std::sync::Arc;
+    use fcb::search::{CompleteCapture, DirectSourceScanner, QueryError, QueryOptions, SearchMode};
+
+    let budget = budget(); let session = BrowserSession::new(owner());
+    let scope = raw(100, 106);
+    let request = CaptureRequest::new(file(), SourceRevision::new(owner(), 1).unwrap()).unwrap()
+        .with_range(scope).unwrap();
+    let complete_request = CompleteCapture::new(request, ByteLength::new(6),
+        Arc::from(b"banana".as_slice())).unwrap();
+    let opts = QueryOptions::new(generation(1)).with_mode(SearchMode::RawBytes);
+    assert_eq!(DirectSourceScanner::scan_complete_capture(&complete_request, "ana", &opts),
+        Err(QueryError::PartialCapture));
+
+    // The host supplies the independently observed full length to the extent
+    // route. Searching those same captured bytes remains useful and exact.
+    let extent = ObservedExtent::from_bytes(request, ByteLength::new(1000),
+        complete_request.bytes(), &budget, allocation(1)).unwrap();
+    let view = session.open_extent(extent).unwrap();
+    let mut query = ExtentQuery::raw(&view, scope, b"ana", ExtentQueryOptions::new(generation(1)),
+        &budget, allocation(2)).unwrap();
+    finish(&mut query, 1, 1);
+    assert_eq!(query.hits().iter().map(|hit| hit.original_range()).collect::<Vec<_>>(),
+        [raw(101, 104), raw(103, 106)]);
+    assert!(query.scope_complete());
+    assert!(query.has_unsearched_source());
+    for hit in query.hits() { assert_eq!(hit.original_bytes().unwrap(), b"ana"); }
+}
+
+#[test]
 fn byte_limits_and_match_limits_preserve_overlaps_without_false_truncation() {
     let budget = budget(); let session = BrowserSession::new(owner());
     let view = session.open_extent(capture(b"bananana", raw(0, 8), 8, 1, &budget, 1)).unwrap();
