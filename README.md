@@ -131,7 +131,11 @@ save and recovery. Closing the reader or replacing the live file does not change
 that saved evidence. See [keeping observed passages](native/macos/README.md#keeping-large-file-passages-in-the-reading-desk)
 for limits. **Export source pack…** also includes saved observed passages and
 all their notes, including desks recovered without access to the source files.
-The pack preserves each absolute selection and its observation evidence. This source implementation awaits
+The pack preserves each absolute selection and its observation evidence, with
+readable Unicode text beside authoritative original-byte hex. UTF-8 and UTF-16
+selections keep their line endings. Each entry reports when a split scalar,
+malformed encoding or output limit prevents including readable text; original
+bytes and notes remain available. This source implementation awaits
 independent executable and physical-Mac verification.
 
 **Atlas folders and landmarks survive reopening.** Folder Back/Forward history,
@@ -175,6 +179,8 @@ independent native verification.
 Choose **Export source pack… → Include other saved archives…** and select the
 additional captures. The export combines exact selections and notes in one JSON
 file, routes each visit by verified archive digest and preserves repeated visits.
+Native and CLI trail packs include readable selected text when exact decoding
+and the output budget permit, with explicit per-entry status otherwise.
 The current retained archive plus up to seven explicitly selected archives share
 bounded validation and source-work allowances. Existing destinations are never
 overwritten. See [source-pack export](native/macos/README.md#exporting-a-saved-trail-with-its-source)

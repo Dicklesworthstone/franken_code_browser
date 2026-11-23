@@ -120,6 +120,8 @@ fn passage_above_four_gib_keeps_raw_path_provenance_and_recovers_without_live_ac
     assert_eq!(entry.get("body"), note.get("body"));
     assert_eq!(entry.get("observation"), restored_observation);
     assert_eq!(entry.get("selected_original_hex").text(), "6e6565646c65");
+    assert_eq!(entry.get("selected_text").text(), "needle");
+    assert_eq!(entry.get("selected_text_status").text(), "exact");
     assert_eq!(export.coverage().total_bookmarks, 0);
     assert_eq!(export.coverage().total_observed_passages, 1);
     assert_eq!(export.coverage().selected_original_bytes, 6);
@@ -166,9 +168,13 @@ fn utf16_selections_share_one_observation_and_personal_edits_preserve_the_origin
     let pack = parse(&fs::read(&destination).unwrap()).unwrap();
     let entries = pack.get("entries").array();
     assert_eq!(entries[0].get("selected_original_hex").text(), "3ed880dd");
+    assert_eq!(entries[0].get("selected_text").text(), "🦀");
+    assert_eq!(entries[0].get("selected_text_status").text(), "exact");
+    assert_eq!(entries[0].get("source_encoding").text(), "UTF-16LE");
     assert_eq!(entries[0].get("body").text(), "Line one\nline two\0");
     assert_eq!(entries[0].get("observation").get("encoding").text(), "utf16le");
     assert_eq!(entries[1].get("selected_original_hex").text(), "4100");
+    assert_eq!(entries[1].get("selected_text").text(), "A");
     assert_eq!(entries[0].get("observation"), entries[1].get("observation"));
     assert_eq!(exported.coverage().selected_original_bytes, 6);
     kept.forget_observed_passage(kept.model().revision(), 12, first, 1, || false).unwrap();
@@ -202,6 +208,8 @@ fn malformed_bytes_stay_exact_and_checkpointed_replacement_text_is_disclosed() {
     assert_eq!(exported.error(), None);
     let pack = parse(&fs::read(&destination).unwrap()).unwrap();
     assert_eq!(pack.get("entries").array()[0].get("selected_original_hex").text(), "ff");
+    assert_eq!(pack.get("entries").array()[0].get("selected_text"), &Json::Null);
+    assert_eq!(pack.get("entries").array()[0].get("selected_text_status").text(), "malformed-source");
     assert_eq!(exported.coverage().selected_original_bytes, 1);
 }
 

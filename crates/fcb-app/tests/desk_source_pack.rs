@@ -59,6 +59,8 @@ fn export_preserves_exact_closed_capture_selections_full_notes_and_provenance() 
     for (ordinal, entry) in entries.iter().enumerate() {
         assert_eq!(entry.get("ordinal").number(), ordinal as u64);
         assert_eq!(entry.get("selected_original_hex").text(), "ff00c3");
+        assert_eq!(entry.get("selected_text"), &Json::Null);
+        assert_eq!(entry.get("selected_text_status").text(), "malformed-source");
         assert_eq!(entry.get("source_owner").number(), s.model().owner().get());
         assert_eq!(entry.get("file_id").number(), location.file.get());
         assert_eq!(entry.get("source_revision").number(), location.revision.get());
@@ -102,10 +104,14 @@ fn source_budget_omits_whole_selections_but_keeps_every_note_and_later_smaller_s
     assert_eq!(saved.coverage().exported_selections, 1); assert_eq!(saved.coverage().selected_original_bytes, 2);
     let pack = parse(&fs::read(&destination).unwrap()).unwrap(); let entries = pack.get("entries").array();
     assert_eq!(entries[0].get("reason").text(), "DESK_EXPORT_NO_SAVED_SELECTION");
+    assert_eq!(entries[0].get("selected_text"), &Json::Null);
+    assert_eq!(entries[0].get("selected_text_status").text(), "no-selection");
     assert_eq!(entries[1].get("reason").text(), "DESK_EXPORT_SOURCE_BYTE_LIMIT");
     assert_eq!(entries[1].get("selected_original_hex"), &Json::Null);
     assert_eq!(entries[1].get("body").text(), "retain rationale");
     assert_eq!(entries[2].get("selected_original_hex").text(), "3839");
+    assert_eq!(entries[2].get("selected_text").text(), "89");
+    assert_eq!(entries[2].get("selected_text_status").text(), "exact");
     assert!(!pack.get("complete").flag());
 }
 
@@ -191,5 +197,70 @@ fn cancellation_after_create_or_written_prefix_keeps_actual_effect_and_prevents_
         let retry = s.export_source_pack(revision, &destination, DeskSourcePackLimits::default(), || false);
         assert_eq!(retry.error(), Some(CheckpointIoError::DestinationExists));
         assert_eq!(fs::metadata(&destination).unwrap().len(), saved.bytes_written());
+    }
+}
+
+#[test]
+fn readable_utf16_text_uses_the_retained_capture_and_discloses_bom_and_split_scalars() {
+    for big_endian in [false, true] {
+        let root = fixture(); let source = root.join("utf16");
+        let bytes: Vec<u8> = "\u{feff}A🦀B\r\n".encode_utf16()
+            .flat_map(|unit| if big_endian { unit.to_be_bytes() } else { unit.to_le_bytes() }).collect();
+        fs::write(&source, &bytes).unwrap();
+        let mut s = session(); let pane = open(&mut s, &source);
+        select(&mut s, pane, 0, bytes.len() as u64); note(&mut s, pane, "Whole selection", "Keep line endings");
+        select(&mut s, pane, 4, 8); note(&mut s, pane, "One scalar", "Original coordinates");
+        select(&mut s, pane, 4, 6); note(&mut s, pane, "Half a surrogate pair", "Hex remains authoritative");
+        apply(&mut s, DeskCommand::Close(pane));
+        fs::write(&source, b"changed live file").unwrap();
+        let destination = root.join("readable.json");
+        let saved = s.export_source_pack(s.model().revision(), &destination, DeskSourcePackLimits::default(), || false);
+        assert_eq!(saved.error(), None); assert_eq!(saved.exit_code(), EXIT_OK);
+        let pack = parse(&fs::read(&destination).unwrap()).unwrap();
+        let entries = pack.get("entries").array();
+        assert_eq!(entries[0].get("selected_text").text(), "A🦀B\r\n");
+        assert_eq!(entries[0].get("selected_text_status").text(), "exact");
+        assert!(entries[0].get("selected_text_bom_omitted").flag());
+        assert_eq!(entries[0].get("source_encoding").text(), if big_endian { "UTF-16BE" } else { "UTF-16LE" });
+        assert_eq!(entries[1].get("selected_text").text(), "🦀");
+        assert!(!entries[1].get("selected_text_bom_omitted").flag());
+        assert_eq!(entries[1].get("selected_original_hex").text(), if big_endian { "d83edd80" } else { "3ed880dd" });
+        assert_eq!(entries[2].get("selected_text"), &Json::Null);
+        assert_eq!(entries[2].get("selected_text_status").text(), "invalid-boundary");
+        assert_eq!(entries[2].get("selected_original_hex").text(), if big_endian { "d83e" } else { "3ed8" });
+        assert!(pack.get("complete").flag(), "complete measures preserved original selections");
+        assert!(!pack.get("live_roots_accessed").flag());
+    }
+}
+
+#[test]
+fn readable_text_budget_preserves_later_hex_and_still_includes_later_smaller_text() {
+    for scalar_limited in [false, true] {
+        let root = fixture(); let source = root.join("escaped");
+        let mut source_bytes = vec![0u8; 4000]; source_bytes.push(b'z');
+        fs::write(&source, &source_bytes).unwrap();
+        let mut s = session(); let pane = open(&mut s, &source);
+        select(&mut s, pane, 0, 4000); note(&mut s, pane, "Escaped controls", "All exact bytes must fit");
+        select(&mut s, pane, 4000, 4001); note(&mut s, pane, "Later selection", "Keep this text too");
+        let limits = DeskSourcePackLimits {
+            output_bytes: if scalar_limited { 64 * 1024 } else { 16 * 1024 },
+            output_scalars: if scalar_limited { 16 * 1024 } else { 64 * 1024 }, ..Default::default()
+        };
+        let destination = root.join("bounded-text.json");
+        let saved = s.export_source_pack(s.model().revision(), &destination, limits, || false);
+        assert_eq!(saved.error(), None); assert_eq!(saved.exit_code(), EXIT_OK);
+        assert_eq!(saved.coverage().exported_selections, 2);
+        assert_eq!(saved.coverage().selected_original_bytes, 4001);
+        let bytes = fs::read(&destination).unwrap();
+        assert!(bytes.len() <= limits.output_bytes);
+        assert!(std::str::from_utf8(&bytes).unwrap().chars().count() <= limits.output_scalars);
+        let pack = parse(&bytes).unwrap(); let entries = pack.get("entries").array();
+        assert_eq!(entries[0].get("selected_original_hex").text(), "00".repeat(4000));
+        assert_eq!(entries[0].get("selected_text"), &Json::Null);
+        assert_eq!(entries[0].get("selected_text_status").text(), "output-budget");
+        assert_eq!(entries[1].get("selected_original_hex").text(), "7a");
+        assert_eq!(entries[1].get("selected_text").text(), "z");
+        assert_eq!(entries[1].get("selected_text_status").text(), "exact");
+        assert_eq!(entries[1].get("body").text(), "Keep this text too");
     }
 }

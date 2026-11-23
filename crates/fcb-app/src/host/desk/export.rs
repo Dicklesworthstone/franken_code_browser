@@ -6,16 +6,18 @@
 //! missing selections and budget omissions stay visible alongside every note.
 
 use std::path::Path;
-use fcb::{ArenaOwnerId, SourceCapture, ui::reading_panes::desk::{DeskBookmark, DeskObservation, DeskObservedPassage}};
+use fcb::{ArenaOwnerId, ByteLength, ByteRange, SourceCapture,
+    ui::reading_panes::desk::{DeskBookmark, DeskObservation, DeskObservedPassage}};
 use fcb::store::envelope::{Sha256, Sha256Digest};
 use super::{DeskSession, DeskSessionError, DeskError, Output, OutputError, HostResponse,
     check, location_fields, persistence::{self, CheckpointIoError, CheckpointSave, CheckpointSaveEffect}};
 use crate::{EXIT_PARTIAL, output::MAX_ENCODED_BYTES};
+use crate::source_pack_text::{self, TextSource, TextStatus, TextError};
 
 const COMPLETE_SCHEMA: &str = "fcb.desk-source-pack/1";
 const OBSERVED_SCHEMA: &str = "fcb.desk-source-pack/2";
 const METADATA_SCRATCH: usize = 256 * 1024;
-const ENTRY_RESERVE: usize = 512;
+const ENTRY_RESERVE: usize = 512 + source_pack_text::FIELDS_RESERVE;
 const TAIL_RESERVE: usize = 2048;
 
 /// Source bytes count repeated selections separately. Byte/scalar ceilings
@@ -125,18 +127,25 @@ impl DeskSession {
             || limits.output_scalars == 0 || limits.output_scalars > MAX_ENCODED_BYTES {
             return Err(DeskError::InvalidLimits.into());
         }
-        let [pack_id, metadata_id] = self.ids()?;
+        let [pack_id, metadata_id, decode_id] = self.ids()?;
         let mut pack = Output::new(self.desk.owner(), limits.output_bytes, &self.budget, pack_id)?;
+        let _decode_scratch = self.budget.try_reserve_managed(self.desk.owner(), decode_id,
+            ByteLength::new(source_pack_text::DECODE_SCRATCH_BYTES))
+            .map_err(|_| DeskError::ResourceDenied)?;
         header(&mut pack, self, limits)?;
         let with_observations = !self.desk.observed_passages().is_empty();
         let mut metadata = Output::new(self.desk.owner(), METADATA_SCRATCH, &self.budget, metadata_id)?;
         let mut reserved_bytes = pack.as_bytes().len() + TAIL_RESERVE;
         let mut reserved_scalars = scalar_count(pack.as_bytes())? + TAIL_RESERVE;
+        let mut requested_source_bytes = 0u64;
         // Charge the exact escaped representation of every note first. Omitting
         // payload must never silently drop the evidence explaining that payload.
         for (ordinal, bookmark) in self.desk.bookmarks().iter().enumerate() {
             check(canceled)?;
             let at = bookmark.location();
+            if let Some(range) = at.selection {
+                requested_source_bytes = requested_source_bytes.saturating_add(range.len().get());
+            }
             let source = self.desk.retained_capture(expected, at.file, at.revision)?;
             metadata.clear(); entry_metadata(&mut metadata, bookmark, source, ordinal, with_observations)?;
             reserved_bytes = reserved_bytes.checked_add(metadata.as_bytes().len() + ENTRY_RESERVE)
@@ -146,6 +155,7 @@ impl DeskSession {
         }
         for (position, passage) in self.desk.observed_passages().iter().enumerate() {
             check(canceled)?;
+            requested_source_bytes = requested_source_bytes.saturating_add(passage.selection().len().get());
             let observation = self.desk.observation(expected, passage.observation())?;
             metadata.clear();
             observed_entry_metadata(&mut metadata, passage, observation, self.desk.bookmarks().len() + position)?;
@@ -157,6 +167,13 @@ impl DeskSession {
         let remaining_bytes = limits.output_bytes.checked_sub(reserved_bytes).ok_or(OutputError::Limit)?;
         let remaining_scalars = limits.output_scalars.checked_sub(reserved_scalars).ok_or(OutputError::Limit)?;
         let mut payload_room = (remaining_bytes.min(remaining_scalars) / 2) as u64;
+        // Reserve every original payload that could be admitted before offering
+        // spare output capacity to readable text. Text never displaces a later
+        // bookmark's bytes or notes, including repeated selections.
+        let hex_reserve = requested_source_bytes.min(limits.source_bytes).min(payload_room) as usize * 2;
+        let mut text_room = TextRoom {
+            bytes: remaining_bytes - hex_reserve, scalars: remaining_scalars - hex_reserve,
+        };
         let output_reason = if remaining_bytes <= remaining_scalars {
             "DESK_EXPORT_OUTPUT_BYTE_LIMIT"
         } else { "DESK_EXPORT_OUTPUT_SCALAR_LIMIT" };
@@ -174,10 +191,12 @@ impl DeskSession {
                 None => None,
                 Some(range) => {
                     let (start, end) = range.as_usize_bounds().map_err(|_| DeskError::InvalidLocation)?;
-                    Some(source.bytes().get(start..end).ok_or(DeskError::InvalidLocation)?)
+                    Some(PackSelection { bytes: source.bytes().get(start..end).ok_or(DeskError::InvalidLocation)?,
+                        source: TextSource::complete(source.bytes()), range })
                 }
             };
-            selection_output(&mut pack, selected, limits, &mut payload_room, output_reason, &mut coverage, canceled)?;
+            selection_output(&mut pack, selected, limits, &mut payload_room, &mut text_room,
+                output_reason, &mut coverage, canceled)?;
         }
         for (position, passage) in self.desk.observed_passages().iter().enumerate() {
             check(canceled)?;
@@ -187,7 +206,12 @@ impl DeskSession {
             observed_entry_metadata(&mut pack, passage, observation, ordinal)?;
             let selected = observation.extent().range_bytes(passage.selection())
                 .map_err(super::ObservedReaderError::from)?;
-            selection_output(&mut pack, Some(selected), limits, &mut payload_room, output_reason, &mut coverage, canceled)?;
+            let extent = observation.extent();
+            let selected = PackSelection { bytes: selected,
+                source: TextSource { bytes: extent.bytes(), original_start: extent.range().start().get(),
+                    encoding: observation.encoding() }, range: passage.selection() };
+            selection_output(&mut pack, Some(selected), limits, &mut payload_room, &mut text_room,
+                output_reason, &mut coverage, canceled)?;
         }
         pack.literal("],\"coverage\":")?; coverage_output(&mut pack, coverage)?;
         pack.literal(",\"complete\":")?; pack.boolean(coverage.complete())?;
@@ -247,7 +271,7 @@ fn header(out: &mut Output, session: &DeskSession, limits: DeskSourcePackLimits)
     out.literal(",\"last_attempt\":")?; out.integer(session.desk.last_attempt())?;
     out.literal(",\"observed_passages_included\":")?; out.boolean(observed > 0)?;
     out.literal(",\"excluded_observed_passages\":\"0\"")?;
-    out.literal(",\"source_representation\":\"original-bytes-lowercase-hex\",\"character_representation\":\"unicode-scalars-in-serialized-utf8-json\",\"completeness_scope\":")?;
+    out.literal(",\"source_representation\":\"original-bytes-lowercase-hex\",\"selected_text_representation\":\"exact-unicode-when-decodable-and-budgeted\",\"character_representation\":\"unicode-scalars-in-serialized-utf8-json\",\"completeness_scope\":")?;
     out.quoted(completeness_scope(observed))?;
     out.literal(",\"deduplication\":")?;
     out.quoted(if observed == 0 { "none-preserve-bookmark-order" } else { "none-preserve-bookmarks-then-observed-passages" })?;
@@ -287,21 +311,24 @@ fn observed_entry_metadata(out: &mut Output, passage: &DeskObservedPassage,
     out.literal(",\"observation\":")?;
     super::observations::encode_observation(out, observation)
 }
-fn selection_output(out: &mut Output, bytes: Option<&[u8]>, limits: DeskSourcePackLimits,
-    payload_room: &mut u64, output_reason: &'static str, coverage: &mut DeskSourcePackCoverage,
+struct PackSelection<'a> { bytes: &'a [u8], source: TextSource<'a>, range: ByteRange }
+struct TextRoom { bytes: usize, scalars: usize }
+
+fn selection_output(out: &mut Output, selection: Option<PackSelection<'_>>, limits: DeskSourcePackLimits,
+    payload_room: &mut u64, text_room: &mut TextRoom, output_reason: &'static str, coverage: &mut DeskSourcePackCoverage,
     canceled: &mut impl FnMut() -> bool) -> Result<(), DeskSessionError> {
     let mut selected = None;
-    let reason = match bytes {
+    let reason = match selection {
         None => { coverage.omitted_no_selection += 1; Some("DESK_EXPORT_NO_SAVED_SELECTION") }
-        Some(bytes) => {
-            let size = bytes.len() as u64;
+        Some(selection) => {
+            let size = selection.bytes.len() as u64;
             if size > limits.source_bytes - coverage.selected_original_bytes {
                 coverage.omitted_source_limit += 1; Some("DESK_EXPORT_SOURCE_BYTE_LIMIT")
             } else if size > *payload_room {
                 coverage.omitted_output_limit += 1; Some(output_reason)
             } else {
                 *payload_room -= size; coverage.selected_original_bytes += size;
-                coverage.exported_selections += 1; selected = Some(bytes); None
+                coverage.exported_selections += 1; selected = Some(selection); None
             }
         }
     };
@@ -310,8 +337,33 @@ fn selection_output(out: &mut Output, bytes: Option<&[u8]>, limits: DeskSourcePa
     out.literal(",\"reason\":")?;
     match reason { Some(code) => out.quoted(code)?, None => out.literal("null")? }
     out.literal(",\"selected_original_hex\":")?;
-    match selected { Some(bytes) => source_hex(out, bytes, canceled)?, None => out.literal("null")? }
+    match selected {
+        Some(selection) => {
+            source_hex(out, selection.bytes, canceled)?;
+            let text = source_pack_text::prepare(selection.source, selection.range,
+                text_room.bytes.saturating_add(4), text_room.scalars.saturating_add(4), canceled).map_err(text_error)?;
+            source_pack_text::write_fields(out, &text, canceled).map_err(text_error)?;
+            if text.status() == TextStatus::Exact {
+                text_room.bytes -= text.json_bytes().saturating_sub(4);
+                text_room.scalars -= text.json_scalars().saturating_sub(4);
+            }
+        }
+        None => {
+            out.literal("null")?;
+            source_pack_text::write_unavailable_fields(out,
+                if reason == Some("DESK_EXPORT_NO_SAVED_SELECTION") { TextStatus::NoSelection }
+                else { TextStatus::SourceUnavailable })?;
+        }
+    }
     out.literal("}")?; Ok(())
+}
+
+fn text_error(error: TextError) -> DeskSessionError {
+    match error {
+        TextError::Canceled => DeskError::Canceled.into(),
+        TextError::Decode => DeskError::InvalidLocation.into(),
+        TextError::Output(error) => error.into(),
+    }
 }
 
 fn coverage_output(out: &mut Output, c: DeskSourcePackCoverage) -> Result<(), OutputError> {

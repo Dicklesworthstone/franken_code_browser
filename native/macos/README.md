@@ -1059,10 +1059,19 @@ them. Existing destinations are never overwritten.
 
 The pack uses the same `fcb.trail-source-pack/1` representation as CLI trail
 export: exact original bytes are lowercase hex, preserving malformed text,
-byte-order marks and selections inside a text scalar without inventing a decoded
-representation. Saved order, repeated visits, zero-length bookmarks and rationale
+byte-order marks and selections inside a text scalar. Each entry also includes
+`selected_text` when UTF-8 or UTF-16 decoding is exact and the remaining output
+budget admits the entire text. `selected_text_status` explains unavailable text;
+malformed bytes and split scalars retain their original hex. The source encoding
+and any omitted initial byte-order mark are explicit, while interior byte-order
+marks and original line endings remain text. Saved order, repeated visits, zero-length bookmarks and rationale
 remain intact. It is a source-evidence artifact, not an FCBT trail attachment or
 an archive, and its notes are never executed.
+
+Original-byte coverage determines `complete`. Readable text is an additional
+representation: the exporter reserves all admitted original selections and
+notes before spending spare output capacity on text. A text omission never
+truncates a selection or prevents a later smaller text selection from fitting.
 
 The ordinary presets use the currently retained FCBS archive descriptor.
 To include visits from other repository captures, choose **Export source pack…
@@ -2031,6 +2040,15 @@ range, with absolute original offsets and an explicit observed-extent identity;
 it never claims a complete immutable file. Source and JSON limits apply to the
 whole export. A selection that does not fit retains its metadata and note with
 an omission reason. If all metadata cannot fit, no destination is created.
+
+Each exported selection also provides readable `selected_text` when exact
+decoding and the remaining JSON byte and scalar budgets permit. This works for
+retained UTF-8 and UTF-16 captures and for observed passages recovered offline,
+using their saved encoding and absolute offsets. Original line endings remain
+intact. `selected_text_status` explains a malformed, split or budget-limited
+selection; the authoritative original hex is preserved. Initial BOM omission is
+explicit, and optional text cannot consume space reserved for later original
+selections or notes. `complete` continues to describe original-byte coverage.
 
 Complete-capture-only exports retain `fcb.desk-source-pack/1`. Exports with
 observed passages use `fcb.desk-source-pack/2`, preserving bookmarks followed by
