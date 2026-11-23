@@ -142,7 +142,7 @@ struct AtlasProjectImportEvidence: Equatable, Sendable {
               try w.text("relationship_kind") == "lexical-import",
               try w.text("evidence_precision") == "exact-import-source-range",
               try w.text("extractor") == "franken-markdown-d6fbd1d5/import-statements-v7",
-              try w.text("resolver") == "fcb-closed-catalog-imports-v8",
+              try w.text("resolver") == "fcb-closed-catalog-imports-v9",
               try w.text("extraction_policy") == "rust-use-tree-js-literal-loads-python-cpp-go-java-v7",
               try !w.flag("compiler_resolved"), try !w.flag("semantic_complete") else {
             throw AtlasProjectLinksError.invalidResponse
@@ -163,7 +163,7 @@ struct AtlasProjectImportEvidence: Equatable, Sendable {
         default: throw AtlasProjectLinksError.invalidResponse
         }
         guard kinds.contains(kind),
-              ["exact-relative-path", "unique-relative-module-candidate", "rust-module-file-candidate",
+              ["exact-relative-path", "unique-relative-module-candidate", "typescript-source-extension-candidate", "rust-module-file-candidate",
                "rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "ambiguous-rust-crate-root",
                "python-relative-module-candidate", "python-absolute-module-candidate", "cpp-source-relative-include-candidate",
                "go-module-package-file-candidate", "go-module-context-unavailable", "go-nested-module-boundary",
@@ -182,8 +182,11 @@ struct AtlasProjectImportEvidence: Equatable, Sendable {
         if resolutionBasis == "python-absolute-module-candidate" && (language != "python") {
             throw AtlasProjectLinksError.invalidResponse
         }
+        if resolutionBasis == "typescript-source-extension-candidate" && !["typescript", "tsx"].contains(language) {
+            throw AtlasProjectLinksError.invalidResponse
+        }
         if ["javascript", "typescript", "jsx", "tsx"].contains(language)
-            && !["exact-relative-path", "unique-relative-module-candidate", "external-specifier",
+            && !["exact-relative-path", "unique-relative-module-candidate", "typescript-source-extension-candidate", "external-specifier",
                 "unsupported-specifier", "no-catalog-target", "ambiguous-catalog-target"].contains(resolutionBasis) {
             throw AtlasProjectLinksError.invalidResponse
         }
@@ -359,7 +362,7 @@ struct AtlasProjectLink: Identifiable, Sendable, Equatable, Decodable {
             let allowed: [String]
             switch resolution {
             case "captured", "unavailable", "uncaptured", "outside-capture-scope":
-                allowed = ["exact-relative-path", "unique-relative-module-candidate", "rust-module-file-candidate",
+                allowed = ["exact-relative-path", "unique-relative-module-candidate", "typescript-source-extension-candidate", "rust-module-file-candidate",
                     "rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "python-relative-module-candidate",
                     "python-absolute-module-candidate",
                     "cpp-source-relative-include-candidate", "go-module-package-file-candidate",

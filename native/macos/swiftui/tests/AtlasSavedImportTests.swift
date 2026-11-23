@@ -29,7 +29,7 @@ private final class SavedImportFixture: @unchecked Sendable {
          "evidence_precision": "exact-import-source-range", "resolution_domain": "declared-catalog-candidates",
          "compiler_resolved": false, "semantic_complete": false,
          "extractor": "franken-markdown-d6fbd1d5/import-statements-v7",
-         "extraction_policy": "rust-use-tree-js-literal-loads-python-cpp-go-java-v7", "resolver": "fcb-closed-catalog-imports-v8"]
+         "extraction_policy": "rust-use-tree-js-literal-loads-python-cpp-go-java-v7", "resolver": "fcb-closed-catalog-imports-v9"]
     }
     func link(_ id: UInt64) -> [String: Any] {
         let target = base.members[id == 1 ? 3 : 4]
@@ -486,6 +486,35 @@ private final class SavedImportFixture: @unchecked Sendable {
         }
     }
 
+    private static func typescriptSourceWire(_ f: SavedImportFixture, identity: AtlasSavedIdentity) throws {
+        let decode: ([String: Any]) throws -> AtlasSavedImports = {
+            try AtlasSavedImports.decode(f.base.encode($0), identity: identity, generation: 1,
+                direction: .all, member: nil, start: 0, limit: 64)
+        }
+        for language in ["typescript", "tsx"] {
+            var value = f.page(identity.owner, generation: 1)
+            var rows = value["links"] as! [[String: Any]]
+            for i in rows.indices {
+                rows[i]["language"] = language; rows[i]["lexical_import_kind"] = "javascript-import"
+                rows[i]["destination"] = "./child.js"
+                rows[i]["resolution_basis"] = "typescript-source-extension-candidate"
+                rows[i]["source_path"] = f.base.path(Array("src/main.ts".utf8), "src/main.ts")
+                rows[i]["target_path"] = f.base.path(Array("src/child.ts".utf8), "src/child.ts")
+            }
+            value["links"] = rows
+            let page = try decode(value)
+            precondition(page.links[0].canOpenTarget && !page.links[1].canOpenTarget)
+            precondition(page.links[0].resolutionBasis == "typescript-source-extension-candidate")
+            for (key, wrong) in [("language", "javascript"), ("language", "jsx"), ("language", "rust"),
+                ("lexical_import_kind", "rust-module"), ("resolution", "missing"), ("resolution", "ambiguous")] {
+                var bad = value, changed = rows
+                changed[0][key] = wrong; bad["links"] = changed; reject { _ = try decode(bad) }
+            }
+            var old = value; old["resolver"] = "fcb-closed-catalog-imports-v8"
+            reject { _ = try decode(old) }
+        }
+    }
+
     @MainActor static func main() async throws {
         let f = SavedImportFixture()
         let browser = AtlasSavedRepositoryModel(transport: f.transport)
@@ -498,6 +527,7 @@ private final class SavedImportFixture: @unchecked Sendable {
         }
         let accepted = try decode(f.page(identity.owner, generation: 1))
         try cppWire(f, identity: identity)
+        try typescriptSourceWire(f, identity: identity)
         try goWire(f, identity: identity)
         try javaWire(f, identity: identity)
         try pythonAbsoluteWire(f, identity: identity)

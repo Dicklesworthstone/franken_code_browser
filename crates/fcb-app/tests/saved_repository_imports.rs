@@ -44,6 +44,58 @@ fn utf16(text: &str, big: bool) -> Vec<u8> {
 }
 
 #[test]
+fn saved_typescript_extension_candidates_keep_utf16_evidence_and_offline_readers() {
+    let statement = "import { value } from './child.js';";
+    let target = b"export const value: number = 7;\n";
+    for big in [false, true] {
+        let source = utf16(&format!("// \u{1f980} captured TypeScript\r\n{statement}\r\n"), big);
+        let f = Fixture::new(&[entry(b"src/main.ts", &source), entry(b"src/child.ts", target)], true);
+        let mut saved = f.open(58100 + u64::from(big) * 10);
+        let page = prepare(&mut saved, 1);
+        assert!(page.get("imports_complete").flag());
+        let row = link(&page, b"src/main.ts", "./child.js");
+        assert_eq!(row.get("resolution_basis").text(), "typescript-source-extension-candidate");
+        assert_eq!(row.get("target_path").get("hex").text(), hex(b"src/child.ts"));
+        assert_eq!(range(&source, row.get("evidence_range")), &utf16(statement, big)[2..]);
+        assert_eq!(range(&source, row.get("specifier_range")), &utf16("./child.js", big)[2..]);
+        let before = reads(&mut saved);
+        let incoming = json(&saved.import_page(1, Some(row.get("target_member").number()),
+            Direction::Incoming, 0, 64, || false).unwrap());
+        assert_eq!(incoming.get("links").array(), page.get("links").array());
+        assert_eq!(reads(&mut saved), before);
+        let id = row.get("link_id").number();
+        let (mut evidence, receipt) = saved.open_import_reader(owner(58101 + u64::from(big) * 10),
+            1, id, Side::Evidence, || false).unwrap();
+        assert_eq!(json(&receipt).get("selection"), row.get("evidence_range"));
+        let (mut reader, receipt) = saved.open_import_reader(owner(58102 + u64::from(big) * 10),
+            1, id, Side::Target, || false).unwrap();
+        assert_eq!(json(&receipt).get("source_digest").text(), Sha256::digest(target).to_hex());
+        assert!(!json(&receipt).get("live_source_reopened").flag());
+        saved.clear_imports(2, || false).unwrap(); drop(saved);
+        fs::rename(&f.path, f.root.join("moved-typescript.fcbs")).unwrap();
+        assert_eq!(copy_all(&mut evidence).get("original_hex").text(), hex(&source));
+        assert_eq!(copy_all(&mut reader).get("original_hex").text(), hex(target));
+    }
+}
+
+#[test]
+fn saved_typescript_ambiguous_and_unavailable_candidates_cannot_open_targets() {
+    let source = b"import './same.js'; import './absent.cjs';";
+    let f = Fixture::new(&[entry(b"main.ts", source), entry(b"same.ts", b"export {};"),
+        entry(b"same.d.ts", b"export {};"), SnapshotEntry { path: b"absent.cts", observed_bytes: 50,
+            data: SnapshotData::Unavailable("READ_DENIED") }], true);
+    let mut saved = f.open(58120);
+    let page = prepare(&mut saved, 1);
+    for (destination, resolution, basis) in [("./same.js", "ambiguous", "ambiguous-catalog-target"),
+        ("./absent.cjs", "unavailable", "typescript-source-extension-candidate")] {
+        let row = link(&page, b"main.ts", destination);
+        assert_eq!(row.get("resolution").text(), resolution);
+        assert_eq!(row.get("resolution_basis").text(), basis);
+        assert!(saved.open_import_reader(owner(58121), 1, row.get("link_id").number(), Side::Target, || false).is_err());
+    }
+}
+
+#[test]
 fn saved_java_imports_preserve_utf16_evidence_and_offline_source_readers() {
     let statement = "import example.Tool;";
     let target = b"package example; public class Tool { public static final int VALUE = 7; }\n";
@@ -273,7 +325,7 @@ fn saved_rust_use_tree_pages_preserve_leaf_identity_and_original_utf16_evidence(
         let result = prepare(&mut saved, 1);
         assert!(result.get("imports_complete").flag());
         assert_eq!(result.get("links_seen").number(), 5);
-        assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v8");
+        assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v9");
         let rows = result.get("links").array();
         for (index, (destination, spelling)) in [
             ("crate::shared", "self"), ("crate::shared::Thing", "Thing"),
@@ -356,7 +408,7 @@ fn shared_language_extractors_publish_exact_occurrences_and_metadata_only_revers
     assert_eq!(result.get("import_generation").number(), 7);
     assert_eq!(result.get("projection").text(), "lexical-source-imports");
     assert_eq!(result.get("evidence_precision").text(), "exact-import-source-range");
-    assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v8");
+    assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v9");
     assert_eq!(result.get("extraction_policy").text(), "rust-use-tree-js-literal-loads-python-cpp-go-java-v7");
     assert_eq!(result.get("completeness_scope").text(), "parsed-source-imports-in-saved-manifest");
     assert!(!result.get("compiler_resolved").flag());

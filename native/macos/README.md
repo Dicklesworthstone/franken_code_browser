@@ -1631,7 +1631,13 @@ shadowed function; an `import()` spelling can occur in a TypeScript type query.
 The labels do not establish a runtime load or compiler binding. Relative
 specifiers resolve only against the captured catalog: an exact path takes
 precedence; an extensionless path can otherwise offer a unique supported
-extension or directory-index candidate. Competing paths remain ambiguous. Bare package names stay
+extension or directory-index candidate. TypeScript/TSX sources also admit a
+unique typed source when a written runtime extension is absent: `.js` checks
+`.ts`, `.tsx`, and `.d.ts`; `.jsx` checks `.tsx`; `.mjs` checks `.mts` and
+`.d.mts`; `.cjs` checks `.cts` and `.d.cts`. These rows explicitly report
+`typescript-source-extension-candidate`; they do not infer compiler ordering,
+`tsconfig` aliases, or omitted `.mts`/`.cts` extensions. The exact written path
+still wins. Competing paths remain ambiguous. Bare package names stay
 external; the resolver does not read package manifests, follow Node resolution,
 or execute source.
 

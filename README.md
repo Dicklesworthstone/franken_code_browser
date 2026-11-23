@@ -265,6 +265,16 @@ requests refuse them. Navigation reuses the captured source, performs no extra
 source reads, and does not claim a rendered-text hit highlight. Executable
 regression verification remains pending.
 
+**TypeScript imports can navigate from emitted extensions to captured source.**
+In TypeScript and TSX files, a relative import such as `./worker.js` can open a
+unique captured `worker.ts`, `worker.tsx`, or `worker.d.ts` when the exact written
+path is absent. The same bounded policy supports `.jsx` → `.tsx`, `.mjs` →
+`.mts`/`.d.mts`, and `.cjs` → `.cts`/`.d.cts`. It works in live-project and saved
+repository relationships, including incoming links and exact source readers.
+The literal path wins when present; competing typed files remain ambiguous.
+These are labeled source candidates, without compiler ordering or `tsconfig`
+inference. Native regression execution remains pending.
+
 **Go imports connect captured package sources.** Project and saved-repository
 import navigation now recognize single/grouped imports and aliases. A retained
 `go.mod` supplies module-local package candidates, with exact import evidence,

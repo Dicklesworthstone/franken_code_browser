@@ -19,6 +19,59 @@ use fcb_app::host::{HostResponse, atlas_session::{AtlasSession, AtlasSessionOpti
         MAX_ATLAS_IMPORT_SOURCE_BYTES}};
 use support::{Json, parse};
 
+#[test]
+fn typescript_emitted_extensions_navigate_retained_sources_and_reverse_links() {
+    let source = b"import { value } from './child.js';\nexport { value } from './child.js';\n";
+    let child = b"export const value: number = 7;\n";
+    let mut f = Fixture::raw(&[(b"src/\xff/main.ts", source), (b"src/\xff/child.ts", child)]);
+    f.build(1); let page = f.prepare(1, 1);
+    assert!(page.get("relationships_complete").flag());
+    assert_eq!(page.get("links_seen").number(), 2);
+    let rows = page.get("links").array();
+    for row in rows {
+        assert_eq!(row.get("resolution").text(), "captured");
+        assert_eq!(row.get("resolution_basis").text(), "typescript-source-extension-candidate");
+        assert_eq!(row.get("target_path").get("hex").text(), hex(b"src/\xff/child.ts"));
+        assert_eq!(range(row.get("specifier_range"), source), b"./child.js");
+    }
+    let incoming = f.page(1, Direction::Incoming, Some(b"src/\xff/child.ts"), 0, 64);
+    assert_eq!(incoming.get("links").array(), rows);
+    assert_eq!(incoming.get("source_bytes_read").number(), 0);
+    fs::write(f.root.join(OsStr::from_bytes(b"src/\xff/main.ts")), b"import './replacement.js';").unwrap();
+    fs::write(f.root.join(OsStr::from_bytes(b"src/\xff/child.ts")), b"replacement").unwrap();
+    let id = rows[0].get("link_id").number();
+    let (evidence, receipt) = f.search.open_import_reader(&f.atlas, owner(73080), 1, id, Side::Evidence, || false).unwrap();
+    assert_eq!(json(&receipt).get("relationship"), &rows[0]);
+    let (target, receipt) = f.search.open_import_reader(&f.atlas, owner(73081), 1, id, Side::Target, || false).unwrap();
+    let receipt = json(&receipt);
+    assert_eq!(receipt.get("source_sha256").text(), Sha256::digest(child).to_hex());
+    assert!(!receipt.get("source_reopened").flag());
+    assert!(!receipt.get("compiler_resolved").flag());
+    f.search.clear_index(&f.atlas, 2, || false).unwrap();
+    assert_eq!(evidence.capture().bytes(), source);
+    assert_eq!(target.capture().bytes(), child);
+}
+
+#[test]
+fn typescript_candidates_do_not_hide_exact_targets_or_ambiguity() {
+    let source = b"import './same.js'; import './exact.js'; import './module.mjs'; import './common.cjs';";
+    let mut f = Fixture::new(&[("main.mts", source), ("same.ts", b"export {};"),
+        ("same.d.ts", b"export {};"), ("exact.js", b"export {};"), ("exact.ts", b"export {};"),
+        ("module.mts", b"export {};"), ("common.cts", b"export {};")]);
+    f.build(1); let page = f.prepare(1, 1);
+    let ambiguous = link(&page, b"main.mts", "./same.js");
+    assert_eq!(ambiguous.get("resolution").text(), "ambiguous");
+    assert_eq!(ambiguous.get("target_file_id"), &Json::Null);
+    assert!(f.search.open_import_reader(&f.atlas, owner(73082), 1,
+        ambiguous.get("link_id").number(), Side::Target, || false).is_err());
+    assert_eq!(link(&page, b"main.mts", "./exact.js").get("resolution_basis").text(), "exact-relative-path");
+    for (destination, target) in [("./module.mjs", b"module.mts".as_slice()), ("./common.cjs", b"common.cts")] {
+        let row = link(&page, b"main.mts", destination);
+        assert_eq!(row.get("resolution_basis").text(), "typescript-source-extension-candidate");
+        assert_eq!(row.get("target_path").get("hex").text(), hex(target));
+    }
+}
+
 struct Fixture { root: PathBuf, owner: ArenaOwnerId, atlas: AtlasSession, search: RetainedAtlasSearch }
 impl Fixture {
     fn new(files: &[(&str, &[u8])]) -> Self {
@@ -92,7 +145,7 @@ fn coverage(page: &Json) {
     assert_eq!(page.get("relationship_kind").text(), "lexical-import");
     assert_eq!(page.get("resolution_domain").text(), "declared-catalog-candidates");
     assert_eq!(page.get("extractor").text(), "franken-markdown-d6fbd1d5/import-statements-v7");
-    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v8");
+    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v9");
     assert_eq!(page.get("extraction_policy").text(), "rust-use-tree-js-literal-loads-python-cpp-go-java-v7");
     assert!(!page.get("compiler_resolved").flag()); assert!(!page.get("semantic_complete").flag());
     assert_eq!(page.get("source_files").number(), page.get("captured_source_files").number()
@@ -854,7 +907,7 @@ fn python_relative_imports_share_incoming_navigation_and_exact_retained_readers(
     let page = f.prepare(1, 1);
     assert!(page.get("relationships_complete").flag(), "{page:?}");
     assert_eq!(page.get("retained_links").number(), 5);
-    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v8");
+    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v9");
 
     let row = link(&page, b"pkg/main.py", ".worker");
     assert_eq!(row.get("language").text(), "python");

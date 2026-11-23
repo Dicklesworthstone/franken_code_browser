@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn counting_mode_finishes_after_retained_rows_fill_including_zero_rows() {
         let (_, _, options) = options();
-        let result = scan_counting(&[b"aaaaa"], b"a", &options.with_max_matches(2));
+        let result = scan_counting(&[b"aaaaa"], b"a", &options.clone().with_max_matches(2));
         assert_eq!(result.matches.len(), 2);
         assert_eq!(result.match_count(), 5);
         assert_eq!(result.scanned_bytes, 5);

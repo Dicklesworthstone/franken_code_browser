@@ -48,8 +48,10 @@ impl<T> ImportResolution<T> {
 /// JavaScript/TypeScript static imports, literal import() expressions and bare
 /// require() candidates use the exact relative filename first. The latter does
 /// not establish that the require identifier binds to Node's module loader.
-/// If absent and
-/// extensionless, a finite set of source extensions and index files is admitted
+/// In TypeScript/TSX sources, absent relative .js/.jsx, .mjs and .cjs targets
+/// admit a unique corresponding typed source or declaration file. This is a
+/// closed-catalog source candidate, without compiler ordering or configuration.
+/// If absent and extensionless, a finite set of source extensions and index files is admitted
 /// only when exactly one path exists. Rust uses conventional file modules for
 /// a top-level external mod. Eligible qualified use leaves navigate conventional
 /// module files through the bounded policy in `rust`; a remaining item suffix
@@ -117,7 +119,12 @@ pub fn resolve_import<T: Copy + Eq>(
     if let Some(target) = lookup(path.bytes()) {
         return ImportResolution::local(target, "exact-relative-path");
     }
-    // A literal extension is meaningful; foo.js never silently means foo.ts.
+    if matches!(ImportLanguage::from_path(source_path), Some(ImportLanguage::TypeScript | ImportLanguage::Tsx)) {
+        if let Some(result) = typescript_source_candidate(&mut path, &mut lookup) {
+            return result;
+        }
+    }
+    // Other literal extensions never acquire an unrelated source suffix.
     if path.file_name().contains(&b'.') {
         return ImportResolution::without(Missing, "no-catalog-target");
     }
@@ -126,6 +133,21 @@ pub fn resolve_import<T: Copy + Eq>(
         b"/index.ts", b"/index.tsx", b"/index.js", b"/index.jsx", b"/index.mjs", b"/index.cjs",
     ];
     candidates(&mut path, &CANDIDATES, "unique-relative-module-candidate", &mut lookup)
+}
+
+fn typescript_source_candidate<T: Copy + Eq>(
+    path: &mut CatalogPath, lookup: &mut impl FnMut(&[u8]) -> Option<T>,
+) -> Option<ImportResolution<T>> {
+    let (runtime_suffix, source_suffixes): (&[u8], &[&[u8]]) =
+        if path.file_name().ends_with(b".js") { (b".js", &[b".ts", b".tsx", b".d.ts"]) }
+        else if path.file_name().ends_with(b".jsx") { (b".jsx", &[b".tsx"]) }
+        else if path.file_name().ends_with(b".mjs") { (b".mjs", &[b".mts", b".d.mts"]) }
+        else if path.file_name().ends_with(b".cjs") { (b".cjs", &[b".cts", b".d.cts"]) }
+        else { return None; };
+    // Strip only the written runtime extension; parent bytes and filename case
+    // stay exact. Declaration files are candidates, not runtime implementations.
+    path.len -= runtime_suffix.len();
+    Some(candidates(path, source_suffixes, "typescript-source-extension-candidate", lookup))
 }
 
 fn cpp_include<T: Copy + Eq>(source_path: &[u8], fact: &ImportFact,
@@ -317,8 +339,78 @@ mod tests {
         let result = resolve_import(b"src/main.ts", &fact(ImportKind::JavaScriptImport, "./tool"),
             |path| [b"src/tool.ts".as_slice(), b"src/tool.js"].contains(&path).then_some(7));
         assert_eq!(result.kind, ImportResolutionKind::Ambiguous, "two paths remain ambiguous even with one aliased identity");
-        let result = resolve(b"src/main.ts", ImportKind::JavaScriptImport, "./tool.js", &[b"src/tool.ts"]);
-        assert_eq!(result.kind, ImportResolutionKind::Missing, "explicit .js must not infer tsconfig");
+        let result = resolve(b"src/main.js", ImportKind::JavaScriptImport, "./tool.js", &[b"src/tool.ts"]);
+        assert_eq!(result.kind, ImportResolutionKind::Missing, "JavaScript sources do not infer typed source replacements");
+    }
+
+    #[test]
+    fn typescript_runtime_extensions_find_unique_typed_sources() {
+        for (destination, target) in [
+            ("./tool.js", b"src/\xff/tool.ts".as_slice()),
+            ("./tool.js", b"src/\xff/tool.tsx"),
+            ("./tool.js", b"src/\xff/tool.d.ts"),
+            ("./tool.jsx", b"src/\xff/tool.tsx"),
+            ("./tool.mjs", b"src/\xff/tool.mts"),
+            ("./tool.mjs", b"src/\xff/tool.d.mts"),
+            ("./tool.cjs", b"src/\xff/tool.cts"),
+            ("./tool.cjs", b"src/\xff/tool.d.cts"),
+        ] {
+            for source in [b"src/\xff/main.ts".as_slice(), b"src/\xff/main.tsx", b"src/\xff/main.mts", b"src/\xff/main.cts"] {
+                for kind in [ImportKind::JavaScriptImport, ImportKind::JavaScriptExport,
+                    ImportKind::JavaScriptRequire, ImportKind::JavaScriptDynamicImport] {
+                    let result = resolve(source, kind, destination, &[target]);
+                    assert_eq!(result.target, Some(0), "{source:?}: {destination} -> {target:?}");
+                    assert_eq!(result.basis, "typescript-source-extension-candidate");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typed_source_candidates_preserve_exact_precedence_and_ambiguity() {
+        let result = resolve(b"src/main.ts", ImportKind::JavaScriptImport, "./tool.js",
+            &[b"src/tool.ts", b"src/tool.d.ts", b"src/tool.js"]);
+        assert_eq!(result.target, Some(2));
+        assert_eq!(result.basis, "exact-relative-path");
+        for paths in [vec![b"src/tool.ts".as_slice(), b"src/tool.tsx"],
+            vec![b"src/tool.ts".as_slice(), b"src/tool.d.ts"]] {
+            let result = resolve(b"src/main.ts", ImportKind::JavaScriptImport, "./tool.js", &paths);
+            assert_eq!(result.kind, ImportResolutionKind::Ambiguous);
+            assert_eq!(result.target, None);
+        }
+        let result = resolve_import(b"src/main.ts", &fact(ImportKind::JavaScriptExport, "./tool.mjs"),
+            |path| [b"src/tool.mts".as_slice(), b"src/tool.d.mts"].contains(&path).then_some(7));
+        assert_eq!(result.kind, ImportResolutionKind::Ambiguous, "distinct paths cannot become a unique candidate through aliased IDs");
+        for (source, destination, target) in [
+            (b"src/main.js".as_slice(), "./tool.js", b"src/tool.ts".as_slice()),
+            (b"src/main.jsx", "./tool.jsx", b"src/tool.tsx"),
+            (b"src/main.ts", "./tool.mjs", b"src/tool.ts"),
+            (b"src/main.ts", "./tool.cjs", b"src/tool.mts"),
+            (b"src/main.ts", "./tool.JS", b"src/tool.ts"),
+            (b"src/main.ts", "./tool.css", b"src/tool.css.ts"),
+            (b"src/main.ts", "./tool", b"src/tool.mts"),
+        ] {
+            assert_eq!(resolve(source, ImportKind::JavaScriptImport, destination, &[target]).kind,
+                ImportResolutionKind::Missing, "{source:?}: {destination}");
+        }
+    }
+
+    #[test]
+    fn typed_source_lookup_is_bounded_and_confined_to_the_capture() {
+        let mut calls = Vec::new();
+        let result: ImportResolution<usize> = resolve_import(b"src/deep/main.ts",
+            &fact(ImportKind::JavaScriptImport, "../tool.js"), |path| { calls.push(path.to_vec()); None });
+        assert_eq!(result.kind, ImportResolutionKind::Missing);
+        assert_eq!(calls, [b"src/tool.js".to_vec(), b"src/tool.ts".to_vec(), b"src/tool.tsx".to_vec(), b"src/tool.d.ts".to_vec()]);
+        let result: ImportResolution<usize> = resolve_import(b"main.ts",
+            &fact(ImportKind::JavaScriptImport, "../tool.js"), |_| panic!("cannot leave catalog root"));
+        assert_eq!(result.kind, ImportResolutionKind::Unresolved);
+        let source = [vec![b'x'; MAX_IMPORT_RESOLUTION_PATH_BYTES - 9], b"/main.ts".to_vec()].concat();
+        let mut calls = 0;
+        let result: ImportResolution<usize> = resolve_import(&source,
+            &fact(ImportKind::JavaScriptImport, "./tool.js"), |_| { calls += 1; None });
+        assert_eq!(result.kind, ImportResolutionKind::Unresolved, "oversized declaration candidate cannot prove uniqueness");
+        assert_eq!(calls, 1, "validate all substituted path lengths before probing any of them");
     }
 
     #[test]

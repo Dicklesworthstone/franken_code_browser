@@ -22,7 +22,7 @@ enum AtlasSavedImportWire {
               w.resolution_domain == "declared-catalog-candidates",
               w.extractor == "franken-markdown-d6fbd1d5/import-statements-v7",
               w.extraction_policy == "rust-use-tree-js-literal-loads-python-cpp-go-java-v7",
-              w.resolver == "fcb-closed-catalog-imports-v8",
+              w.resolver == "fcb-closed-catalog-imports-v9",
               !w.compiler_resolved, !w.semantic_complete else { throw AtlasSavedError.invalidResponse }
     }
 
@@ -149,7 +149,7 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
               specifier.start >= evidence.start, specifier.end <= evidence.end,
               !destination.isEmpty, destination.utf8.count <= 1024, kinds.contains(kind),
               ["captured", "unavailable", "missing", "ambiguous", "external", "unresolved"].contains(resolution),
-              ["exact-relative-path", "unique-relative-module-candidate", "rust-module-file-candidate",
+              ["exact-relative-path", "unique-relative-module-candidate", "typescript-source-extension-candidate", "rust-module-file-candidate",
                "rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "ambiguous-rust-crate-root",
                "python-relative-module-candidate", "python-absolute-module-candidate", "cpp-source-relative-include-candidate",
                "go-module-package-file-candidate", "go-module-context-unavailable", "go-nested-module-boundary",
@@ -168,8 +168,11 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
         if resolutionBasis == "python-absolute-module-candidate" && (language != "python" || destination.hasPrefix(".")) {
             throw AtlasSavedError.invalidResponse
         }
+        if resolutionBasis == "typescript-source-extension-candidate" && !["typescript", "tsx"].contains(language) {
+            throw AtlasSavedError.invalidResponse
+        }
         if ["javascript", "typescript", "jsx", "tsx"].contains(language)
-            && !["exact-relative-path", "unique-relative-module-candidate", "external-specifier",
+            && !["exact-relative-path", "unique-relative-module-candidate", "typescript-source-extension-candidate", "external-specifier",
                 "unsupported-specifier", "no-catalog-target", "ambiguous-catalog-target"].contains(resolutionBasis) {
             throw AtlasSavedError.invalidResponse
         }
@@ -201,7 +204,7 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
         }
         let acceptedBases: [String]
         switch resolution {
-        case "captured", "unavailable": acceptedBases = ["exact-relative-path", "unique-relative-module-candidate",
+        case "captured", "unavailable": acceptedBases = ["exact-relative-path", "unique-relative-module-candidate", "typescript-source-extension-candidate",
             "rust-module-file-candidate", "rust-use-module-file-candidate", "rust-use-module-prefix-candidate",
             "python-relative-module-candidate", "python-absolute-module-candidate",
             "cpp-source-relative-include-candidate", "go-module-package-file-candidate",
