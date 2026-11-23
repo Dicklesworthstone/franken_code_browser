@@ -19,7 +19,7 @@ pub use fcb::search::snapshot::SnapshotLimits;
 use fcb_core::ResourceLease;
 use crate::{AppError, input, MANAGED_BYTES, EXIT_OK, EXIT_PARTIAL};
 use crate::output::{Output, OutputError};
-use super::{HostResponse, MAX_HOST_TEXT_BYTES, reader::{ReaderSession, ReaderSessionError}};
+use super::{HostResponse, reader::{ReaderSession, ReaderSessionError, MAX_READER_SOURCE_BYTES}};
 
 pub const MAX_SNAPSHOT_COMPARISON_PAGE: usize = 128;
 pub const MAX_SNAPSHOT_COMPARISON_STEP: usize = 1024;
@@ -149,7 +149,7 @@ impl SnapshotComparisonSession {
     pub fn open(owner: ArenaOwnerId, before: &Path, after: &Path, limits: SnapshotLimits,
         mut canceled: impl FnMut() -> bool) -> Result<Self, SnapshotComparisonError> {
         check(&mut canceled)?;
-        if limits.max_file_bytes > MAX_HOST_TEXT_BYTES || limits.max_files > MEMBERS_PER_ARCHIVE
+        if limits.max_file_bytes > MAX_READER_SOURCE_BYTES || limits.max_files > MEMBERS_PER_ARCHIVE
             || limits.max_path_bytes > 16_384
             || [before, after].iter().any(|path| path.as_os_str().is_empty() || path.as_os_str().len() > 16_384) {
             return Err(SnapshotComparisonError::InvalidLimits);

@@ -12,21 +12,19 @@ mod catalog;
 mod expression;
 mod structure;
 mod matching;
+mod save;
 
-use std::{ffi::OsString, fs::{self, File, OpenOptions}, io::{self, Write}, path::{Path, PathBuf}, sync::Arc};
-use fcb::{ByteLength, ByteOffset, ByteRange};
-use fcb::source::{CancelFlag, SourceError, NormalizedPath};
-use fcb::search::{CaptureRequest, CompleteCapture, ExtentConsistency, ExtentReadState, ExtentStepBudget,
-    FileRangeReader, RawPath, ResourceBudget, RootId, SearchManifestId, SymbolNameMode};
+use std::{ffi::OsString, fs::{File, OpenOptions}, io::{self, Write}, path::{Path, PathBuf}};
+use fcb::ByteLength;
+use fcb::search::{RawPath, ResourceBudget, SymbolNameMode};
 use fcb::search::snapshot_structure::{StructureMode, MAX_STRUCTURE_SOURCE_BYTES};
-use fcb::search::workspace::{RootGrant, RuleLimits, WorkspaceCatalog, WorkspaceCaptures, WorkspaceLimits, WorkspaceStage};
-use fcb::search::snapshot::{SavedSourceError, SnapshotError, SnapshotLimits, SnapshotView, Sha256Digest,
-    export_workspace, MAX_SNAPSHOT_BYTES};
+use fcb::search::workspace::WorkspaceLimits;
+use fcb::search::snapshot::{SavedSourceError, SnapshotError, SnapshotLimits, Sha256Digest,
+    MAX_SNAPSHOT_BYTES, MAX_PAGED_SNAPSHOT_FILE_BYTES, MAX_PAGED_SNAPSHOT_SOURCE_BYTES};
 use crate::{AppError, MANAGED_BYTES, SCHEMA, EXIT_OK, EXIT_NO_MATCH, EXIT_ERROR, EXIT_PARTIAL, EXIT_CANCELED,
-    allocation, file_id, owner, revision};
+    allocation, owner};
 use crate::args::{decimal, MAX_ARGUMENTS, MAX_ARGUMENT_BYTES, MAX_SINGLE_ARGUMENT};
 use crate::output::{Output, OutputError, MAX_RESPONSE_BYTES};
-use crate::{input, workspace};
 
 const MAX_CALLS: u64 = 131_072;
 const HELP: &str = "fcb snapshot save ROOT --output NEW_FILE [--json] [--respect-ignores | --include-excluded]\n\
@@ -60,6 +58,9 @@ Expression work: --max-scan-bytes N, default 256 MiB across ALL predicate and pr
 --text always remains literal; expressions do not enable regex, OR, or compiler semantics.\n\
 Read options: --line N OR --offset N; --bytes N --lines N; --raw for original bytes\n\
 Save options: --max-files N --max-file-bytes N --max-total-bytes N\n\
+Save defaults: 4096 files, 1 MiB per file, 32 MiB total source.\n\
+Explicit larger budgets: at most 65536 files, 32 MiB per file and 1 GiB total source.\n\
+Saving retains one member at a time; archive bytes are written and hashed in bounded chunks.\n\
 --respect-ignores explicitly reads bounded nested .gitignore/.fcbignore policies.\n\
 Rule failures withhold affected source and preserve incomplete discovery in the archive.\n\
 Offline open options: --catalog FILE --catalog-digest TRUSTED_SHA256\n\
@@ -75,7 +76,8 @@ struct Settings {
     mode: Mode, source: Option<PathBuf>, output: Option<PathBuf>, text: Option<String>,
     raw_needle: Option<Vec<u8>>, member: Option<Vec<u8>>, offset: u64, line: Option<u64>,
     window_bytes: usize, lines: usize, raw: bool,
-    json: bool, limit: usize, limits: WorkspaceLimits, include_excluded: bool, respect_ignores: bool,
+    json: bool, limit: usize, limits: WorkspaceLimits, save_limits: SnapshotLimits,
+    include_excluded: bool, respect_ignores: bool,
     catalog: Option<PathBuf>, catalog_pin: Option<Sha256Digest>,
     expression: Option<String>, max_scan_bytes: u64,
     structure_mode: Option<StructureMode>, structure_name: Option<String>,
@@ -139,7 +141,9 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
     };
     let mut settings = Settings { mode, source: None, output: None, text: None, raw_needle: None,
         member: None, offset: 0, line: None, window_bytes: 64 * 1024, lines: 100, raw: false, json: false,
-        limit: 100, limits: WorkspaceLimits::default(), include_excluded: false, respect_ignores: false,
+        limit: 100, limits: WorkspaceLimits { max_file_bytes: 0, max_source_bytes: 0, ..WorkspaceLimits::default() },
+        save_limits: SnapshotLimits { max_file_bytes: 1024 * 1024, max_source_bytes: 32 * 1024 * 1024,
+            ..SnapshotLimits::paged() }, include_excluded: false, respect_ignores: false,
         catalog: None, catalog_pin: None, expression: None, max_scan_bytes: 256 * 1024 * 1024,
         structure_mode: None, structure_name: None, name_mode: SymbolNameMode::Exact,
         max_structure_source_bytes: MAX_STRUCTURE_SOURCE_BYTES, ignore_case: false, count_all_matches: false,
@@ -216,8 +220,8 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
             match option {
                 "--limit" if number <= 4096 => settings.limit = number as usize,
                 "--max-files" if (1..=65_536).contains(&number) => settings.limits.max_files = number as usize,
-                "--max-file-bytes" if number <= 1024 * 1024 => settings.limits.max_file_bytes = number as usize,
-                "--max-total-bytes" if number <= 64 * 1024 * 1024 => settings.limits.max_source_bytes = number as usize,
+                "--max-file-bytes" if number <= MAX_PAGED_SNAPSHOT_FILE_BYTES as u64 => settings.save_limits.max_file_bytes = number as usize,
+                "--max-total-bytes" if number <= MAX_PAGED_SNAPSHOT_SOURCE_BYTES as u64 => settings.save_limits.max_source_bytes = number as usize,
                 "--max-scan-bytes" if number <= crate::args::MAX_SCAN_BYTES => settings.max_scan_bytes = number,
                 "--max-source-bytes" if number <= MAX_STRUCTURE_SOURCE_BYTES => settings.max_structure_source_bytes = number,
                 "--offset" => settings.offset = number,
@@ -326,7 +330,7 @@ fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBudget, effec
         else { out.literal(HELP)?; }
         return Ok(EXIT_OK);
     }
-    if settings.mode == Mode::Save { return save(settings, out, budget, effect, canceled); }
+    if settings.mode == Mode::Save { return save::execute(settings, out, budget, effect, canceled); }
     if settings.mode == Mode::Catalog { return catalog::build(settings, out, budget, effect, canceled); }
     if settings.mode == Mode::Search && settings.expression.is_some() { return expression::execute(settings, out, budget, canceled); }
     if settings.mode == Mode::Structure { return structure::execute(settings, out, budget, canceled); }
@@ -337,90 +341,6 @@ fn begin(out: &mut Output, command: &str) -> Result<(), OutputError> {
     out.literal(",\"status\":\"ok\",\"command\":")?; out.quoted(command)
 }
 
-fn save(settings: &Settings, out: &mut Output, budget: &ResourceBudget, effect: &mut Effect,
-    canceled: &mut impl FnMut() -> bool) -> Result<u8, Failure> {
-    if !input::NATIVE_FILE_SUPPORTED { return Err(AppError::UnsupportedPlatform.into()); }
-    let requested = input::absolute(settings.source.as_deref().ok_or_else(|| Failure::new("CLI_MISSING_SOURCE"))?)?;
-    let metadata = fs::symlink_metadata(&requested).map_err(|_| Failure::new("SNAPSHOT_ROOT_UNAVAILABLE"))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() { return Err(Failure::new("SNAPSHOT_ROOT_NOT_DIRECTORY")); }
-    let root = fs::canonicalize(requested).map_err(|_| Failure::new("SNAPSHOT_ROOT_UNAVAILABLE"))?;
-    let destination = input::absolute(settings.output.as_deref().ok_or_else(|| Failure::new("SNAPSHOT_OUTPUT_REQUIRED"))?)?;
-    match fs::symlink_metadata(&destination) {
-        Ok(_) => return Err(Failure::new("SNAPSHOT_DESTINATION_EXISTS")),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {},
-        Err(_) => return Err(Failure::new("SNAPSHOT_DESTINATION_UNAVAILABLE")),
-    }
-    let grant = RootGrant::new(RootId::new(owner(), 1).map_err(|_| Failure::new("SNAPSHOT_OWNER"))?, RawPath::from_path(&root));
-    let id = SearchManifestId::new(owner(), 1).map_err(AppError::from)?;
-    let mut catalog = if settings.respect_ignores {
-        WorkspaceCatalog::open_rule_aware(grant, id, file_id(), settings.limits, RuleLimits::default(),
-            budget, [allocation(101), allocation(119)])
-    } else {
-        WorkspaceCatalog::open(grant, id, file_id(), settings.limits, settings.include_excluded, budget, allocation(101))
-    }.map_err(AppError::from)?;
-    let cancel = CancelFlag::new();
-    while catalog.stage() == WorkspaceStage::Discovering {
-        if canceled() { return Err(Failure::canceled()); }
-        catalog.step(&cancel).map_err(AppError::from)?;
-    }
-    let mut captures = WorkspaceCaptures::new(&catalog, revision(), budget, allocation(102)).map_err(AppError::from)?;
-    let mut io = IoCounts::default();
-    while !captures.finished() {
-        if canceled() { return Err(Failure::canceled()); }
-        captures.step(&cancel, |request, path, limit| capture(&root, request, path, limit,
-            settings.limits.max_source_bytes as u64, &mut io, budget, canceled)).map_err(AppError::from)?;
-    }
-    let encoded = export_workspace(&captures, SnapshotLimits::default(), budget,
-        [allocation(103), allocation(104)], &mut *canceled)?;
-    let view = SnapshotView::open(encoded.bytes(), SnapshotLimits::default(), &mut *canceled)?;
-    let complete = view.discovery_complete() && view.captured_files() == view.len();
-    catalog.validate_active().map_err(AppError::from)?;
-    write_new(&destination, encoded.bytes(), effect, canceled)?;
-    if settings.json {
-        begin(out, "snapshot-save")?; out.literal(",\"effect\":")?; out.quoted(effect.name())?;
-        out.literal(",\"destination\":")?; out.path(&destination)?;
-        summary(out, view, true)?;
-        workspace::rule_output::fields(out, &catalog)?;
-        out.literal(",\"payload_bytes_read\":")?; out.integer(io.bytes)?;
-        out.literal(",\"read_calls\":")?; out.integer(io.calls)?;
-        out.literal(",\"archive_bytes\":")?; out.integer(encoded.bytes().len() as u64)?;
-        out.literal(",\"source_contains_plaintext\":true,\"power_loss_qualified\":false}\n")?;
-    } else {
-        out.literal("Saved source-containing snapshot ")?; out.path(&destination)?;
-        out.literal(if complete { "\nComplete observed membership and captures.\n" } else { "\nPARTIAL saved scope: discovery or captures are incomplete.\n" })?;
-        workspace::rule_output::human(out, &catalog)?;
-        out.literal("No overwrite; sync requested; no power-loss durability qualification.\n")?;
-    }
-    Ok(if complete { EXIT_OK } else { EXIT_PARTIAL })
-}
-#[derive(Default)]
-struct IoCounts { bytes: u64, calls: u64 }
-fn capture(root: &Path, request: CaptureRequest, path: &NormalizedPath, limit: usize,
-    total_limit: u64, io: &mut IoCounts, budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool)
-    -> Result<CompleteCapture, SourceError> {
-    if canceled() { return Err(SourceError::Canceled); }
-    let native = workspace::checked_source_path(root, path)?;
-    let (file, metadata) = input::open_regular(&native).map_err(|_| SourceError::CaptureUnavailable)?;
-    if metadata.len() > limit as u64 || metadata.len() > total_limit.saturating_sub(io.bytes) { return Err(SourceError::PayloadTooLarge); }
-    let length = ByteLength::new(metadata.len());
-    let mut selected = request;
-    if metadata.len() > 0 { selected = selected.with_range(ByteRange::new(ByteOffset::new(0), ByteOffset::new(metadata.len()))
-        .map_err(|_| SourceError::InvalidRange)?)?; }
-    let mut reader = FileRangeReader::new(request.file(), file).map_err(|_| SourceError::CaptureUnavailable)?;
-    let mut read = reader.begin(selected, budget, allocation(109)).map_err(|_| SourceError::CaptureUnavailable)?;
-    while read.state() == ExtentReadState::Pending {
-        if canceled() { return Err(SourceError::Canceled); }
-        if io.calls >= MAX_CALLS { return Err(SourceError::CaptureUnavailable); }
-        let before = read.stats();
-        let status = read.step(ExtentStepBudget { max_bytes: 64 * 1024, max_calls: (MAX_CALLS - io.calls).min(32) as usize }, &mut *canceled);
-        let after = read.stats(); io.bytes += after.bytes_read - before.bytes_read; io.calls += after.read_calls - before.read_calls;
-        status.map_err(|_| if canceled() { SourceError::Canceled } else { SourceError::CaptureUnavailable })?;
-    }
-    let extent = read.finish(&mut *canceled).map_err(|_| if canceled() { SourceError::Canceled } else { SourceError::CaptureUnavailable })?;
-    if !extent.request_filled() || !extent.covers_whole_observation() || extent.final_length() != Some(length)
-        || extent.consistency() != ExtentConsistency::UnchangedMetadata { return Err(SourceError::MetadataMismatch); }
-    CompleteCapture::new(request, length, Arc::from(extent.bytes()))
-}
 fn write_new(path: &Path, bytes: &[u8], effect: &mut Effect, canceled: &mut impl FnMut() -> bool) -> Result<(), Failure> {
     if canceled() { return Err(Failure::canceled()); }
     if bytes.len() > MAX_SNAPSHOT_BYTES { return Err(Failure::new("SNAPSHOT_LIMIT")); }
@@ -444,6 +364,10 @@ fn write_new(path: &Path, bytes: &[u8], effect: &mut Effect, canceled: &mut impl
             Err(_) => return Err(Failure::new("SNAPSHOT_WRITE_FAILED")),
         }
     }
+    sync_written(&file, path, effect, canceled)
+}
+fn sync_written(file: &File, path: &Path, effect: &mut Effect,
+    canceled: &mut impl FnMut() -> bool) -> Result<(), Failure> {
     *effect = Effect::Written;
     if canceled() { return Err(Failure::canceled()); }
     file.sync_all().map_err(|_| Failure::new("SNAPSHOT_SYNC_UNCERTAIN"))?;
@@ -452,18 +376,6 @@ fn write_new(path: &Path, bytes: &[u8], effect: &mut Effect, canceled: &mut impl
     *effect = Effect::Synced;
     Ok(())
 }
-fn summary(out: &mut Output, view: SnapshotView<'_>, live_roots_accessed: bool) -> Result<(), OutputError> {
-    out.literal(",\"source_scope\":\"saved-observations-only\",\"live_roots_accessed\":")?;
-    out.boolean(live_roots_accessed)?;
-    out.literal(",\"snapshot_digest\":")?; out.quoted(&view.digest().to_hex())?;
-    out.literal(",\"policy\":")?; out.quoted(view.policy())?;
-    out.literal(",\"discovery_complete\":")?; out.boolean(view.discovery_complete())?;
-    out.literal(",\"known_files\":")?; out.integer(view.len() as u64)?;
-    out.literal(",\"captured_files\":")?; out.integer(view.captured_files() as u64)?;
-    out.literal(",\"unavailable_files_count\":")?; out.integer((view.len() - view.captured_files()) as u64)?;
-    out.literal(",\"captured_bytes\":")?; out.integer(view.source_bytes() as u64)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,7 +385,22 @@ mod tests {
         assert!(parse(&args(&["save", "root"])).is_err());
         assert!(parse(&args(&["save", "root", "--output", "new", "--text", "secret"])).is_err());
         let parsed = parse(&args(&["save", "root", "--output", "new", "--max-total-bytes", "0"])).unwrap();
-        assert_eq!(parsed.limits.max_source_bytes, 0);
+        assert_eq!(parsed.save_limits.max_source_bytes, 0);
+    }
+    #[test]
+    fn larger_save_budgets_are_explicit_and_do_not_expand_workspace_capture_limits() {
+        let default = parse(&args(&["save", "root", "--output", "new"])).unwrap();
+        assert_eq!(default.save_limits.max_file_bytes, 1024 * 1024);
+        assert_eq!(default.save_limits.max_source_bytes, 32 * 1024 * 1024);
+        let large = parse(&args(&["save", "root", "--output", "new", "--max-file-bytes", "33554432",
+            "--max-total-bytes", "1073741824", "--max-files", "65536"])).unwrap();
+        assert_eq!(large.save_limits.max_file_bytes, MAX_PAGED_SNAPSHOT_FILE_BYTES);
+        assert_eq!(large.save_limits.max_source_bytes, MAX_PAGED_SNAPSHOT_SOURCE_BYTES);
+        assert_eq!(large.limits.max_files, 65_536);
+        assert_eq!(large.limits.max_file_bytes, 0); assert_eq!(large.limits.max_source_bytes, 0);
+        for (option, value) in [("--max-file-bytes", "33554433"), ("--max-total-bytes", "1073741825")] {
+            assert!(parse(&args(&["save", "root", "--output", "new", option, value])).is_err());
+        }
     }
     #[test]
     fn option_values_and_delimited_native_paths_cannot_change_output_mode() {

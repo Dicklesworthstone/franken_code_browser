@@ -20,7 +20,7 @@ use fcb_core::ResourceLease;
 pub use fcb::search::snapshot::{SnapshotLimits, Sha256Digest};
 use crate::{AppError, input, MANAGED_BYTES, EXIT_OK, EXIT_PARTIAL};
 use crate::output::{Output, OutputError, MAX_RESPONSE_BYTES};
-use super::{HostResponse, MAX_HOST_TEXT_BYTES, reader::{ReaderSession, ReaderSessionError}};
+use super::{HostResponse, reader::{ReaderSession, ReaderSessionError, MAX_READER_SOURCE_BYTES}};
 
 pub const MAX_SAVED_HITS: usize = 4096;
 pub const MAX_SAVED_PAGE: usize = 128;
@@ -130,7 +130,7 @@ impl SavedRepositorySession {
         mut canceled: impl FnMut() -> bool) -> Result<Self, SavedRepositoryError> {
         check(&mut canceled)?;
         if path.as_os_str().is_empty() || path.as_os_str().len() > 16_384
-            || limits.max_file_bytes > MAX_HOST_TEXT_BYTES {
+            || limits.max_file_bytes > MAX_READER_SOURCE_BYTES {
             return Err(SavedRepositoryError::InvalidLimits);
         }
         let budget = ResourceBudget::new(owner, ByteLength::new(MANAGED_BYTES)).map_err(|_| AppError::Admission)?;

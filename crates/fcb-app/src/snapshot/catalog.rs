@@ -6,13 +6,13 @@
 use std::{fs::{self, File}, io::{self, Read}, path::Path};
 use fcb::{ByteLength};
 use fcb::search::{ResourceAllocationId, ResourceBudget};
-use fcb::search::snapshot::Sha256Digest;
+use fcb::search::snapshot::{Sha256Digest, MAX_PAGED_SNAPSHOT_BYTES};
 use fcb::search::snapshot_catalog::{CatalogError, PinnedCatalog, MAX_CATALOG_BYTES};
 use fcb::search::paged_snapshot::{PagedSnapshot, SnapshotDirectory};
 use fcb_core::ResourceLease;
 use crate::{allocation, owner, input, EXIT_OK, EXIT_PARTIAL};
 use crate::output::{Output, OutputError};
-use super::{Settings, Failure, Effect, SnapshotLimits, MAX_SNAPSHOT_BYTES, begin, write_new};
+use super::{Settings, Failure, Effect, SnapshotLimits, begin, write_new};
 
 impl From<CatalogError> for Failure {
     fn from(error: CatalogError) -> Self {
@@ -39,17 +39,17 @@ pub(super) fn open(path: &Path, catalog_path: Option<&Path>, pin: Option<Sha256D
         (None, None) => None,
         (Some(path), Some(pin)) => {
             let loaded = load(path, budget, allocations[1], canceled)?;
-            Some(PinnedCatalog::decode_pinned(&loaded.bytes, pin, owner(), SnapshotLimits::default(),
+            Some(PinnedCatalog::decode_pinned(&loaded.bytes, pin, owner(), SnapshotLimits::paged(),
                 budget, allocations[0], &mut *canceled)?)
         }
         _ => return Err(Failure::new("CATALOG_PATH_AND_PIN_REQUIRED")),
     };
     let source = input::absolute(path)?;
     let (file, metadata) = input::open_regular(&source)?;
-    if metadata.len() > MAX_SNAPSHOT_BYTES as u64 { return Err(Failure::new("SNAPSHOT_LIMIT")); }
+    if metadata.len() > MAX_PAGED_SNAPSHOT_BYTES as u64 { return Err(Failure::new("SNAPSHOT_LIMIT")); }
     match catalog {
         Some(catalog) => Ok(PagedSnapshot::open_pinned(file, catalog, &mut *canceled)?),
-        None => Ok(PagedSnapshot::open(file, owner(), SnapshotLimits::default(), budget, allocations[0], &mut *canceled)?),
+        None => Ok(PagedSnapshot::open(file, owner(), SnapshotLimits::paged(), budget, allocations[0], &mut *canceled)?),
     }
 }
 

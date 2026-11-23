@@ -37,6 +37,40 @@ import Foundation
             identity: identity, generation: hugeGeneration)
         precondition(huge.generation == hugeGeneration && huge.identity.owner == owner)
 
+        var largeInfo = SnapshotComparisonFixture.info(owner: owner)
+        for key in ["before_archive", "after_archive"] {
+            var archive = largeInfo[key] as! [String: Any]
+            archive["source_bytes"] = "1073741824"
+            archive["archive_bytes"] = "1090519040"; archive["initial_archive_bytes_read"] = "1090519040"
+            archive["initial_archive_read_calls"] = "16384"; largeInfo[key] = archive
+        }
+        let largeIdentity = try AtlasSnapshotComparisonInfo.decode(SnapshotComparisonFixture.json(largeInfo),
+            owner: owner, before: Array("/before.fcbs".utf8), after: Array("/after.fcbs".utf8), fresh: true).identity
+        var largePage = valid
+        for key in ["before_archive", "after_archive"] { largePage[key] = largeInfo[key] }
+        var largeRows = largePage["entries"] as! [[String: Any]]
+        for side in ["before", "after"] {
+            var member = largeRows[0][side] as! [String: Any]
+            member["observed_bytes"] = "33554432"; member["captured_bytes"] = "33554432"
+            largeRows[0][side] = member
+        }
+        largePage["entries"] = largeRows
+        let large = try decode(largePage, identity: largeIdentity)
+        precondition(large.rows[0].canOpen(.before) && large.rows[0].canOpen(.after),
+            "Metadata handoff opens a retained 32 MiB capture without using the smaller clipboard transfer limit")
+        var tooLargeMember = largeRows[0]["after"] as! [String: Any]
+        tooLargeMember["observed_bytes"] = "33554433"; tooLargeMember["captured_bytes"] = "33554433"
+        largeRows[0]["after"] = tooLargeMember; largePage["entries"] = largeRows
+        refuse(largePage, identity: largeIdentity)
+        var tooLargeArchive = largeInfo["after_archive"] as! [String: Any]
+        tooLargeArchive["archive_bytes"] = "1090519041"; tooLargeArchive["initial_archive_bytes_read"] = "1090519041"
+        largeInfo["after_archive"] = tooLargeArchive
+        do {
+            _ = try AtlasSnapshotComparisonInfo.decode(SnapshotComparisonFixture.json(largeInfo),
+                owner: owner, before: Array("/before.fcbs".utf8), after: Array("/after.fcbs".utf8), fresh: true)
+            preconditionFailure("Comparison archives beyond the paged envelope limit were accepted")
+        } catch {}
+
         var shortened = valid
         shortened["entries"] = Array((valid["entries"] as! [[String: Any]]).prefix(3))
         shortened["next_offset"] = "3"; shortened["page_limited"] = true

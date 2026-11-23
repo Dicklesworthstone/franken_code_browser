@@ -17,6 +17,7 @@ char *fcb_snapshot_save_cancelable(const char *root, const char *destination,
     assert(root && destination && !strcmp(root, "/repo") && !strcmp(destination, "/out/project.fcbs"));
     assert(poll && context && poll(context) == 0);
     if (mode == 7) assert(files == 1 && file_bytes == 0 && source_bytes == 0 && ignores == 0);
+    else if (mode == 8) assert(files == 65536 && file_bytes == 32 * 1024 * 1024 && source_bytes == 1024 * 1024 * 1024 && ignores == 1);
     else assert(files == 20000 && file_bytes == 1024 * 1024 && source_bytes == 64 * 1024 * 1024 && ignores == 1);
     ++calls;
     if (mode == 4 || mode == 5) {

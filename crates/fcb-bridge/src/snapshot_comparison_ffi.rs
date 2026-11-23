@@ -66,7 +66,7 @@ pub unsafe extern "C" fn fcb_snapshot_comparison_open(handle: u64,
     reply(|| answer(handle, |sessions| {
         let before = unsafe { path(before_path) }?;
         let after = unsafe { path(after_path) }?;
-        sessions.open(handle, before, after, SnapshotLimits::default(), || false)
+        sessions.open(handle, before, after, SnapshotLimits::paged(), || false)
     }))
 }
 /// Cooperatively cancel both archive opens and verification before acceptance.
@@ -82,7 +82,7 @@ pub unsafe extern "C" fn fcb_snapshot_comparison_open_cancelable(handle: u64,
         if canceled() { return Err(AccessError::Canceled); }
         let before = unsafe { path(before_path) }?;
         let after = unsafe { path(after_path) }?;
-        sessions.open(handle, before, after, SnapshotLimits::default(), &mut canceled)
+        sessions.open(handle, before, after, SnapshotLimits::paged(), &mut canceled)
     }))
 }
 #[unsafe(no_mangle)]

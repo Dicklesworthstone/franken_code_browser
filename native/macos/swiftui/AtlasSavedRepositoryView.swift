@@ -59,6 +59,7 @@ private final class AtlasSavedTrailArchiveAccess {
     var currentSource: @MainActor () -> AtlasSnapshotExportSource? = { nil }
     @Environment(\.dismiss) private var dismiss
     @State private var panelNotice = ""
+    @State private var exportProfile: AtlasSnapshotExportProfile = .standard
     @State private var section: Section = .text
     private enum Section: String, CaseIterable, Identifiable {
         case text = "Search", links = "Documentation links", imports = "Imports", trail = "Reading trail"
@@ -143,6 +144,9 @@ private final class AtlasSavedTrailArchiveAccess {
                 }
                 .disabled(exporter.busy || currentSource() == nil)
                 .help("Capture current files under the project's read grant into a new source-containing FCBS archive")
+                Picker("Capture limits", selection: $exportProfile) {
+                    ForEach(AtlasSnapshotExportProfile.allCases) { Text($0.label).tag($0) }
+                }.frame(maxWidth: 240).disabled(exporter.busy)
                 if exporter.busy {
                     ProgressView().controlSize(.small)
                     Text(exporter.cancellationRequested ? "Waiting for save outcome…" : "Capturing and saving…")
@@ -166,7 +170,7 @@ private final class AtlasSavedTrailArchiveAccess {
                     .font(.caption).lineLimit(2).textSelection(.enabled)
             }
             Text(exporter.notice).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
-            Text("Captures current on-disk observations using repository ignore rules: up to 20,000 known files, 1 MiB per file and 64 MiB of source. Source and filenames are stored as plaintext. The archive may be partial; existing files are never overwritten.")
+            Text("Captures current on-disk observations using repository ignore rules: up to \(exportProfile.summary). Source and filenames are stored as plaintext. The archive may be partial; existing files are never overwritten.")
                 .font(.caption2).foregroundStyle(.secondary)
             if currentSource() == nil {
                 Text("Open a project to enable Save current project. Existing archives can be opened independently.")
@@ -1228,11 +1232,12 @@ private final class AtlasSavedTrailArchiveAccess {
 
     private func saveCurrentProject() {
         guard !exporter.busy, let source = currentSource() else { return }
+        let profile = exportProfile
         let panel = NSSavePanel()
         panel.title = "Save the current project as an FCBS archive"
         panel.prompt = "Save archive"
         panel.nameFieldStringValue = "Repository.fcbs"
-        panel.message = "Captures current files from \(String(reflecting: source.root)), including plaintext source and filenames. Repository ignore rules are respected. Limits: 20,000 known files, 1 MiB per file, 64 MiB source. Omitted or unavailable files remain explicit; discovery may be incomplete. Choose a new filename."
+        panel.message = "Captures current files from \(String(reflecting: source.root)), including plaintext source and filenames. Repository ignore rules are respected. \(profile.label) limits: \(profile.summary). Omitted or unavailable files remain explicit; discovery may be incomplete. Choose a new filename."
         panel.canCreateDirectories = true
         guard panel.runModal() == .OK, let url = panel.url else { return }
         let access = AtlasSavedFileAccess(selectedURL: url)
@@ -1245,7 +1250,7 @@ private final class AtlasSavedTrailArchiveAccess {
             return
         }
         panelNotice = ""
-        exporter.save(source: source, destination: path, destinationAccess: access)
+        exporter.save(source: source, destination: path, destinationAccess: access, limits: profile.limits)
     }
     private func chooseArchive() {
         guard model.canOperate, readerTask == nil else { return }

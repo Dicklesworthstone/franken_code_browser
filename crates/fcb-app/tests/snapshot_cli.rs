@@ -174,6 +174,90 @@ fn raw_paths_roundtrip_and_new_archives_start_owner_private() {
 }
 
 #[test]
+fn streaming_save_reopens_an_archive_beyond_the_old_contiguous_limit() {
+    const MEMBER: usize = 16 * 1024 * 1024;
+    const FILES: usize = 6;
+    let fixture = Fixture::new();
+    // Build 96 MiB of source without a fixture-sized allocation. The production
+    // save must fit its unchanged 256 MiB admission budget while retaining only
+    // one 16 MiB member, plus bounded extent and metadata scratch.
+    for ordinal in 0..FILES {
+        let mut file = fs::File::create(fixture.root().join(format!("file-{ordinal}"))).unwrap();
+        let chunk = [b'a' + ordinal as u8; 64 * 1024];
+        for _ in 0..MEMBER / chunk.len() { file.write_all(&chunk).unwrap(); }
+    }
+    let mut args = fixture.save_args();
+    args.extend(["--max-file-bytes".into(), MEMBER.to_string().into(),
+        "--max-total-bytes".into(), (MEMBER * FILES).to_string().into()]);
+    let (exit, saved, errors) = invoke(&args, || false);
+    assert_eq!(exit, EXIT_OK); assert!(errors.is_empty());
+    assert_eq!(saved.get("captured_files").number(), FILES as u64);
+    assert_eq!(saved.get("captured_bytes").number(), (MEMBER * FILES) as u64);
+    assert_eq!(saved.get("payload_bytes_read").number(), (MEMBER * FILES) as u64);
+    assert_eq!(saved.get("largest_captured_member_bytes").number(), MEMBER as u64);
+    assert_eq!(saved.get("payload_residency").text(), "one-captured-member");
+    assert_eq!(saved.get("archive_bytes").number(), fs::metadata(fixture.archive()).unwrap().len());
+    assert!(saved.get("archive_bytes").number() > 80 * 1024 * 1024);
+    assert_eq!(saved.get("archive_hash_bytes_read").number() + 32, saved.get("archive_bytes").number());
+    fs::rename(fixture.root(), fixture.0.join("old-root")).unwrap();
+    fs::create_dir(fixture.root()).unwrap(); fs::write(fixture.root().join("file-5"), b"replacement").unwrap();
+    let (exit, inspected, _) = invoke(&fixture.inspect_args(), || false);
+    assert_eq!(exit, EXIT_OK); assert_eq!(inspected.get("snapshot_digest"), saved.get("snapshot_digest"));
+    assert_eq!(inspected.get("member_payload_bytes_loaded").number(), 0);
+    assert!(!inspected.get("live_roots_accessed").flag());
+    let catalog = fixture.0.join("source.fcbc");
+    let (exit, pinned, _) = invoke(&["snapshot".into(), "catalog".into(), fixture.archive().into_os_string(),
+        "--output".into(), catalog.clone().into_os_string(), "--json".into()], || false);
+    assert_eq!(exit, EXIT_OK);
+    let (exit, read, _) = invoke(&["snapshot".into(), "read".into(), fixture.archive().into_os_string(),
+        "--member".into(), "file-5".into(), "--raw".into(), "--offset".into(), (MEMBER - 16).to_string().into(),
+        "--bytes".into(), "16".into(), "--catalog".into(), catalog.into_os_string(),
+        "--catalog-digest".into(), pinned.get("catalog_digest").text().into(), "--json".into()], || false);
+    assert_eq!(exit, EXIT_OK); assert_eq!(read.get("original_hex").text(), "66".repeat(16));
+    assert_eq!(read.get("member_payload_bytes_loaded").number(), MEMBER as u64);
+    assert!(!read.get("archive_body_verified_on_open").flag());
+    assert!(!read.get("live_roots_accessed").flag());
+}
+
+#[test]
+fn streaming_source_quotas_keep_unavailable_members_and_later_empty_captures() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root().join("a-large"), vec![b'a'; 3 * 1024 * 1024]).unwrap();
+    fs::write(fixture.root().join("b-over-total"), vec![b'b'; 2 * 1024 * 1024]).unwrap();
+    fs::write(fixture.root().join("z-empty"), []).unwrap();
+    let mut args = fixture.save_args();
+    args.extend(["--max-file-bytes".into(), "33554432".into(), "--max-total-bytes".into(), "4194304".into()]);
+    let (exit, saved, _) = invoke(&args, || false);
+    assert_eq!(exit, EXIT_PARTIAL); assert_eq!(saved.get("known_files").number(), 3);
+    assert_eq!(saved.get("captured_files").number(), 2); assert_eq!(saved.get("unavailable_files_count").number(), 1);
+    assert_eq!(saved.get("payload_bytes_read").number(), 3 * 1024 * 1024);
+    let (exit, inspected, _) = invoke(&fixture.inspect_args(), || false);
+    assert_eq!(exit, EXIT_PARTIAL); let members = inspected.get("files").array();
+    assert!(members[0].get("captured").flag());
+    assert_eq!(members[1].get("unavailable_reason").text(), "WORKSPACE_TOTAL_SOURCE_LIMIT");
+    assert!(members[2].get("captured").flag()); assert_eq!(members[2].get("observed_bytes").number(), 0);
+}
+
+#[test]
+fn a_member_changed_after_discovery_is_unavailable_without_losing_other_members() {
+    let fixture = Fixture::new(); let source = fixture.root().join("a-changing");
+    fs::write(&source, b"before").unwrap(); fs::write(fixture.root().join("b-stable"), b"stable").unwrap();
+    let mut changed = false;
+    let (exit, saved, _) = invoke(&fixture.save_args(), || {
+        if !changed && fixture.archive().exists() {
+            fs::write(&source, b"changed length after discovery").unwrap(); changed = true;
+        }
+        false
+    });
+    assert!(changed); assert_eq!(exit, EXIT_PARTIAL);
+    assert_eq!(saved.get("known_files").number(), 2); assert_eq!(saved.get("captured_files").number(), 1);
+    let (exit, inspected, _) = invoke(&fixture.inspect_args(), || false);
+    assert_eq!(exit, EXIT_PARTIAL); let members = inspected.get("files").array();
+    assert_eq!(members[0].get("unavailable_reason").text(), "SOURCE_METADATA_MISMATCH");
+    assert!(members[1].get("captured").flag());
+}
+
+#[test]
 fn actual_binary_can_search_a_snapshot_after_the_source_root_is_moved() {
     let fixture = Fixture::new(); fs::write(fixture.root().join("a.rs"), b"banana").unwrap();
     let saved = Command::new(env!("CARGO_BIN_EXE_fcb")).args(fixture.save_args()).output().unwrap();

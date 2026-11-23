@@ -44,6 +44,12 @@ import Foundation
             limits: AtlasSnapshotExportLimits(files: 1, fileBytes: 0, sourceBytes: 0, respectIgnores: false))
         let bounded = try transport.save(metadataOnly, AtlasSearchCancellation())
         precondition(bounded != nil && live() == 0)
+        mode(8)
+        let large = try AtlasSnapshotExportRequest(root: "/repo", destination: "/out/project.fcbs",
+            limits: AtlasSnapshotExportProfile.largeWorkspace.limits)
+        let streamed = try transport.save(large, AtlasSearchCancellation())
+        precondition(streamed != nil && live() == 0,
+            "An explicitly selected large-workspace preset crosses the ABI without narrowing its limits")
         print("Snapshot export bridge ABI, cancellation and owned-allocation fixtures passed.")
     }
 }

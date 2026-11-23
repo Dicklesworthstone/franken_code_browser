@@ -6,12 +6,13 @@
 //! both current read authority and a separately chosen output destination.
 
 use std::{ffi::OsString, path::Path};
+use fcb::search::snapshot::{MAX_PAGED_SNAPSHOT_FILE_BYTES, MAX_PAGED_SNAPSHOT_SOURCE_BYTES};
 use super::{HostError, HostResponse};
 use crate::AppError;
 
 pub const MAX_EXPORT_FILES: usize = 65_536;
-pub const MAX_EXPORT_FILE_BYTES: usize = 1024 * 1024;
-pub const MAX_EXPORT_SOURCE_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_EXPORT_FILE_BYTES: usize = MAX_PAGED_SNAPSHOT_FILE_BYTES;
+pub const MAX_EXPORT_SOURCE_BYTES: usize = MAX_PAGED_SNAPSHOT_SOURCE_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SnapshotExportOptions {
@@ -22,8 +23,8 @@ pub struct SnapshotExportOptions {
 }
 impl Default for SnapshotExportOptions {
     fn default() -> Self {
-        Self { max_files: 20_000, max_file_bytes: MAX_EXPORT_FILE_BYTES,
-            max_source_bytes: MAX_EXPORT_SOURCE_BYTES, respect_ignores: true }
+        Self { max_files: 20_000, max_file_bytes: 1024 * 1024,
+            max_source_bytes: 64 * 1024 * 1024, respect_ignores: true }
     }
 }
 

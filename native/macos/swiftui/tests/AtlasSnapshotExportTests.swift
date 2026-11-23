@@ -59,6 +59,9 @@ private final class SnapshotExportGrant {
 
     @MainActor static func main() async throws {
         let request = try AtlasSnapshotExportRequest(root: "/repo", destination: "/out/project.fcbs")
+        check(request.limits == .standard && request.limits.fileBytes == 1024 * 1024
+            && request.limits.sourceBytes == 64 * 1024 * 1024,
+            "Ordinary saves retain the compact source budget")
         let valid = try encode(success())
         let complete = try AtlasSnapshotExportReceipt.decode(valid, request: request)
         check(complete.succeeded && complete.summary?.complete == true && complete.summary?.capturedFiles == 2,
@@ -75,6 +78,21 @@ private final class SnapshotExportGrant {
         for key in ["known_files", "captured_files", "unavailable_files_count", "captured_bytes", "payload_bytes_read", "read_calls"] { empty[key] = "0" }
         check(try AtlasSnapshotExportReceipt.decode(encode(empty), request: request).summary?.complete == true,
             "An empty closed source universe produces a valid nonempty archive frame")
+        let largeRequest = try AtlasSnapshotExportRequest(root: "/repo", destination: "/out/project.fcbs",
+            limits: AtlasSnapshotExportProfile.largeWorkspace.limits)
+        var large = success()
+        large["known_files"] = "32"; large["captured_files"] = "32"
+        large["captured_bytes"] = "1073741824"; large["payload_bytes_read"] = "1073741824"
+        large["archive_bytes"] = "1090519040"; large["read_calls"] = "16384"
+        let largeReceipt = try AtlasSnapshotExportReceipt.decode(encode(large), request: largeRequest)
+        check(largeReceipt.succeeded && largeReceipt.summary?.sourceBytes == 1024 * 1024 * 1024,
+            "Explicit large-workspace saves admit the full paged profile without truncating receipt counts")
+        try rejects(large, request: request)
+        var excessiveArchive = large; excessiveArchive["archive_bytes"] = "1090519041"
+        try rejects(excessiveArchive, request: largeRequest)
+        var excessiveSource = large; excessiveSource["captured_bytes"] = "1073741825"
+        excessiveSource["payload_bytes_read"] = "1073741825"
+        try rejects(excessiveSource, request: largeRequest)
         for effect in [AtlasSnapshotExportEffect.none, .incomplete, .written, .synced] {
             let receipt = try AtlasSnapshotExportReceipt.decode(encode(failure(effect)), request: request)
             check(!receipt.succeeded && receipt.effect == effect && receipt.summary == nil,
@@ -124,8 +142,8 @@ private final class SnapshotExportGrant {
         for limits in [
             AtlasSnapshotExportLimits(files: 0, fileBytes: 1, sourceBytes: 1, respectIgnores: true),
             AtlasSnapshotExportLimits(files: 65_537, fileBytes: 1, sourceBytes: 1, respectIgnores: true),
-            AtlasSnapshotExportLimits(files: 1, fileBytes: 1_048_577, sourceBytes: 1, respectIgnores: true),
-            AtlasSnapshotExportLimits(files: 1, fileBytes: 1, sourceBytes: 67_108_865, respectIgnores: true)
+            AtlasSnapshotExportLimits(files: 1, fileBytes: 33_554_433, sourceBytes: 1, respectIgnores: true),
+            AtlasSnapshotExportLimits(files: 1, fileBytes: 1, sourceBytes: 1_073_741_825, respectIgnores: true)
         ] {
             do { _ = try AtlasSnapshotExportRequest(root: "/repo", destination: "/out/file.fcbs", limits: limits); preconditionFailure("Unbounded capture admitted") }
             catch AtlasSnapshotExportError.invalidInput { checks += 1 }
@@ -133,6 +151,17 @@ private final class SnapshotExportGrant {
         let small = try AtlasSnapshotExportRequest(root: "/repo", destination: "/out/project.fcbs",
             limits: AtlasSnapshotExportLimits(files: 2, fileBytes: 2, sourceBytes: 4, respectIgnores: true))
         try rejects(success(), request: small)
+        let largeReply = try encode(large)
+        let explicitLarge = AtlasSnapshotExportModel(transport: AtlasSnapshotExportTransport { accepted, _ in
+            precondition(accepted.limits == .largeWorkspace,
+                "The worker receives the selected immutable capture budget")
+            return largeReply
+        })
+        check(explicitLarge.save(source: source(), destination: "/out/project.fcbs",
+            destinationAccess: nil, limits: largeRequest.limits), "The explicit larger preset is admitted")
+        await wait("large save did not finish") { !explicitLarge.busy }
+        check(explicitLarge.canOpenSavedArchive && explicitLarge.request?.limits == .largeWorkspace,
+            "A larger saved archive keeps its request budget through receipt admission and independent open")
         try await modelLifecycle(valid)
         try await effectAndUnknownOutcomes()
         print("AtlasSnapshotExportTests: \(checks) checks passed")

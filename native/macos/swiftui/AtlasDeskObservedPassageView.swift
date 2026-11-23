@@ -77,7 +77,7 @@ import AppKit
                 Text(problem).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
             }
             if !notice.isEmpty { Text(notice).font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
-            Text("Checkpoints and automatic recovery include this passage, its retained decoding context and accepted note. Source packs currently exclude observed passages; save a checkpoint for the complete desk.")
+            Text("Checkpoints and automatic recovery include this passage, its retained decoding context and accepted note. Source packs include the selected original bytes, readable text when available, and the full note.")
                 .font(.caption).foregroundStyle(.secondary)
             HStack {
                 Button("Forget passage…", role: .destructive) { confirmForget = true }

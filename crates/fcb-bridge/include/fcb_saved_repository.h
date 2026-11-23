@@ -18,8 +18,8 @@ extern "C" {
 uint64_t fcb_saved_create(void);
 
 /* Capture the named archive descriptor and validate the full archive once.
- * Retains its directory, not its complete source body. Default limits: 65536
- * members, 1 MiB per member, 64 MiB captured source, 80 MiB archive, 2048 bytes
+ * Retains its directory, not its complete source body. Paged limits: 65536
+ * members, 32 MiB per member, 1 GiB captured source, 1 GiB + 16 MiB archive, 2048 bytes
  * per relative native name. UTF-8 path must be readable/NUL-terminated until
  * return. No archived pathname confers live-root or execution authority.
  * An opened handle cannot reopen another archive. Failed initial open leaves

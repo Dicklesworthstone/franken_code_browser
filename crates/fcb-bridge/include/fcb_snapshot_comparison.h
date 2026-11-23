@@ -14,9 +14,11 @@ extern "C" {
  * still held by entered calls. Handles share the process/library allocator with
  * readers and saved repositories; handles from other registries cannot alias.
  * create returns zero on refusal. Each owner opens both archives exactly once
- * under the host's default SnapshotLimits: at most 65,536 members, 2,048 path
- * bytes per member, 8 MiB total path bytes, 1 MiB per captured member, 64 MiB
- * total source bytes and 80 MiB per archive. A failed open leaves it retryable.
+ * under SnapshotLimits::paged(): at most 65,536 members, 2,048 path bytes per
+ * member, 8 MiB total path bytes, 32 MiB per captured member, 1 GiB total source
+ * bytes and 1 GiB + 16 MiB per archive. Both archives are validated in bounded
+ * chunks; at most 2 GiB + 32 MiB is read for a pair's initial validation.
+ * A failed open leaves it retryable.
  *
  * All source work/reclamation belongs on a worker. Operations on one busy owner
  * fail without waiting. Returned JSON owns its bytes independently: release

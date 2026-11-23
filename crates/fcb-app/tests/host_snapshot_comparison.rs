@@ -13,7 +13,7 @@ use fcb::search::snapshot::{SnapshotBytes, SnapshotData, SnapshotEntry};
 use fcb::search::paged_snapshot::{PagedSearchError, PagedSnapshotError};
 use fcb::store::Sha256;
 use fcb_app::{EXIT_OK, EXIT_PARTIAL};
-use fcb_app::host::{HostResponse, reader::ReaderSession,
+use fcb_app::host::{HostResponse, reader::{ReaderSession, MAX_READER_SOURCE_BYTES},
     snapshot_comparison::{SnapshotComparisonSession as Session, SnapshotComparisonError as Error,
         SnapshotComparisonSide as Side, SnapshotChangeFilter as Filter, SnapshotLimits,
         MAX_SNAPSHOT_COMPARISON_RESPONSE}};
@@ -327,11 +327,24 @@ fn in_place_archive_mutation_is_detected_before_reader_authority_is_published() 
 }
 
 #[test]
+fn paged_archive_limits_allow_exact_readers_from_both_comparison_sides() {
+    let fixture = Fixture::new(&[entry(b"a", b"old")], &[entry(b"a", b"new")]);
+    let mut session = Session::open(owner(58122), &fixture.before, &fixture.after, SnapshotLimits::paged(), || false).unwrap();
+    assert!(finish(&mut session, 1, 8).get("comparison_complete").flag());
+    assert_eq!(reads(&mut session), [(0, 0), (0, 0)]);
+    let before = session.open_reader(owner(58123), 1, 1, Side::Before, || false).unwrap().0;
+    let after = session.open_reader(owner(58124), 1, 1, Side::After, || false).unwrap().0;
+    assert_eq!(before.capture().bytes(), b"old"); assert_eq!(after.capture().bytes(), b"new");
+    let loaded = reads(&mut session);
+    assert_eq!(loaded[0].0, 3); assert_eq!(loaded[1].0, 3);
+}
+
+#[test]
 fn invalid_archive_limits_and_cancellation_do_not_produce_a_half_open_pair() {
     let fixture = Fixture::new(&[entry(b"a", b"old")], &[entry(b"a", b"new")]);
     for limits in [
         SnapshotLimits { max_files: 65_537, ..fixture.limits },
-        SnapshotLimits { max_file_bytes: 4 * 1024 * 1024 + 1, ..fixture.limits },
+        SnapshotLimits { max_file_bytes: MAX_READER_SOURCE_BYTES + 1, ..SnapshotLimits::paged() },
         SnapshotLimits { max_path_bytes: 16_385, ..fixture.limits },
     ] {
         assert_eq!(Session::open(owner(58122), &fixture.before, &fixture.after, limits, || false).err(), Some(Error::InvalidLimits));

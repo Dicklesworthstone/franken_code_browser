@@ -64,8 +64,8 @@ final class SnapshotComparisonFixture: @unchecked Sendable {
          "last_comparison_attempt": String(state.generation),
          "accepted_comparison_generation": state.finished ? String(state.generation) as Any : NSNull(),
          "pending_comparison_generation": state.generation > 0 && !state.finished ? String(state.generation) as Any : NSNull(),
-         "max_members_per_archive": "65536", "max_path_bytes": "2048", "max_source_file_bytes": "1048576",
-         "max_archive_bytes": "83886080", "max_retained_entries": "131072", "max_response_bytes": "4194304"]
+         "max_members_per_archive": "65536", "max_path_bytes": "2048", "max_source_file_bytes": "33554432",
+         "max_archive_bytes": "1090519040", "max_retained_entries": "131072", "max_response_bytes": "4194304"]
     }
     static func info(owner: UInt64, before: String = "/before.fcbs", after: String = "/after.fcbs") -> [String: Any] {
         var state = State(); state.before = before; state.after = after

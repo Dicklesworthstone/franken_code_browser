@@ -56,7 +56,7 @@ fn pin(text: &str) -> Result<Sha256Digest, AccessError> {
 pub extern "C" fn fcb_saved_create() -> u64 {
     std::panic::catch_unwind(|| SAVED.get_or_init(SavedSessions::new).create().unwrap_or(0)).unwrap_or(0)
 }
-/// Open FCBS once under the existing default source/archive limits. Worker only.
+/// Open FCBS once under the bounded paged source/archive profile. Worker only.
 /// # Safety
 /// path is null or readable NUL-terminated UTF-8 stable until return. Every
 /// non-null response, including errors, must be freed once with fcb_free_string.
@@ -64,7 +64,7 @@ pub extern "C" fn fcb_saved_create() -> u64 {
 pub unsafe extern "C" fn fcb_saved_open(handle: u64, path: *const c_char) -> *mut c_char {
     reply(|| answer(handle, |sessions| {
         let path = unsafe { cstr(path) }.ok_or(AccessError::InvalidArgument)?;
-        sessions.open(handle, Path::new(path), SnapshotLimits::default(), || false)
+        sessions.open(handle, Path::new(path), SnapshotLimits::paged(), || false)
     }))
 }
 #[unsafe(no_mangle)]

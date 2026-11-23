@@ -9,6 +9,7 @@ use fcb::search::snapshot::{SnapshotBytes, SnapshotData, SnapshotEntry};
 use fcb::search::paged_snapshot::PagedSnapshot;
 use fcb::search::snapshot_index::SnapshotIndex;
 use fcb_app::{EXIT_OK, EXIT_PARTIAL};
+use fcb_app::host::reader::MAX_READER_SOURCE_BYTES;
 use fcb_app::host::saved_repository::{SavedRepositorySession, SavedRepositoryError, SnapshotLimits, Sha256Digest};
 
 fn owner(n: u64) -> ArenaOwnerId { ArenaOwnerId::new(n).unwrap() }
@@ -65,6 +66,17 @@ fn metadata_pages_load_no_member_payload_and_keep_missing_distinct_from_empty() 
     assert!(session.open_member_reader(owner(8814), 1, || false).is_err());
     let (empty, _) = session.open_member_reader(owner(8814), 0, || false).unwrap();
     assert!(empty.capture().bytes().is_empty());
+}
+
+#[test]
+fn paged_archive_limits_allow_verified_reader_handoff() {
+    let f = Fixture::new(&[entry(b"saved.rs", b"retained evidence")], true);
+    let mut session = SavedRepositorySession::open(owner(8815), &f.path, SnapshotLimits::paged(), || false).unwrap();
+    assert_eq!(field(session.info(|| false).unwrap().as_str(), "member_bytes_read"), 0);
+    let (reader, receipt) = session.open_member_reader(owner(8816), 0, || false).unwrap();
+    assert_eq!(reader.capture().bytes(), b"retained evidence");
+    assert!(receipt.as_str().contains("\"live_source_reopened\":false"));
+    assert_eq!(field(session.info(|| false).unwrap().as_str(), "member_bytes_read"), 17);
 }
 
 #[test]
@@ -210,8 +222,9 @@ fn failed_limits_and_generation_exhaustion_leave_a_usable_query() {
     session.search(u64::MAX, "path:src", 10, || false).unwrap();
     assert_eq!(session.clear_results(1, || false).err(), Some(SavedRepositoryError::StaleQuery));
     assert_eq!(session.accepted_generation(), Some(u64::MAX));
-    let limits = SnapshotLimits { max_file_bytes: 8 * 1024 * 1024, ..Default::default() };
-    assert!(SavedRepositorySession::open(owner(8815), &f.path, limits, || false).is_err());
+    let limits = SnapshotLimits { max_file_bytes: MAX_READER_SOURCE_BYTES + 1, ..SnapshotLimits::paged() };
+    assert_eq!(SavedRepositorySession::open(owner(8815), &f.path, limits, || false).err(),
+        Some(SavedRepositoryError::InvalidLimits));
 }
 
 #[test]

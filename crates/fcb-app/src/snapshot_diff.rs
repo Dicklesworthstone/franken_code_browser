@@ -135,7 +135,7 @@ fn open(path: &PathBuf, budget: &ResourceBudget, id: u64, canceled: &mut impl Fn
     if canceled() { return Err(Failure::canceled()); }
     let path = input::absolute(path)?;
     let (file, _) = input::open_regular(&path)?;
-    Ok(PagedSnapshot::open(file, owner(), SnapshotLimits::default(), budget, allocation(id), canceled)?)
+    Ok(PagedSnapshot::open(file, owner(), SnapshotLimits::paged(), budget, allocation(id), canceled)?)
 }
 fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget,
     canceled: &mut impl FnMut() -> bool) -> Result<u8, Failure> {

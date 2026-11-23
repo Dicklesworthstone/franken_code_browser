@@ -5,14 +5,32 @@ enum AtlasSnapshotExportError: Error, Sendable {
 }
 
 struct AtlasSnapshotExportLimits: Sendable, Equatable {
+    // Mirrors SnapshotLimits::paged(); the ordinary preset stays compact.
+    static let maximumFileBytes: UInt64 = 32 * 1024 * 1024
+    static let maximumSourceBytes: UInt64 = 1024 * 1024 * 1024
+    static let archiveOverheadBytes: UInt64 = 16 * 1024 * 1024
     let files: UInt64
     let fileBytes: UInt64
     let sourceBytes: UInt64
     let respectIgnores: Bool
     static let standard = Self(files: 20_000, fileBytes: 1024 * 1024,
         sourceBytes: 64 * 1024 * 1024, respectIgnores: true)
+    static let largeWorkspace = Self(files: 65_536, fileBytes: maximumFileBytes,
+        sourceBytes: maximumSourceBytes, respectIgnores: true)
+    var maximumArchiveBytes: UInt64 { sourceBytes + Self.archiveOverheadBytes }
     var isValid: Bool {
-        (1...65_536).contains(files) && fileBytes <= 1024 * 1024 && sourceBytes <= 64 * 1024 * 1024
+        (1...65_536).contains(files) && fileBytes <= Self.maximumFileBytes && sourceBytes <= Self.maximumSourceBytes
+    }
+}
+
+enum AtlasSnapshotExportProfile: String, CaseIterable, Identifiable, Sendable {
+    case standard, largeWorkspace
+    var id: String { rawValue }
+    var label: String { self == .standard ? "Standard" : "Large workspace" }
+    var limits: AtlasSnapshotExportLimits { self == .standard ? .standard : .largeWorkspace }
+    var summary: String {
+        self == .standard ? "20,000 known files, 1 MiB per file and 64 MiB of source"
+            : "65,536 known files, 32 MiB per file and 1 GiB of source"
     }
 }
 
@@ -121,7 +139,7 @@ struct AtlasSnapshotExportReceipt: Sendable {
                   known <= request.limits.files, captured <= known, unavailable == known - captured,
                   bytes <= request.limits.sourceBytes, bytes <= captured * request.limits.fileBytes,
                   reads >= bytes, reads <= request.limits.sourceBytes,
-                  archive > 0, archive <= 80 * 1024 * 1024, archive >= bytes else {
+                  archive > 0, archive <= request.limits.maximumArchiveBytes, archive >= bytes else {
                 throw AtlasSnapshotExportError.unverifiedOutcome
             }
             let summary = AtlasSnapshotExportSummary(digest: digest, discoveryComplete: discovery,

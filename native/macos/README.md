@@ -480,26 +480,41 @@ compilation, code-signing validity, Launch Services behavior or rendering.
 
 Open **Saved Repository → Save current project…** to choose a new FCBS archive
 destination. The action captures current on-disk observations using repository
-ignore rules, with limits of 20,000 known files, 1 MiB per member and 64 MiB of
-total captured source. Source bytes and filenames are stored as plaintext. The
+ignore rules. **Capture limits → Standard** remains the default: 20,000 known
+files, 1 MiB per member and 64 MiB of total captured source. Choose **Large
+workspace** explicitly to allow 65,536 known files, 32 MiB per member and 1 GiB
+of total captured source. The chosen limits are frozen into the save-panel
+request and shown before saving. Source bytes and filenames are stored as plaintext. The
 receipt reports captured and unavailable members, discovery coverage and the
 actual destination effect, including when cancellation arrives after writing.
 Existing destinations are never overwritten. **Open saved archive** opens the
 completed saved observation independently of subsequent live edits.
 
-The shared native/CLI writer now releases unused capture quota and temporary
-handoff reservations after all capture callbacks finish. FCBS encoding writes
-directly into one exactly reserved final envelope, retaining the existing
-canonical format and checksum. This removes the former four-times-archive
-reservation and duplicate output buffer without raising the 256 MiB managed
-budget or the source limits. Capture work still reserves its full working
-overlap before reading; unavailable members remain explicit.
+The shared native/CLI writer captures and writes one member at a time. It
+retains bounded discovery metadata and the current member, then releases that
+member before capturing the next. Finalization hashes the output
+in bounded chunks. It does not retain every captured file or a whole encoded
+archive in memory. The FCBS format and checksum remain compatible with existing
+archives, and the 256 MiB managed budget stays unchanged. Each member's working
+overlap is reserved before reading; unavailable and over-budget members remain
+explicit. Cancellation during a streamed write reports an incomplete destination;
+a completed write keeps its distinct synchronization outcome.
 
-`crates/fcb-app/tests/snapshot_export_capacity.rs` exercises the production host
-at the 64 MiB source limit, opens the saved final member after a live edit, and
-checks that a smaller requested quota still produces a partial archive. Codec
-and capture-ledger regressions accompany it. These are unexecuted code-first
-regressions; independent batch verification remains pending.
+Saved Repository and saved-capture comparisons open the paged profile: up to
+1 GiB of source and 16 MiB of archive overhead. Opening validates the selected
+archive in bounded chunks and retains its directory. A selected captured member
+can open independently up to 32 MiB; source search, copying, indexing and
+structural extraction keep their separate work/output budgets. Larger archive
+admission does not silently widen those operations. Existing compact archives
+continue to open unchanged.
+
+`crates/fcb-app/tests/snapshot_export_capacity.rs` covers production-host capture
+capacity and partial quotas. C-boundary regressions save a member beyond both
+the previous 1 MiB archive member limit and the 4 MiB text-transfer limit, then
+open it through saved and comparison readers after a live edit. Swift fixtures
+cover explicit preset forwarding, receipt bounds, full-width archive metadata
+and cancellation effects. These are unexecuted code-first regressions;
+independent batch verification and physical-Mac execution remain pending.
 
 ## Finding filenames in a saved repository
 
@@ -1196,9 +1211,10 @@ them to an independent reader. Replacing the archive pathname or editing the
 live project cannot silently substitute another source. A changed archive
 payload fails verification; an already opened reader retains its own capture.
 
-Each native archive is limited to 65,536 members, 80 MiB of archive bytes,
-64 MiB of captured source, 1 MiB per captured member and 2,048 bytes per member
-path. Comparison progresses in steps of up to 256 merged paths; list pages
+Each native archive is limited to 65,536 members, 1 GiB + 16 MiB of archive bytes,
+1 GiB of captured source, 32 MiB per captured member and 2,048 bytes per member
+path. The two selected archives therefore admit at most 2 GiB + 32 MiB of initial
+validation reads, processed in bounded chunks. Comparison progresses in steps of up to 256 merged paths; list pages
 request 64 entries and may be shorter to respect the 4 MiB response bound.
 Two comparison owners allow an accepted pair to remain available while a new
 pair is validated. Cancellation, invalid archives and failed replacement leave

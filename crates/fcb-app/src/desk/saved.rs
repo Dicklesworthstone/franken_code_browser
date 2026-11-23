@@ -179,7 +179,7 @@ impl SavedCommands {
                 // Requests are unique across saved AND live root attachment.
                 let owner = desk.model().owner().get().checked_add(attempt)
                     .and_then(|n| fcb::ArenaOwnerId::new(n).ok()).ok_or(Failure::Protocol("DESK_SAVED_IDENTITY_EXHAUSTED"))?;
-                let mut candidate = SavedRepositorySession::open(owner, &path, SnapshotLimits::default(), &mut *canceled)?;
+                let mut candidate = SavedRepositorySession::open(owner, &path, SnapshotLimits::paged(), &mut *canceled)?;
                 let response = candidate.info(&mut *canceled)?;
                 if canceled() { return Err(Failure::Canceled); }
                 self.current = Some((attempt, candidate));

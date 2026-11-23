@@ -138,6 +138,21 @@ malformed encoding or output limit prevents including readable text; original
 bytes and notes remain available. This source implementation awaits
 independent executable and physical-Mac verification.
 
+**Saved repositories can preserve larger workspaces with bounded capture memory.**
+The Mac save workflow offers an explicit **Large workspace** preset for up to
+65,536 known files, 32 MiB per member and 1 GiB of source. The standard preset
+remains available. Exports retain one captured file at a time and preserve the
+existing FCBS format; paged offline readers, pinned catalogs and saved comparison
+can reopen the larger archives. CLI callers select the same larger budgets
+explicitly. See [streaming saved snapshots](crates/fcb-app/README.md#streaming-saved-snapshots)
+for commands, discovery limits and partial-export behavior. This source addition
+awaits independent executable and physical-Mac verification.
+
+The persistent CLI Reading Desk can also export its saved selections, observed
+passages and complete notes using `export` or `export-hex`, with explicit source
+and output budgets. It uses retained evidence after live files change or a Desk
+checkpoint is restored. See [CLI source-pack export](crates/fcb-app/README.md#export-reading-desk-source-packs-from-the-cli).
+
 **Atlas folders and landmarks survive reopening.** Folder Back/Forward history,
 file filters, named landmarks and parcel-relative camera positions are saved
 for each project and discovery policy. Reopening resolves saved views through

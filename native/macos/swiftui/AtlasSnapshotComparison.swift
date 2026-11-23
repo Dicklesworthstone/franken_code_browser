@@ -1,5 +1,13 @@
 import Foundation
 
+/// The C bridge opens both descriptors with SnapshotLimits::paged(). These
+/// bounds admit archive metadata; they do not authorize a whole-archive copy.
+enum AtlasSnapshotComparisonLimits {
+    static let fileBytes: UInt64 = 32 * 1024 * 1024
+    static let sourceBytes: UInt64 = 1024 * 1024 * 1024
+    static let archiveBytes: UInt64 = sourceBytes + 16 * 1024 * 1024
+}
+
 enum AtlasSnapshotComparisonError: Error, Sendable {
     case unavailable, invalidInput, invalidResponse, canceled, engine(String)
     var message: String {
@@ -122,8 +130,8 @@ struct AtlasSnapshotComparisonArchive: Sendable, Equatable {
         discoveryComplete = try wire.flag("discovery_complete")
         guard AtlasSnapshotComparisonWire.digest(digest), !policy.isEmpty, policy.utf8.count <= 128,
               policy.utf8.allSatisfy({ (33...126).contains($0) }),
-              members <= 65_536, captured <= members, sourceBytes <= 64 * 1024 * 1024,
-              archiveBytes > 0, archiveBytes <= 80 * 1024 * 1024, sourceBytes <= archiveBytes,
+              members <= 65_536, captured <= members, sourceBytes <= AtlasSnapshotComparisonLimits.sourceBytes,
+              archiveBytes > 0, archiveBytes <= AtlasSnapshotComparisonLimits.archiveBytes, sourceBytes <= archiveBytes,
               initialBytes == archiveBytes, initialCalls > 0, initialCalls <= 1_048_576,
               captured > 0 || sourceBytes == 0 else { throw AtlasSnapshotComparisonError.invalidResponse }
     }
@@ -244,8 +252,9 @@ struct AtlasSnapshotComparisonWire: Decodable {
                   try !wire.flag("history_inferred"), try !wire.flag("renames_inferred"),
                   try wire.text("alignment") == "native-path-pair-not-logical-file-continuity",
                   try !wire.flag("native_presented"), try wire.number("max_members_per_archive") == 65_536,
-                  try wire.number("max_path_bytes") == 2048, try wire.number("max_source_file_bytes") == 1024 * 1024,
-                  try wire.number("max_archive_bytes") == 80 * 1024 * 1024,
+                  try wire.number("max_path_bytes") == 2048,
+                  try wire.number("max_source_file_bytes") == AtlasSnapshotComparisonLimits.fileBytes,
+                  try wire.number("max_archive_bytes") == AtlasSnapshotComparisonLimits.archiveBytes,
                   try wire.number("max_retained_entries") == 131_072,
                   try wire.number("max_response_bytes") == UInt64(maximumResponseBytes) else {
                 throw AtlasSnapshotComparisonError.invalidResponse
@@ -289,7 +298,8 @@ struct AtlasSnapshotComparisonMember: Sendable, Equatable {
         guard ordinal < archive.members, file == ordinal + (side == .before ? 1 : 65_537),
               revision == file else { throw AtlasSnapshotComparisonError.invalidResponse }
         if captured {
-            guard let bytes, bytes <= 1024 * 1024, bytes == observedBytes, bytes <= archive.sourceBytes,
+            guard let bytes, bytes <= AtlasSnapshotComparisonLimits.fileBytes,
+                  bytes == observedBytes, bytes <= archive.sourceBytes,
                   let digest, AtlasSnapshotComparisonWire.digest(digest), unavailableReason == nil else {
                 throw AtlasSnapshotComparisonError.invalidResponse
             }
@@ -312,7 +322,7 @@ struct AtlasSnapshotComparisonRow: Identifiable, Sendable, Equatable {
     func member(_ side: AtlasSnapshotComparisonSide) -> AtlasSnapshotComparisonMember? { side == .before ? before : after }
     func canOpen(_ side: AtlasSnapshotComparisonSide) -> Bool {
         guard let member = member(side), member.captured, let bytes = member.bytes else { return false }
-        return bytes <= AtlasReaderLimits.transferBytes
+        return bytes <= AtlasReaderLimits.captureBytes
     }
     fileprivate init(_ wire: AtlasSnapshotComparisonWire, identity: AtlasSnapshotComparisonIdentity) throws {
         id = try wire.number("entry_id")

@@ -60,6 +60,68 @@ but is not a recursively authorized workspace. A directory requires explicit
 `--workspace` on `inspect` or `search`. Selecting stdin, a single file, or a
 metadata diagnostic never silently widens that authority.
 
+## Streaming saved snapshots
+
+`snapshot save` discovers a bounded catalog, captures one member at a time and
+writes the existing FCBS/1 format directly to a new private destination. It
+releases each capture before opening the next source. Finalization hashes the
+output in 64 KiB chunks and checks it against the accepted payload before writing
+the checksum. Neither the complete source collection nor the encoded archive is
+allocated as one buffer.
+
+The compact CLI defaults stay at 4,096 files, 1 MiB per file and 32 MiB total
+source. Larger exports require explicit budgets:
+
+```sh
+fcb snapshot save /path/to/repository --output repository.fcbs --respect-ignores \
+  --max-files 65536 --max-file-bytes 33554432 --max-total-bytes 1073741824 --json
+fcb snapshot inspect repository.fcbs --json
+fcb snapshot read repository.fcbs --member src/large.rs --offset 4194304 --bytes 32768 --json
+fcb snapshot catalog repository.fcbs --output repository.fcbc --json
+```
+
+The file-backed profile admits at most **32 MiB per captured member**, **1 GiB
+total source** and **1 GiB + 16 MiB of archive bytes**. The metadata walk retains
+its own path, queue, depth and page bounds; a larger requested file count does
+not guarantee complete discovery. Failed source reads consume the shared I/O
+allowance too. An oversized, changing, unreadable or over-budget member remains
+an explicit unavailable record; a captured empty file stays distinct. Rule-file
+reads retain their separately reported limits and evidence.
+
+Ordinary and pinned-catalog snapshot opening, offline member reading, comparison,
+Reading Desk saved repositories and direct trail reading use this larger paged
+profile. They never reopen archive member names as live source paths. The Mac
+Saved Repository window offers **Standard** and **Large workspace** capture
+presets; its standard 20,000-file / 1 MiB / 64 MiB preset remains the default.
+Search, structural analysis, index building, diff work and supplemental trail
+pack validation keep their independently bounded operation budgets.
+
+The save receipt retains the existing digest, coverage, rule and filesystem
+effect fields. `payload_residency` is `one-captured-member`;
+`largest_captured_member_bytes` reports the largest successfully captured member,
+while `payload_bytes_read` includes failed reads. `archive_hash_bytes_read`
+separately reports final archive readback. These are work and payload counters,
+not a process-memory measurement.
+
+Destinations are created exclusively with owner-only permissions and are never
+overwritten or automatically removed. Cancellation can leave an empty or partial
+destination. A completed checksum advances the effect to
+`complete-file-sync-unconfirmed` before another cancellation check; successful
+file and parent sync requests advance it to `complete-file-sync-requested`.
+Broken response delivery preserves the known effect. Saved observations are not
+an atomic cross-file filesystem snapshot, and no power-loss qualification is
+claimed.
+
+Library callers select `SnapshotLimits::paged()` with `SnapshotStreamWriter` and
+`PagedSnapshot`. The contiguous `SnapshotBytes` encoder and `SnapshotView`
+retain their compact limits. Regression source covers format equivalence,
+bounded writer admission, a 96 MiB CLI archive with pinned reopening, larger
+members, changed live sources, quotas and cancellation effects. Compilation,
+execution and native qualification remain pending the independent strict-RCH
+lane.
+
+## Reading trail source packs
+
 The CLI also provides bounded saved-archive and reading-trail commands, including
 `trail add`, `inspect`, `read` and `export`. The native Saved Repository window can
 follow the resulting FCBT files; see [reading-trail usage](../../native/macos/README.md#following-saved-reading-trails).

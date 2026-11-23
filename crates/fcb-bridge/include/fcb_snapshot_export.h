@@ -9,7 +9,9 @@ extern "C" {
  * requires current read authority; destination requires a separate user-chosen
  * write grant. Existing destinations are never overwritten or removed.
  * Strings are readable NUL-terminated UTF-8 and stay valid through return.
- * Limits: files 1..65536, per-file bytes 0..1048576, total reads 0..67108864.
+ * Limits: files 1..65536, per-file bytes 0..33554432, total reads 0..1073741824.
+ * The native standard preset stays at 20000 files, 1 MiB/member and 64 MiB source;
+ * larger capture allowances require an explicitly selected request.
  * respect_ignores: 1 bounded .gitignore/.fcbignore rules, 0 default exclusions.
  * Poll runs only on this thread; zero continues, nonzero cancels. It must not
  * block, unwind or reenter. Retain context and BOTH grants until return.

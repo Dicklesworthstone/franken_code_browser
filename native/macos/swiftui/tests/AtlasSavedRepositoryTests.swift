@@ -1218,6 +1218,24 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             identity: info.identity, start: 0, limit: 64)
         precondition(members.items[1].path.bytes == f.rawPath)
         precondition(!members.items[4].captured && members.items[4].observedBytes == 99)
+        var largeArchive = f.info(40)
+        largeArchive["initial_archive_bytes_read"] = "1090519040"
+        let largeInfo = try AtlasSavedInfo.decode(f.encode(largeArchive), handle: 40,
+            expectedPath: Array("/saved/repository.fcbs".utf8), fresh: true)
+        precondition(largeInfo.initialArchiveBytes == 1024 * 1024 * 1024 + 16 * 1024 * 1024)
+        largeArchive["initial_archive_bytes_read"] = "1090519041"
+        rejected("Archive reads above the paged ceiling were accepted") {
+            _ = try AtlasSavedInfo.decode(f.encode(largeArchive), handle: 40,
+                expectedPath: Array("/saved/repository.fcbs".utf8), fresh: true)
+        }
+        var largeMember = f.memberObject(0)
+        largeMember["observed_bytes"] = "33554432"
+        let retainedMember = try JSONDecoder().decode(AtlasSavedMember.self, from: Data(f.encode(largeMember).utf8))
+        precondition(retainedMember.captured && retainedMember.observedBytes == 32 * 1024 * 1024)
+        largeMember["observed_bytes"] = "33554433"
+        rejected("Captured members above the retained reader ceiling were accepted") {
+            _ = try JSONDecoder().decode(AtlasSavedMember.self, from: Data(f.encode(largeMember).utf8))
+        }
         let page = try AtlasSavedRelationships.decode(f.encode(f.relationships(40, generation: 1)),
             identity: info.identity, generation: 1, direction: .all, member: nil, start: 0, limit: 64)
         precondition(!page.complete && !page.truncated && page.unsupported == 1 && page.unavailable == 1)

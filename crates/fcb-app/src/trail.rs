@@ -343,7 +343,7 @@ fn execute(s: &Settings, out: &mut Output, budget: &ResourceBudget, effect: &mut
 
 fn open_archive(path: &Path, budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool) -> Result<PagedSnapshot<File>, Failure> {
     let path = input::absolute(path)?; let (file, _) = input::open_regular(&path)?;
-    PagedSnapshot::open(file, owner(), SnapshotLimits::default(), budget, allocation(201), canceled).map_err(fail)
+    PagedSnapshot::open(file, owner(), SnapshotLimits::paged(), budget, allocation(201), canceled).map_err(fail)
 }
 struct Loaded { bytes: Vec<u8>, _lease: ResourceLease }
 fn load_trail(path: &Path, budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool) -> Result<Loaded, Failure> {

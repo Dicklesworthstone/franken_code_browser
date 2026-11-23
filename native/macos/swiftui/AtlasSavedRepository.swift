@@ -71,7 +71,9 @@ struct AtlasSavedIdentity: Decodable, Sendable, Equatable {
 
 enum AtlasSavedWire {
     static let maximumResponseBytes = 8 * 1024 * 1024
-    static let memberBytes: UInt64 = 1024 * 1024
+    // Mirrors the native SnapshotLimits::paged() admission profile.
+    static let memberBytes: UInt64 = 32 * 1024 * 1024
+    static let archiveBytes: UInt64 = 1024 * 1024 * 1024 + 16 * 1024 * 1024
     static let documentBytes: UInt64 = 256 * 1024
     static let relationshipBytes: UInt64 = 32 * 1024 * 1024
     static let evidencePrecision = "whole-captured-markdown-document"
@@ -155,7 +157,7 @@ struct AtlasSavedInfo: Sendable {
             let actualIdentity = try JSONDecoder().decode(AtlasSavedIdentity.self, from: data)
             let index = try AtlasSavedIndex.current(data, identity: actualIdentity, generation: w.index)
             guard w.path.bytes == expectedPath, w.path.bytes.first == 47,
-                  w.initial.value <= 80 * 1024 * 1024,
+                  w.initial.value <= AtlasSavedWire.archiveBytes,
                   !fresh || (w.relationship == nil && w.query == nil && w.index == nil && w.expression == nil &&
                     w.expressionAttempt == 0 && w.structure == nil && w.structureAttempt == 0 && w.indexAttempt == 0 &&
                     w.indexBuildAttempt == 0 && w.indexBuildOperation == nil &&
