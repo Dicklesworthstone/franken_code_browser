@@ -19,6 +19,9 @@ fn selected(reader: &ReaderSession, range: ByteRange) -> &[u8] {
     &reader.capture().bytes()[range.start().get() as usize..range.end().get() as usize]
 }
 fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() }
+fn count(json: &str, field: &str, expected: u64) {
+    assert!(json.contains(&format!("\"{field}\":\"{expected}\"")), "{field}={expected}: {json}");
+}
 fn fixture() -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!("fcb-reference-{}-{}-{}", std::process::id(),
@@ -279,4 +282,132 @@ fn fork_shares_exact_source_but_does_not_inherit_occurrence_authority() {
     r.clear_references(2, || false).unwrap(); drop(r);
     assert_eq!(selected(&fork, fork.reference_range(1, 2).unwrap()), b"token");
     assert!(fork.copy_reference(1, 2, || false).is_ok());
+}
+
+#[test]
+fn later_counted_windows_keep_utf16_source_and_distinct_local_and_global_ids() {
+    for little in [true, false] {
+        let encode = |text: &str| -> Vec<u8> {
+            text.encode_utf16().flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect()
+        };
+        let source = encode(&format!("\u{feff}😀\r\n{}", "foo\r\n".repeat(5005)));
+        let expected = encode("foo");
+        let path = fixture().join("source.rs"); fs::write(&path, &source).unwrap();
+        let mut r = ReaderSession::open(ArenaOwnerId::new(9514).unwrap(), &path, 1024 * 1024, || false).unwrap();
+        let address = r.capture().bytes().as_ptr();
+        fs::write(&path, b"replacement").unwrap();
+        let first = r.prepare_references_window(1, "foo", 4096, true, 0, || false).unwrap();
+        assert_eq!(first.exit_code(), EXIT_OK);
+        count(first.as_str(), "matches_counted", 5005); count(first.as_str(), "retained_references", 4096);
+        count(first.as_str(), "next_match_offset", 4096); count(first.as_str(), "next_offset", 64);
+        for fragment in ["\"count_all_matches\":true", "\"count_complete\":true", "\"search_complete\":true",
+            "\"output_limited\":true", "\"rows_truncated\":true", "\"has_more_matches\":true"] {
+            assert!(first.as_str().contains(fragment), "{fragment}: {}", first.as_str());
+        }
+        let later = r.prepare_references_window(2, "foo", 128, true, 4096, || false).unwrap();
+        count(later.as_str(), "result_offset", 4096); count(later.as_str(), "skipped_matches", 4096);
+        count(later.as_str(), "retained_references", 128); count(later.as_str(), "next_match_offset", 4224);
+        count(later.as_str(), "reference_id", 1); count(later.as_str(), "occurrence_id", 4097);
+        let second_page = r.reference_page(2, 64, 64, || false).unwrap();
+        count(second_page.as_str(), "reference_id", 65); count(second_page.as_str(), "occurrence_id", 4161);
+        count(second_page.as_str(), "occurrence_id", 4224);
+        assert!(second_page.as_str().contains("\"next_offset\":null"));
+        count(second_page.as_str(), "next_match_offset", 4224);
+        let range = r.reference_range(2, 65).unwrap();
+        assert_eq!((range.start().get(), range.end().get()), (41_610, 41_616));
+        assert_eq!(selected(&r, range), expected);
+        // Global ordinals are display/navigation metadata, never local IDs.
+        assert!(r.reference_range(2, 4161).is_err());
+        let selection = r.reference_window(2, 65, 128, || false).unwrap();
+        assert!(selection.as_str().contains("\"window_utf8_range\":"));
+        count(selection.as_str(), "reference_id", 65); count(selection.as_str(), "reference_line", 4162);
+        count(selection.as_str(), "additional_source_bytes_read", 0);
+        let copied = r.copy_reference(2, 65, || false).unwrap();
+        assert!(copied.as_str().contains(&format!("\"original_hex\":\"{}\"", hex(&expected))));
+        let last = r.prepare_references_window(3, "foo", 5, false, 5000, || false).unwrap();
+        assert_eq!(last.exit_code(), EXIT_OK);
+        count(last.as_str(), "matches_counted", 5005); count(last.as_str(), "retained_references", 5);
+        count(last.as_str(), "occurrence_id", 5005);
+        assert!(last.as_str().contains("\"search_complete\":true"));
+        assert!(last.as_str().contains("\"has_more_matches\":false"));
+        assert!(last.as_str().contains("\"next_match_offset\":null"));
+        assert_eq!(r.reference_range(2, 65).err(), Some(ReaderSessionError::Reference(ReferenceError::StaleQuery)));
+        assert_eq!(r.capture().bytes().as_ptr(), address);
+        assert_eq!(r.capture().bytes(), source);
+        drop(r);
+        assert!(copied.as_str().contains(&hex(&expected)));
+    }
+}
+
+#[test]
+fn window_counting_zero_storage_full_width_offsets_and_lookahead_are_independent() {
+    for (offset, max_items, all, retained, counted, complete, more, next) in [
+        (1, 2, false, 2, 4, false, true, Some(3)),
+        (3, 2, false, 2, 5, true, false, None),
+        (0, 0, true, 0, 5, true, true, None),
+        (2, 0, false, 0, 3, false, true, None),
+        (u64::MAX, 2, false, 0, 5, true, false, None),
+        (u64::MAX, 0, true, 0, 5, true, false, None),
+    ] {
+        let mut r = reader(b"foo foo foo foo foo");
+        let response = r.prepare_references_window(1, "foo", max_items, all, offset, || false).unwrap();
+        let json = response.as_str();
+        assert_eq!(response.exit_code(), if complete { EXIT_OK } else { EXIT_PARTIAL });
+        count(json, "result_offset", offset); count(json, "skipped_matches", offset.min(counted));
+        count(json, "matches_counted", counted); count(json, "retained_references", retained);
+        assert!(json.contains(&format!("\"count_complete\":{complete}")), "{json}");
+        assert!(json.contains(&format!("\"search_complete\":{complete}")), "{json}");
+        assert!(json.contains(&format!("\"has_more_matches\":{more}")), "{json}");
+        assert!(json.contains(&format!("\"output_limited\":{more}")), "{json}");
+        if let Some(next) = next { count(json, "next_match_offset", next); }
+        else { assert!(json.contains("\"next_match_offset\":null")); }
+        if retained == 0 { assert!(r.reference_range(1, 1).is_err()); }
+        let page = r.reference_page(1, retained as usize, 1, || false).unwrap();
+        assert!(page.as_str().contains("\"references\":[]"));
+    }
+    let mut empty = reader(b"");
+    let response = empty.prepare_references_window(1, "foo", 0, true, u64::MAX, || false).unwrap();
+    count(response.as_str(), "matches_counted", 0);
+    assert!(response.as_str().contains("\"rows_truncated\":false"));
+    assert!(response.as_str().contains("\"search_complete\":true"));
+}
+
+#[test]
+fn counted_tail_cancellation_and_refused_window_preserve_accepted_rows_and_source() {
+    let source = format!("old {}", "foo ".repeat(5005));
+    let mut r = reader(source.as_bytes()); prepare(&mut r, 1, "old");
+    let before = r.reference_range(1, 1).unwrap();
+    let mut polls = 0;
+    let result = r.prepare_references_window(2, "foo", 1, true, 0, || { polls += 1; polls == 5 });
+    assert_eq!(result.err(), Some(ReaderSessionError::Reference(ReferenceError::Canceled)));
+    assert_eq!(polls, 5);
+    assert_eq!(r.reference_generation(), Some(1));
+    assert_eq!(r.reference_range(1, 1).unwrap(), before);
+    assert!(r.prepare_references_window(2, "foo", 1, true, 4096, || false).is_err());
+    assert_eq!(r.prepare_references_window(3, "foo", MAX_READER_REFERENCES + 1, true, 4096, || false).err(),
+        Some(ReaderSessionError::Reference(ReferenceError::InvalidLimits)));
+    assert_eq!(r.reference_generation(), Some(1));
+    assert!(r.copy_reference(1, 1, || false).unwrap().as_str().contains("\"original_hex\":\"6f6c64\""));
+    let next = r.prepare_references_window(4, "foo", 2, true, 5000, || false).unwrap();
+    count(next.as_str(), "matches_counted", 5005); count(next.as_str(), "occurrence_id", 5001);
+    assert_eq!(selected(&r, r.reference_range(4, 1).unwrap()), b"foo");
+    assert_eq!(r.capture().bytes(), source.as_bytes());
+    let mut malformed = reader(b"foo foo\xff");
+    assert_eq!(malformed.prepare_references_window(1, "foo", 0, true, u64::MAX, || false).err(),
+        Some(ReaderSessionError::Reference(ReferenceError::UnsupportedEncoding)));
+}
+
+#[test]
+fn switching_back_to_legacy_references_keeps_the_legacy_wire_contract() {
+    let mut r = reader(b"foo foo foo");
+    let window = r.prepare_references_window(1, "foo", 1, true, 1, || false).unwrap();
+    count(window.as_str(), "occurrence_id", 2);
+    let legacy = r.prepare_references(2, "foo", 1, || false).unwrap();
+    count(legacy.as_str(), "matches_counted", 2); count(legacy.as_str(), "reference_id", 1);
+    assert!(legacy.as_str().contains("\"count_complete\":false"));
+    for field in ["result_offset", "count_all_matches", "skipped_matches", "rows_truncated",
+        "has_more_matches", "next_match_offset", "occurrence_id"] {
+        assert!(!legacy.as_str().contains(&format!("\"{field}\":")), "{field}: {}", legacy.as_str());
+    }
+    assert_eq!(r.reference_range(2, 1).unwrap().start().get(), 0);
 }

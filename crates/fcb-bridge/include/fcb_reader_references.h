@@ -42,11 +42,36 @@ extern "C" {
 char *fcb_reader_references(uint64_t handle, uint64_t generation,
     const char *name, uint64_t max_items);
 
+/* Retain a later occurrence window from the SAME immutable reader capture.
+ * All existing source/name/generation/cancellation limits apply. result_offset
+ * is a full-width count of preceding matches, not a byte or local page offset.
+ * count_all_matches is strictly 0 or 1. With 1, scan the complete admitted source
+ * and count every occurrence independently of the 0..4096 retained-row cap.
+ * With 0, count skipped/retained matches plus at most one later lookahead.
+ * No skipped prefix rows are stored, and no live source pathname is opened.
+ *
+ * The normal references response adds result_offset, count_all_matches,
+ * skipped_matches, rows_truncated, has_more_matches and next_match_offset.
+ * count_complete/search_complete can be true while output_limited is true;
+ * output_limited and has_more_matches mean a match follows this retained window.
+ * next_match_offset is result_offset + retained_references when more exist and
+ * at least one row was retained, otherwise null (including zero-row counting).
+ * Each row adds its global one-based occurrence_id. Activation and exact copy
+ * still require the returned window-local reference_id and reference generation.
+ * fcb_reader_reference_page pages this accepted window with its existing local
+ * next_offset; a later match window requires a fresh generation and this call.
+ * The legacy fcb_reader_references response shape and behavior are unchanged.
+ */
+char *fcb_reader_references_window(uint64_t handle, uint64_t generation,
+    const char *name, uint64_t max_items, uint64_t count_all_matches,
+    uint64_t result_offset);
+
 /* Page the accepted inventory; limit is 1..128. start is a zero-based offset
  * and next_offset continues that inventory. reference_id is one-based within
  * the accepted generation and is NOT a row offset or a symbol/search-hit ID.
- * A limited inventory's matches_counted includes at most one unstored lookahead,
- * never an exhaustive total. line values count LF, including CRLF.
+ * Without count_all_matches, a limited inventory's matches_counted includes at
+ * most one unstored lookahead, never an exhaustive total. line values count LF,
+ * including CRLF. Window count metadata and occurrence_id survive paging.
  */
 char *fcb_reader_reference_page(uint64_t handle, uint64_t generation,
     uint64_t start, uint64_t limit);

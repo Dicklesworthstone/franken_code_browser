@@ -24,9 +24,14 @@ pub(super) struct AcceptedReferences {
     rows: Vec<ReferenceCandidate>,
     counted: usize,
     limited: bool,
+    count_complete: bool,
     max_items: usize,
+    window: Option<ReferenceResultWindow>,
     _lease: ResourceLease,
 }
+
+#[derive(Clone, Copy)]
+struct ReferenceResultWindow { result_offset: u64, count_all_matches: bool }
 
 impl ReaderSession {
     pub fn reference_generation(&self) -> Option<u64> {
@@ -43,14 +48,38 @@ impl ReaderSession {
     /// Failures/cancellation consume the attempt but preserve accepted results.
     /// The first page is encoded privately before replacing that inventory.
     pub fn prepare_references(&mut self, generation: u64, name: &str, max_items: usize,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, ReaderSessionError> {
+        self.prepare_references_inner(generation, name, max_items, None, canceled)
+    }
+
+    /// Retain a bounded later window from this SAME immutable source capture.
+    /// result_offset counts whole-token occurrences, never source bytes or local
+    /// row offsets. Skipped matches allocate no rows. Counting can finish while
+    /// later rows remain omitted; a zero cap counts without storing selections.
+    /// Without counting, at most one extra occurrence establishes continuation.
+    ///
+    /// Every window consumes a new reference generation. Activation and copying
+    /// continue to use one-based window-local reference_id; receipt rows also
+    /// carry occurrence_id for their ordinal in the unchanged source/query.
+    /// Failures and cancellation preserve the previously accepted inventory.
+    pub fn prepare_references_window(&mut self, generation: u64, name: &str,
+        max_items: usize, count_all_matches: bool, result_offset: u64,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, ReaderSessionError> {
+        self.prepare_references_inner(generation, name, max_items,
+            Some(ReferenceResultWindow { result_offset, count_all_matches }), canceled)
+    }
+
+    fn prepare_references_inner(&mut self, generation: u64, name: &str, max_items: usize,
+        window: Option<ReferenceResultWindow>,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, ReaderSessionError> {
         self.reference_attempt(generation)?;
         check(&mut canceled)?;
         let [extract_id, rows_id] = self.allocations()?;
         let query = QueryGeneration::new(self.owner(), generation)
             .map_err(|_| ReaderSessionError::IdentityExhausted)?;
-        let extracted = CapturedReferences::build(self.capture.bytes(), *self.capture.request(),
-            query, name, Some(self.encoding), max_items, &self.budget, extract_id, &mut canceled)?;
+        let extracted = CapturedReferences::build_window(self.capture.bytes(), *self.capture.request(),
+            query, name, Some(self.encoding), max_items, window.map_or(0, |window| window.result_offset),
+            window.is_some_and(|window| window.count_all_matches), &self.budget, extract_id, &mut canceled)?;
         let count = extracted.candidates().len();
         let charge = count.checked_mul(size_of::<ReferenceCandidate>())
             .and_then(|n| n.checked_add(size_of::<AcceptedReferences>()))
@@ -70,7 +99,7 @@ impl ReaderSession {
         owned_name.push_str(name);
         let candidate = AcceptedReferences { generation, name: owned_name, rows,
             counted: extracted.total_matches_counted(), limited: extracted.output_limited(),
-            max_items, _lease: lease };
+            count_complete: extracted.is_complete(), max_items, window, _lease: lease };
         drop(extracted);
         check(&mut canceled)?;
         let mut out = self.output("references")?;
@@ -164,7 +193,7 @@ impl ReaderSession {
 }
 
 fn references_exit(references: &AcceptedReferences) -> u8 {
-    if references.limited { EXIT_PARTIAL } else { EXIT_OK }
+    if references.count_complete { EXIT_OK } else { EXIT_PARTIAL }
 }
 
 fn encode_page(out: &mut Output, references: &AcceptedReferences, start: usize, limit: usize,
@@ -175,17 +204,36 @@ fn encode_page(out: &mut Output, references: &AcceptedReferences, start: usize, 
     out.literal(",\"selection_namespace\":\"reference\",\"evidence_level\":\"whole-token-text-candidate\",\"includes_comments_and_literals\":true,\"compiler_resolved\":false,\"semantic_complete\":false,\"name_case\":\"sensitive\",\"line_semantics\":\"LF-counted-source-lines\",\"max_source_bytes\":")?;
     out.integer(MAX_READER_REFERENCE_SOURCE_BYTES as u64)?;
     out.literal(",\"max_items\":")?; out.integer(references.max_items as u64)?;
-    out.literal(",\"search_complete\":")?; out.boolean(!references.limited)?;
-    out.literal(",\"count_complete\":")?; out.boolean(!references.limited)?;
+    out.literal(",\"search_complete\":")?; out.boolean(references.count_complete)?;
+    out.literal(",\"count_complete\":")?; out.boolean(references.count_complete)?;
     out.literal(",\"output_limited\":")?; out.boolean(references.limited)?;
     out.literal(",\"retained_references\":")?; out.integer(references.rows.len() as u64)?;
     out.literal(",\"matches_counted\":")?; out.integer(references.counted as u64)?;
+    if let Some(window) = references.window {
+        out.literal(",\"result_offset\":")?; out.integer(window.result_offset)?;
+        out.literal(",\"count_all_matches\":")?; out.boolean(window.count_all_matches)?;
+        out.literal(",\"skipped_matches\":")?;
+        out.integer((references.counted as u64).min(window.result_offset))?;
+        out.literal(",\"rows_truncated\":")?; out.boolean(references.counted > references.rows.len())?;
+        out.literal(",\"has_more_matches\":")?; out.boolean(references.limited)?;
+        out.literal(",\"next_match_offset\":")?;
+        if references.limited && !references.rows.is_empty() {
+            let next = window.result_offset.checked_add(references.rows.len() as u64)
+                .ok_or(ReaderSessionError::IdentityExhausted)?;
+            out.integer(next)?;
+        } else { out.literal("null")?; }
+    }
     out.literal(",\"references\":[")?;
     let end = start.saturating_add(limit).min(references.rows.len());
     for (index, row) in references.rows[start..end].iter().enumerate() {
         check(canceled)?;
         if index > 0 { out.literal(",")?; }
         out.literal("{\"reference_id\":")?; out.integer(row.id())?;
+        if let Some(window) = references.window {
+            let occurrence = window.result_offset.checked_add(row.id())
+                .ok_or(ReaderSessionError::IdentityExhausted)?;
+            out.literal(",\"occurrence_id\":")?; out.integer(occurrence)?;
+        }
         out.literal(",\"original_range\":")?; out.range(row.original_range())?;
         out.literal(",\"line\":")?; out.integer(row.line())?;
         out.literal("}")?;

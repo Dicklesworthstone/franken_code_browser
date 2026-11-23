@@ -149,3 +149,29 @@ fn fork_uses_same_bytes_but_earns_its_own_reference_authority() {
         .as_str().contains("\"original_hex\":\"666f6f\""));
     readers.close(fork).unwrap();
 }
+
+#[test]
+fn canceling_a_counted_window_after_storage_fills_preserves_the_accepted_generation() {
+    let readers = ReaderSessions::new();
+    let bytes = format!("old {}", "foo ".repeat(5005));
+    let handle = opened(&readers, bytes.as_bytes());
+    references(&readers, handle, 1, "old");
+    let mut polls = 0;
+    let result = readers.execute(handle, Command::ReferencesWindow { generation: 2,
+        name: "foo", max_items: 1, count_all_matches: true, result_offset: 0 }, || {
+        polls += 1;
+        if polls == 5 { readers.cancel(handle).unwrap(); }
+        false
+    });
+    assert!(result.err().unwrap().canceled());
+    assert!(page(&readers, handle, 1).as_str().contains("\"name\":\"old\""));
+    assert!(readers.execute(handle, Command::CopyReference { generation: 1, id: 1 }, || false)
+        .unwrap().as_str().contains("\"original_hex\":\"6f6c64\""));
+    let later = readers.execute(handle, Command::ReferencesWindow { generation: 3,
+        name: "foo", max_items: 2, count_all_matches: true, result_offset: 5000 }, || false).unwrap();
+    assert!(later.as_str().contains("\"matches_counted\":\"5005\""));
+    assert!(later.as_str().contains("\"reference_id\":\"1\",\"occurrence_id\":\"5001\""));
+    assert!(readers.execute(handle, Command::CopyReference { generation: 3, id: 1 }, || false)
+        .unwrap().as_str().contains("\"original_hex\":\"666f6f\""));
+    readers.close(handle).unwrap();
+}

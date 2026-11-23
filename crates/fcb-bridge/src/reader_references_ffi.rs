@@ -21,6 +21,23 @@ pub unsafe extern "C" fn fcb_reader_references(handle: u64, generation: u64,
     }))
 }
 
+/// Retain a later whole-token occurrence window from the immutable capture.
+/// count_all_matches is strictly 0 or 1. result_offset counts occurrences;
+/// local activation IDs remain reference_id, not the added occurrence_id.
+/// # Safety
+/// Same foreign-string lifetime and response-ownership contract as references.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_reader_references_window(handle: u64, generation: u64,
+    name: *const c_char, max_items: u64, count_all_matches: u64, result_offset: u64) -> *mut c_char {
+    reply(|| answer(handle, |readers| {
+        if count_all_matches > 1 { return Err(AccessError::InvalidArgument); }
+        let name = unsafe { cstr(name) }.ok_or(AccessError::InvalidArgument)?;
+        readers.execute(handle, Command::ReferencesWindow { generation, name,
+            max_items: number(max_items)?, count_all_matches: count_all_matches == 1,
+            result_offset }, || false)
+    }))
+}
+
 /// Page already-retained occurrences without rescanning or source I/O. start is
 /// a zero-based page offset; activate the returned one-based reference_id.
 #[unsafe(no_mangle)]

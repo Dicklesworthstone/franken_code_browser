@@ -114,14 +114,86 @@ fn c_limited_and_zero_cap_results_do_not_claim_exhaustive_counts() {
 }
 
 #[test]
+fn c_later_occurrence_windows_count_beyond_the_cap_and_activate_original_utf16() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let name = CString::new("foo").unwrap();
+    for little in [true, false] {
+        let text = format!("\u{feff}😀\r\n{}", "foo\r\n".repeat(5005));
+        let bytes: Vec<_> = text.encode_utf16()
+            .flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect();
+        let (path, handle) = source(&bytes);
+        fs::write(path, b"replacement").unwrap();
+        let inventory = take(unsafe { fcb_reader_references_window(handle, 1, name.as_ptr(), 2, 1, 4500) });
+        for fragment in ["\"matches_counted\":\"5005\"", "\"retained_references\":\"2\"",
+            "\"result_offset\":\"4500\"", "\"skipped_matches\":\"4500\"", "\"reference_id\":\"1\"",
+            "\"occurrence_id\":\"4501\"", "\"next_match_offset\":\"4502\"", "\"count_all_matches\":true",
+            "\"count_complete\":true", "\"search_complete\":true", "\"output_limited\":true",
+            "\"has_more_matches\":true", "\"additional_source_bytes_read\":\"0\"",
+            "\"original_range\":{\"start\":\"45010\",\"end\":\"45016\"}"] {
+            assert!(inventory.contains(fragment), "{fragment}: {inventory}");
+        }
+        let page = take(fcb_reader_reference_page(handle, 1, 1, 1));
+        assert!(page.contains("\"reference_id\":\"2\""));
+        assert!(page.contains("\"occurrence_id\":\"4502\""));
+        assert!(page.contains("\"next_offset\":null"));
+        assert!(take(fcb_reader_reference(handle, 1, 4501, 0)).contains("REFERENCE_NOT_FOUND"));
+        let window = take(fcb_reader_reference(handle, 1, 1, 128));
+        assert!(window.contains("\"reference_line\":\"4502\""));
+        assert!(window.contains("\"window_utf8_range\":"));
+        let copy = fcb_reader_copy_reference(handle, 1, 2);
+        let last = take(unsafe { fcb_reader_references_window(handle, 2, name.as_ptr(), 2, 0, 5003) });
+        assert!(last.contains("\"occurrence_id\":\"5005\""));
+        assert!(last.contains("\"count_complete\":true"));
+        assert!(last.contains("\"has_more_matches\":false"));
+        assert!(last.contains("\"next_match_offset\":null"));
+        assert!(take(fcb_reader_reference(handle, 1, 1, 0)).contains("REFERENCE_STALE_QUERY"));
+        assert_eq!(fcb_reader_close(handle), 1);
+        let expected = if little { "66006f006f00" } else { "0066006f006f" };
+        assert!(take(copy).contains(expected));
+    }
+}
+
+#[test]
+fn c_window_flags_refusals_full_width_offsets_and_zero_storage_keep_exact_contracts() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let (_, handle) = source(b"foo foo foo foo foo"); let name = CString::new("foo").unwrap();
+    take(unsafe { fcb_reader_references_window(handle, 1, name.as_ptr(), 2, 1, 0) });
+    assert!(take(unsafe { fcb_reader_references_window(handle, 2, name.as_ptr(), 2, 2, 2) })
+        .contains("INVALID_ARGUMENT"));
+    assert!(take(unsafe { fcb_reader_references_window(handle, 2, std::ptr::null(), 2, 1, 2) })
+        .contains("INVALID_ARGUMENT"));
+    assert!(take(unsafe { fcb_reader_references_window(handle, 2, name.as_ptr(), 4097, 1, 2) })
+        .contains("REFERENCE_INVALID_LIMITS"));
+    assert!(take(fcb_reader_info(handle)).contains("\"accepted_reference_generation\":\"1\""));
+    assert!(take(fcb_reader_reference_page(handle, 1, 0, 128)).contains("\"occurrence_id\":\"1\""));
+    let beyond = take(unsafe { fcb_reader_references_window(handle, 3, name.as_ptr(), 2, 0, u64::MAX) });
+    for fragment in ["\"result_offset\":\"18446744073709551615\"", "\"skipped_matches\":\"5\"",
+        "\"matches_counted\":\"5\"", "\"references\":[]", "\"search_complete\":true",
+        "\"has_more_matches\":false", "\"next_match_offset\":null"] {
+        assert!(beyond.contains(fragment), "{fragment}: {beyond}");
+    }
+    let counted = take(unsafe { fcb_reader_references_window(handle, 4, name.as_ptr(), 0, 1, 0) });
+    for fragment in ["\"matches_counted\":\"5\"", "\"retained_references\":\"0\"",
+        "\"search_complete\":true", "\"has_more_matches\":true", "\"next_match_offset\":null"] {
+        assert!(counted.contains(fragment), "{fragment}: {counted}");
+    }
+    let legacy = take(unsafe { fcb_reader_references(handle, 5, name.as_ptr(), 2) });
+    assert!(!legacy.contains("\"result_offset\":")); assert!(!legacy.contains("\"occurrence_id\":"));
+    assert!(legacy.contains("\"matches_counted\":\"3\""));
+    assert!(legacy.contains("\"count_complete\":false"));
+    assert_eq!(fcb_reader_close(handle), 1);
+}
+
+#[test]
 fn c_reference_types_and_public_header_declarations_agree() {
     let _: unsafe extern "C" fn(u64, u64, *const c_char, u64) -> *mut c_char = fcb_reader_references;
+    let _: unsafe extern "C" fn(u64, u64, *const c_char, u64, u64, u64) -> *mut c_char = fcb_reader_references_window;
     let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_reader_reference_page;
     let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_reader_reference;
     let _: extern "C" fn(u64, u64, u64) -> *mut c_char = fcb_reader_copy_reference;
     let _: extern "C" fn(u64, u64) -> *mut c_char = fcb_reader_references_clear;
     let header = include_str!("../include/fcb_reader_references.h");
-    for name in ["fcb_reader_references(", "fcb_reader_reference_page(", "fcb_reader_reference(",
+    for name in ["fcb_reader_references(", "fcb_reader_references_window(", "fcb_reader_reference_page(", "fcb_reader_reference(",
         "fcb_reader_copy_reference(", "fcb_reader_references_clear("] {
         assert_eq!(header.matches(name).count(), 1, "{name}");
     }
