@@ -132,6 +132,7 @@ fn a_full_last_window_and_a_count_only_window_do_not_claim_later_results() {
         let counted = literal(route, &entries, true, "ana", true, 2, 0, true, 100_000);
         assert!(counted.hits().is_empty()); assert_eq!(counted.matches_seen(), 4);
         assert_eq!(counted.skipped_matches(), 2); assert!(counted.has_more_matches());
+        assert_eq!(counted.next_match_offset(), None, "count-only output cannot advance past its offset");
         assert!(counted.is_complete());
         let beyond = literal(route, &entries, true, "ana", true, (1u64 << 53) + 7, 2, false, 100_000);
         assert_eq!(beyond.matches_seen(), 4); assert_eq!(beyond.skipped_matches(), 4);
@@ -278,11 +279,35 @@ fn expression_zero_row_windows_probe_after_the_offset_and_can_count_the_tail() {
         let probe = expression(&entries, "ana required", 2, 0, false, 100_000, indexed);
         assert!(probe.hits().is_empty()); assert_eq!(probe.skipped_matches(), 2);
         assert_eq!(probe.matches_seen(), 3); assert!(probe.has_more_matches());
+        assert_eq!(probe.next_match_offset(), None, "an existence probe retains no advancing rows");
         assert!(!probe.is_complete());
         let counted = expression(&entries, "ana required", 2, 0, true, 100_000, indexed);
         assert!(counted.hits().is_empty()); assert_eq!(counted.skipped_matches(), 2);
         assert_eq!(counted.matches_seen(), 4); assert!(counted.has_more_matches());
+        assert_eq!(counted.next_match_offset(), None, "a complete count still retains no advancing rows");
         assert!(counted.is_complete());
+    }
+}
+
+#[test]
+fn zero_row_saved_windows_never_offer_a_nonprogressing_continuation() {
+    let entries = [entry(b"a.rs", b"banana required"), entry(b"b.rs", b"banana required")];
+    for skip in [0, 2, 4, u64::MAX] {
+        for route in ROUTES {
+            let report = literal(route, &entries, true, "ana", true, skip, 0, true, 100_000);
+            assert!(report.hits().is_empty()); assert!(report.is_complete());
+            assert_eq!(report.matches_seen(), 4); assert_eq!(report.skipped_matches(), skip.min(4));
+            assert_eq!(report.has_more_matches(), skip < 4);
+            assert_eq!(report.next_match_offset(), None, "{route:?}, skip={skip}");
+        }
+        for indexed in [false, true] { for counted in [false, true] {
+            let report = expression(&entries, "ana required", skip, 0, counted, 100_000, indexed);
+            assert!(report.hits().is_empty());
+            assert_eq!(report.skipped_matches(), skip.min(4));
+            assert_eq!(report.has_more_matches(), skip < 4);
+            assert_eq!(report.next_match_offset(), None, "indexed={indexed}, counted={counted}, skip={skip}");
+            assert_eq!(report.is_complete(), counted || skip >= 4);
+        } }
     }
 }
 

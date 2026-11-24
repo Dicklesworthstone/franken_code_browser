@@ -461,11 +461,19 @@ impl PagedReport {
     /// when a window begins beyond the available or fully verified input.
     pub const fn skip_matches(&self) -> u64 { self.skip_matches }
     pub fn skipped_matches(&self) -> u64 { self.skip_matches.min(self.matches_seen) }
+    /// At least one verified match after this window was omitted. Count-only
+    /// queries can know this without retaining any navigable result rows.
+    /// False does not establish complete coverage; consult `is_complete`.
     pub fn has_more_matches(&self) -> bool {
         self.matches_seen.saturating_sub(self.skipped_matches()) > self.hits.len() as u64
     }
+    /// Continue only after retaining rows that advance the requested offset.
+    /// A zero-row count/probe may report omitted matches, but repeating it at
+    /// the same offset is not a continuation; request a positive row limit.
     pub fn next_match_offset(&self) -> Option<u64> {
-        self.has_more_matches().then(|| self.skipped_matches() + self.hits.len() as u64)
+        if !self.has_more_matches() || self.hits.is_empty() { return None; }
+        self.skipped_matches().checked_add(self.hits.len() as u64)
+            .filter(|next| *next > self.skip_matches)
     }
     pub const fn unavailable_files(&self) -> usize { self.unavailable }
     pub const fn truncated(&self) -> bool { self.truncated }

@@ -27,9 +27,12 @@ fn rows(page: &Json) -> Vec<(u64, u64, u64)> {
         hit.get("original_range").get("end").number())).collect()
 }
 fn window(page: &Json, offset: u64, skipped: u64, next: Option<u64>) {
+    window_with_evidence(page, offset, skipped, next.is_some(), next);
+}
+fn window_with_evidence(page: &Json, offset: u64, skipped: u64, has_more: bool, next: Option<u64>) {
     assert_eq!(page.get("result_offset").number(), offset);
     assert_eq!(page.get("skipped_matches").number(), skipped);
-    assert_eq!(page.get("has_more_matches").flag(), next.is_some());
+    assert_eq!(page.get("has_more_matches").flag(), has_more);
     match next {
         Some(next) => assert_eq!(page.get("next_match_offset").number(), next),
         None => assert_eq!(page.get("next_match_offset"), &Json::Null),
@@ -132,8 +135,35 @@ fn missing_and_malformed_members_do_not_consume_offsets_or_turn_partial_counts_e
     assert_eq!(page.get("unsupported_files").number(), 1); assert_eq!(page.get("unavailable_files").number(), 1);
     assert!(!page.get("search_complete").flag()); assert!(!page.get("matches_seen_exact").flag());
     let only = json(&session.search_matching_page(2, "ana", 0, true, true, 1, || false).unwrap());
-    window(&only, 1, 1, Some(1)); assert_eq!(only.get("matches_seen").number(), 2);
+    window_with_evidence(&only, 1, 1, true, None); assert_eq!(only.get("matches_seen").number(), 2);
     assert!(only.get("hits").array().is_empty()); assert!(!only.get("matches_seen_exact").flag());
+}
+
+#[test]
+fn count_only_saved_queries_report_omitted_matches_without_a_continuation() {
+    let f = Fixture::new(&[entry(b"a.rs", b"banana required"), entry(b"b.rs", b"banana required")], true);
+    let mut session = f.open(88925);
+    let literal = session.search_matching_page(1, "ana", 0, true, true, 1, || false).unwrap();
+    assert_eq!(literal.exit_code(), EXIT_OK);
+    let literal = json(&literal);
+    window_with_evidence(&literal, 1, 1, true, None);
+    assert!(literal.get("hits").array().is_empty());
+    assert!(literal.get("matches_seen_exact").flag());
+    assert_eq!(literal.get("matches_seen").number(), 4);
+    let expression = session.expression_search_matching_page(2, "ana required", 0,
+        100_000, true, true, 1, || false).unwrap();
+    assert_eq!(expression.exit_code(), EXIT_OK);
+    let expression = json(&expression);
+    window_with_evidence(&expression, 1, 1, true, None);
+    assert!(expression.get("hits").array().is_empty());
+    assert!(expression.get("matches_seen_exact").flag());
+    assert_eq!(expression.get("matches_seen").number(), 4);
+    // A positive limit explicitly turns the same count offset into a readable
+    // result window; no zero-row cursor is fed back into an endless loop.
+    let retained = json(&session.expression_search_matching_page(3, "ana required", 2,
+        100_000, true, true, 1, || false).unwrap());
+    window(&retained, 1, 1, Some(3));
+    assert_eq!(rows(&retained), [(0, 3, 6), (1, 1, 4)]);
 }
 
 #[test]

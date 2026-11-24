@@ -391,11 +391,19 @@ impl ExpressionReport {
     pub const fn matches_seen(&self) -> u64 { self.seen }
     pub const fn skip_matches(&self) -> u64 { self.skip_matches }
     pub fn skipped_matches(&self) -> u64 { self.skip_matches.min(self.seen) }
+    /// Qualified occurrences after this window were omitted. This is count
+    /// evidence, independent of whether any rows can advance a continuation.
+    /// False leaves later matches unknown when input coverage is incomplete.
     pub fn has_more_matches(&self) -> bool {
         self.seen.saturating_sub(self.skipped_matches()) > self.hits.len() as u64
     }
+    /// A continuation must retain rows and move beyond the requested offset.
+    /// Count-only and zero-row existence probes never advertise an unchanged
+    /// offset, even when they establish that omitted matches exist.
     pub fn next_match_offset(&self) -> Option<u64> {
-        self.has_more_matches().then(|| self.skipped_matches() + self.hits.len() as u64)
+        if !self.has_more_matches() || self.hits.is_empty() { return None; }
+        self.skipped_matches().checked_add(self.hits.len() as u64)
+            .filter(|next| *next > self.skip_matches)
     }
     pub const fn case_sensitive(&self) -> bool { self.case_sensitive }
     pub const fn realized_mode(&self) -> &'static str { realized_mode(self.case_sensitive) }
