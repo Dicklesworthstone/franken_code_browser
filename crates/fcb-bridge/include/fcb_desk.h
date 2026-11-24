@@ -113,6 +113,19 @@ char *fcb_desk_window(uint64_t handle, uint64_t expected, uint64_t pane,
  * original range. Repeated source identities reuse the receiving capture. */
 char *fcb_desk_import_reader(uint64_t handle, uint64_t expected, uint64_t attempt,
     uint64_t reader, uint64_t start, uint64_t end);
+/* Keep [start,end) from a retained fcb_reader as a saved passage. Nonempty,
+ * <=256 KiB selection; UTF-8/UTF-16 scalar and CRLF boundaries must be exact.
+ * Retains only the selection plus <=8 context bytes per side, with original
+ * owner/file/source_revision, raw path, encoding and capture length. Supports
+ * the reader's full 32 MiB capture limit without a whole-capture desk import.
+ * Evidence is an observed-extent with consistency host-supplied-sequence:
+ * immutable captured bytes, no new live observation or whole-file desk claim.
+ * Notes, recovery checkpoints and source-pack export use existing passage APIs.
+ * Both handles must remain alive through return. Reconcile a canceled/lost
+ * mutation reply through desk state before another action; never replay it.
+ * Free every non-null response with fcb_free_string. */
+char *fcb_desk_import_reader_passage(uint64_t handle, uint64_t expected, uint64_t attempt,
+    uint64_t reader, uint64_t start, uint64_t end);
 /* Open a retained pane in an ALREADY CREATED EMPTY fcb_reader destination.
  * Copies <=4 MiB of exact original bytes under independent reader admission.
  * No path lookup, disk refresh, source grant or desk mutation is involved.

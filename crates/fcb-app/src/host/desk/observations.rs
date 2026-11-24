@@ -12,6 +12,31 @@ use crate::EXIT_OK;
 use crate::host::observed_reader::ObservedReaderSession;
 
 impl DeskSession {
+    /// Keep a bounded passage from a complete retained reader. The source's
+    /// original owner/file/revision, path bytes and encoding remain evidence;
+    /// the desk stores only the selected bytes and decoder context, never an
+    /// invented complete file. Existing notes, checkpoints and exports apply.
+    pub fn import_reader_passage(&mut self, expected: u64, attempt: u64,
+        passage: &crate::host::reader::ReaderRetainedPassage<'_>, mut canceled: impl FnMut() -> bool)
+        -> Result<DeskObservationChange, DeskSessionError> {
+        self.validate_mutation(expected, attempt)?;
+        check(&mut canceled)?;
+        let allocation = self.next_id()?;
+        let first_source_identity = self.claim_source_identity()?;
+        #[cfg(unix)] {
+            use std::os::unix::ffi::OsStrExt;
+            let changed = self.desk.import_observation(expected, attempt, &passage.extent,
+                passage.path.as_os_str().as_bytes(), passage.encoding, passage.selection,
+                first_source_identity, allocation, canceled)?;
+            self.next_source = self.next_source.max(changed.next_source_identity);
+            Ok(changed)
+        }
+        #[cfg(not(unix))] {
+            let _ = (allocation, first_source_identity, passage);
+            Err(crate::AppError::UnsupportedPlatform.into())
+        }
+    }
+
     /// Import the exact selection admitted by a retained observed reader. The
     /// provider owns the path, encoding and immutable bytes; a display string or
     /// a pathname cannot substitute for that authority. No source I/O occurs.

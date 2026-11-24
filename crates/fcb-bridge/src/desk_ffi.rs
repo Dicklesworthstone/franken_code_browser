@@ -119,6 +119,20 @@ pub extern "C" fn fcb_desk_import_reader(handle: u64, expected: u64, attempt: u6
         desks.import_reader(handle, readers, reader, expected, attempt, start, end, || false)
     }))
 }
+/// Keep <=256 KiB of selected original bytes from an immutable retained reader,
+/// including readers larger than the desk's 4 MiB whole-capture import limit.
+/// Saves a bounded host-supplied excerpt with original offsets and evidence;
+/// does not reopen a path or claim that the desk retained the complete file.
+/// Both handles remain alive through return. Reconcile lost mutation replies
+/// through desk state; cancellation after publication is not a rollback.
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_desk_import_reader_passage(handle: u64, expected: u64, attempt: u64,
+    reader: u64, start: u64, end: u64) -> *mut c_char {
+    reply(|| answer(handle, |desks| {
+        let readers = super::reader_ffi::registry().ok_or(AccessError::InvalidArgument)?;
+        desks.import_reader_passage(handle, readers, reader, expected, attempt, start, end, || false)
+    }))
+}
 /// Keep a verified selection from one retained bounded observation. Both opaque
 /// handles must remain alive through return; no source path or text is supplied.
 /// Canceled/lost mutation replies require state reconciliation before retry.

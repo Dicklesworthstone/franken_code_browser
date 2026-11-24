@@ -216,6 +216,14 @@ impl ReaderSessions {
     /// try_lock returns Busy for competing work rather than nesting waits.
     pub(super) fn with_document_images<T, E: From<AccessError>>(&self, handle: u64,
         work: impl FnOnce(&mut ReaderSession, &mut dyn FnMut() -> bool) -> Result<T, E>,
+        canceled: impl FnMut() -> bool) -> Result<T, E> {
+        self.with_retained_mut(handle, work, canceled)
+    }
+    /// Borrow retained state for a bounded cross-service operation that needs
+    /// fresh accounting identities. No source handle or mutable borrow escapes;
+    /// close/cancel still revokes delivery after an already committed effect.
+    pub(super) fn with_retained_mut<T, E: From<AccessError>>(&self, handle: u64,
+        work: impl FnOnce(&mut ReaderSession, &mut dyn FnMut() -> bool) -> Result<T, E>,
         mut canceled: impl FnMut() -> bool) -> Result<T, E> {
         let cell = self.get(handle)?;
         let epoch = cell.epoch.load(Ordering::Acquire);

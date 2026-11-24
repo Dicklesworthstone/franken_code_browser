@@ -276,6 +276,22 @@ impl DeskSessions {
             }, &mut *desk_stop)
         })
     }
+    /// Save only a bounded selection from a complete immutable reader. The
+    /// reader admits its excerpt before copying; both handle epochs cover
+    /// preparation, publication and response delivery. No source path is read.
+    pub(super) fn import_reader_passage(&self, handle: u64, readers: &ReaderSessions, reader: u64,
+        expected: u64, attempt: u64, start: u64, end: u64, canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, AccessError> {
+        let selected = range(start, end)?;
+        self.with_session(handle, canceled, |desk, desk_stop| {
+            readers.with_retained_mut(reader, |source, source_stop| {
+                let passage = source.retained_passage(selected, &mut *source_stop)
+                    .map_err(reader_sessions::AccessError::from)?;
+                desk.import_reader_passage(expected, attempt, &passage, &mut *source_stop)?;
+                Ok(desk.state(&mut *source_stop)?)
+            }, &mut *desk_stop)
+        })
+    }
     /// Retain selected observed bytes without treating an extent as a complete
     /// capture. The source handle supplies provenance, decoder and exact data;
     /// no caller-provided display text or pathname authorizes this transfer.

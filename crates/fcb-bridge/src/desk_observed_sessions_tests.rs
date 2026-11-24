@@ -138,3 +138,63 @@ fn committed_stream_excerpt_with_lost_reply_reconciles_once_and_never_replays_th
     assert!(desks.import_catalog_stream_excerpt(desk, &streams, stream, 1, 1, 7, revision, 0, || false).is_err());
     assert_eq!(desks.execute(desk, Command::State, || false).unwrap().as_str(), accepted.as_str());
 }
+
+fn populated_retained() -> (DeskSessions, u64, ReaderSessions, u64) {
+    let desks = DeskSessions::new(); let desk = desks.create().unwrap();
+    desks.start(desk, || false).unwrap();
+    let readers = ReaderSessions::new(); let reader = readers.create().unwrap();
+    readers.initialize_prepared(reader, |owner, stop| {
+        let mut source = fcb_app::host::reader::ReaderSession::from_bytes(owner,
+            std::path::Path::new("unopened-retained-source"), b"exact retained evidence", &mut *stop)?;
+        let reply = source.info(&mut *stop)?;
+        Ok::<_, reader_sessions::AccessError>((source, reply))
+    }, || false).unwrap();
+    (desks, desk, readers, reader)
+}
+
+#[test]
+fn retained_passage_transfer_observes_both_cancel_epochs_without_mutating_the_desk() {
+    for cancel_reader in [true, false] {
+        let (desks, desk, readers, reader) = populated_retained();
+        let mut polls = 0;
+        let rejected = desks.import_reader_passage(desk, &readers, reader, 0, 1, 0, 5, || {
+            polls += 1;
+            if polls == 2 {
+                if cancel_reader { readers.cancel(reader).unwrap(); } else { desks.cancel(desk).unwrap(); }
+            }
+            false
+        });
+        assert!(rejected.is_err_and(AccessError::canceled));
+        let unchanged = desks.execute(desk, Command::State, || false).unwrap();
+        assert_eq!(field(unchanged.as_str(), "model_revision"), 0);
+        assert!(unchanged.as_str().contains("\"observed_passages\":[]"));
+        let accepted = desks.import_reader_passage(desk, &readers, reader, 0, 2, 0, 5, || false).unwrap();
+        assert!(accepted.as_str().contains("\"consistency\":\"host-supplied-sequence\""));
+        let passage = field(accepted.as_str(), "passage"); readers.close(reader).unwrap();
+        let read = desks.execute(desk, Command::ObservedPassage { expected: 2, passage }, || false).unwrap();
+        assert!(read.as_str().contains("\"text\":\"exact\""));
+        assert!(read.as_str().contains("\"additional_source_bytes_read\":\"0\""));
+    }
+}
+
+#[test]
+fn retained_passage_commit_survives_lost_delivery_and_is_reconciled_without_replay() {
+    let (desks, desk, readers, reader) = populated_retained();
+    let lost = desks.with_session(desk, || false, |session, desk_stop| {
+        readers.with_retained_mut(reader, |source, source_stop| {
+            let excerpt = source.retained_passage(range(0, 5)?, &mut *source_stop)
+                .map_err(reader_sessions::AccessError::from)?;
+            session.import_reader_passage(0, 1, &excerpt, &mut *source_stop)?;
+            readers.cancel(reader)?;
+            Ok(session.state(|| false)?)
+        }, &mut *desk_stop)
+    });
+    assert!(lost.is_err_and(AccessError::canceled));
+    let accepted = desks.execute(desk, Command::State, || false).unwrap();
+    assert_eq!(field(accepted.as_str(), "model_revision"), 1);
+    assert_eq!(field(accepted.as_str(), "last_attempt"), 1);
+    assert_eq!(accepted.as_str().matches("\"passage\":").count(), 1);
+    assert!(desks.import_reader_passage(desk, &readers, reader, 1, 1, 0, 5, || false).is_err());
+    assert!(desks.import_reader_passage(desk, &readers, desk, 1, 2, 0, 5, || false).is_err());
+    assert_eq!(desks.execute(desk, Command::State, || false).unwrap().as_str(), accepted.as_str());
+}

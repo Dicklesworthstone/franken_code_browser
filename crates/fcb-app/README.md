@@ -1533,6 +1533,21 @@ retains that observation's bounded bytes and decoder context. Neither this
 transfer nor a later read reopens the source pathname. The public C equivalents
 are in [`fcb_desk.h`](../fcb-bridge/include/fcb_desk.h).
 
+For an immutable `ReaderSession`, `retained_passage` prepares at most 256 KiB of
+selected original bytes plus eight decoder-context bytes per side, under the
+reader's managed admission. `DeskSession::import_reader_passage` keeps that
+excerpt without copying the whole capture; the C adapter is
+`fcb_desk_import_reader_passage`. This supports selected passages from the
+reader's full 32 MiB capture allowance while complete Desk panes still retain
+their independent 4 MiB limit. UTF-8/UTF-16 selections must preserve exact
+scalar and CRLF boundaries. The saved evidence keeps the original capture's
+owner/file/revision, raw path, encoding, byte offsets and captured length.
+It is labeled `observed-extent` / `host-supplied-sequence`: an immutable excerpt
+from retained bytes, with no new live observation or whole-file Desk claim.
+Source closure and later filesystem changes do not affect notes, recovery, or
+source-pack export. A lost mutation reply requires a state read, never an
+automatic second import.
+
 State exposes separate `observations` and `observed_passages` arrays. These
 records preserve absolute 64-bit offsets, reversible path bytes, original
 observation provenance, explicit encoding, before/after observed lengths,

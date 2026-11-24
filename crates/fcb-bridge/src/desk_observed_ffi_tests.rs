@@ -130,3 +130,41 @@ fn c_stream_excerpt_import_preserves_both_query_families_and_rejects_cross_famil
         assert!(!read.contains("replacement source"));
     }
 }
+
+#[test]
+fn c_retained_passage_keeps_large_capture_offsets_after_reader_close_and_live_replacement() {
+    use crate::reader_ffi;
+    let _guard = reader_ffi::FFI_TEST_LOCK.lock().unwrap();
+    let desk = fcb_desk_create(); assert_ne!(desk, 0); ok(fcb_desk_start(desk));
+    let reader = reader_ffi::fcb_reader_create(); assert_ne!(reader, 0);
+    let root = std::env::temp_dir().join(format!("fcb-desk-retained-passage-abi-{}-{reader}", std::process::id()));
+    fs::create_dir(&root).unwrap(); let path = root.join("source.rs");
+    let start = 5 * 1024 * 1024;
+    let mut bytes = vec![b'x'; start]; bytes.extend_from_slice(b"exact retained evidence");
+    fs::write(&path, &bytes).unwrap();
+    let cpath = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    ok(unsafe { reader_ffi::fcb_reader_open(reader, cpath.as_ptr(), 32 * 1024 * 1024) });
+    fs::write(&path, b"changed live source").unwrap();
+    for (source, from, to) in [(desk, start as u64, start as u64 + 5),
+        (reader, 0, 256 * 1024 + 1), (reader, 2, 2), (reader, 0, u64::MAX)] {
+        assert!(consume(fcb_desk_import_reader_passage(desk, 0, 1, source, from, to))
+            .contains("\"status\":\"error\""));
+    }
+    assert!(ok(fcb_desk_state(desk)).contains("\"observed_passages\":[]"));
+    let kept = ok(fcb_desk_import_reader_passage(desk, 0, 1, reader, start as u64, start as u64 + 5));
+    assert_eq!(field(&kept, "retained_source_bytes"), 21);
+    assert_eq!(field(&kept, "origin_owner"), reader);
+    let passage = field(&kept, "passage");
+    assert_eq!(reader_ffi::fcb_reader_close(reader), 1);
+    let pending = fcb_desk_observed_passage(desk, 1, passage);
+    assert_eq!(fcb_desk_close(desk), 1);
+    let read = ok(pending);
+    assert!(read.contains("\"text\":\"exact\""));
+    assert!(read.contains("\"original_hex\":\"6578616374\""));
+    assert!(read.contains("\"consistency\":\"host-supplied-sequence\""));
+    assert_eq!(field(&read, "observed_length"), bytes.len() as u64);
+    assert!(read.contains(&format!("\"selection\":{{\"start\":\"{start}\",\"end\":\"{}\"}}", start + 5)));
+    assert!(read.contains("\"additional_source_bytes_read\":\"0\""));
+    assert!(read.contains("\"source_reopened\":false"));
+    assert!(read.contains("\"whole_file_immutable\":false"));
+}

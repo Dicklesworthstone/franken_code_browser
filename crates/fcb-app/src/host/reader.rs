@@ -20,6 +20,7 @@ mod position;
 mod selection;
 mod delimiter;
 mod export;
+mod passage;
 mod search;
 pub(crate) mod document;
 mod document_display;
@@ -39,6 +40,7 @@ pub use document_images::{DocumentImageError, MAX_DOCUMENT_IMAGE_BYTES,
 pub use comparison::ReaderComparisonLimits;
 pub use position::ReaderColumnKind;
 pub use selection::MAX_READER_SELECTION_WINDOW_BYTES;
+pub use passage::ReaderRetainedPassage;
 pub use search::ReaderFindOptions;
 use outline::{AcceptedOutline, SelectionIdentity};
 use references::AcceptedReferences;
