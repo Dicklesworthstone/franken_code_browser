@@ -66,17 +66,7 @@ impl<'text> Tokens<'text> {
             checkpoint(canceled)?;
             let Some(word) = text.get(span.start..span.end) else { return Err(SymbolError::InvalidEvidence); };
             if span.start != previous || span.start >= span.end { return Err(SymbolError::InvalidEvidence); }
-            // The pinned batch lexer clamps nested block-comment depth at 64.
-            // Refuse a comment that can reach that clamp before discarding it;
-            // otherwise apparent later tokens could still be inside a comment.
-            // This inspects an upstream-classified comment, not source lexing.
-            if span.kind == Tok::Comment && word.starts_with("/*") && word.match_indices("/*").count() >= 64 {
-                return Err(SymbolError::UnsupportedLexicalContext);
-            }
-            // Raw C-string boundaries are not supported by this pinned Rust
-            // lexer. An embedded quote could otherwise expose apparent items.
-            if !matches!(span.kind, Tok::Comment | Tok::Str) && word == "cr"
-                && text.as_bytes().get(span.end).is_some_and(|&byte| matches!(byte, b'#' | b'"')) {
+            if !crate::imports::qualified_rust_span(span.kind, word, text.as_bytes().get(span.end).copied()) {
                 return Err(SymbolError::UnsupportedLexicalContext);
             }
             previous = span.end;

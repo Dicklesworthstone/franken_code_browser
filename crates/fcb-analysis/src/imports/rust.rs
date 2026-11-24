@@ -25,9 +25,27 @@ impl Statements<'_> {
                 && self.word(i + 2) == "[" && matches!(self.word(i + 3), "cfg" | "cfg_attr");
         }
         let mut depth = 0usize;
+        let mut include_data_end = 0usize;
         let mut i = 0;
         while i < self.tokens.len() {
             check(canceled)?;
+            if i >= include_data_end {
+                // Another macro's token tree may be arbitrary data, or a
+                // macro_rules! template, rather than an expression at this
+                // location. Leave the existing mod/use traversal untouched.
+                if let Some(end) = self.rust_file_include(i)? {
+                    i = end;
+                    continue;
+                }
+                if self.word(i) == "!" && i > 0 && identifier(self.word(i - 1)) {
+                    let group = if self.word(i - 1) == "macro_rules" && identifier(self.word(i + 1)) {
+                        i + 2
+                    } else { i + 1 };
+                    if matches!(self.word(group), "(" | "[" | "{") {
+                        include_data_end = self.rust_token_tree_end(group, canceled)?;
+                    }
+                }
+            }
             if self.keyword(i, "mod") && !self.rust_raw_tail(i) {
                 let raw = self.word(i + 1) == "r" && self.word(i + 2) == "#" && identifier(self.word(i + 3))
                     && self.tokens[i + 1].end == self.tokens[i + 2].start

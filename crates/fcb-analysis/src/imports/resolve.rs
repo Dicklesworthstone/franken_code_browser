@@ -57,7 +57,8 @@ impl<T> ImportResolution<T> {
 /// module files through the bounded policy in `rust`; a remaining item suffix
 /// is explicitly a module-prefix candidate, never a definition location.
 /// A single supported top-level #[path] attribute admits only its exact
-/// source-directory-relative catalog file. Other attributes and unmodeled
+/// source-directory-relative catalog file. A literal file-inclusion macro likewise admits
+/// one exact path relative to its declaring source, including in function bodies. Other attributes and unmodeled
 /// source scopes remain unresolved. Multiple matching
 /// paths are ambiguous even if a callback maps them to the same target identity.
 /// No extension preference is inferred.
@@ -92,8 +93,12 @@ pub fn resolve_import<T: Copy + Eq>(
     if fact.kind() == ImportKind::RustUse {
         return rust::resolve_use(source_path, fact, &mut lookup);
     }
-    if fact.kind() == ImportKind::RustPathModule {
-        return rust::resolve_path_module(source_path, fact, &mut lookup);
+    match fact.kind() {
+        ImportKind::RustPathModule => return rust::resolve_literal_path(source_path, fact,
+            "rust-path-attribute-candidate", &mut lookup),
+        ImportKind::RustInclude | ImportKind::RustIncludeStr | ImportKind::RustIncludeBytes =>
+            return rust::resolve_literal_path(source_path, fact, "rust-include-file-candidate", &mut lookup),
+        _ => {}
     }
     if matches!(fact.kind(), ImportKind::CppQuotedInclude | ImportKind::CppAngleInclude | ImportKind::CppComputedInclude) {
         return cpp_include(source_path, fact, &mut lookup);

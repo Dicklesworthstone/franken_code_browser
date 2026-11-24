@@ -28,8 +28,8 @@ private final class SavedImportFixture: @unchecked Sendable {
         ["projection": "lexical-source-imports", "relationship_kind": "lexical-import",
          "evidence_precision": "exact-import-source-range", "resolution_domain": "declared-catalog-candidates",
          "compiler_resolved": false, "semantic_complete": false,
-         "extractor": "franken-markdown-d6fbd1d5/import-statements-v8",
-         "extraction_policy": "rust-use-tree-js-literal-loads-python-cpp-go-java-v8", "resolver": "fcb-closed-catalog-imports-v10"]
+         "extractor": "franken-markdown-d6fbd1d5/import-statements-v9",
+         "extraction_policy": "rust-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v9", "resolver": "fcb-closed-catalog-imports-v11"]
     }
     func link(_ id: UInt64) -> [String: Any] {
         let target = base.members[id == 1 ? 3 : 4]
@@ -546,6 +546,24 @@ private final class SavedImportFixture: @unchecked Sendable {
             && unavailable.targetMember == 4 && unavailable.targetDigest == nil,
             "Saved path modules retain exact attribute/declaration ranges and unavailable target identity")
 
+        for (kind, label) in [("rust-include", "Rust include! file candidate"),
+            ("rust-include-str", "Rust include_str! text candidate"), ("rust-include-bytes", "Rust include_bytes! data candidate")] {
+            var includes = value, includedRows = rows
+            for i in includedRows.indices {
+                includedRows[i]["lexical_import_kind"] = kind
+                includedRows[i]["resolution_basis"] = "rust-include-file-candidate"
+            }
+            includes["links"] = includedRows
+            let included = try decode(includes).links[0]
+            precondition(included.canOpenTarget && included.label == label)
+            includedRows[0]["resolution_basis"] = "rust-path-attribute-candidate"
+            includes["links"] = includedRows
+            reject { _ = try decode(includes) }
+            includedRows[0]["lexical_import_kind"] = "rust-module"
+            includedRows[0]["resolution_basis"] = "rust-include-file-candidate"
+            includes["links"] = includedRows
+            reject { _ = try decode(includes) }
+        }
         for (language, kind) in [("rust", "rust-module"), ("rust", "rust-use"),
             ("python", "python-from"), ("javascript", "javascript-import"), ("typescript", "rust-path-module")] {
             var bad = value, changed = rows

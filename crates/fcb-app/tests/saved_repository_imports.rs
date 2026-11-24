@@ -377,7 +377,7 @@ fn saved_rust_use_tree_pages_preserve_leaf_identity_and_original_utf16_evidence(
         let result = prepare(&mut saved, 1);
         assert!(result.get("imports_complete").flag());
         assert_eq!(result.get("links_seen").number(), 5);
-        assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v10");
+        assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v11");
         let rows = result.get("links").array();
         for (index, (destination, spelling)) in [
             ("crate::shared", "self"), ("crate::shared::Thing", "Thing"),
@@ -460,8 +460,8 @@ fn shared_language_extractors_publish_exact_occurrences_and_metadata_only_revers
     assert_eq!(result.get("import_generation").number(), 7);
     assert_eq!(result.get("projection").text(), "lexical-source-imports");
     assert_eq!(result.get("evidence_precision").text(), "exact-import-source-range");
-    assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v10");
-    assert_eq!(result.get("extraction_policy").text(), "rust-use-tree-js-literal-loads-python-cpp-go-java-v8");
+    assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v11");
+    assert_eq!(result.get("extraction_policy").text(), "rust-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v9");
     assert_eq!(result.get("completeness_scope").text(), "parsed-source-imports-in-saved-manifest");
     assert!(!result.get("compiler_resolved").flag());
     assert!(!result.get("semantic_complete").flag());
@@ -970,4 +970,24 @@ fn saved_computed_loads_remain_partial_without_hiding_literal_candidates() {
     assert_eq!(row.get("lexical_import_kind").text(), "javascript-dynamic-import");
     assert_eq!(row.get("resolution").text(), "captured");
     assert_eq!(range(source, row.get("evidence_range")), b"import('./child')");
+}
+
+#[test]
+fn rust_include_bytes_opens_exact_binary_from_the_retained_archive() {
+    let source = b"const BYTES: &[u8] = include_bytes!(\"../data.bin\");";
+    let target = b"\0\xffcaptured";
+    let f = Fixture::new(&[entry(b"data.bin", target), entry(b"src/lib.rs", source)], true);
+    let mut saved = f.open(58170);
+    let page = prepare(&mut saved, 1);
+    assert_eq!(page.get("links_seen").number(), 1);
+    let row = &page.get("links").array()[0];
+    assert_eq!(row.get("lexical_import_kind").text(), "rust-include-bytes");
+    assert_eq!(row.get("resolution_basis").text(), "rust-include-file-candidate");
+    let incoming = json(&saved.import_page(1, Some(0), Direction::Incoming, 0, 64, || false).unwrap());
+    assert_eq!(incoming.get("links").array(), page.get("links").array());
+    let (mut reader, receipt) = saved.open_import_reader(owner(58171), 1, row.get("link_id").number(),
+        Side::Target, || false).unwrap();
+    assert!(!json(&receipt).get("live_source_reopened").flag());
+    drop(saved);
+    assert_eq!(copy_all(&mut reader).get("original_hex").text(), hex(target));
 }

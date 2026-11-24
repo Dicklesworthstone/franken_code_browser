@@ -25,12 +25,12 @@ const MAX_PATH_COMPONENTS: usize = 128;
 const EXACT: &str = "rust-use-module-file-candidate";
 const PREFIX: &str = "rust-use-module-prefix-candidate";
 
-/// A single explicit path on an external module is relative to the directory
+/// An explicit module path or literal file inclusion is relative to the directory
 /// containing its source, including flat modules such as `src/parent.rs`.
 /// Unlike conventional module discovery, this route performs one exact catalog
 /// lookup: no stem directory, suffix alternatives, Cargo root, or cfg inference.
-pub(super) fn resolve_path_module<T: Copy + Eq>(
-    source: &[u8], fact: &ImportFact, lookup: &mut impl FnMut(&[u8]) -> Option<T>,
+pub(super) fn resolve_literal_path<T: Copy + Eq>(
+    source: &[u8], fact: &ImportFact, basis: &'static str, lookup: &mut impl FnMut(&[u8]) -> Option<T>,
 ) -> ImportResolution<T> {
     let unsupported = || ImportResolution::without(ImportResolutionKind::Unresolved, "unsupported-specifier");
     let destination = fact.destination();
@@ -44,7 +44,7 @@ pub(super) fn resolve_path_module<T: Copy + Eq>(
     }
     let Some(path) = CatalogPath::relative(source, destination.as_bytes()) else { return unsupported(); };
     match lookup(path.bytes()) {
-        Some(target) => ImportResolution::local(target, "rust-path-attribute-candidate"),
+        Some(target) => ImportResolution::local(target, basis),
         None => ImportResolution::without(ImportResolutionKind::Missing, "no-catalog-target"),
     }
 }

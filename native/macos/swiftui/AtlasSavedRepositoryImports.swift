@@ -20,9 +20,9 @@ enum AtlasSavedImportWire {
         guard w.projection == "lexical-source-imports", w.relationship_kind == "lexical-import",
               w.evidence_precision == "exact-import-source-range",
               w.resolution_domain == "declared-catalog-candidates",
-              w.extractor == "franken-markdown-d6fbd1d5/import-statements-v8",
-              w.extraction_policy == "rust-use-tree-js-literal-loads-python-cpp-go-java-v8",
-              w.resolver == "fcb-closed-catalog-imports-v10",
+              w.extractor == "franken-markdown-d6fbd1d5/import-statements-v9",
+              w.extraction_policy == "rust-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v9",
+              w.resolver == "fcb-closed-catalog-imports-v11",
               !w.compiler_resolved, !w.semantic_complete else { throw AtlasSavedError.invalidResponse }
     }
 
@@ -62,6 +62,9 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
     var label: String {
         switch kind {
         case "rust-module": return "Rust module declaration"
+        case "rust-include": return "Rust include! file candidate"
+        case "rust-include-str": return "Rust include_str! text candidate"
+        case "rust-include-bytes": return "Rust include_bytes! data candidate"
         case "rust-path-module": return "Rust path module declaration"
         case "rust-use": return "Rust use statement"
         case "python-import": return "Python import statement"
@@ -134,7 +137,7 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
         targetPath = try c.decodeIfPresent(AtlasSavedPath.self, forKey: .target_path)
         let kinds: [String]
         switch language {
-        case "rust": kinds = ["rust-module", "rust-use", "rust-path-module"]
+        case "rust": kinds = ["rust-module", "rust-use", "rust-path-module", "rust-include", "rust-include-str", "rust-include-bytes"]
         case "python": kinds = ["python-import", "python-from"]
         case "go": kinds = ["go-import"]
         case "java": kinds = ["java-import", "java-static-import"]
@@ -150,13 +153,18 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
               specifier.start >= evidence.start, specifier.end <= evidence.end,
               !destination.isEmpty, destination.utf8.count <= 1024, kinds.contains(kind),
               ["captured", "unavailable", "missing", "ambiguous", "external", "unresolved"].contains(resolution),
-              ["exact-relative-path", "unique-relative-module-candidate", "typescript-source-extension-candidate", "rust-path-attribute-candidate", "rust-module-file-candidate",
+              ["exact-relative-path", "unique-relative-module-candidate", "typescript-source-extension-candidate", "rust-path-attribute-candidate", "rust-include-file-candidate", "rust-module-file-candidate",
                "rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "ambiguous-rust-crate-root",
                "python-relative-module-candidate", "python-absolute-module-candidate", "cpp-source-relative-include-candidate",
                "go-module-package-file-candidate", "go-module-context-unavailable", "go-nested-module-boundary",
                "java-source-file-candidate", "java-enclosing-type-candidate", "unresolved-java-wildcard",
                "unresolved-cpp-include", "unresolved-rust-use", "external-specifier",
                "unsupported-specifier", "no-catalog-target", "ambiguous-catalog-target"].contains(resolutionBasis) else {
+            throw AtlasSavedError.invalidResponse
+        }
+        let fileInclude = ["rust-include", "rust-include-str", "rust-include-bytes"].contains(kind)
+        if (resolutionBasis == "rust-include-file-candidate" && !fileInclude)
+            || (fileInclude && !["rust-include-file-candidate", "no-catalog-target", "unsupported-specifier"].contains(resolutionBasis)) {
             throw AtlasSavedError.invalidResponse
         }
         if resolutionBasis == "rust-path-attribute-candidate" && (language != "rust" || kind != "rust-path-module") {
@@ -212,7 +220,7 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
         let acceptedBases: [String]
         switch resolution {
         case "captured", "unavailable": acceptedBases = ["exact-relative-path", "unique-relative-module-candidate", "typescript-source-extension-candidate",
-            "rust-path-attribute-candidate", "rust-module-file-candidate", "rust-use-module-file-candidate", "rust-use-module-prefix-candidate",
+            "rust-path-attribute-candidate", "rust-include-file-candidate", "rust-module-file-candidate", "rust-use-module-file-candidate", "rust-use-module-prefix-candidate",
             "python-relative-module-candidate", "python-absolute-module-candidate",
             "cpp-source-relative-include-candidate", "go-module-package-file-candidate",
             "java-source-file-candidate", "java-enclosing-type-candidate"]

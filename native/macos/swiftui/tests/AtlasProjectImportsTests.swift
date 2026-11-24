@@ -640,6 +640,24 @@ import Foundation
                 && retained.targetPath?.bytes == Array("src/platform/custom.rs".utf8)
                 && retained.importEvidence?.resolutionBasis == "rust-path-attribute-candidate")
         }
+        for (kind, label) in [("rust-include", "Rust include! file candidate"),
+            ("rust-include-str", "Rust include_str! text candidate"), ("rust-include-bytes", "Rust include_bytes! data candidate")] {
+            var includes = value, includedRows = rows
+            for i in includedRows.indices {
+                includedRows[i]["lexical_import_kind"] = kind
+                includedRows[i]["resolution_basis"] = "rust-include-file-candidate"
+            }
+            includes["links"] = includedRows
+            let included = try decode(includes, index: index).links[0]
+            precondition(included.canOpenTarget && included.evidenceLabel.contains(label))
+            includedRows[0]["resolution_basis"] = "rust-path-attribute-candidate"
+            includes["links"] = includedRows
+            refuse(includes, index: index)
+            includedRows[0]["lexical_import_kind"] = "rust-module"
+            includedRows[0]["resolution_basis"] = "rust-include-file-candidate"
+            includes["links"] = includedRows
+            refuse(includes, index: index)
+        }
         for (language, kind) in [("rust", "rust-module"), ("rust", "rust-use"),
             ("python", "python-from"), ("javascript", "javascript-import"), ("typescript", "rust-path-module")] {
             var bad = value, changed = rows

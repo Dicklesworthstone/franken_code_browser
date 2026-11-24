@@ -4,7 +4,7 @@
 //!
 //! FrankenMarkdown owns string/comment/keyword classification. This module
 //! consumes its validated byte spans and recognizes a small source-specific
-//! statement grammar: Rust external mod/use, JS/TS static import/export-from and
+//! statement grammar: Rust modules, use trees and literal file inclusions, JS/TS static import/export-from and
 //! literal require/import() expressions, Python import/from statements,
 //! C/C++ literal include directives, Go package imports and Java imports.
 //! It is not a compiler, build graph, package resolver, or replacement lexer.
@@ -16,6 +16,7 @@ mod python;
 mod cpp;
 mod resolve;
 mod rust;
+mod rust_include;
 mod go;
 mod java;
 pub use resolve::{resolve_import, ImportResolution, ImportResolutionKind};
@@ -33,8 +34,8 @@ pub const MAX_IMPORT_ITEMS: usize = 4096;
 pub const MAX_IMPORT_SPECIFIER_BYTES: usize = 1024;
 const MAX_STATEMENT_TERMINALS: usize = 1024;
 const MAX_STATEMENT_BYTES: usize = 16 * 1024;
-pub const IMPORT_EXTRACTOR: &str = "franken-markdown-d6fbd1d5/import-statements-v8";
-pub const IMPORT_POLICY: &str = "rust-use-tree-js-literal-loads-python-cpp-go-java-v8";
+pub const IMPORT_EXTRACTOR: &str = "franken-markdown-d6fbd1d5/import-statements-v9";
+pub const IMPORT_POLICY: &str = "rust-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v9";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImportLanguage { Rust, JavaScript, TypeScript, Jsx, Tsx, Python, Cpp, Go, Java }
@@ -61,13 +62,14 @@ impl ImportLanguage {
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ImportKind { RustModule, RustPathModule, RustUse, JavaScriptImport, JavaScriptExport,
+pub enum ImportKind { RustModule, RustPathModule, RustUse, RustInclude, RustIncludeStr, RustIncludeBytes, JavaScriptImport, JavaScriptExport,
     JavaScriptRequire, JavaScriptDynamicImport, PythonImport, PythonFrom,
     CppQuotedInclude, CppAngleInclude, CppComputedInclude, GoImport, JavaImport, JavaStaticImport }
 impl ImportKind {
     pub const fn name(self) -> &'static str {
         match self { Self::RustModule => "rust-module", Self::RustPathModule => "rust-path-module",
-            Self::RustUse => "rust-use",
+            Self::RustUse => "rust-use", Self::RustInclude => "rust-include",
+            Self::RustIncludeStr => "rust-include-str", Self::RustIncludeBytes => "rust-include-bytes",
             Self::JavaScriptImport => "javascript-import", Self::JavaScriptExport => "javascript-export",
             Self::JavaScriptRequire => "javascript-require", Self::JavaScriptDynamicImport => "javascript-dynamic-import",
             Self::PythonImport => "python-import", Self::PythonFrom => "python-from",
@@ -164,6 +166,15 @@ impl<'source> CapturedImports<'source> {
         let mut spans = reserve::<Span>(capacity)?;
         highlight::highlight_into(language.name(), text, &mut spans);
         if spans.capacity() > capacity { return Err(ImportError::InvalidEvidence); }
+        if language == ImportLanguage::Rust {
+            for span in &spans {
+                check(&mut canceled)?;
+                let word = text.get(span.start..span.end).ok_or(ImportError::InvalidEvidence)?;
+                if !qualified_rust_span(span.kind, word, text.as_bytes().get(span.end).copied()) {
+                    return Err(ImportError::UnsupportedLexicalContext);
+                }
+            }
+        }
         if language == ImportLanguage::Go { go::validate_context(text, &spans, &mut canceled)?; }
         if language == ImportLanguage::Java { java::validate_context(text, &spans, &mut canceled)?; }
         let terminals = terminals(text, &spans, &mut canceled)?;
@@ -210,6 +221,11 @@ impl<'source> CapturedImports<'source> {
         let (start, end) = fact.original_range.as_usize_bounds().map_err(|_| ImportError::InvalidEvidence)?;
         self.source.get(start..end).ok_or(ImportError::InvalidEvidence)
     }
+}
+/// The pinned Rust lexer clamps nested block comments and lacks raw C strings.
+pub(crate) fn qualified_rust_span(kind: Tok, word: &str, following: Option<u8>) -> bool {
+    !(kind == Tok::Comment && word.starts_with("/*") && word.match_indices("/*").nth(63).is_some()
+        || !matches!(kind, Tok::Comment | Tok::Str) && word == "cr" && matches!(following, Some(b'#' | b'"')))
 }
 /// Shared source-specific guard for consumers of the pinned JS-family lexer.
 /// Terminal normalization and regex/control/ASI policy stay identical to the

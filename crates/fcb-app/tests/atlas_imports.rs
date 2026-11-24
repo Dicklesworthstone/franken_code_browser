@@ -197,9 +197,9 @@ fn coverage(page: &Json) {
     assert_eq!(page.get("evidence_precision").text(), "exact-import-source-range");
     assert_eq!(page.get("relationship_kind").text(), "lexical-import");
     assert_eq!(page.get("resolution_domain").text(), "declared-catalog-candidates");
-    assert_eq!(page.get("extractor").text(), "franken-markdown-d6fbd1d5/import-statements-v8");
-    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v10");
-    assert_eq!(page.get("extraction_policy").text(), "rust-use-tree-js-literal-loads-python-cpp-go-java-v8");
+    assert_eq!(page.get("extractor").text(), "franken-markdown-d6fbd1d5/import-statements-v9");
+    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v11");
+    assert_eq!(page.get("extraction_policy").text(), "rust-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v9");
     assert!(!page.get("compiler_resolved").flag()); assert!(!page.get("semantic_complete").flag());
     assert_eq!(page.get("source_files").number(), page.get("captured_source_files").number()
         + page.get("capture_unavailable_source_files").number() + page.get("outside_capture_scope_source_files").number()
@@ -960,7 +960,7 @@ fn python_relative_imports_share_incoming_navigation_and_exact_retained_readers(
     let page = f.prepare(1, 1);
     assert!(page.get("relationships_complete").flag(), "{page:?}");
     assert_eq!(page.get("retained_links").number(), 5);
-    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v10");
+    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v11");
 
     let row = link(&page, b"pkg/main.py", ".worker");
     assert_eq!(row.get("language").text(), "python");
@@ -1108,4 +1108,25 @@ fn ambiguous_upstream_javascript_regex_context_stays_partial_without_false_impor
     assert_eq!(result.get("links").array()[0].get("destination").text(), "./child");
     assert_eq!(result.get("links").array()[0].get("resolution").text(), "captured");
     assert_eq!(f.page(1, Direction::Outgoing, Some(b"ambiguous.js"), 0, 64).get("matching_links").number(), 0);
+}
+
+#[test]
+fn rust_literal_includes_connect_project_backlinks_to_retained_docs() {
+    let source = b"#![doc = include_str!(\"../docs/intro.md\")]\n";
+    let text = b"# a captured guide\n";
+    let mut f = Fixture::new(&[("src/lib.rs", source), ("docs/intro.md", text)]);
+    f.build(1);
+    let page = f.prepare(1, 1);
+    let row = link(&page, b"src/lib.rs", "../docs/intro.md");
+    assert_eq!(row.get("lexical_import_kind").text(), "rust-include-str");
+    assert_eq!(row.get("resolution_basis").text(), "rust-include-file-candidate");
+    assert_eq!(range(row.get("evidence_range"), source), br#"include_str!("../docs/intro.md")"#);
+    assert_eq!(range(row.get("specifier_range"), source), b"../docs/intro.md");
+    let incoming = f.page(1, Direction::Incoming, Some(b"docs/intro.md"), 0, 64);
+    assert_eq!(incoming.get("links").array(), page.get("links").array());
+    fs::write(f.root.join("docs/intro.md"), b"changed live").unwrap();
+    let (reader, receipt) = f.search.open_import_reader(&f.atlas, owner(73189), 1,
+        row.get("link_id").number(), Side::Target, || false).unwrap();
+    assert!(!json(&receipt).get("source_reopened").flag());
+    assert_eq!(reader.capture().bytes(), text);
 }
