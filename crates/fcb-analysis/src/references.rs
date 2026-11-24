@@ -22,7 +22,7 @@ use fcb_core::{ByteLength, ByteOffset, ByteRange, DecodedUtf8Offset, DecodedUtf8
 use fcb_search::identifier::{IdentifierCursor, MAX_IDENTIFIER_BYTES, token_scalar, validate_identifier};
 use fcb_source::{CaptureEncodingMap, CaptureRequest, DetectedEncoding, SpanKind, StatefulChunkDecoder, detect_encoding};
 
-pub const MAX_REFERENCE_SOURCE_BYTES: usize = 512 * 1024;
+pub const MAX_REFERENCE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_REFERENCE_ITEMS: usize = 4096;
 pub const MAX_REFERENCE_NAME_BYTES: usize = MAX_IDENTIFIER_BYTES;
 const CANCEL_QUANTUM: usize = 4096;
@@ -789,6 +789,15 @@ mod bounded_window_tests {
             assert!(refs.is_complete() && !refs.output_limited());
             assert_eq!(refs.total_matches_counted(), 0);
             assert!(refs.candidates().is_empty());
+            let named = encode("foo", encoding);
+            let refs = query(&named, "foo", 1, 0, true);
+            assert_eq!(refs.total_matches_counted(), 1);
+            let hit = &refs.candidates()[0];
+            assert_eq!(hit.original_range().start().get(), encoding.bom_bytes_len());
+            assert_eq!(hit.original_range().end().get(), named.len() as u64);
+            assert_eq!(hit.decoded_range().start().get(), 0);
+            assert_eq!(hit.decoded_range().end().get(), 3);
+            assert_eq!(refs.source_bytes(1).unwrap(), &named[encoding.bom_bytes_len() as usize..]);
         }
     }
 

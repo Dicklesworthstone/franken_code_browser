@@ -43,7 +43,7 @@ private enum ReferenceModelFixture {
         out["includes_comments_and_literals"] = true; out["compiler_resolved"] = false; out["semantic_complete"] = false
         out["search_complete"] = true; out["count_complete"] = true; out["output_limited"] = false
         out["retained_references"] = String(total); out["matches_counted"] = String(total)
-        out["max_items"] = "4096"; out["max_source_bytes"] = "524288"; out["line_semantics"] = "LF-counted-source-lines"
+        out["max_items"] = "4096"; out["max_source_bytes"] = "33554432"; out["line_semantics"] = "LF-counted-source-lines"
         out["references"] = (start..<end).map { offset -> [String: Any] in
             let id = offset + 1, span = original(name, id)
             return ["reference_id": String(id), "line": String(line(name, id)), "original_range": range(span.0, span.1)]
@@ -78,13 +78,13 @@ private enum ReferenceModelFixture {
 /// Selection responses contain only bounded context around the requested row.
 private struct ReferenceWindowFixture: Sendable {
     static let name = "café𐐀"
-    let copies: UInt64 = 5005
+    let copies: UInt64
     let littleEndian: Bool
     let raw: [UInt8]
 
-    init(littleEndian: Bool) {
-        self.littleEndian = littleEndian
-        let text = "😀\r\n" + String(repeating: Self.name + "\r\n", count: 5005)
+    init(littleEndian: Bool, copies: UInt64 = 5_005) {
+        self.littleEndian = littleEndian; self.copies = copies
+        let text = "😀\r\n" + String(repeating: Self.name + "\r\n", count: Int(copies))
         raw = (littleEndian ? [255, 254] : [254, 255]) + text.utf16.flatMap {
             littleEndian ? [UInt8($0 & 255), UInt8($0 >> 8)] : [UInt8($0 >> 8), UInt8($0 & 255)]
         }
@@ -114,7 +114,7 @@ private struct ReferenceWindowFixture: Sendable {
         out["includes_comments_and_literals"] = true; out["compiler_resolved"] = false; out["semantic_complete"] = false
         out["search_complete"] = complete; out["count_complete"] = complete; out["output_limited"] = more
         out["retained_references"] = String(retained); out["matches_counted"] = String(counted)
-        out["max_items"] = "4096"; out["max_source_bytes"] = "524288"; out["line_semantics"] = "LF-counted-source-lines"
+        out["max_items"] = "4096"; out["max_source_bytes"] = "33554432"; out["line_semantics"] = "LF-counted-source-lines"
         out["result_offset"] = String(window.offset); out["count_all_matches"] = window.countAllMatches
         out["skipped_matches"] = String(skipped); out["rows_truncated"] = counted > retained
         out["has_more_matches"] = more
@@ -313,6 +313,44 @@ private final class ReferenceModelDriver: @unchecked Sendable {
         model.referenceName = name; model.findReferences()
         wait("occurrence inventory did not arrive") { !model.busy && model.referencesAreCurrent }
     }
+
+    @MainActor private static func largeCaptureRegressions() {
+        for littleEndian in [true, false] {
+            let fixture = ReferenceWindowFixture(littleEndian: littleEndian, copies: 32_770)
+            let driver = ReferenceModelDriver(windows: fixture), model = opened(driver)
+            check(fixture.raw.count == 524_330 && model.page?.end == 65_536
+                && model.canFindReferences, "occurrences remained disabled above the former 512 KiB limit")
+            find(model, ReferenceWindowFixture.name)
+            check(model.referencePage?.inventory.matchesCounted == 32_770
+                && model.referencePage?.inventory.countComplete == true,
+                "larger capture lost its complete count")
+            for offset in stride(from: UInt64(4_096), through: 32_768, by: 4_096) {
+                model.nextReferenceWindow()
+                wait("large capture result window") {
+                    !model.busy && model.referencesAreCurrent
+                        && model.referencePage?.inventory.window?.request.offset == offset
+                }
+            }
+            let page = model.referencePage!, target = page.target(id: 1)!
+            check(page.inventory.retained == 2 && page.rows.count == 2 && !model.canReferenceWindowNext
+                && target.occurrence.ordinal == 32_769
+                && target.occurrence.range == AtlasOutlineRange(start: 524_298, end: 524_310),
+                "later occurrence window lost its exact range beyond the former source limit")
+            model.openReference(target)
+            wait("large capture exact selection") { !model.busy && model.referenceHex != nil }
+            let expectedHex = littleEndian ? "630061006600e90001d800dc" : "00630061006600e9d801dc00"
+            check(model.referenceHex == expectedHex
+                && model.nativeSelectionRange == NSRange(location: 1026, length: 6)
+                && model.referenceSelectionLabel == "Identifier occurrence 32769 · LF line 32770"
+                && model.page!.end - model.page!.start <= 4116
+                && driver.log.contains("reference:7:9:1")
+                && driver.log.filter { $0.hasPrefix("open:") }.count == 1
+                && driver.log.filter { $0.hasPrefix("window:") }.count == 1,
+                "large-capture activation lost bounded context, UTF-16 coordinates, or retained-source identity")
+            model.close(); wait("large capture retirement") { driver.log.contains("close:7") }
+        }
+    }
+
     @MainActor private static func windowRegressions() {
         for littleEndian in [true, false] {
             let fixture = ReferenceWindowFixture(littleEndian: littleEndian)
@@ -625,6 +663,7 @@ private final class ReferenceModelDriver: @unchecked Sendable {
             model.close(); wait("query race retirement") { driver.log.contains("close:7") }
         }
         windowRegressions()
+        largeCaptureRegressions()
         print("Occurrence coordinator, counted windows, paging, exact copy, query races, and independent fork regressions passed.")
     }
 }

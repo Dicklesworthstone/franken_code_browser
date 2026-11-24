@@ -427,3 +427,32 @@ fn indexed_java_and_csharp_symbols_reuse_utf16_sources_after_paths_disappear() {
         assert!(receipt.as_str().contains("\"source_reopened\":false"));
     }
 }
+
+#[test]
+fn large_captured_occurrences_count_and_activate_after_index_and_live_source_change() {
+    let source = [vec![b' '; 768 * 1024], b"needle needle_suffix needle\n".to_vec()].concat();
+    let fixture = Fixture::new(&[("large.txt", &source)]);
+    let atlas = fixture.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
+    search.prepare_index(&atlas, 1, index_options(), || false).unwrap();
+    fs::write(fixture.0.join("large.txt"), b"replacement").unwrap();
+    let mut settings = options(AtlasStructureMode::Occurrences); settings.max_matches = 1;
+    search.begin_indexed_structure_window(&atlas, 2, 1, "needle", AtlasSearchScope::all(),
+        settings, AtlasResultWindow { result_offset: 1, count_all_matches: true }, || false).unwrap();
+    let receipt = finish(&mut search, &atlas, 2);
+    count(&receipt, "matches_seen", 2);
+    count(&receipt, "retained_hits", 1);
+    count(&receipt, "occurrence_id", 2);
+    count(&receipt, "structure_file_byte_limit", 32 * 1024 * 1024);
+    assert!(receipt.contains("\"search_complete\":true"));
+    assert!(receipt.contains("\"has_more_matches\":false"));
+    let hit = search.hit(&atlas, 2, 1).unwrap();
+    assert_eq!(hit.original_range.start().get(), 768 * 1024 + 21);
+    search.clear_index(&atlas, 3, || false).unwrap();
+    let (mut reader, opened) = search.open_reader(&atlas, ArenaOwnerId::new(31628).unwrap(),
+        2, 1, || false).unwrap();
+    assert_eq!(reader.capture().bytes(), source);
+    assert!(opened.as_str().contains("\"source_reopened\":false"));
+    let refs = reader.prepare_references_window(1, "needle", 1, true, 1, || false).unwrap();
+    count(refs.as_str(), "matches_counted", 2);
+    assert_eq!(reader.reference_range(1, 1).unwrap(), hit.original_range);
+}

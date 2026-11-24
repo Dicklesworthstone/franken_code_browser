@@ -51,7 +51,7 @@ private struct ReferenceFixture {
         out["includes_comments_and_literals"] = true; out["compiler_resolved"] = false; out["semantic_complete"] = false
         out["search_complete"] = !limited; out["count_complete"] = !limited; out["output_limited"] = limited
         out["retained_references"] = String(retained); out["matches_counted"] = String(retained + (limited ? 1 : 0))
-        out["line_semantics"] = "LF-counted-source-lines"; out["max_source_bytes"] = "524288"; out["max_items"] = String(cap)
+        out["line_semantics"] = "LF-counted-source-lines"; out["max_source_bytes"] = "33554432"; out["max_items"] = String(cap)
         out["references"] = (request.start..<end).map { row($0 + 1) }
         out["next_offset"] = end < retained ? String(end) as Any : NSNull()
         return out
@@ -107,7 +107,8 @@ private struct ReferenceFixture {
             ("reference_generation", "01"), ("reference_generation", "2"),
             ("command", "symbols"), ("selection_namespace", "outline"),
             ("evidence_level", "compiler-resolved"), ("name_case", "insensitive"),
-            ("line_semantics", "native-wrapped-lines"), ("max_source_bytes", "524289"),
+            ("line_semantics", "native-wrapped-lines"), ("max_source_bytes", "524288"),
+            ("max_source_bytes", "33554433"),
             ("max_items", "4095"), ("retained_references", "3"), ("matches_counted", "3"),
             ("next_offset", "2"), ("additional_source_bytes_read", "1"), ("encoding", "unsupported")
         ] {
@@ -239,8 +240,41 @@ private struct ReferenceFixture {
         retainedReceipt.removeValue(forKey: "accepted_reference_generation")
         _ = try AtlasReaderInfo.decodeRetainedInitialization(ReferenceFixture.json(retainedReceipt),
             handle: 7, pathBytes: Array("source.rs".utf8))
+        try largerCapturesPreserveExactRanges()
         try windowRegressions()
         print("Occurrence wire, exact spelling, source ranges, paging and evidence regressions passed.")
+    }
+
+
+    private static func largerCapturesPreserveExactRanges() throws {
+        // Wire fixtures exercise the boundary without allocating a 32 MiB Swift
+        // string. The engine tests own extraction and bounded decoding evidence.
+        for encoding in ["utf8", "utf16le", "utf16be"] {
+            let fixture = ReferenceFixture(name: "café𐐀", copies: 1, littleEndian: encoding != "utf16be")
+            let width = encoding == "utf8" ? UInt64(fixture.name.utf8.count) : fixture.nameLength
+            for bytes in [UInt64(524_304), 33_554_432] {
+                var header = fixture.header("info")
+                header["captured_bytes"] = String(bytes); header["encoding"] = encoding
+                let info = try AtlasReaderInfo.decode(ReferenceFixture.json(header), handle: 7, path: "source.rs")
+                var wire = fixture.page()
+                wire["captured_bytes"] = String(bytes); wire["encoding"] = encoding
+                wire["references"] = [["reference_id": "1", "line": "1",
+                    "original_range": ReferenceFixture.range(bytes - width, bytes)]] as [[String: Any]]
+                let page = try AtlasReferencePage.decode(ReferenceFixture.json(wire), info: info,
+                    generation: 1, name: fixture.name, request: .initial, preparing: true)
+                let target = page.target(id: 1)!
+                precondition(page.inventory.identity.capturedBytes == bytes
+                    && target.occurrence.range == AtlasOutlineRange(start: bytes - width, end: bytes)
+                    && page.inventory.countComplete,
+                    "large occurrence receipt lost its original byte range or exact count")
+                try AtlasReaderRequest.reference(target).validate(capturedBytes: bytes)
+            }
+        }
+        var oversized = ReferenceFixture().header("info")
+        oversized["captured_bytes"] = "33554433"
+        reject("occurrences enlarged the retained-reader capture boundary") {
+            _ = try AtlasReaderInfo.decode(ReferenceFixture.json(oversized), handle: 7, path: "source.rs")
+        }
     }
 
     private static func windowRegressions() throws {

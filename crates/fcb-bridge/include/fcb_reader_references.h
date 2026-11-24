@@ -6,7 +6,7 @@
 extern "C" {
 #endif
 
-#define FCB_READER_REFERENCE_SOURCE_BYTES UINT64_C(524288)
+#define FCB_READER_REFERENCE_SOURCE_BYTES UINT64_C(33554432)
 #define FCB_READER_REFERENCE_NAME_BYTES UINT64_C(1024)
 #define FCB_READER_REFERENCE_ITEMS UINT64_C(4096)
 #define FCB_READER_REFERENCE_PAGE UINT64_C(128)
@@ -30,8 +30,9 @@ extern "C" {
  * name must be nonempty NUL-terminated UTF-8 <=1024 bytes, readable and stable
  * until return. It must be one admitted token and cannot begin with an ASCII
  * digit. max_items is 0..4096; zero permits a one-occurrence lookahead only.
- * Sources larger than 512 KiB or malformed/unsupported text fail explicitly;
- * they remain readable without an occurrence inventory.
+ * Complete captures up to 32 MiB use bounded decoder windows; malformed or
+ * unsupported text fails explicitly. Reader capture and occurrence admission
+ * share this source ceiling; other analysis services retain their own limits.
  *
  * Each attempt uses a strictly increasing reference generation independent of
  * ordinary Find, outline and document generations. Failed/canceled attempts

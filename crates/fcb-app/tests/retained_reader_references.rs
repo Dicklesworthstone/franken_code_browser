@@ -43,7 +43,7 @@ fn token_occurrences_include_comments_and_literals_without_substring_false_posit
     assert!(first.as_str().contains("\"compiler_resolved\":false"));
     assert!(first.as_str().contains("\"semantic_complete\":false"));
     assert!(first.as_str().contains("\"name_case\":\"sensitive\""));
-    assert!(first.as_str().contains("\"max_source_bytes\":\"524288\""));
+    count(first.as_str(), "max_source_bytes", MAX_READER_REFERENCE_SOURCE_BYTES as u64);
     for id in 1..=4 {
         assert_eq!(selected(&r, r.reference_range(1, id).unwrap()), b"target");
     }
@@ -233,12 +233,16 @@ fn occurrence_limit_is_independent_of_outline_limit_and_reader_refusals_do_not_l
     assert!(r.prepare_outline(1, Default::default(), || false).is_err());
     prepare(&mut r, 1, "target");
     assert_eq!(selected(&r, r.reference_range(1, 1).unwrap()), b"target");
-    source.resize(MAX_READER_REFERENCE_SOURCE_BYTES + 1, b' ');
+    source.resize(1024 * 1024, b' ');
     let mut large = reader(&source);
-    assert_eq!(large.prepare_references(1, "target", 10, || false).err(),
-        Some(ReaderSessionError::Reference(ReferenceError::SourceLimit)));
+    prepare(&mut large, 1, "target");
+    assert_eq!(selected(&large, large.reference_range(1, 1).unwrap()), b"target");
+    assert!(large.prepare_outline(1, Default::default(), || false).is_err());
     assert!(large.read_window(0, 128, || false).is_ok());
-    assert!(large.search(1, "target", 10, source.len() as u64, || false).is_ok());
+    assert_eq!(MAX_READER_REFERENCE_SOURCE_BYTES, fcb_app::host::reader::MAX_READER_SOURCE_BYTES);
+    source.resize(MAX_READER_REFERENCE_SOURCE_BYTES + 1, b' ');
+    assert!(matches!(ReaderSession::from_bytes(ArenaOwnerId::new(9511).unwrap(),
+        Path::new("oversized.rs"), &source, || false), Err(ReaderSessionError::InvalidLimits)));
     let mut malformed = reader(b"target \xff");
     assert_eq!(malformed.prepare_references(1, "target", 10, || false).err(),
         Some(ReaderSessionError::Reference(ReferenceError::UnsupportedEncoding)));
@@ -410,4 +414,47 @@ fn switching_back_to_legacy_references_keeps_the_legacy_wire_contract() {
         assert!(!legacy.as_str().contains(&format!("\"{field}\":")), "{field}: {}", legacy.as_str());
     }
     assert_eq!(r.reference_range(2, 1).unwrap().start().get(), 0);
+}
+
+#[test]
+fn large_retained_occurrence_windows_copy_exact_utf8_and_utf16_after_live_replacement() {
+    let text = format!("{}😀\r\n{}", " ".repeat(600 * 1024), "foo\r\n".repeat(4101));
+    for little in [None, Some(true), Some(false)] {
+        let source: Vec<u8> = match little {
+            None => text.as_bytes().to_vec(),
+            Some(little) => format!("\u{feff}{text}").encode_utf16()
+                .flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect(),
+        };
+        let expected: Vec<u8> = match little {
+            None => b"foo".to_vec(),
+            Some(little) => "foo".encode_utf16()
+                .flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect(),
+        };
+        assert!(source.len() > 512 * 1024);
+        let path = fixture().join("large.txt"); fs::write(&path, &source).unwrap();
+        let mut r = ReaderSession::open(ArenaOwnerId::new(9518).unwrap(), &path,
+            MAX_READER_REFERENCE_SOURCE_BYTES, || false).unwrap();
+        let retained = r.capture().bytes().as_ptr();
+        fs::write(&path, b"the live source has changed").unwrap();
+        let result = r.prepare_references_window(1, "foo", 2, true, 4096, || false).unwrap();
+        assert_eq!(result.exit_code(), EXIT_OK);
+        count(result.as_str(), "matches_counted", 4101);
+        count(result.as_str(), "retained_references", 2);
+        count(result.as_str(), "occurrence_id", 4097);
+        count(result.as_str(), "next_match_offset", 4098);
+        count(result.as_str(), "max_source_bytes", MAX_READER_REFERENCE_SOURCE_BYTES as u64);
+        let range = r.reference_range(1, 1).unwrap();
+        assert!(range.start().get() > 512 * 1024);
+        assert_eq!(selected(&r, range), expected);
+        let window = r.reference_window(1, 1, 32, || false).unwrap();
+        count(window.as_str(), "reference_line", 4098);
+        count(window.as_str(), "additional_source_bytes_read", 0);
+        assert!(window.as_str().contains("\"window_utf8_range\":"));
+        assert!(r.copy_reference(1, 1, || false).unwrap().as_str()
+            .contains(&format!("\"original_hex\":\"{}\"", hex(&expected))));
+        assert!(r.prepare_references_window(2, "foo", 2, true, 4098, || true).is_err());
+        assert_eq!(r.reference_generation(), Some(1));
+        assert_eq!(r.capture().bytes().as_ptr(), retained);
+        assert_eq!(selected(&r, r.reference_range(1, 1).unwrap()), expected);
+    }
 }

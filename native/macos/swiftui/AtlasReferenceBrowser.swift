@@ -89,7 +89,7 @@ import SwiftUI
             } else {
                 Text(model.canFindReferences
                     ? "Enter an identifier, use Search selection in the reader, or choose Occurrences beside a source outline entry."
-                    : "Identifier occurrences are available for retained source captures up to 512 KiB.")
+                    : "Identifier occurrences are available for retained source captures up to 32 MiB.")
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -98,8 +98,8 @@ import SwiftUI
                     .textSelection(.enabled)
             }
             Text(model.supportsReferenceWindows
-                ? "Searches this retained file up to 512 KiB, counts every whole-token occurrence and retains up to 4,096 per result window. Line numbers count LF boundaries. Changing the identifier or refreshing the capture invalidates old targets."
-                : "Searches this retained file only, up to 512 KiB and 4,096 occurrences. Line numbers count LF boundaries; exact byte ranges also work for CR-only source. Changing the identifier or refreshing the capture invalidates old targets.")
+                ? "Searches this retained file up to 32 MiB, counts every whole-token occurrence and retains up to 4,096 per result window. Line numbers count LF boundaries. Changing the identifier or refreshing the capture invalidates old targets."
+                : "Searches this retained file only, up to 32 MiB and 4,096 occurrences. Line numbers count LF boundaries; exact byte ranges also work for CR-only source. Changing the identifier or refreshing the capture invalidates old targets.")
                 .font(.caption2).foregroundStyle(.secondary)
         }
         .padding(12)

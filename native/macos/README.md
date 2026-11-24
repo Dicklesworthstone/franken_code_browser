@@ -603,7 +603,7 @@ member names are labels and never open working-tree paths.
 | --- | --- | --- |
 | Symbols | Exact, prefix, or contains matching against shared outline names, including qualified names. Rust, Python, JavaScript, TypeScript, Go, C/C++, Swift, Java and C# declarations are heuristic candidates. | 64 KiB |
 | Headings | Exact, prefix, or contains matching against FrankenMarkdown heading titles. Results retain duplicate-aware slugs and qualified original source ranges. | 256 KiB |
-| Occurrences | One exact identifier token, including spelling matches in declarations, comments and string literals. Supported UTF-8 and BOM-marked UTF-16 keep their original byte coordinates. | 512 KiB |
+| Occurrences | One exact identifier token, including spelling matches in declarations, comments and string literals. Supported UTF-8 and BOM-marked UTF-16 keep their original byte coordinates. | 32 MiB |
 
 These evidence levels remain visible in each result. Symbols and occurrences do
 not claim compiler binding or a call graph. Search preserves Unicode spelling
@@ -1851,7 +1851,7 @@ this mode does not rely on the declaration extractor's language list.
 
 The native query retains at most 1,000 matches, examines at most 4,096 files and
 spends at most 32 MiB of source-read work. The shared occurrence extractor admits
-**512 KiB per complete file**, with UTF-8 and BOM-marked UTF-16 in either byte
+**32 MiB per complete file**, with UTF-8 and BOM-marked UTF-16 in either byte
 order. Oversized sources, malformed text, read failures and exhausted budgets
 remain explicit incomplete coverage. Reaching the result allowance alone does
 not prove omitted matches: the query can continue checking later files for a
@@ -1920,7 +1920,7 @@ and **Stop and keep matches** remains available. Returning to Text or Occurrence
 restores the user's counting preference.
 
 Choose **Occurrences** for one complete, case-sensitive identifier. This route
-continues beyond the captured occurrence extractor's 512 KiB source allowance,
+continues beyond the captured occurrence extractor's 32 MiB source allowance,
 subject to the same total scan limits as Text. It uses the same token policy as
 captured occurrences: ASCII letters, digits, underscore and dollar are token
 characters, and an identifier cannot start with an ASCII digit. Non-ASCII
@@ -2880,7 +2880,7 @@ conservative non-ASCII runs; matching does not normalize Unicode spelling.
 Occurrence line labels count LF boundaries, including CRLF. Original byte
 ranges remain exact for CR-only source as well.
 
-This service admits up to **512 KiB** of valid UTF-8 or BOM-marked UTF-16 source
+This service admits up to **32 MiB** of valid UTF-8 or BOM-marked UTF-16 source
 and identifiers of at most **1,024 UTF-8 bytes**. The native reader counts all
 whole-token occurrences and retains up to **4,096 per result window**. It returns
 the first 64 rows and pages through the retained rows without rescanning.
@@ -2890,6 +2890,16 @@ window-local IDs used to activate and copy rows. A new window replays the bounde
 capture without allocating or retaining its skipped prefix. Legacy transports
 retain their capped inventory and report a lower bound when it is incomplete.
 Files outside the source/name bounds remain available through the ordinary reader.
+
+Occurrence extraction decodes one bounded source window at a time and carries
+only token positions between windows. Its temporary decoder reservation stops
+growing after the first 4 KiB of input; retained result storage stays bounded by
+the requested window. The complete captured file still has its own source
+reservation. Malformed text anywhere in the file rejects the replacement query,
+including a suffix after the visible results are full. The previously accepted
+results remain available. The larger occurrence allowance does not increase the
+separate declaration-outline or matching-bracket limits. Executable and native
+verification of this source addition remain pending.
 
 Opening an Occurrences result from workspace search can also reach matches past
 the first 4,096. The handoff narrows the possible occurrence ranks using ordered,

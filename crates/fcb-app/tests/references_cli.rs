@@ -174,12 +174,19 @@ fn malformed_and_unread_sources_cannot_publish_complete_absence() {
 
 #[test]
 fn reference_search_accepts_larger_files_without_relaxing_outline_limits() {
-    let fixture = Fixture::new(); let mut bytes = vec![b' '; 128 * 1024]; bytes.extend_from_slice(b"foo");
+    let fixture = Fixture::new(); let mut bytes = vec![b' '; 768 * 1024]; bytes.extend_from_slice(b"foo");
     fixture.file("large.rs", &bytes);
     let (exit, json) = invoke(&fixture.file_args("large.rs", "foo"), || false);
     assert_eq!(exit, EXIT_OK);
-    assert_eq!(json.get("candidates").array()[0].get("original_range").get("start").number(), 128 * 1024);
-    fixture.file("denied.txt", &vec![b' '; 512 * 1024 + 1]);
+    assert_eq!(json.get("candidates").array()[0].get("original_range").get("start").number(), 768 * 1024);
+    let outline = vec!["symbols".into(), fixture.root().join("large.rs").into_os_string(),
+        "--name".into(), "foo".into(), "--json".into()];
+    let (exit, json) = invoke(&outline, || false);
+    assert_eq!(exit, EXIT_PARTIAL);
+    assert_eq!(json.get("notices").array()[0].get("reason").text(), "SYMBOL_SOURCE_LIMIT");
+    fixture.file("denied.txt", b"");
+    fs::OpenOptions::new().write(true).open(fixture.root().join("denied.txt")).unwrap()
+        .set_len(fcb::search::symbols::MAX_REFERENCE_SOURCE_BYTES as u64 + 1).unwrap();
     let (exit, json) = invoke(&fixture.file_args("denied.txt", "foo"), || false);
     assert_eq!(exit, EXIT_PARTIAL);
     assert_eq!(json.get("notices").array()[0].get("reason").text(), "REFERENCE_SOURCE_LIMIT");

@@ -57,7 +57,7 @@ private final class OccurrenceReports: @unchecked Sendable {
             "includes_comments_and_literals": true, "compiler_resolved": false,
             "token_policy": AtlasSearchOccurrencePolicy.tokenPolicy,
             "name_syntax": AtlasSearchOccurrencePolicy.nameSyntax, "unicode_normalization": "none",
-            "structure_file_byte_limit": "524288", "unsupported_structure_files": "0",
+            "structure_file_byte_limit": "33554432", "unsupported_structure_files": "0",
             "extraction_limited_files": "0", "structure_metadata_omitted": "0",
             "structure_metadata_bytes": String(total * name.utf8.count),
             "discovery_complete": true, "search_in_progress": running, "search_complete": complete,
@@ -125,7 +125,54 @@ private final class OccurrenceReports: @unchecked Sendable {
             edit(&structure); row["structure"] = structure
         }
     }
+
+    @MainActor private static func largerCapturesKeepRetainedReaders() throws {
+        for bytes in [UInt64(524_304), 33_554_432] {
+            for utf16 in [false, true] {
+                let name = "éx", width = UInt64(utf16 ? name.utf16.count * 2 : name.utf8.count)
+                let range = ["start": String(bytes - width), "end": String(bytes)]
+                try setup(name: name, utf16: utf16)
+                var terminal = page("step", step: 1, total: 1, running: false, complete: true,
+                    name: name, utf16: utf16)
+                editFirst(&terminal) { row in
+                    row["capture_byte_length"] = String(bytes); row["original_range"] = range
+                    var structure = row["structure"] as! [String: Any]
+                    structure["evidence_range"] = range; row["structure"] = structure
+                }
+                try install(2, terminal)
+                var result: AtlasSearchReport? = try run(name: name)
+                check(result!.complete && result!.hits[0].start == bytes - width
+                    && result!.hits[0].end == bytes && result!.hits[0].captureByteLength == bytes,
+                    "large workspace occurrence lost its complete capture and exact original range")
+                var target = result!.capture?.target(result!.hits[0])
+                check(target != nil, "large occurrence result cannot retain its reader handoff")
+                var imported = (terminal["hits"] as! [[String: Any]])[0]
+                imported.merge(["schema": "fcb.atlas-search/1", "status": "ok", "command": "open-reader",
+                    "owner": "11", "source_manifest": "1", "layout_revision": "1", "query_generation": "1",
+                    "discovery_policy": "repository-rules-v1",
+                    "reader_owner": "100", "source_reopened": false, "source_observation": "retained-search-capture",
+                    "reader": ["schema": "fcb.reader-session/1", "status": "ok", "command": "info",
+                        "owner": "100", "file_id": "1", "source_revision": "1", "captured_bytes": String(bytes),
+                        "path": ["encoding": "unix-bytes", "hex": hex("src/a.rs"), "display": "src/a.rs"],
+                        "capture_origin": "host-supplied", "initial_source_bytes_read": "0", "initial_read_calls": "0",
+                        "additional_source_bytes_read": "0", "native_presented": false,
+                        "encoding": utf16 ? "utf16le" : "utf8"]], uniquingKeysWith: { _, new in new })
+                try install(4, imported)
+                result = nil
+                let reader = try AtlasReaderInfo.decode(target!.openReader(100), handle: 100, path: "src/a.rs")
+                check(reader.identity.capturedBytes == bytes && fixtureCount(8) == 1 && fixtureCount(1) == 1,
+                    "large occurrence activation failed to import the retained source without reopening it")
+                target = nil; retired()
+            }
+        }
+    }
+
     @MainActor static func main() throws {
+        check(AtlasSearchMode.occurrences.structureFileByteLimit == 33_554_432
+            && AtlasSearchMode.symbols.structureFileByteLimit == 65_536
+            && AtlasSearchMode.headings.structureFileByteLimit == 262_144,
+            "occurrence coverage must expand without enlarging declaration or heading extraction")
+        try largerCapturesKeepRetainedReaders()
         check(AtlasSearchMode.occurrences.code == 4 && !AtlasSearchMode.occurrences.isTextual,
             "Occurrences uses the structural live path, never the literal index")
         check(!AtlasSearchMode.occurrences.supportsNameMatching
@@ -246,7 +293,8 @@ private final class OccurrenceReports: @unchecked Sendable {
             ("name_syntax", "arbitrary-text" as Any), ("unicode_normalization", "NFC" as Any),
             ("name_mode", "prefix" as Any), ("name_case", "insensitive" as Any),
             ("requested_mode", "symbols" as Any), ("realized_mode", "heuristic-outline-candidate" as Any),
-            ("evidence_level", "exact-decoded-literal" as Any), ("structure_file_byte_limit", "1048576" as Any)
+            ("evidence_level", "exact-decoded-literal" as Any), ("structure_file_byte_limit", "1048576" as Any),
+            ("structure_file_byte_limit", "524288" as Any)
         ] {
             try rejected("wrong " + key) { $0[key] = wrong }
         }
@@ -272,7 +320,7 @@ private final class OccurrenceReports: @unchecked Sendable {
                 structure["evidence_range"] = row["original_range"]; row["structure"] = structure
             }
         }
-        try rejected("oversize occurrence capture") { editFirst(&$0) { $0["capture_byte_length"] = "524289" } }
+        try rejected("oversize occurrence capture") { editFirst(&$0) { $0["capture_byte_length"] = "33554433" } }
         try rejected("literal namespace mixed into occurrence") { editFirst(&$0) { $0["matched_text"] = "run" } }
         try rejected("wrong preview spelling") {
             editFirst(&$0) { $0["excerpt"] = [

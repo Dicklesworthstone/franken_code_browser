@@ -40,7 +40,7 @@ impl ReaderSession {
 
     /// Find exact same-token text occurrences, including declarations, comments
     /// and literals. This is not compiler reference resolution. The shared
-    /// engine admits at most 512 KiB of valid UTF-8/BOM-marked UTF-16 source,
+    /// engine admits at most 32 MiB of valid UTF-8/BOM-marked UTF-16 source,
     /// independently of the ordinary reader and declaration-outline limits.
     ///
     /// A zero cap probes existence. The engine counts at most one unstored

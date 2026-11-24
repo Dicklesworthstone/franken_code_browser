@@ -175,3 +175,33 @@ fn canceling_a_counted_window_after_storage_fills_preserves_the_accepted_generat
         .unwrap().as_str().contains("\"original_hex\":\"666f6f\""));
     readers.close(handle).unwrap();
 }
+
+#[test]
+fn large_forked_capture_keeps_exact_occurrence_windows_after_original_closes() {
+    let readers = ReaderSessions::new();
+    let prefix_bytes = 768 * 1024;
+    let bytes = [vec![b' '; prefix_bytes], b"foo foo_ foo".to_vec()].concat();
+    let original = opened(&readers, &bytes);
+    references(&readers, original, 1, "foo");
+    let fork = readers.create().unwrap();
+    readers.fork(original, fork, || false).unwrap();
+    readers.close(original).unwrap();
+    assert_eq!(readers.execute(fork, Command::Reference { generation: 1, id: 1, context: 0 }, || false).err(),
+        Some(AccessError::Reader(ReaderSessionError::MissingReferences)));
+    let inventory = readers.execute(fork, Command::ReferencesWindow { generation: 1,
+        name: "foo", max_items: 1, count_all_matches: true, result_offset: 1 }, || false).unwrap();
+    for fragment in ["\"matches_counted\":\"2\"", "\"retained_references\":\"1\"",
+        "\"occurrence_id\":\"2\"", "\"search_complete\":true",
+        "\"has_more_matches\":false", "\"additional_source_bytes_read\":\"0\""] {
+        assert!(inventory.as_str().contains(fragment), "{fragment}: {}", inventory.as_str());
+    }
+    let exact = readers.execute(fork, Command::Reference { generation: 1, id: 1, context: 32 }, || false).unwrap();
+    assert!(exact.as_str().contains(&format!(
+        "\"original_range\":{{\"start\":\"{}\",\"end\":\"{}\"}}", prefix_bytes + 9, prefix_bytes + 12)));
+    assert!(readers.execute(fork, Command::CopyReference { generation: 1, id: 1 }, || false)
+        .unwrap().as_str().contains("\"original_hex\":\"666f6f\""));
+    readers.close(fork).unwrap();
+    assert!(exact.as_str().contains("\"selection_namespace\":\"reference\""));
+    assert_eq!(readers.live.load(Ordering::Acquire), 0);
+    assert_eq!(readers.budget.accounting().reserved().get(), 0);
+}

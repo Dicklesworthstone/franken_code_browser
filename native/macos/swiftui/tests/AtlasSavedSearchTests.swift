@@ -1232,6 +1232,41 @@ import Dispatch
             nameMode: .exact, needle: f.occurrenceNeedle), mode: .occurrences, name: .exact, needle: f.occurrenceNeedle)
         precondition(occurrences.hits.map(\.hit.start) == [0, 2] && occurrences.hits.map(\.hit.end) == [208, 416])
 
+        // Admit original UTF-8 and UTF-16 ranges at the end of two retained
+        // 32 MiB members; extraction remains the shared engine's responsibility.
+        var largeOccurrences = f.structurePage(40, generation: 1, mode: .occurrences,
+            nameMode: .exact, needle: f.occurrenceNeedle)
+        largeOccurrences["max_source_bytes"] = "67108864"
+        largeOccurrences["loaded_bytes"] = "67108864"; largeOccurrences["member_bytes_read"] = "67108864"
+        largeOccurrences["peak_source_bytes"] = "33554432"
+        var largeRows = largeOccurrences["hits"] as! [[String: Any]]
+        for index in largeRows.indices {
+            let original = largeRows[index]["original_range"] as! [String: Any]
+            let width = UInt64(original["end"] as! String)! - UInt64(original["start"] as! String)!
+            let range = ["start": String(33_554_432 - width), "end": "33554432"]
+            largeRows[index]["original_range"] = range
+            var witness = largeRows[index]["structure"] as! [String: Any]
+            witness["evidence_range"] = range; largeRows[index]["structure"] = witness
+        }
+        largeOccurrences["hits"] = largeRows
+        let large = try decode(largeOccurrences, mode: .occurrences, name: .exact, needle: f.occurrenceNeedle)
+        precondition(large.sourceBytes == 67_108_864 && large.hits.count == 2
+            && large.hits.map(\.hit.start) == [33_554_224, 33_554_018]
+            && large.hits.allSatisfy { $0.hit.end == 33_554_432 },
+            "saved occurrence receipts did not preserve large UTF-8/UTF-16 member ranges")
+        var oversizedOccurrence = largeOccurrences
+        oversizedOccurrence["peak_source_bytes"] = "33554433"
+        rejected("saved occurrences exceeded the retained-member limit") {
+            _ = try decode(oversizedOccurrence, mode: .occurrences, name: .exact, needle: f.occurrenceNeedle)
+        }
+        var oversizedHeading = f.structurePage(40, generation: 1, mode: .headings, needle: "Café")
+        oversizedHeading["peak_source_bytes"] = "262145"
+        oversizedHeading["loaded_bytes"] = "262145"; oversizedHeading["member_bytes_read"] = "262145"
+        rejected("larger occurrence allowance leaked into heading extraction") {
+            _ = try decode(oversizedHeading, mode: .headings, needle: "Café")
+        }
+
+
         // Wire admission only; saved-structure CLI tests run the actual extractor.
         // The engine emits distinct JSX/TSX names; request aliases are not wire tags.
         let supported = ["java", "csharp", "javascript", "typescript", "jsx", "tsx", "cpp"]

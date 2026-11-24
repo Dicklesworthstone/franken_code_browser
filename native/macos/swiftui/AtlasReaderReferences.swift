@@ -95,7 +95,7 @@ struct AtlasReferenceInventory: Sendable {
 /// references. Completeness covers only that declared policy in one capture.
 struct AtlasReferencePage: Sendable {
     static let maxItems: UInt64 = 4096
-    static let sourceLimit: UInt64 = 512 * 1024
+    static let sourceLimit: UInt64 = 32 * 1024 * 1024
     static let nameBytes = 1024
     let id: UUID
     let inventory: AtlasReferenceInventory

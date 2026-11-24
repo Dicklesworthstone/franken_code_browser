@@ -531,3 +531,28 @@ fn snapshot_without_markdown_keeps_symbols_and_occurrences_but_refuses_heading_m
         &budget, allocations()), Err(StructureError::CapabilityUnavailable)));
     assert_eq!(saved.load_stats().loaded_members, 0);
 }
+
+#[test]
+fn large_saved_occurrences_keep_bounded_windows_and_verified_original_members() {
+    let budget = budget();
+    let source = [vec![b' '; 768 * 1024], b"needle needle_suffix needle\n".to_vec()].concat();
+    let mut saved = archive(&[entry(b"large.txt", &source)], true, &budget);
+    let opts = options(StructureMode::Occurrences, 1);
+    let report = run_matching(&mut saved, "needle", opts, 1, true, true, &budget);
+    assert!(report.is_complete());
+    assert!(report.matches_seen_exact());
+    assert_eq!(report.matches_seen(), 2);
+    assert_eq!(report.hits().len(), 1);
+    assert_eq!(report.stats().source_limited_files, 0);
+    assert_eq!(report.stats().peak_source_bytes, source.len());
+    let hit = &report.hits()[0];
+    assert_eq!(hit.original_range().start().get(), 768 * 1024 + 21);
+    let opened = hit.open(&mut saved, opts.generation, &budget,
+        [allocation(30), allocation(31)], || false).unwrap();
+    let range = hit.original_range();
+    assert_eq!(&opened.bytes()[range.start().get() as usize..range.end().get() as usize], b"needle");
+    drop(saved);
+    assert_eq!(opened.bytes(), source);
+    assert_eq!(StructureMode::Occurrences.source_limit(), 32 * 1024 * 1024);
+    assert_eq!(StructureMode::Symbols.source_limit(), 64 * 1024);
+}

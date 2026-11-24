@@ -15,7 +15,8 @@ fn source(bytes: &[u8]) -> (std::path::PathBuf, u64) {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(), NEXT.fetch_add(1, Ordering::Relaxed)));
     fs::write(&path, bytes).unwrap(); let cpath = CString::new(path.to_str().unwrap()).unwrap();
     let handle = fcb_reader_create(); assert_ne!(handle, 0);
-    let opened = take(unsafe { fcb_reader_open(handle, cpath.as_ptr(), 1024 * 1024) });
+    let opened = take(unsafe { fcb_reader_open(handle, cpath.as_ptr(),
+        fcb_app::host::reader::MAX_READER_SOURCE_BYTES as u64) });
     assert!(opened.contains("\"status\":\"ok\""), "{opened}"); (path, handle)
 }
 
@@ -92,9 +93,26 @@ fn c_invalid_names_and_source_limits_are_errors_with_intact_reader() {
     let (_, malformed) = source(b"foo\xff");
     assert!(take(unsafe { fcb_reader_references(malformed, 1, name.as_ptr(), 4096) }).contains("REFERENCE_UNSUPPORTED_ENCODING"));
     assert_eq!(fcb_reader_close(malformed), 1);
-    let (_, oversized) = source(&vec![b' '; 512 * 1024 + 1]);
-    assert!(take(unsafe { fcb_reader_references(oversized, 1, name.as_ptr(), 4096) }).contains("REFERENCE_SOURCE_LIMIT"));
-    assert_eq!(fcb_reader_close(oversized), 1);
+    // The occurrence ceiling now matches complete-reader admission. A sparse
+    // file exercises that boundary without constructing another giant buffer.
+    let (path, original) = source(b"foo");
+    assert_eq!(fcb_reader_close(original), 1);
+    let maximum = fcb_app::host::reader::MAX_READER_SOURCE_BYTES as u64;
+    let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+    file.set_len(maximum + 1).unwrap();
+    drop(file);
+    let cpath = CString::new(path.to_str().unwrap()).unwrap();
+    let handle = fcb_reader_create(); assert_ne!(handle, 0);
+    let refused = take(unsafe { fcb_reader_open(handle, cpath.as_ptr(), maximum) });
+    assert!(refused.contains("\"status\":\"error\""), "{refused}");
+    assert!(take(fcb_reader_info(handle)).contains("READER_HANDLE_NOT_OPEN"));
+    // A failed admission leaves the handle usable for a valid complete source.
+    fs::write(&path, b"foo").unwrap();
+    let opened = take(unsafe { fcb_reader_open(handle, cpath.as_ptr(), maximum) });
+    assert!(opened.contains("\"status\":\"ok\""), "{opened}");
+    assert!(take(unsafe { fcb_reader_references(handle, 1, name.as_ptr(), 4096) })
+        .contains("\"retained_references\":\"1\""));
+    assert_eq!(fcb_reader_close(handle), 1);
 }
 
 #[test]
@@ -114,13 +132,23 @@ fn c_limited_and_zero_cap_results_do_not_claim_exhaustive_counts() {
 }
 
 #[test]
-fn c_later_occurrence_windows_count_beyond_the_cap_and_activate_original_utf16() {
+fn c_later_occurrence_windows_count_and_activate_large_retained_sources() {
     let _guard = FFI_TEST_LOCK.lock().unwrap();
     let name = CString::new("foo").unwrap();
-    for little in [true, false] {
-        let text = format!("\u{feff}😀\r\n{}", "foo\r\n".repeat(5005));
-        let bytes: Vec<_> = text.encode_utf16()
-            .flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect();
+    for little in [None, Some(true), Some(false)] {
+        let prefix_bytes = 600 * 1024;
+        let text = format!("{}😀\r\n{}", " ".repeat(prefix_bytes), "foo\r\n".repeat(5005));
+        let bytes: Vec<u8> = match little {
+            None => text.as_bytes().to_vec(),
+            Some(little) => format!("\u{feff}{text}").encode_utf16()
+                .flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect(),
+        };
+        assert!(bytes.len() > 512 * 1024);
+        let (first_start, width) = if little.is_some() {
+            (2 + prefix_bytes * 2 + 8 + 4500 * 10, 6)
+        } else {
+            (prefix_bytes + 6 + 4500 * 5, 3)
+        };
         let (path, handle) = source(&bytes);
         fs::write(path, b"replacement").unwrap();
         let inventory = take(unsafe { fcb_reader_references_window(handle, 1, name.as_ptr(), 2, 1, 4500) });
@@ -128,10 +156,13 @@ fn c_later_occurrence_windows_count_beyond_the_cap_and_activate_original_utf16()
             "\"result_offset\":\"4500\"", "\"skipped_matches\":\"4500\"", "\"reference_id\":\"1\"",
             "\"occurrence_id\":\"4501\"", "\"next_match_offset\":\"4502\"", "\"count_all_matches\":true",
             "\"count_complete\":true", "\"search_complete\":true", "\"output_limited\":true",
-            "\"has_more_matches\":true", "\"additional_source_bytes_read\":\"0\"",
-            "\"original_range\":{\"start\":\"45010\",\"end\":\"45016\"}"] {
+            "\"has_more_matches\":true", "\"additional_source_bytes_read\":\"0\""] {
             assert!(inventory.contains(fragment), "{fragment}: {inventory}");
         }
+        assert!(inventory.contains(&format!("\"original_range\":{{\"start\":\"{first_start}\",\"end\":\"{}\"}}",
+            first_start + width)), "{inventory}");
+        assert!(inventory.contains(&format!("\"max_source_bytes\":\"{}\"",
+            fcb_app::host::reader::MAX_READER_REFERENCE_SOURCE_BYTES)), "{inventory}");
         let page = take(fcb_reader_reference_page(handle, 1, 1, 1));
         assert!(page.contains("\"reference_id\":\"2\""));
         assert!(page.contains("\"occurrence_id\":\"4502\""));
@@ -148,7 +179,9 @@ fn c_later_occurrence_windows_count_beyond_the_cap_and_activate_original_utf16()
         assert!(last.contains("\"next_match_offset\":null"));
         assert!(take(fcb_reader_reference(handle, 1, 1, 0)).contains("REFERENCE_STALE_QUERY"));
         assert_eq!(fcb_reader_close(handle), 1);
-        let expected = if little { "66006f006f00" } else { "0066006f006f" };
+        let expected = match little {
+            None => "666f6f", Some(true) => "66006f006f00", Some(false) => "0066006f006f",
+        };
         assert!(take(copy).contains(expected));
     }
 }
@@ -193,6 +226,9 @@ fn c_reference_types_and_public_header_declarations_agree() {
     let _: extern "C" fn(u64, u64, u64) -> *mut c_char = fcb_reader_copy_reference;
     let _: extern "C" fn(u64, u64) -> *mut c_char = fcb_reader_references_clear;
     let header = include_str!("../include/fcb_reader_references.h");
+    assert!(header.contains(&format!(
+        "#define FCB_READER_REFERENCE_SOURCE_BYTES UINT64_C({})",
+        fcb_app::host::reader::MAX_READER_REFERENCE_SOURCE_BYTES)));
     for name in ["fcb_reader_references(", "fcb_reader_references_window(", "fcb_reader_reference_page(", "fcb_reader_reference(",
         "fcb_reader_copy_reference(", "fcb_reader_references_clear("] {
         assert_eq!(header.matches(name).count(), 1, "{name}");
