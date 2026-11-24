@@ -466,14 +466,17 @@ fn structure_scope(kind: &str, value: &str) -> Result<AtlasSearchScope, Failure>
     query_scope(kind, value, "DESK_STRUCTURE_SCOPE")
 }
 fn text_scope(kind: &str, value: &str, case: &str) -> Result<AtlasSearchScope, Failure> {
-    let case_sensitive = match case {
-        "sensitive" => true,
-        "unicode-lowercase" => false,
-        _ => return Err(Failure::Protocol("DESK_SEARCH_CASE")),
-    };
+    let case_sensitive = case_sensitive(case)?;
     Ok(query_scope(kind, value, "DESK_SEARCH_SCOPE")?.with_case_sensitive(case_sensitive))
 }
-fn count_all(mode: &str) -> Result<bool, Failure> {
+pub(super) fn case_sensitive(case: &str) -> Result<bool, Failure> {
+    match case {
+        "sensitive" => Ok(true),
+        "unicode-lowercase" => Ok(false),
+        _ => Err(Failure::Protocol("DESK_SEARCH_CASE")),
+    }
+}
+pub(super) fn count_all(mode: &str) -> Result<bool, Failure> {
     match mode {
         "bounded" => Ok(false),
         "count-all" => Ok(true),

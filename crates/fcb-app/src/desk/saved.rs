@@ -20,6 +20,7 @@ pub(super) const SAVED_HELP: &str = "\nOffline FCBS repositories (not FCBK readi
   saved-info TOKEN | saved-members TOKEN FIRST_MEMBER COUNT\n\
   saved-find TOKEN QUERY_GEN LIMIT TEXT\n\
   saved-find-text-hex TOKEN QUERY_GEN LIMIT UTF8_TEXT_HEX\n\
+  saved-find-window TOKEN QUERY_GEN LIMIT CASE COUNT SKIP_MATCHES TEXT\n\
   saved-page TOKEN QUERY_GEN OFFSET COUNT\n\
   saved-hit TOKEN QUERY_GEN HIT_ID | saved-member TOKEN MEMBER\n\
   saved-clear TOKEN NEW_QUERY_GEN | saved-close TOKEN\n\
@@ -29,6 +30,7 @@ pub(super) const SAVED_HELP: &str = "\nOffline FCBS repositories (not FCBK readi
   saved-path-hit TOKEN PATH_GEN HIT_ID | saved-path-clear TOKEN NEW_PATH_GEN\n\
   saved-structure TOKEN STRUCT_GEN symbols|headings|occurrences exact|prefix|contains LIMIT SOURCE_BYTES SKIP_MATCHES TEXT\n\
   saved-structure-text-hex TOKEN STRUCT_GEN MODE NAME_MODE LIMIT SOURCE_BYTES SKIP_MATCHES UTF8_TEXT_HEX\n\
+  saved-structure-window TOKEN STRUCT_GEN MODE NAME_MODE LIMIT SOURCE_BYTES CASE COUNT SKIP_MATCHES TEXT\n\
   saved-structure-page TOKEN STRUCT_GEN OFFSET COUNT\n\
   saved-structure-hit TOKEN STRUCT_GEN HIT_ID | saved-structure-clear TOKEN NEW_STRUCT_GEN\n\
   saved-index-attach TOKEN INDEX_GEN INDEX_FILE TRUSTED_PIN_HEX\n\
@@ -36,6 +38,7 @@ pub(super) const SAVED_HELP: &str = "\nOffline FCBS repositories (not FCBK readi
   saved-index-detach TOKEN NEW_INDEX_GEN\n\
   saved-expression TOKEN EXPR_GEN LIMIT SCAN_BYTES EXPRESSION\n\
   saved-expression-hex TOKEN EXPR_GEN LIMIT SCAN_BYTES UTF8_EXPRESSION_HEX\n\
+  saved-expression-window TOKEN EXPR_GEN LIMIT SCAN_BYTES CASE COUNT SKIP_MATCHES EXPRESSION\n\
   saved-expression-page TOKEN EXPR_GEN OFFSET COUNT\n\
   saved-expression-hit TOKEN EXPR_GEN HIT_ID\n\
   saved-expression-clear TOKEN EXPR_GEN\n\
@@ -59,7 +62,16 @@ limit makes the result partial. Path activation selects no source-text range.\n\
 Structural search uses verified captured sources: symbols are heuristic outline\n\
 candidates, headings use the qualified Markdown extractor, and occurrences are\n\
 whole-token text candidates including comments/literals, never compiler resolution.\n\
-Name matching is case-sensitive; occurrences require exact mode. LIMIT is 0..4096;\n\
+Window commands accept CASE sensitive|unicode-lowercase, COUNT bounded|count-all,\n\
+and a zero-based SKIP_MATCHES. Append -hex to any window command for UTF8 hex.\n\
+Use count-all with LIMIT=0 for counts alone. Check matches_seen_exact before\n\
+treating a total as exact. To read the next window use next_match_offset with a\n\
+new query generation. In a tab-delimited session after opening archive token 1,\n\
+for example, 0\tsaved-find-window\t1\t1\t5\tunicode-lowercase\tcount-all\t0\tReader\n\
+returns up to five hits. Follow the same query with generation 2 and its returned\n\
+offset. Use saved-hit with the new generation and hit_id to open captured bytes.\n\
+Original commands default to sensitive bounded matching. Structural occurrences\n\
+require sensitive exact mode. The structural result limit is 0..4096;\n\
 SOURCE_BYTES is 0..67108864 with additional per-language extraction limits.\n\
 SKIP_MATCHES requests a later window with a NEW generation; follow the returned\n\
 next_match_offset. Retained page OFFSET is different and performs no extraction.\n\
@@ -96,7 +108,7 @@ links never fetch URLs or open live paths. Link source/target imports change\n\
 the desk revision and retain exact saved bytes; other link commands do not.\n\
 Expressions reuse the first-party 1024-byte/64-token query grammar: one primary\n\
 word or quoted phrase, further required terms, -excluded terms, path: and lang:\n\
-filters (including -path: and -lang:). Matching is case-sensitive. Predicates\n\
+filters (including -path: and -lang:). CASE applies to all content terms. Predicates\n\
 apply to the whole captured member, not merely a matching line. Regex is refused.\n\
 LIMIT is 0..4096; zero probes existence. SCAN_BYTES bounds aggregate matching\n\
 work across ALL terms/files, including rescans of retained bytes. Incomplete\n\
@@ -110,7 +122,7 @@ Open validates the archive once; searches verify one member at a time. Defaults\
 are 80 MiB archive, 64 MiB total captured source, 1 MiB per member, 65536 members.\n\
 Members and page offsets are zero-based; hit IDs are one-based. Use the returned\n\
 saved_token and query generation, never IDs from an earlier archive attachment.\n\
-Member pages contain 1..128 rows. Literal queries return at most 1..4096 hits.\n\
+Member pages contain 1..128 rows. Literal queries retain 1..4096 hits, or zero with count-all.\n\
 A selected member is verified again before import; no live source path is opened.\n\
 Missing/unsupported members and truncation remain explicit incomplete coverage.\n\
 Search is synchronous worker work, not a background task or fixed-latency step.\n\
@@ -122,6 +134,20 @@ Attach validates archive binding; verified index pages use the existing cache.\n
 Query and index generations are separate and strictly increasing within this\n\
 saved attachment. Live repository queries are independent and are not advanced.\n\
 No saved archive handle, index or live-root permission enters a desk checkpoint.\n";
+
+/// Legacy commands have fixed defaults and retain their original arities.
+fn matching_window(command: &str, controls: &[&str]) -> Result<(bool, bool, u64), Failure> {
+    match (command, controls) {
+        ("saved-structure" | "saved-structure-text-hex", [skip]) => Ok((true, false, number(skip)?)),
+        ("saved-find" | "saved-find-text-hex" | "saved-expression" | "saved-expression-hex", []) =>
+            Ok((true, false, 0)),
+        ("saved-find-window" | "saved-find-window-hex" | "saved-expression-window"
+            | "saved-expression-window-hex" | "saved-structure-window" | "saved-structure-window-hex",
+            [case, count, skip]) => Ok((super::repository::case_sensitive(case)?,
+                super::repository::count_all(count)?, number(skip)?)),
+        _ => Err(Failure::Protocol("DESK_SAVED_COMMAND_SYNTAX")),
+    }
+}
 
 impl From<SavedRepositoryError> for Failure {
     fn from(error: SavedRepositoryError) -> Self { Self::Saved(SavedDeskError::Saved(error)) }
@@ -213,8 +239,9 @@ impl SavedCommands {
             }
             ("saved-path-clear", [token, generation]) =>
                 Ok(self.get(number(token)?)?.clear_paths(number(generation)?, &mut *canceled)?),
-            ("saved-structure" | "saved-structure-text-hex",
-                [token, generation, mode, name_mode, limit, bytes, skip, text]) => {
+            ("saved-structure" | "saved-structure-text-hex" | "saved-structure-window" | "saved-structure-window-hex",
+                [token, generation, mode, name_mode, limit, bytes, controls @ .., text]) => {
+                let (case_sensitive, count_all, skip) = matching_window(command, controls)?;
                 let mode = match *mode { "symbols" => StructureMode::Symbols,
                     "headings" => StructureMode::Headings, "occurrences" => StructureMode::Occurrences,
                     _ => return Err(Failure::Protocol("DESK_STRUCTURE_MODE")) };
@@ -222,13 +249,13 @@ impl SavedCommands {
                     "prefix" => SymbolNameMode::Prefix, "contains" => SymbolNameMode::Contains,
                     _ => return Err(Failure::Protocol("DESK_STRUCTURE_NAME_MODE")) };
                 let decoded;
-                let needle = if command == "saved-structure-text-hex" {
+                let needle = if command.ends_with("-hex") {
                     decoded = String::from_utf8(hex(text, fcb::search::snapshot_structure::MAX_STRUCTURE_NEEDLE_BYTES)?)
                         .map_err(|_| Failure::Protocol("DESK_INVALID_TEXT"))?;
                     decoded.as_str()
                 } else { text };
-                Ok(self.get(number(token)?)?.structure_search_page(number(generation)?, mode, name_mode,
-                    needle, count(limit)?, number(bytes)?, number(skip)?, &mut *canceled)?)
+                Ok(self.get(number(token)?)?.structure_search_matching_page(number(generation)?, mode, name_mode,
+                    needle, count(limit)?, number(bytes)?, case_sensitive, count_all, skip, &mut *canceled)?)
             }
             ("saved-structure-page", [token, generation, first, limit]) =>
                 Ok(self.get(number(token)?)?.structure_results(number(generation)?, count(first)?, count(limit)?, &mut *canceled)?),
@@ -280,15 +307,20 @@ impl SavedCommands {
             }
             ("saved-imports-clear", [token, generation]) =>
                 Ok(self.get(number(token)?)?.clear_imports(number(generation)?, &mut *canceled)?),
-            ("saved-find" | "saved-find-text-hex", [token, generation, limit, text]) => {
+            ("saved-find" | "saved-find-text-hex" | "saved-find-window" | "saved-find-window-hex",
+                [token, generation, limit, controls @ .., text]) => {
+                let (case_sensitive, count_all, skip) = matching_window(command, controls)?;
                 let decoded;
-                let needle = if command == "saved-find-text-hex" {
+                let needle = if command.ends_with("-hex") {
                     decoded = String::from_utf8(hex(text, 1024)?).map_err(|_| Failure::Protocol("DESK_INVALID_TEXT"))?;
                     decoded.as_str()
                 } else { text };
-                Ok(self.get(number(token)?)?.search(number(generation)?, needle, count(limit)?, &mut *canceled)?)
+                Ok(self.get(number(token)?)?.search_matching_page(number(generation)?, needle, count(limit)?,
+                    case_sensitive, count_all, skip, &mut *canceled)?)
             }
-            ("saved-expression" | "saved-expression-hex", [token, generation, limit, bytes, text]) => {
+            ("saved-expression" | "saved-expression-hex" | "saved-expression-window" | "saved-expression-window-hex",
+                [token, generation, limit, bytes, controls @ .., text]) => {
+                let (case_sensitive, count_all, skip) = matching_window(command, controls)?;
                 let token = number(token)?; self.get(token)?;
                 let generation = number(generation)?;
                 if generation == 0 || generation <= self.last_expression_attempt {
@@ -297,13 +329,14 @@ impl SavedCommands {
                 self.last_expression_attempt = generation;
                 let options = SavedExpressionOptions { max_hits: count(limit)?, max_scan_bytes: number(bytes)? };
                 let decoded;
-                let query = if command == "saved-expression-hex" {
+                let query = if command.ends_with("-hex") {
                     decoded = String::from_utf8(hex(text, fcb::search::MAX_QUERY_LEN)?)
                         .map_err(|_| Failure::Protocol("DESK_INVALID_TEXT"))?;
                     decoded.as_str()
                 } else { text };
                 let saved = self.get(token)?;
-                let candidate = SavedExpression::prepare(saved, generation, query, options, &mut *canceled)?;
+                let candidate = SavedExpression::prepare_matching_page(saved, generation, query, options,
+                    case_sensitive, count_all, skip, &mut *canceled)?;
                 let response = candidate.page(saved, generation, 0, 64, &mut *canceled)?;
                 if canceled() { return Err(Failure::Canceled); }
                 self.expression = Some(candidate);

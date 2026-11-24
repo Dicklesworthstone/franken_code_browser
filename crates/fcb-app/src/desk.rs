@@ -351,7 +351,8 @@ fn execute(session: &mut DeskSession, attempt: u64, frame: &str,
     let field_limit = match command {
         "repo-begin-indexed-matching-window" | "repo-begin-indexed-matching-window-text-hex"
         | "repo-begin-indexed-expression-window" | "repo-begin-indexed-expression-window-text-hex" => 13,
-        "repo-begin-structure" | "repo-begin-structure-text-hex"
+        "saved-structure-window" | "saved-structure-window-hex"
+        | "repo-begin-structure" | "repo-begin-structure-text-hex"
         | "repo-begin-indexed-structure" | "repo-begin-indexed-structure-text-hex"
         | "repo-begin-matching" | "repo-begin-matching-text-hex"
         | "repo-begin-expression" | "repo-begin-expression-text-hex"

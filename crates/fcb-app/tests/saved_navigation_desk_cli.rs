@@ -231,3 +231,62 @@ fn work_limits_missing_sources_and_extra_frame_fields_remain_explicit() {
     assert_eq!(rows[10].get("last_saved_structure_attempt").number(), 2);
     assert_eq!(rows[11].get("accepted_revision").number(), 6);
 }
+
+#[test]
+fn matching_windows_count_qualified_saved_rows_and_open_original_spelling() {
+    let f = Fixture::new(&[
+        entry(b"a.md", b"# Reader Guide\n# READER GUIDE\n# Reader extra\n\nRequire\n"),
+        entry(b"b.md", b"# Reader Guide\n\nRequire Exclude\n"),
+    ], true);
+    let (exit, rows) = invoke(&format!(
+        "0\tsaved-open\t{}\n\
+         0\tsaved-find-window\t1\t1\t0\tunicode-lowercase\tcount-all\t0\treader guide\n\
+         0\tsaved-find-window-hex\t1\t2\t1\tunicode-lowercase\tcount-all\t1\t{}\n\
+         0\tsaved-expression-window\t1\t1\t1\t100000\tunicode-lowercase\tcount-all\t0\t\"reader guide\" require -exclude\n\
+         0\tsaved-expression-window-hex\t1\t2\t1\t100000\tunicode-lowercase\tcount-all\t1\t{}\n\
+         0\tsaved-structure-window\t1\t1\theadings\texact\t1\t100000\tunicode-lowercase\tcount-all\t0\treader guide\n\
+         0\tsaved-structure-window-hex\t1\t2\theadings\texact\t1\t100000\tunicode-lowercase\tcount-all\t1\t{}\n\
+         0\tsaved-hit\t1\t2\t1\n\
+         8\tcopy\t1\n8\tsaved-find\t1\t3\t4\tReader Guide\n8\tquit\n", f.path.display(), hex(b"reader guide"),
+        hex(b"\"reader guide\" require -exclude"), hex(b"reader guide")));
+    assert_eq!(exit, EXIT_OK, "{rows:?}");
+    for (index, matches) in [(1, 3), (2, 3), (3, 2), (4, 2), (5, 3), (6, 3)] {
+        let page = result(&rows[index]);
+        assert!(page.get("matches_seen_exact").flag());
+        assert_eq!(page.get("matches_seen").number(), matches);
+        assert!(!page.get("case_sensitive").flag());
+    }
+    let count_only = result(&rows[1]);
+    assert!(count_only.get("hits").array().is_empty());
+    assert_eq!(count_only.get("next_match_offset"), &Json::Null);
+    for index in [2, 4, 6] {
+        assert_eq!(result(&rows[index]).get("skipped_matches").number(), 1);
+        assert_eq!(result(&rows[index]).get("retained_hits").number(), 1);
+    }
+    assert_eq!(result(&rows[3]).get("next_match_offset").number(), 1);
+    assert_eq!(result(&rows[4]).get("next_match_offset"), &Json::Null);
+    let selected = result(&rows[8]).get("original_hex").text();
+    assert_eq!(selected, hex(b"READER GUIDE"));
+    assert!(result(&rows[9]).get("case_sensitive").flag());
+    assert_eq!(result(&rows[9]).get("matches_seen").number(), 2);
+}
+
+#[test]
+fn saved_window_rejects_invalid_controls_and_keeps_partial_counts_explicit() {
+    let f = Fixture::new(&[entry(b"a.md", b"# Reader\n")], false);
+    let (exit, rows) = invoke(&format!(
+        "0\tsaved-open\t{}\n\
+         0\tsaved-find-window\t1\t1\t1\tunicode-lowercase\tcount-all\t0\treader\n\
+         0\tsaved-find-window\t1\t2\t1\tunknown\tcount-all\t0\treader\n\
+         0\tsaved-expression-window\t1\t1\t1\t10000\tsensitive\tunknown\t0\tReader\n\
+         0\tsaved-structure-window\t1\t1\theadings\texact\t1\t10000\tsensitive\tbounded\t-1\tReader\n\
+         0\tsaved-page\t1\t1\t0\t1\n0\tquit\n", f.path.display()));
+    assert_eq!(exit, EXIT_ERROR);
+    assert_eq!(rows[1].get("exit_code").number(), EXIT_PARTIAL as u64);
+    assert!(!result(&rows[1]).get("matches_seen_exact").flag());
+    assert_eq!(result(&rows[1]).get("matches_seen").number(), 1);
+    assert_eq!(error(&rows[2]), "DESK_SEARCH_CASE");
+    assert_eq!(error(&rows[3]), "DESK_SEARCH_COUNT_MODE");
+    assert_eq!(error(&rows[4]), "DESK_INVALID_NUMBER");
+    assert_eq!(result(&rows[5]).get("hits"), result(&rows[1]).get("hits"));
+}
