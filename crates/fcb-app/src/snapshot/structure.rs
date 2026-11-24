@@ -146,6 +146,8 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
             out.literal("Aggregate source allowance exhausted; no exhaustive-negative claim.\n")?;
         }
     }
-    Ok(if !report.is_complete() || (!report.count_all_matches() && report.skipped_matches() > 0) { EXIT_PARTIAL }
+    let partial = if report.count_all_matches() { !report.matches_seen_exact() }
+        else { !report.is_complete() || report.skipped_matches() > 0 };
+    Ok(if partial { EXIT_PARTIAL }
         else if report.matches_seen() == 0 { EXIT_NO_MATCH } else { EXIT_OK })
 }

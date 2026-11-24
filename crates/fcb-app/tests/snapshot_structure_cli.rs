@@ -67,6 +67,27 @@ fn count_all_structure_reports_exact_totals_with_bounded_rows_and_stable_continu
 }
 
 #[test]
+fn count_all_exit_uses_exact_totals_when_only_result_metadata_is_omitted() {
+    let long_name = format!("needle_{}", "x".repeat(4096));
+    let text = format!("fn {long_name}() {{}}\nfn needle_a() {{}}\nfn needle_b() {{}}\n");
+    let f = Fixture::new(&[entry(b"a.rs", text.as_bytes())], true);
+    for (counted, expected_exit) in [(false, EXIT_PARTIAL), (true, EXIT_OK)] {
+        let mut extra = vec!["--name-mode", "prefix", "--limit", "1"];
+        if counted { extra.push("--count-all"); }
+        let (exit, page) = invoke(&args(&f, "symbols", "needle_", &extra), || false);
+        assert_eq!(exit, expected_exit);
+        assert_eq!(page.get("matches_seen_exact").flag(), counted);
+        assert_eq!(page.get("matches_seen").number(), 3);
+        assert_eq!(page.get("metadata_omitted").number(), 1);
+        assert!(!page.get("workspace_complete").flag());
+        assert_eq!(page.get("retained_hits").number(), 1);
+        assert_eq!(page.get("hits").array()[0].get("name").text(), "needle_a");
+        assert_eq!(page.get("next_match_offset").number(), 2);
+        assert!(!page.get("semantic_complete").flag());
+    }
+}
+
+#[test]
 fn insensitive_structure_keeps_original_names_and_utf16_source_bytes() {
     let text = "// 🚀\nfn Run() {}\nfn Runner() {}\nfn preRun() {}\n";
     let mut bytes = vec![0xff, 0xfe]; bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
