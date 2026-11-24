@@ -1325,6 +1325,22 @@ coordinates, and retains its bytes if the working file changes. Symbols remain
 heuristic outline candidates. Headings use the shared Markdown extractor and
 qualified original-source mapping; neither mode claims compiler completeness.
 
+The reader keeps a **Back / Forward** trail of the last three accepted source
+captures, including each reader's position and selection. Moving through this
+trail uses retained bytes. A failed or canceled result opening preserves the
+current reader and its Forward history; a successful new destination replaces
+the Forward branch. Editing the query, case policy or result window preserves
+accepted readers while revoking old search-result actions.
+
+Use **Pin source** to keep up to two independently retained readers beside the
+current result. Pins keep their positions when another result opens, and two
+pins can use the shared **Compare** action. **Keep in Reading Desk** is available
+from the current source and pinned sources. It copies the actual selection or
+current source window into the existing desk, where bookmarks, personal notes,
+saved checkpoints and source-evidence exports remain available. Closing this
+search sheet or replacing its project grant retires its history and pins; a
+copy already accepted by the Reading Desk remains independently owned there.
+
 The default total source-read allowance is **256 MiB**, with **1 GiB** and
 **4 GiB** choices. Per-file extraction currently admits complete symbol sources
 up to **64 KiB** and Markdown sources up to **256 KiB**. At most **256 result

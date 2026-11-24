@@ -165,7 +165,8 @@ private final class AtlasWorkspaceStructureSession: @unchecked Sendable {
 
 /// Main-actor scheduling and identity ownership. Every foreign operation runs on
 /// the existing bounded worker; a pause takes effect between admitted batches.
-/// Only one result page and one independently opened reader are displayed.
+/// One result page is displayed. The shared bounded history owns independently
+/// opened readers; revisiting one never replays an old search-row capability.
 @Observable @MainActor final class AtlasWorkspaceStructureModel {
     var queryText: String {
         didSet { if !oldValue.utf8.elementsEqual(queryText.utf8) { edited() } }
@@ -184,8 +185,9 @@ private final class AtlasWorkspaceStructureSession: @unchecked Sendable {
     }
     let discoveryPolicy: AtlasDiscoveryPolicy
     private(set) var page: AtlasWorkspaceStructurePage?
-    private(set) var currentReader: AtlasWorkspaceStructureReader?
-    private(set) var busy = false
+    var currentReader: AtlasWorkspaceStructureReader? { readerHistory.current }
+    var busy: Bool { working || readerHistory.busy }
+    private var working = false
     private(set) var running = false
     private(set) var pausing = false
     private(set) var stopping = false
@@ -204,6 +206,10 @@ private final class AtlasWorkspaceStructureSession: @unchecked Sendable {
     @ObservationIgnored private var operation = UUID()
     @ObservationIgnored private var generation: UInt64 = 0
     @ObservationIgnored private var previousWindows: [UInt64] = []
+    private let readerHistory = AtlasDocumentLinkHistory<AtlasWorkspaceStructureReader>(
+        retire: { $0.reader.close() },
+        failureMessage: { ($0 as? AtlasWorkspaceStructureError)?.message
+            ?? ($0 as? AtlasReaderError)?.message ?? "The source could not be opened. Your retained readers are unchanged." })
 
     init(transport: AtlasWorkspaceStructureTransport, query: String = "", mode: AtlasWorkspaceStructureMode = .symbols,
         nameMode: AtlasSearchNameMode = .contains, caseSensitive: Bool = true,
@@ -229,6 +235,11 @@ private final class AtlasWorkspaceStructureSession: @unchecked Sendable {
             && (page?.summary.retainedHits ?? 0) > 0 && generation < UInt64.max
     }
     var canEarlierWindow: Bool { canSelect && !previousWindows.isEmpty && generation < UInt64.max }
+    var canPreviousReader: Bool { !closed && readerHistory.canBack }
+    var canNextReader: Bool { !closed && readerHistory.canForward }
+    var readerHistorySummary: String {
+        "Source \(readerHistory.position + 1) of \(readerHistory.captures.count) retained visits"
+    }
 
     private func request(startAfter: UInt64) throws -> AtlasWorkspaceStructureRequest {
         guard let authority else { throw AtlasWorkspaceStructureError.unavailable }
@@ -246,6 +257,7 @@ private final class AtlasWorkspaceStructureSession: @unchecked Sendable {
             return
         }
         authority = source; closed = false
+        bindReaderHistory(source)
         notice = "The selected location, file types and discovery policy stay fixed in this sheet."
         if canSearch { search() }
     }
@@ -416,12 +428,15 @@ private final class AtlasWorkspaceStructureSession: @unchecked Sendable {
     }
 
     func open(_ target: AtlasWorkspaceStructureTarget) {
-        guard canSelect, let session, let page, page.admits(target), let registryDomain else { return }
+        guard canSelect, readerHistory.canFollow, let session, let page, page.admits(target), let registryDomain else { return }
         let summary = page.summary, root = page.summary.root
         let next = makeReader()
         let (ticket, flag) = begin("Opening the exact retained source at original byte \(target.hit.range.start)…")
         pendingReader = next
-        task = Task {
+        readerHistory.follow(didFinish: { [weak self] in
+            guard let self, self.operation == ticket else { return }
+            self.pendingReader = nil; self.finish(ticket)
+        }) { [self] in
             do {
                 try await next.openRetained(registryDomain: registryDomain) { destination in
                     guard !flag.isCanceled else { throw AtlasWorkspaceStructureError.canceled }
@@ -435,23 +450,34 @@ private final class AtlasWorkspaceStructureSession: @unchecked Sendable {
                       authorized, self.page?.admits(target) == true else {
                     next.close()
                     if operation == ticket { pendingReader = nil; finish(ticket) }
-                    return
+                    throw AtlasWorkspaceStructureError.canceled
                 }
-                let previous = currentReader
-                currentReader = .init(hit: target.hit, reader: next)
                 pendingReader = nil; finish(ticket)
-                previous?.reader.close()
                 notice = "Opened the retained capture at original byte \(target.hit.range.start). Candidate range: "
-                    + "\(target.hit.range.start)..<\(target.hit.range.end). No live source was reopened."
+                    + "\(target.hit.range.start)..<\(target.hit.range.end). Back and Forward retain the last three sources."
+                return AtlasWorkspaceStructureReader(hit: target.hit, reader: next)
             } catch {
                 next.close()
                 if operation == ticket { pendingReader = nil; finish(ticket); notice = message(error) }
+                throw error
             }
         }
     }
+    func previousReader() {
+        guard canPreviousReader else { return }
+        readerHistory.back(); notice = readerHistory.notice
+    }
+    func nextReader() {
+        guard canNextReader else { return }
+        readerHistory.forward(); notice = readerHistory.notice
+    }
     func closeReader() {
         pendingReader?.close(); pendingReader = nil
-        currentReader?.reader.close(); currentReader = nil
+        readerHistory.close()
+        if !closed, let authority { bindReaderHistory(authority) }
+    }
+    private func bindReaderHistory(_ source: AtlasWorkspaceStreamSource) {
+        readerHistory.bind(root: source.root, accessIdentity: source.access.map { ObjectIdentifier($0) })
     }
 
     func cancel() {
@@ -460,7 +486,7 @@ private final class AtlasWorkspaceStructureSession: @unchecked Sendable {
     }
     func close() {
         cancelWork(retireSession: true)
-        closeReader(); closed = true; authority = nil; page = nil; previousWindows = []
+        closed = true; closeReader(); authority = nil; page = nil; previousWindows = []
     }
     private func edited() {
         guard !closed else { return }
@@ -470,22 +496,23 @@ private final class AtlasWorkspaceStructureSession: @unchecked Sendable {
     }
     private func begin(_ notice: String) -> (UUID, AtlasSearchCancellation) {
         let ticket = UUID(), flag = AtlasSearchCancellation()
-        operation = ticket; cancellation = flag; busy = true; running = false; pausing = false; stopping = false
+        operation = ticket; cancellation = flag; working = true; running = false; pausing = false; stopping = false
         self.notice = notice
         return (ticket, flag)
     }
     private func cancelWork(retireSession: Bool) {
         operation = UUID(); cancellation?.cancel(); task?.cancel(); io.cancel()
+        readerHistory.cancel()
         pendingReader?.close(); pendingReader = nil
         if retireSession { session?.cancel(); session = nil; authorized = false }
-        cancellation = nil; task = nil; busy = false; running = false; pausing = false; stopping = false
+        cancellation = nil; task = nil; working = false; running = false; pausing = false; stopping = false
     }
     private func accepts(_ ticket: UUID, _ flag: AtlasSearchCancellation, session: AtlasWorkspaceStructureSession) -> Bool {
         !closed && operation == ticket && !flag.isCanceled && !Task.isCancelled && self.session === session
     }
     private func finish(_ ticket: UUID) {
         guard operation == ticket else { return }
-        task = nil; cancellation = nil; busy = false; running = false; pausing = false; stopping = false
+        task = nil; cancellation = nil; working = false; running = false; pausing = false; stopping = false
     }
     private func fail(_ error: Error, ticket: UUID) {
         guard operation == ticket else { return }

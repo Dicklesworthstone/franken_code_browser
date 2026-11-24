@@ -33,7 +33,8 @@ set -- "$@" -swift-version 6 -warnings-as-errors \
     "$src/AtlasReaderOutline.swift" "$src/AtlasReaderReferences.swift" "$src/AtlasReaderTextSelection.swift" \
     "$src/AtlasReaderDocument.swift" "$src/AtlasDocumentDisplay.swift" \
     "$src/AtlasReaderCoordinator.swift" "$src/AtlasCapturedReader.swift" "$src/AtlasSuppliedReader.swift" \
-    "$src/AtlasNavigationHistory.swift" "$src/AtlasSource.swift" "$src/AtlasProjectCatalog.swift" \
+    "$src/AtlasNavigationHistory.swift" "$src/AtlasDocumentLinkHistory.swift" "$src/AtlasPinnedReaders.swift" \
+    "$src/AtlasSource.swift" "$src/AtlasProjectCatalog.swift" \
     "$src/AtlasDocumentPreviewModel.swift" "$src/AtlasPagedReaderModel.swift" \
     "$src/AtlasWorkspaceStructure.swift" "$src/AtlasWorkspaceStructureBridge.swift"
 swiftc "$@" "$out/Source.swift" "$out/Model.swift" \

@@ -4,14 +4,20 @@ import SwiftUI
 /// Result rows carry the accepted page identity into their activation callback.
 @MainActor struct AtlasWorkspaceStructureView: View {
     let presentation: AtlasWorkspaceStructurePresentation
+    let desk: AtlasReadingDeskModel
     @State private var model: AtlasWorkspaceStructureModel
+    @State private var pins = AtlasPinnedReaders<AtlasPagedReaderModel>(
+        canFork: { $0.canPin }, fork: { try await $0.fork() }, retire: { $0.close() },
+        failureMessage: { ($0 as? AtlasReaderError)?.message ?? "The structural search source could not be pinned." })
+    @State private var keepingSource = false
     @Environment(\.dismiss) private var dismiss
     @FocusState private var queryFocused: Bool
 
-    init(presentation: AtlasWorkspaceStructurePresentation) {
-        self.presentation = presentation
+    init(presentation: AtlasWorkspaceStructurePresentation, desk: AtlasReadingDeskModel) {
+        self.presentation = presentation; self.desk = desk
         _model = State(initialValue: presentation.model)
     }
+    private var pinGroup: String { "workspace-structure:\(presentation.id.uuidString)" }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -19,7 +25,7 @@ import SwiftUI
                 Label("Project symbols and headings", systemImage: "list.bullet.rectangle")
                     .font(.headline)
                 Spacer()
-                Button("Done") { presentation.close(); dismiss() }
+                Button("Done") { close(); dismiss() }
                     .keyboardShortcut(.cancelAction)
             }
             Text(verbatim: "Project: " + String(reflecting: presentation.source.root))
@@ -42,9 +48,14 @@ import SwiftUI
             }
             Text(verbatim: model.notice).font(.callout).foregroundStyle(.secondary)
                 .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+            if keepingSource {
+                Text(verbatim: desk.notice).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+            }
         }
-        .padding(16).frame(minWidth: 1040, idealWidth: 1240, minHeight: 720, idealHeight: 820)
-        .onAppear { presentation.start(); queryFocused = true }
+        .padding(16).frame(minWidth: 1040, idealWidth: 1400, minHeight: 720, idealHeight: 820)
+        .onAppear { pins.bind(root: pinGroup); presentation.start(); queryFocused = true }
+        .onChange(of: model.closed) { _, closed in if closed { pins.closeAll() } }
+        .onDisappear { close() }
     }
 
     private var queryControls: some View {
@@ -185,15 +196,33 @@ import SwiftUI
         if let capture = model.currentReader {
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
+                    Button(action: model.previousReader) { Label("Back", systemImage: "chevron.left") }
+                        .disabled(!model.canPreviousReader)
+                    Button(action: model.nextReader) { Label("Forward", systemImage: "chevron.right") }
+                        .disabled(!model.canNextReader)
                     Text(verbatim: capture.hit.displayPath).font(.system(.callout, design: .monospaced))
                         .lineLimit(2).textSelection(.enabled)
                     Spacer()
-                    Button("Close source", action: model.closeReader)
-                }
-                Text("Retained source · original bytes \(capture.hit.range.start)..<\(capture.hit.range.end)")
+                    Button("Close history", action: model.closeReader)
+                        .help("Close the retained reading history. Pinned readers and Reading Desk copies stay open.")
+                }.controlSize(.small)
+                Text("\(model.readerHistorySummary) · candidate original bytes \(capture.hit.range.start)..<\(capture.hit.range.end)")
                     .font(.caption).foregroundStyle(.secondary)
-                AtlasPagedSourceView(model: capture.reader).id(capture.id)
+                HSplitView {
+                    AtlasPagedSourceView(model: capture.reader, canPin: !model.closed && pins.canAdd,
+                        pin: { source in pins.pin(source, root: pinGroup, label: capture.hit.displayPath) },
+                        canKeep: desk.canOperate, keep: keep)
+                        .id(capture.id).frame(minWidth: 330, maxWidth: .infinity, maxHeight: .infinity)
+                    if !pins.entries.isEmpty || pins.busy {
+                        AtlasPinnedReadersView(readers: pins, canKeep: desk.canOperate, keep: keep)
+                            .frame(minWidth: 330, idealWidth: 430)
+                    }
+                }
+                Text("Back and Forward keep the last three sources. Pin sources to compare them. Keep sends your exact selection or current source window to the Reading Desk.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
+        } else if !pins.entries.isEmpty || pins.busy {
+            AtlasPinnedReadersView(readers: pins, canKeep: desk.canOperate, keep: keep)
         } else {
             ContentUnavailableView {
                 Label("Read the captured source", systemImage: "doc.text")
@@ -201,5 +230,14 @@ import SwiftUI
                 Text("Pause or finish the search, then choose a result. The reader opens the exact captured file used for that match.")
             }.frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+    }
+    private func keep(_ source: AtlasPagedReaderModel) {
+        guard !model.closed, desk.canOperate, source.canKeep, let domain = desk.readerDomain,
+              source.retainedRegistryDomain == domain else { return }
+        keepingSource = true
+        desk.keep(reader: source)
+    }
+    private func close() {
+        pins.closeAll(); presentation.close()
     }
 }

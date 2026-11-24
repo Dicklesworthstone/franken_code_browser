@@ -303,7 +303,115 @@ import Foundation
         precondition(late.page == nil && late.currentReader == nil && !late.busy,
             "A root/sheet close must reject late receipts")
 
+        await researchWorkflow()
         print("AtlasWorkspaceStructureTests: schema, canonical roots, retained activation and lifecycle contracts passed")
+    }
+
+    @MainActor private static func researchWorkflow() async {
+        let fixture = WorkspaceStructureFixture(), model = Self.model(fixture)
+        let pins = AtlasPinnedReaders<AtlasPagedReaderModel>(canFork: { $0.canPin },
+            fork: { try await $0.fork() }, retire: { $0.close() })
+        pins.bind(root: "structure-presentation-one")
+        model.open(source(access: NSObject()))
+        await waitFor { !model.busy }
+        @MainActor func visit(_ index: Int) async -> AtlasWorkspaceStructureReader {
+            let page = model.page!
+            model.open(page.target(page.rows[index])!)
+            await waitFor { !model.busy }
+            guard let reader = model.currentReader else { preconditionFailure(model.notice) }
+            return reader
+        }
+
+        let first = await visit(0)
+        first.reader.offsetInput = "17"; first.reader.goToByte()
+        await waitFor { !first.reader.busy }
+        precondition(first.reader.page?.start == 17)
+        let second = await visit(1)
+        precondition(first.reader.page != nil && model.canPreviousReader)
+        let reads = fixture.log.filter { $0 == "open-reader" || $0 == "reader-window" }.count
+        model.previousReader()
+        precondition(model.currentReader === first && first.reader.page?.start == 17 && model.canNextReader)
+        model.nextReader()
+        precondition(model.currentReader === second)
+        precondition(fixture.log.filter { $0 == "open-reader" || $0 == "reader-window" }.count == reads,
+            "History must restore retained reader state without opening or reading source")
+
+        pins.pin(second.reader, root: "structure-presentation-one", label: second.hit.displayPath)
+        await waitFor { !pins.busy }
+        guard let pinned = pins.selected?.reader else { preconditionFailure(pins.notice) }
+        precondition(pinned !== second.reader && pinned.page?.identity.owner != second.reader.page?.identity.owner)
+        precondition(pinned.page?.originalHex == second.reader.page?.originalHex
+            && pinned.retainedRegistryDomain == fixture.domain && pinned.canKeep && second.reader.canKeep,
+            "Both independent readers must retain exact bytes and the existing Desk transfer capability")
+
+        model.previousReader()
+        fixture.patch { phase, value in
+            guard phase == "open-reader" else { return value }
+            var bad = value, info = value["reader"] as! [String: Any]
+            info["capture_sha256"] = String(repeating: "b", count: 64); bad["reader"] = info
+            return bad
+        }
+        _ = await visit(2)
+        precondition(model.currentReader === first && model.canNextReader && second.reader.page != nil,
+            "A refused source replacement must preserve the current visit and Forward")
+        fixture.patch { _, value in value }
+
+        let oldPage = model.page!, oldTarget = oldPage.target(oldPage.rows[2])!
+        fixture.pause("open-reader"); model.open(oldTarget)
+        await waitFor { fixture.isBlocked }
+        model.caseSensitive = false
+        precondition(model.busy && !model.canSearch && !model.canSelect && model.currentReader === first,
+            "A canceled history open must keep its admission until foreign work drains")
+        let creates = fixture.log.filter { $0 == "create" }.count
+        model.search(); model.open(oldTarget)
+        precondition(fixture.log.filter { $0 == "create" }.count == creates)
+        fixture.gate.signal(); await waitFor { !model.busy }
+        precondition(model.currentReader === first && model.canNextReader && pinned.page != nil)
+        model.nextReader(); precondition(model.currentReader === second)
+        model.search(); await waitFor { !model.busy }
+        model.open(oldTarget)
+        precondition(!model.busy && model.currentReader === second,
+            "A previous query's row cannot acquire new history authority")
+
+        let third = await visit(2), fourth = await visit(3)
+        precondition(first.reader.page == nil && second.reader.page != nil && third.reader.page != nil,
+            "The shared three-capture history must retire only its oldest visit")
+        model.previousReader(); precondition(model.currentReader === third)
+        _ = await visit(4)
+        precondition(fourth.reader.page == nil && !model.canNextReader && pinned.page != nil,
+            "A successful branch retires Forward while independently forked pins survive")
+
+        // Cancel before history's Task enters: didFinish must release the
+        // model operation even when the opening closure never runs.
+        let currentPage = model.page!
+        model.open(currentPage.target(currentPage.rows[5])!)
+        model.closeReader()
+        await waitFor { !model.busy }
+        precondition(model.currentReader == nil && model.canSelect && pinned.page != nil)
+
+        _ = await visit(0)
+        fixture.pause("open-reader")
+        model.open(currentPage.target(currentPage.rows[1])!)
+        await waitFor { fixture.isBlocked }
+        model.close(); pins.closeAll()
+        model.open(source(access: NSObject()))
+        precondition(model.busy && model.currentReader == nil && !model.canSearch,
+            "Same-path grant replacement cannot overtake a draining history proposal")
+        fixture.gate.signal(); await waitFor { !model.busy }
+        precondition(model.currentReader == nil && !model.canPreviousReader && !model.canNextReader)
+        model.search(); await waitFor { !model.busy }
+        let replacement = await visit(0)
+
+        // A late pin cannot return after the owning presentation closes.
+        pins.bind(root: "structure-presentation-two")
+        fixture.pause("reader-fork")
+        pins.pin(replacement.reader, root: "structure-presentation-two", label: replacement.hit.displayPath)
+        await waitFor { fixture.isBlocked }
+        model.close(); pins.closeAll()
+        precondition(pins.busy && pins.entries.isEmpty)
+        fixture.gate.signal()
+        await waitFor { !pins.busy && fixture.liveReaders == 0 }
+        precondition(model.currentReader == nil && pins.entries.isEmpty)
     }
 }
 

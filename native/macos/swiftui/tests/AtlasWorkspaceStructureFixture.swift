@@ -32,6 +32,7 @@ final class WorkspaceStructureFixture: @unchecked Sendable {
     init(canonicalRoot: [UInt8] = Array("/private/tmp/project".utf8)) { self.canonicalRoot = canonicalRoot }
     var log: [String] { lock.lock(); defer { lock.unlock() }; return events }
     var isBlocked: Bool { lock.lock(); defer { lock.unlock() }; return entered }
+    var liveReaders: Int { lock.lock(); defer { lock.unlock() }; return readers.count }
     func pause(_ phase: String) { lock.lock(); paused = phase; entered = false; lock.unlock() }
     func patch(_ body: @escaping @Sendable (String, [String: Any]) -> [String: Any]) {
         lock.lock(); mutation = body; lock.unlock()
@@ -246,6 +247,14 @@ final class WorkspaceStructureFixture: @unchecked Sendable {
         }, lines: { _, _, _, _ in nil }, cancel: { _ in true }, close: { owner in
             self.lock.lock(); self.readers.removeValue(forKey: owner); self.events.append("close-reader"); self.lock.unlock(); return true
         }, retirementFailed: { preconditionFailure("Fixture retained reader retirement failed") },
+        fork: { source, destination in
+            self.lock.lock()
+            let reader = self.readers[source]!
+            self.readers[destination] = reader
+            self.lock.unlock()
+            return self.reply("reader-fork", Self.readerInfo(owner: destination,
+                request: reader.request, path: reader.path))
+        },
         comparison: .init(domain: domain, compare: { _, _, _, _, _ in nil }))
     }
 }

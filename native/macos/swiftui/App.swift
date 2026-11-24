@@ -776,7 +776,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 .onDisappear { presentation.close() }
         }
         .sheet(item: $workspaceStructureSearch, onDismiss: finishReadingDeskReview) { presentation in
-            AtlasWorkspaceStructureView(presentation: presentation).id(presentation.id)
+            AtlasWorkspaceStructureView(presentation: presentation, desk: readingDesk).id(presentation.id)
                 .onDisappear { presentation.close() }
         }
         .onAppear {
