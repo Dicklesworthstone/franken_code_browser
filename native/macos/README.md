@@ -2210,12 +2210,21 @@ action also handles valid matches beside malformed neighboring text through the
 shared decoder's source map. **Read current context** remains available when the
 intent is to inspect what changed.
 
-Press **Command-F** to focus Find. **Previous match** and **Next match** select
-retained results and their captured excerpts without rereading source; choose
-the current-context action explicitly when a fresh observation is wanted.
+Focus the source text or its Find field to use **Command-F**, **Command-G**,
+and **Shift-Command-G**. Command-F focuses this reader's query; Command-G and
+Shift-Command-G select the next or previous retained match through the same
+actions as **Next match** and **Previous match**. These commands stay with the
+focused reader, including when navigation is unavailable or a lookup is pending.
+They select retained results and their captured excerpts without rereading
+source; choose the current-context action explicitly when a fresh observation
+is wanted. A failed or canceled match lookup keeps the previously accepted
+occurrence, source highlight, context and history; a successful retry advances
+from that accepted occurrence. Closing the reader or presenting its Reading
+Desk suspends its commands.
 They wrap only when the completed observation's entire match set fits in the
 current page. An incomplete scan or a page that omits earlier or later matches
-does not turn its retained subset into a complete cycle.
+does not turn its retained subset into a complete cycle, and keyboard navigation
+does not start a result-page rescan.
 
 Use **Rescan next matches** to reach occurrences beyond the 256 retained rows,
 and **Rescan previous matches** to return to an earlier result page. These
@@ -2241,8 +2250,9 @@ stays readable and its controls remain disabled until another Find succeeds.
 Editing the query or encoding revokes old targets, cancellation leaves the reader
 usable, and stale worker replies cannot activate a different query. Searching
 does not evict the reader's eight retained byte observations. The backend, C ABI,
-and native model regression suites cover these contracts; executable Rust/Swift
-and physical-Mac qualification remain pending.
+and native model regression suites cover these contracts. The focus-scoped
+commands and transactional match-selection regressions are code-first additions;
+independent strict-RCH execution and physical-Mac qualification remain pending.
 
 ## Line navigation in large files
 

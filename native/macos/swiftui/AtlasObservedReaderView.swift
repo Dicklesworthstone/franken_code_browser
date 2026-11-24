@@ -32,7 +32,7 @@ extension AtlasObservedReaderModel {
     @State private var copyNotice = ""
     @State private var showsReadingDesk = false
     @State private var keptPassageRequested = false
-    @FocusState private var searchFocused: Bool
+    @State private var readerCommands = AtlasReaderCommands()
     @Environment(\.dismiss) private var dismiss
 
     init(presentation: AtlasObservedReaderPresentation, showsCloseButton: Bool = true,
@@ -136,10 +136,10 @@ extension AtlasObservedReaderModel {
                         if let selected = model.textSelection {
                             Menu("Search selection") {
                                 Button("Find text in this file") {
-                                    if model.findSelectedText(selectionID: selected.id) { searchFocused = true }
+                                    model.findSelectedText(selectionID: selected.id)
                                 }.disabled(!model.canFindSelectedText)
                                 Button("Find identifier occurrences in this file") {
-                                    if model.findSelectedOccurrences(selectionID: selected.id) { searchFocused = true }
+                                    model.findSelectedOccurrences(selectionID: selected.id)
                                 }.disabled(!model.canFindSelectedOccurrences)
                                 if let searchProject, origin.input.route == .project {
                                     Divider()
@@ -179,6 +179,7 @@ extension AtlasObservedReaderModel {
                         wrapsLines: wrapsLines, showsLineNumbers: showsLineNumbers,
                         showsWhitespace: showsWhitespace, firstPhysicalLine: page.firstPhysicalLine,
                         backgroundColor: Monokai.background, foregroundColor: Monokai.color("plain"),
+                        readerCommands: readerCommands,
                         onSelectionChange: { source, navigation, range in
                             model.updateTextSelection(source: source, navigation: navigation, range: range)
                         }) {
@@ -219,10 +220,6 @@ extension AtlasObservedReaderModel {
         .onChange(of: model.searchCaseSensitive) { _, _ in copyNotice = "" }
         .onChange(of: model.countAllSearchMatches) { _, _ in copyNotice = "" }
         .onChange(of: model.encoding) { _, _ in copyNotice = "" }
-        .background {
-            Button("Find in observed file") { searchFocused = true }
-                .keyboardShortcut("f", modifiers: .command).hidden().accessibilityHidden(true)
-        }
     }
 
     private var controls: some View {
@@ -313,8 +310,12 @@ extension AtlasObservedReaderModel {
     private var searchControls: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 7) {
-                TextField(model.searchMode.prompt, text: $model.searchText)
-                    .textFieldStyle(.roundedBorder).focused($searchFocused).onSubmit(model.find)
+                AtlasReaderFindField(text: $model.searchText, commands: readerCommands,
+                    active: !model.closed && model.info != nil && !showsReadingDesk,
+                    canMove: { [model] in model.canNextSearchHit || model.canPreviousSearchHit },
+                    move: { [model] backwards in
+                        if backwards { model.previousSearchHit() } else { model.nextSearchHit() }
+                    }, submit: model.find, placeholder: model.searchMode.prompt)
                     .accessibilityLabel(model.searchMode.label + " query in the opened file")
                     .help(model.searchMode.help)
                 Picker("Scan up to", selection: $model.searchScanBytes) {
@@ -325,7 +326,9 @@ extension AtlasObservedReaderModel {
                 }.frame(width: 185)
                 Button(model.searching ? "Restart Find" : "Find", action: model.find).disabled(!model.canSearch)
                 Button("Previous match", action: model.previousSearchHit).disabled(!model.canPreviousSearchHit)
+                    .help("Shift-Command-G selects the previous retained match while the source or Find field has focus. It never rescans the file.")
                 Button("Next match", action: model.nextSearchHit).disabled(!model.canNextSearchHit)
+                    .help("Command-G selects the next retained match while the source or Find field has focus. It never rescans the file.")
             }
             HStack(spacing: 7) {
                 Picker("Find mode", selection: $model.searchMode) {

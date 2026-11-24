@@ -890,15 +890,19 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
         guard canSelectSearchHit, let report = searchReport, report.admits(target),
               let session, let input = authority?.input, let search = session.transport.search else { return }
         let (ticket, flag) = begin("Verifying the retained literal for occurrence \(target.hit.occurrence)…")
-        selectedSearchWitness = nil; clearSearchContext(); searchOperation = true
+        // Keep the accepted occurrence and its context visible while the
+        // replacement is checked. A failed or canceled read-only lookup cannot
+        // revoke them or move the next command back to the first result.
+        searchOperation = true
         task = Task {
             do {
                 let witness = try await io.perform(cancellation: flag, keepingAlive: [session]) {
                     try AtlasObservedReaderSearchWitness.decode(search.hit(session.handle, target.generation, target.hit.index),
                         handle: session.handle, input: input, report: report, target: target)
                 }
-                guard accepts(ticket, flag), self.session === session, searchReport?.admits(target) == true else { return }
-                selectedSearchWitness = witness; finish(ticket)
+                guard accepts(ticket, flag), self.session === session, searchAuthorized,
+                      searchReport?.admits(target) == true else { return }
+                clearSearchContext(); selectedSearchWitness = witness; finish(ticket)
                 notice = "Retained literal verified for original bytes \(target.hit.range.start)..<\(target.hit.range.end). No source bytes were reread."
             } catch { fail(error, ticket: ticket) }
         }

@@ -161,6 +161,7 @@ private final class ObservedSearchProbe: @unchecked Sendable {
     private var nextFindReplyGate: ObservedReaderGate?
     private var nextExcerptGate: ObservedReaderGate?
     private var findFailure = false, staleFind = false, staleWindow = false
+    private var hitFailure = false, wrongHit = false
     private var verifiedFailure = false, malformedNeighbor = false
     private var active = 0, mostActive = 0, windows = 0, hits = 0
     private var verifiedJumps = 0
@@ -214,6 +215,8 @@ private final class ObservedSearchProbe: @unchecked Sendable {
     func blockExcerpt(_ gate: ObservedReaderGate) { lock.lock(); nextExcerptGate = gate; lock.unlock() }
     func failExcerpt() { lock.lock(); excerptFailure = true; lock.unlock() }
     func failFind() { lock.lock(); findFailure = true; lock.unlock() }
+    func failHit() { lock.lock(); hitFailure = true; lock.unlock() }
+    func returnWrongHit() { lock.lock(); wrongHit = true; lock.unlock() }
     func failVerifiedJump() { lock.lock(); verifiedFailure = true; lock.unlock() }
     func useMalformedNeighbor() { lock.lock(); malformedNeighbor = true; lock.unlock() }
     func duplicateFindObservation() { lock.lock(); staleFind = true; lock.unlock() }
@@ -378,10 +381,13 @@ private final class ObservedSearchProbe: @unchecked Sendable {
               let rows = report["hits"] as? [[String: Any]], index < UInt64(rows.count) else {
             lock.unlock(); return try ObservedReaderFixture.failure(owner, "OBSERVED_READER_STALE_QUERY")
         }
-        let gate = nextHitGate; nextHitGate = nil
+        let gate = nextHitGate, fail = hitFailure, wrong = wrongHit
+        nextHitGate = nil; hitFailure = false; wrongHit = false
         hits += 1; active += 1; mostActive = max(mostActive, active)
         lock.unlock(); defer { finish() }; gate?.wait()
-        return try ObservedReaderFixture.encode(ObservedSearchFixture.witness(report, index: Int(index)))
+        if fail { return try ObservedReaderFixture.failure(owner, "OBSERVED_READER_SEARCH_FAILED") }
+        let returnedIndex = wrong ? (Int(index) + 1) % rows.count : Int(index)
+        return try ObservedReaderFixture.encode(ObservedSearchFixture.witness(report, index: returnedIndex))
     }
     private func retained(_ owner: UInt64, _ observation: UInt64) throws -> String? {
         lock.lock(); defer { lock.unlock() }
@@ -704,6 +710,113 @@ private final class ObservedSearchProbe: @unchecked Sendable {
         try await wait("owners retire") { probe.lifetime.closedCount == probe.lifetime.createCount }
     }
 
+    @MainActor private static func transactionalHitSelectionTests() async throws {
+        let input = try AtlasObservedReaderInput(root: "/repo", relativePath: Array("large.txt".utf8))
+        let probe = ObservedSearchProbe(capturesContext: true), original = "pre old post old end\n"
+        probe.setContent(original)
+        let model = AtlasObservedReaderModel(transport: probe.transport)
+        model.pageBytes = 4
+        model.open(.init(input: input, project: UUID(), access: nil))
+        try await wait("transactional hit reader") { model.page != nil && !model.busy }
+        let initial = model.page!
+        model.searchText = "old"; model.find()
+        try await wait("transactional hit Find") { model.searchAuthorized && !model.busy }
+        let report = model.searchReport!, first = report.target(for: report.hits[0])
+        let second = report.target(for: report.hits[1])
+        model.nextSearchHit()
+        try await wait("transactional first hit") { model.selectedSearchWitness?.target == first && !model.busy }
+        model.readSearchContext()
+        try await wait("accepted hit context") { !model.busy }
+        let acceptedPage = model.page!, acceptedSource = model.source!, navigation = model.navigation
+        let context = model.searchContext, selection = model.searchSelection
+        let windows = probe.windowCount, finds = probe.findGenerations.count
+        precondition(context == .verified(selection: NSRange(location: 4, length: 3))
+            && selection == NSRange(location: 4, length: 3) && model.canBack && !model.canForward)
+
+        @MainActor func acceptedUnchanged() {
+            precondition(model.selectedSearchWitness?.target == first
+                && model.selectedSearchWitness?.context?.displayText == original,
+                "An unaccepted hit must not erase the previous occurrence or retained excerpt")
+            precondition(model.searchContext == context && model.searchSelection == selection
+                && model.navigation == navigation && model.source === acceptedSource
+                && model.page!.matches(acceptedPage),
+                "Pending, failed and canceled hit lookups must preserve the accepted source and highlight")
+            precondition(model.searchAuthorized && model.searchReport?.admits(first) == true
+                && probe.windowCount == windows && probe.findGenerations.count == finds,
+                "Read-only hit navigation must neither rescan nor replace query authority")
+        }
+
+        let failure = ObservedReaderGate()
+        probe.blockHit(failure); probe.failHit(); model.nextSearchHit()
+        try await wait("failed hit lookup entered") { failure.entered }
+        acceptedUnchanged()
+        precondition(!model.canNextSearchHit && !model.canPreviousSearchHit && !model.canCopySearchWitness)
+        let pendingCalls = probe.hitCount
+        model.nextSearchHit(); model.previousSearchHit()
+        precondition(probe.hitCount == pendingCalls, "Pending navigation must not queue extra occurrence lookups")
+        failure.release()
+        try await wait("failed hit lookup finished") { !model.busy && probe.activeCount == 0 }
+        acceptedUnchanged()
+        precondition(model.canNextSearchHit && model.canPreviousSearchHit && model.canBack && !model.canForward)
+
+        // Both occurrences spell the same literal. The reply must still match
+        // the requested occurrence identity and exact original range.
+        probe.returnWrongHit(); model.nextSearchHit()
+        try await wait("wrong occurrence rejected") { !model.busy }
+        acceptedUnchanged()
+
+        let canceled = ObservedReaderGate()
+        probe.blockHit(canceled); model.nextSearchHit()
+        try await wait("canceled hit lookup entered") { canceled.entered }
+        acceptedUnchanged()
+        model.cancel()
+        acceptedUnchanged()
+        canceled.release()
+        try await wait("canceled hit lookup drained") { probe.activeCount == 0 }
+        await Task.yield()
+        acceptedUnchanged()
+
+        // Retry advances once from the accepted first occurrence. It uses the
+        // original retained bytes even after current file content has changed.
+        probe.setContent("xxx new xxxx new xxx\n")
+        let success = ObservedReaderGate()
+        probe.blockHit(success); model.nextSearchHit()
+        try await wait("replacement hit lookup entered") { success.entered }
+        acceptedUnchanged()
+        success.release()
+        try await wait("replacement hit accepted") { model.selectedSearchWitness?.target == second && !model.busy }
+        precondition(model.searchContext == nil && model.searchSelection == nil
+            && model.source === acceptedSource && model.page!.matches(acceptedPage)
+            && model.retainedSearchContextCopy(hex: false) == original
+            && model.canBack && !model.canForward,
+            "Only an accepted new occurrence clears the previous hit context; it does not replace the page or history")
+
+        model.previousSearchHit()
+        try await wait("previous accepted occurrence") { model.selectedSearchWitness?.target == first && !model.busy }
+        let obsolete = ObservedReaderGate()
+        probe.blockHit(obsolete); model.nextSearchHit()
+        try await wait("obsolete hit lookup entered") { obsolete.entered }
+        model.searchText = "new"
+        precondition(model.searchReport == nil && model.selectedSearchWitness == nil
+            && !model.canNextSearchHit && !model.canPreviousSearchHit)
+        obsolete.release()
+        try await wait("obsolete hit lookup drained") { probe.activeCount == 0 }
+        await Task.yield()
+        precondition(model.selectedSearchWitness == nil && model.page!.matches(acceptedPage),
+            "Editing a query must revoke old hit authority even when a previous occurrence was accepted")
+
+        model.back()
+        try await wait("history before hit navigation") { !model.busy }
+        precondition(model.page!.matches(initial) && model.canForward)
+        model.forward()
+        try await wait("history after hit navigation") { !model.busy }
+        precondition(model.page!.matches(acceptedPage) && model.canBack && !model.canForward
+            && probe.windowCount == windows && probe.findGenerations.count == finds
+            && probe.excerptOpenCount == 0 && probe.verifiedJumpCount == 0 && probe.maximumActive == 1)
+        model.close()
+        try await wait("transactional hit owner retired") { probe.lifetime.closedCount == probe.lifetime.createCount }
+    }
+
     @MainActor private static func cancellationLifetimeTests() async throws {
         let probe = ObservedSearchProbe(), model = AtlasObservedReaderModel(transport: probe.transport)
         let input = try AtlasObservedReaderInput(root: "/repo", relativePath: Array("large.txt".utf8))
@@ -845,6 +958,7 @@ private final class ObservedSearchProbe: @unchecked Sendable {
         try wireTests()
         try lowercaseWireTests()
         try await modelTests()
+        try await transactionalHitSelectionTests()
         try await lowercaseModelTests()
         try await cancellationLifetimeTests()
         try await verifiedNavigationTests()
