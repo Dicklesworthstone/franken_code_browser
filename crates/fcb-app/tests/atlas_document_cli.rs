@@ -49,6 +49,45 @@ fn exact_search_to_markdown_adds_no_source_reads_and_never_repacks_the_atlas() {
 }
 
 #[test]
+fn syntax_only_search_hits_open_their_retained_markdown_block_in_utf8_and_utf16() {
+    let text = "# Overview\n\nEarlier café 😀.\n\n## Usage\n\n[manual](docs/needle.md)\n\nAfter.\n";
+    for endian in [None, Some(true), Some(false)] {
+        let encode = |value: &str| -> Vec<u8> {
+            match endian {
+                None => value.as_bytes().to_vec(),
+                Some(little) => value.encode_utf16()
+                    .flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect(),
+            }
+        };
+        let mut bytes = if endian.is_some() { encode("\u{feff}") } else { Vec::new() };
+        bytes.extend_from_slice(&encode(text));
+        let root = root(&bytes);
+        for (query, rendered) in [("##", "Usage"), ("needle", "manual")] {
+            let (base_exit, base) = invoke_query(&root, query, &[]);
+            assert_eq!(base_exit, EXIT_OK, "{base}");
+            let (exit, result) = invoke_query(&root, query, &["--markdown-hit", "0", "--markdown-lines", "1"]);
+            assert_eq!(exit, EXIT_PARTIAL, "{result}");
+            assert_eq!(parcels(&result), parcels(&base));
+            assert_eq!(payload(&result), payload(&base));
+            let preview = result.split("\"document_preview\":").nth(1).unwrap();
+            assert!(preview.contains(&format!("\"text\":\"{rendered}\"")), "{preview}");
+            assert!(!preview.contains("\"text\":\"Overview\""));
+            assert!(preview.contains("\"navigation\":\"source-region\""));
+            assert!(preview.contains("\"requested_location_resolved\":true"));
+            assert!(preview.contains("\"source_mapping_qualified\":true"));
+            assert!(preview.contains("\"additional_source_bytes_read\":\"0\""));
+            assert!(preview.contains("\"rendered_hit_highlight\":false"));
+            let offset = text.find(query).unwrap();
+            let original = if endian.is_some() { 2 + 2 * text[..offset].encode_utf16().count() } else { offset };
+            assert!(preview.contains(&format!("\"requested_original_anchor\":\"{original}\"")));
+            let hex: String = encode(query).iter().map(|byte| format!("{byte:02x}")).collect();
+            assert!(preview.contains(&format!("\"selected_original_hex\":\"{hex}\"")));
+        }
+        assert_eq!(fs::read(root.join("docs/README.md")).unwrap(), bytes);
+    }
+}
+
+#[test]
 fn documents_outside_camera_focus_keep_the_same_captured_file_identity() {
     let root = root(b"# Documentation\n\nneedle\n");
     let (exit, result) = invoke(&root, &["--focus", "src", "--markdown-hit", "0"]);

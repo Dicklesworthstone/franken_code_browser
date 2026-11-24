@@ -291,3 +291,85 @@ fn utf16_owned_layout_retains_its_map_and_cancellation_releases_candidate_admiss
     assert!(replacement.rendered_text().contains("Replacement"));
     assert!(reader.rendered_text().contains("Retained"));
 }
+
+#[test]
+fn source_navigation_includes_block_delimiters_in_all_declared_encodings() {
+    let text = "\n# Start\n\n## **Café 😀**\n\nA **bold** paragraph with a [link](docs/readme.md) and `code` at the end.\n\nSetext\n======\n\nAfter.\n";
+    let mut bom = vec![0xef, 0xbb, 0xbf]; bom.extend_from_slice(text.as_bytes());
+    for (bytes, is_utf16) in [
+        (text.as_bytes().to_vec(), false), (bom, false),
+        (utf16(text, true), true), (utf16(text, false), true),
+    ] {
+        let source = capture(&bytes); let budget = budget();
+        let reader = DocumentReader::prepare(&source, id(), generation(1),
+            DocumentReadOptions { width_columns: 14, ..Default::default() },
+            &budget, allocation(1), || false).unwrap();
+        reader.qualify_heading_source_ranges(&budget, allocation(2), || false).unwrap();
+        let original = |offset: usize| fcb_core::ByteOffset::new((reader.source_base()
+            + if is_utf16 { 2 * text[..offset].encode_utf16().count() } else { offset }) as u64);
+        let flow_pointer = reader.rendered_text().as_ptr();
+        let heading = &reader.headings()[1];
+        let heading_first = reader.window_at_heading(&heading.slug, 1).unwrap().first_index();
+        let marker = text.find("## **").unwrap();
+        for offset in [marker, marker + 1, marker + 3, text.find("**\n").unwrap()] {
+            let page = reader.window_at_source(original(offset), 1).unwrap();
+            assert_eq!(page.first_index(), heading_first);
+            assert_eq!(page.lines()[0].rendered_text, "Café 😀");
+        }
+        let paragraph_first = reader.window_at_rendered(reader.rendered_text().find("A bold").unwrap(), 1)
+            .unwrap().first_index();
+        let last_word = reader.window_at_rendered(reader.rendered_text().find("end.").unwrap(), 1).unwrap();
+        assert!(last_word.first_index() > paragraph_first, "fixture must exercise a wrapped block");
+        for offset in [
+            text.find("**bold").unwrap(), text.find("**bold").unwrap() + 6,
+            text.find("[link]").unwrap(), text.find("](docs").unwrap(),
+            text.find("docs/readme.md").unwrap(), text.find("`code`").unwrap(),
+            text.find("`code`").unwrap() + 5, text.find("end.").unwrap(),
+        ] {
+            let page = reader.window_at_source(original(offset), 1).unwrap();
+            assert_eq!(page.first_index(), paragraph_first, "original source offset {offset}");
+            assert!(page.lines()[0].rendered_text.starts_with("A bold"));
+        }
+        let setext_first = reader.window_at_heading("setext", 1).unwrap().first_index();
+        let page = reader.window_at_source(original(text.find("======").unwrap()), 1).unwrap();
+        assert_eq!(page.first_index(), setext_first);
+        assert_eq!(page.lines()[0].rendered_text, "Setext");
+        // A valid encoding boundary in a gap is not permission to choose the
+        // nearest block. Invalid scalar/BOM points are still rejected as well.
+        assert_eq!(reader.window_at_source(original(0), 1).err(), Some(DocumentReadError::InvalidRange));
+        let accent = original(text.find('é').unwrap()).get();
+        let emoji = original(text.find('😀').unwrap()).get();
+        for invalid in [accent + 1, emoji + 1, source.bytes().len() as u64 + 1, u64::MAX] {
+            assert_eq!(reader.window_at_source(fcb_core::ByteOffset::new(invalid), 1).err(),
+                Some(DocumentReadError::InvalidRange));
+        }
+        if reader.source_base() > 0 {
+            assert_eq!(reader.window_at_source(fcb_core::ByteOffset::new(0), 1).err(),
+                Some(DocumentReadError::InvalidRange));
+        }
+        if is_utf16 {
+            assert_eq!(reader.window_at_source(fcb_core::ByteOffset::new(emoji + 2), 1).err(),
+                Some(DocumentReadError::InvalidRange));
+        }
+        assert!(reader.window_at_source(fcb_core::ByteOffset::new(source.bytes().len() as u64), 1)
+            .unwrap().lines().is_empty());
+        assert_eq!(reader.rendered_text().as_ptr(), flow_pointer);
+        assert_eq!(reader.capture().bytes(), bytes);
+    }
+}
+
+#[test]
+fn empty_heading_source_cannot_activate_the_following_blocks_row() {
+    let source = capture(b"#\n\n# Present\n\nStill readable.\n");
+    let budget = budget(); let reader = read(&source, &budget);
+    reader.qualify_heading_source_ranges(&budget, allocation(2), || false).unwrap();
+    let heading = &reader.headings()[0];
+    assert!(heading.title.is_empty());
+    let range = reader.original_span(heading.source_span).unwrap();
+    assert_eq!(reader.window_at_source(range.start(), 1).err(), Some(DocumentReadError::InvalidRange));
+    assert_eq!(reader.window_at_heading(&heading.slug, 1).err(), Some(DocumentReadError::InvalidRange));
+    let present = reader.window_at_heading("present", 1).unwrap();
+    assert_eq!(present.lines()[0].rendered_text, "Present");
+    let selected = reader.original_span(reader.heading("present").unwrap().source_span).unwrap();
+    assert_eq!(reader.window_at_source(selected.start(), 1).unwrap().first_index(), present.first_index());
+}

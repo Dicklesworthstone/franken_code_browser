@@ -234,8 +234,10 @@ impl<'capture> DocumentReader<'capture> {
     /// Navigate from original source to the FIRST logical row of its enclosing
     /// upstream-mapped source region. This is a block-level correspondence, not
     /// an exact glyph/column or a claim that all source bytes are rendered.
-    /// Unmapped syntax, BOM bytes and interior encoded scalars are refused. Source
-    /// EOF maps to the valid empty document window. Work is bounded by flow rows.
+    /// Markdown delimiters belong to their upstream block even when no rendered
+    /// inline names those bytes. Unmapped gaps, blocks without a rendered row,
+    /// BOM bytes and interior encoded scalars are refused. Source EOF maps to
+    /// the valid empty document window. Only retained map/flow metadata is read.
     pub fn window_at_source(&self, original: ByteOffset, count: usize)
         -> Result<DocumentWindow<'_, 'capture>, DocumentReadError> {
         if count == 0 || count > MAX_DOCUMENT_WINDOW_LINES { return Err(DocumentReadError::InvalidRange); }
@@ -243,10 +245,40 @@ impl<'capture> DocumentReader<'capture> {
         if original.get() == self.capture.bytes().len() as u64 {
             return self.window(self.total_lines(), count);
         }
-        for line in &self.output.lines {
-            let range = self.original_span(line.source_span)?;
-            if range.start().get() <= original.get() && original.get() < range.end().get() {
-                return self.window(line.line_index, count);
+        // Flow-row spans enclose the rendered inlines, not their full Markdown
+        // block. In particular, heading markers, emphasis delimiters and link
+        // destinations can lie outside every row span. The upstream provenance
+        // graph retains the enclosing blocks in the same order as block_index.
+        // Use that catalog without reconstructing Markdown syntax locally.
+        for (index, block) in self.output.source_map.provenance_graph().root.children.iter().enumerate() {
+            if block.kind != franken_markdown::span::ProvenanceKind::Block {
+                return Err(DocumentReadError::InvalidOutput);
+            }
+            if !block.source_ranges.origin().is_primary() { continue; }
+            for &span in block.source_ranges.spans() {
+                let range = self.original_span(span)?;
+                if range.start().get() <= original.get() && original.get() < range.end().get() {
+                    return self.window_at_block(index, count);
+                }
+            }
+        }
+        Err(DocumentReadError::InvalidRange)
+    }
+
+    /// Select only an actual row associated with this retained upstream block.
+    /// Empty headings and newline-only elements have no row; their rendered
+    /// offset must not silently select the next block's text.
+    fn window_at_block(&self, block_index: usize, count: usize)
+        -> Result<DocumentWindow<'_, 'capture>, DocumentReadError> {
+        let mut first = 0;
+        for (index, element) in self.output.source_map.elements().iter().enumerate() {
+            if element.block_index != block_index || element.rendered_range.is_empty() { continue; }
+            while self.output.lines.get(first).is_some_and(|line|
+                line.rendered_range.end <= element.rendered_range.start) { first += 1; }
+            if let Some(line) = self.output.lines.get(first)
+                && line.rendered_range.overlaps(element.rendered_range) {
+                if !line.element_indices.contains(&index) { return Err(DocumentReadError::InvalidOutput); }
+                return self.window(first, count);
             }
         }
         Err(DocumentReadError::InvalidRange)
@@ -264,8 +296,7 @@ impl<'capture> DocumentReader<'capture> {
     pub fn window_at_heading(&self, slug: &str, count: usize)
         -> Result<DocumentWindow<'_, 'capture>, DocumentReadError> {
         let heading = self.heading(slug)?;
-        let first = self.output.lines.partition_point(|line| line.rendered_range.end <= heading.rendered_offset);
-        self.window(first, count)
+        self.window_at_block(heading.block_index, count)
     }
     /// Rendered text and enclosing original Markdown are deliberately different
     /// copy operations. The enclosing block can contain delimiters or unrelated
