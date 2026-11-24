@@ -96,7 +96,15 @@ impl std::fmt::Display for SnapshotError {
 }
 impl std::error::Error for SnapshotError {}
 impl From<crate::EnvelopeError> for SnapshotError {
-    fn from(_: crate::EnvelopeError) -> Self { Self::Envelope }
+    fn from(error: crate::EnvelopeError) -> Self {
+        match error {
+            // A valid larger archive can exceed the selected reader profile.
+            // Preserve that admission failure so hosts do not report corrupt
+            // saved source when a larger explicit profile can open it.
+            crate::EnvelopeError::LimitExceeded(_) => Self::Limit,
+            _ => Self::Envelope,
+        }
+    }
 }
 impl From<ExactEnvelopeError> for SnapshotError {
     fn from(error: ExactEnvelopeError) -> Self {
@@ -351,6 +359,60 @@ mod tests {
         assert!(matches!(encode(&[entry, entry], true, &budget), Err(SnapshotError::Order)));
         assert!(matches!(encode(&[SnapshotEntry { observed_bytes: 3, ..entry }], true, &budget), Err(SnapshotError::InvalidMember)));
         assert_eq!(budget.accounting().reserved().get(), 0);
+    }
+    #[test]
+    fn member_admission_limits_survive_envelope_decoding() {
+        let budget = budget();
+        // Make the member ceiling the envelope's field ceiling, too. Otherwise
+        // only the later member validator is exercised and this regression is
+        // hidden by the path/policy field allowance.
+        let limits = SnapshotLimits { max_file_bytes: 128, max_path_bytes: 32,
+            max_document_bytes: 4096, ..SnapshotLimits::default() };
+        for length in [128, 129] {
+            let source = vec![b'x'; length];
+            let entries = [SnapshotEntry { path: b"source.rs", observed_bytes: length as u64,
+                data: SnapshotData::Captured(&source) }];
+            let encoded = encode(&entries, true, &budget).unwrap();
+            if length == limits.max_file_bytes {
+                let view = SnapshotView::open(encoded.bytes(), limits, || false).unwrap();
+                assert_eq!(view.entries().next().unwrap().unwrap(), entries[0]);
+            } else {
+                assert!(matches!(SnapshotView::open(encoded.bytes(), limits, || false),
+                    Err(SnapshotError::Limit)));
+                // Reopening the exact same bytes with an explicitly larger
+                // member allowance succeeds without replacing source evidence.
+                let expanded = SnapshotLimits { max_file_bytes: length, ..limits };
+                let view = SnapshotView::open(encoded.bytes(), expanded, || false).unwrap();
+                assert_eq!(view.entries().next().unwrap().unwrap(), entries[0]);
+                assert_eq!(view.digest(), encoded.digest());
+            }
+        }
+        assert_eq!(budget.accounting().reserved().get(), 0);
+    }
+    #[test]
+    fn corrupt_or_impossible_fields_are_not_reclassified_as_admission_limits() {
+        let budget = budget();
+        let source = [b'x'; 129];
+        let path = b"source.rs";
+        let encoded = encode(&[SnapshotEntry { path, observed_bytes: source.len() as u64,
+            data: SnapshotData::Captured(&source) }], true, &budget).unwrap();
+        let limits = SnapshotLimits { max_file_bytes: 128, max_path_bytes: 32,
+            max_document_bytes: 4096, ..SnapshotLimits::default() };
+        let mut corrupt = encoded.bytes().to_vec();
+        let end = corrupt.len() - CHECKSUM_LEN;
+        corrupt[end - 1] ^= 1;
+        assert!(matches!(SnapshotView::open(&corrupt, limits, || false), Err(SnapshotError::Envelope)));
+
+        // A checksummed length that points beyond the available payload is a
+        // malformed record, even when it also exceeds the selected byte limit.
+        let mut impossible = encoded.bytes().to_vec();
+        let length_offset = crate::HEADER_LEN + 2 + 8 + 8 + "test-policy-v1".len()
+            + 8 + path.len() + 8 + 1;
+        let unavailable = impossible.len() as u64;
+        impossible[length_offset..length_offset + 8].copy_from_slice(&unavailable.to_le_bytes());
+        let digest = Sha256::digest(&impossible[..end]);
+        impossible[end..].copy_from_slice(digest.as_bytes());
+        assert!(matches!(SnapshotView::open(&impossible, limits, || false), Err(SnapshotError::Envelope)));
     }
     #[test]
     fn admission_and_cancellation_release_the_candidate() {
