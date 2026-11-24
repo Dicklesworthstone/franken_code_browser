@@ -232,7 +232,8 @@ fn structural_occurrences_reach_later_tokens_inside_the_same_saved_member() {
     let (exit, probe) = invoke(&structure_args(&f, "occurrences", "target",
         &["--skip-matches", "4096", "--limit", "0"]), || false);
     assert_eq!(exit, EXIT_PARTIAL); window(&probe, 4096, 4096, 0, None);
-    assert!(probe.get("has_more_matches").flag());
+    assert!(!probe.get("has_more_matches").flag());
+    assert!(probe.get("truncated").flag());
 }
 
 #[test]

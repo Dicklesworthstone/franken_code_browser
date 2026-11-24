@@ -58,6 +58,200 @@ fn encoded(text: &str, little: bool) -> Vec<u8> {
     out
 }
 
+fn run_matching<R: Read + Seek>(saved: &mut PagedSnapshot<R>, needle: &str, opts: StructureOptions,
+    skip: u64, case_sensitive: bool, count_all: bool, budget: &ResourceBudget) -> StructureReport {
+    let max_steps = saved.directory().len() + 1;
+    let mut query = StructureQuery::new_matching_page(saved, needle, opts, skip, case_sensitive,
+        count_all, budget, allocations()).unwrap();
+    let retained = budget.accounting().reserved().get();
+    for _ in 0..max_steps {
+        let before = query.stats();
+        query.step(opts.generation, budget, || false).unwrap();
+        assert!(query.stats().members_visited - before.members_visited <= 1);
+        assert_eq!(budget.accounting().reserved().get(), retained,
+            "member payloads, extractor state and transient matching tables must be released between steps");
+        if query.state() != StructureState::Pending { return query.finish().unwrap(); }
+    }
+    panic!("matching structural query exceeded its one-member-per-step bound");
+}
+
+#[test]
+fn insensitive_symbol_names_keep_original_utf8_and_utf16_anchors() {
+    let text = "// 🚀\nfn Run() {}\nfn Runner() {}\nfn preRun() {}\n";
+    for little in [None, Some(true), Some(false)] {
+        let budget = budget();
+        let bytes = little.map_or_else(|| text.as_bytes().to_vec(), |little| encoded(text, little));
+        let mut saved = archive(&[entry(b"saved.rs", &bytes)], true, &budget);
+        for (matching, needle, expected) in [(SymbolNameMode::Exact, "run", vec!["Run"]),
+            (SymbolNameMode::Prefix, "rUN", vec!["Run", "Runner"]),
+            (SymbolNameMode::Contains, "RuN", vec!["Run", "Runner", "preRun"])] {
+            let mut opts = options(StructureMode::Symbols, 10); opts.name_mode = matching;
+            let report = run_matching(&mut saved, needle, opts, 0, false, true, &budget);
+            assert!(report.is_complete()); assert!(report.matches_seen_exact());
+            assert!(!report.case_sensitive()); assert!(report.count_all_matches());
+            assert_eq!(report.hits().iter().map(|hit| hit.name()).collect::<Vec<_>>(), expected);
+            for hit in report.hits() {
+                let range = hit.original_range();
+                let wanted = little.map_or_else(|| hit.name().as_bytes().to_vec(),
+                    |little| encoded(hit.name(), little)[2..].to_vec());
+                assert_eq!(&bytes[range.start().get() as usize..range.end().get() as usize], wanted);
+                let capture = hit.open(&mut saved, opts.generation, &budget,
+                    [allocation(30), allocation(31)], || false).unwrap();
+                assert_eq!(capture.bytes(), bytes);
+            }
+        }
+        let sensitive = run(&mut saved, "run", options(StructureMode::Symbols, 10), &budget);
+        assert!(sensitive.case_sensitive()); assert!(!sensitive.count_all_matches());
+        assert_eq!(sensitive.matches_seen(), 0); assert!(sensitive.matches_seen_exact());
+    }
+}
+
+fn complete_count_windows(mode: StructureMode, first: &[u8], second: &[u8], bytes: &[u8]) {
+    let budget = budget();
+    let mut saved = archive(&[entry(first, bytes), entry(second, bytes)], true, &budget);
+    let opts = options(mode, 1);
+    for skip in 0..6 {
+        let report = run_matching(&mut saved, "needle", opts, skip, true, true, &budget);
+        assert_eq!(report.state(), StructureState::Complete); assert!(report.is_complete());
+        assert!(report.matches_seen_exact()); assert_eq!(report.matches_seen(), 6);
+        assert_eq!(report.skipped_matches(), skip); assert_eq!(report.hits().len(), 1);
+        assert_eq!(report.truncated(), skip < 5); assert_eq!(report.has_more_matches(), skip < 5);
+        assert_eq!(report.next_match_offset(), if skip < 5 { Some(skip + 1) } else { None });
+        assert_eq!(report.stats().members_loaded, 2);
+    }
+    let counted = run_matching(&mut saved, "needle", options(mode, 0), 0, true, true, &budget);
+    assert_eq!(counted.matches_seen(), 6); assert!(counted.is_complete()); assert!(counted.truncated());
+    assert!(counted.hits().is_empty()); assert!(!counted.has_more_matches()); assert_eq!(counted.next_match_offset(), None);
+    drop(counted);
+    let beyond = run_matching(&mut saved, "needle", opts, u64::MAX, true, true, &budget);
+    assert_eq!(beyond.matches_seen(), 6); assert_eq!(beyond.skipped_matches(), 6);
+    assert!(beyond.is_complete()); assert!(beyond.hits().is_empty()); assert!(!beyond.truncated());
+    assert_eq!(beyond.next_match_offset(), None);
+    drop(beyond);
+    let absent = run_matching(&mut saved, "absent", options(mode, 0), 0, true, true, &budget);
+    assert_eq!(absent.matches_seen(), 0); assert!(absent.is_complete()); assert!(!absent.truncated());
+    drop(absent);
+    let legacy = run(&mut saved, "needle", opts, &budget);
+    assert_eq!(legacy.matches_seen(), 2); assert_eq!(legacy.state(), StructureState::Truncated);
+    assert!(!legacy.matches_seen_exact()); assert_eq!(legacy.next_match_offset(), Some(1));
+    drop(legacy);
+    let probe = run(&mut saved, "needle", options(mode, 0), &budget);
+    assert_eq!(probe.matches_seen(), 1); assert!(probe.truncated()); assert!(!probe.has_more_matches());
+    assert_eq!(probe.next_match_offset(), None); assert!(!probe.matches_seen_exact());
+}
+
+#[test]
+fn complete_counts_and_continuations_are_independent_of_retained_windows() {
+    complete_count_windows(StructureMode::Symbols, b"a.rs", b"b.rs", b"fn needle() {}\nfn needle() {}\nfn needle() {}\n");
+    complete_count_windows(StructureMode::Occurrences, b"a.txt", b"b.txt", b"needle needle needle\n");
+    #[cfg(feature = "markdown")]
+    complete_count_windows(StructureMode::Headings, b"a.md", b"b.md", b"# needle\n\n## needle\n\n### needle\n");
+}
+
+#[test]
+fn occurrence_counts_exceed_row_limits_across_members_and_encoded_windows() {
+    let text = "needle ".repeat(5003);
+    for little in [None, Some(true), Some(false)] {
+        let budget = budget();
+        let bytes = little.map_or_else(|| text.as_bytes().to_vec(), |little| encoded(&text, little));
+        let mut saved = archive(&[entry(b"a.txt", &bytes), entry(b"b.txt", b"needle needle needle")], true, &budget);
+        let opts = options(StructureMode::Occurrences, 1);
+        let report = run_matching(&mut saved, "needle", opts, 5001, true, true, &budget);
+        assert!(report.is_complete()); assert!(report.matches_seen_exact()); assert_eq!(report.matches_seen(), 5006);
+        assert_eq!(report.hits().len(), 1); assert_eq!(report.next_match_offset(), Some(5002));
+        let range = report.hits()[0].original_range();
+        assert_eq!(range.start().get(), if little.is_some() { 2 + 5001 * 14 } else { 5001 * 7 });
+        assert_eq!(range.len().get(), if little.is_some() { 12 } else { 6 });
+        drop(report);
+        let later = run_matching(&mut saved, "needle", opts, 5003, true, true, &budget);
+        assert_eq!(later.matches_seen(), 5006); assert_eq!(later.next_match_offset(), Some(5004));
+        assert_eq!(later.hits()[0].ordinal(), 1); assert_eq!(later.hits()[0].original_range().start().get(), 0);
+    }
+}
+
+#[test]
+fn metadata_omissions_preserve_exact_counts_and_consumed_continuation_positions() {
+    let budget = budget();
+    let long_name = format!("needle_{}", "x".repeat(4096));
+    let text = format!("fn {long_name}() {{}}\nfn needle_a() {{}}\nfn needle_b() {{}}\n");
+    let mut saved = archive(&[entry(b"a.rs", text.as_bytes())], true, &budget);
+    let mut opts = options(StructureMode::Symbols, 1); opts.name_mode = SymbolNameMode::Prefix;
+    let report = run_matching(&mut saved, "needle_", opts, 0, true, true, &budget);
+    assert_eq!(report.matches_seen(), 3); assert!(report.matches_seen_exact()); assert!(!report.is_complete());
+    assert_eq!(report.stats().metadata_omitted, 1); assert_eq!(report.hits()[0].name(), "needle_a");
+    assert_eq!(report.next_match_offset(), Some(2)); assert!(report.has_more_matches());
+    drop(report);
+    let next = run_matching(&mut saved, "needle_", opts, 2, true, true, &budget);
+    assert_eq!(next.hits()[0].name(), "needle_b"); assert_eq!(next.matches_seen(), 3);
+    assert!(next.is_complete()); assert!(!next.has_more_matches());
+}
+
+#[test]
+fn counting_never_overrides_scope_coverage_work_limits_or_cancellation() {
+    let budget = budget(); let source = b"fn needle() {}\nfn needle() {}\n";
+    let mut saved = archive(&[entry(b"a.rs", source), entry(b"b.rs", source)], true, &budget);
+    let mut opts = options(StructureMode::Symbols, 0); opts.max_source_bytes = source.len() as u64;
+    let limited = run_matching(&mut saved, "needle", opts, 0, true, true, &budget);
+    assert_eq!(limited.state(), StructureState::WorkLimit); assert_eq!(limited.matches_seen(), 2);
+    assert!(!limited.matches_seen_exact()); assert!(!limited.is_complete()); assert!(limited.truncated());
+    drop(limited);
+    opts.max_source_bytes = MAX_STRUCTURE_SOURCE_BYTES;
+    let baseline = budget.accounting().reserved().get();
+    let mut query = StructureQuery::new_matching_page(&mut saved, "needle", opts, 0, true, true,
+        &budget, allocations()).unwrap();
+    assert_eq!(query.step(opts.generation, &budget, || false).unwrap(), StructureState::Pending);
+    assert!(matches!(query.step(opts.generation, &budget, || true), Err(StructureError::Canceled)));
+    assert!(matches!(query.finish(), Err(StructureError::Canceled)));
+    assert_eq!(budget.accounting().reserved().get(), baseline);
+    drop(saved);
+    let oversized = vec![b'x'; StructureMode::Symbols.source_limit() + 1];
+    let mut partial = archive(&[entry(b"a.rs", source), entry(b"b.bin", b"needle"), entry(b"c.rs", &oversized),
+        SnapshotEntry { path: b"d.rs", observed_bytes: 1, data: SnapshotData::Unavailable("missing") }], false, &budget);
+    let report = run_matching(&mut partial, "needle", opts, 0, true, true, &budget);
+    assert_eq!(report.matches_seen(), 2); assert_eq!(report.state(), StructureState::Complete);
+    assert!(!report.matches_seen_exact()); assert!(!report.is_complete());
+    assert_eq!(report.stats().unsupported_files, 1); assert_eq!(report.stats().unavailable_files, 1);
+    assert_eq!(report.stats().source_limited_files, 1);
+}
+
+#[test]
+fn insensitive_occurrences_are_rejected_before_io() {
+    let budget = budget(); let mut saved = archive(&[entry(b"a.txt", b"needle")], true, &budget);
+    assert!(matches!(StructureQuery::new_matching_page(&mut saved, "needle",
+        options(StructureMode::Occurrences, 1), 0, false, true, &budget, allocations()), Err(StructureError::InvalidLimits)));
+    assert_eq!(saved.load_stats().loaded_members, 0);
+}
+
+#[cfg(feature = "markdown")]
+#[test]
+fn insensitive_headings_use_scalar_lowercase_without_folding_or_normalization() {
+    let text = "# İDEA\n\n# Kelvin\n\n# Straße\n\n# École\n";
+    for little in [None, Some(true), Some(false)] {
+        let budget = budget();
+        let bytes = little.map_or_else(|| text.as_bytes().to_vec(), |little| encoded(text, little));
+        let mut saved = archive(&[entry(b"guide.md", &bytes)], true, &budget);
+        for (mode, needle, expected) in [(SymbolNameMode::Exact, "i\u{307}dea", Some("İDEA")),
+            (SymbolNameMode::Exact, "KELVIN", Some("Kelvin")),
+            (SymbolNameMode::Prefix, "i", Some("İDEA")),
+            (SymbolNameMode::Contains, "\u{307}d", Some("İDEA")),
+            (SymbolNameMode::Contains, "aß", Some("Straße")),
+            (SymbolNameMode::Exact, "STRASSE", None),
+            (SymbolNameMode::Exact, "e\u{301}cole", None)] {
+            let mut opts = options(StructureMode::Headings, 10); opts.name_mode = mode;
+            let report = run_matching(&mut saved, needle, opts, 0, false, true, &budget);
+            assert!(report.is_complete()); assert!(report.matches_seen_exact());
+            assert_eq!(report.hits().first().map(|hit| hit.name()), expected);
+            assert_eq!(report.hits().len(), usize::from(expected.is_some()));
+            if let Some(hit) = report.hits().first() {
+                let range = hit.original_range(); let selected = &bytes[range.start().get() as usize..range.end().get() as usize];
+                let syntax = format!("# {}", hit.name());
+                let expected = little.map_or_else(|| syntax.as_bytes().to_vec(), |little| encoded(&syntax, little)[2..].to_vec());
+                assert!(selected.starts_with(&expected));
+            }
+        }
+    }
+}
+
 #[test]
 fn declaration_name_matching_uses_real_extractors_and_raw_archive_paths() {
     let budget = budget();

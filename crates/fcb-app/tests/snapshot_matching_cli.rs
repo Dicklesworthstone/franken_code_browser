@@ -259,7 +259,7 @@ fn unsupported_flag_combinations_fail_before_io_and_literal_flag_values_stay_lit
         vec!["search", "missing.fcbs", "--query", "needle path:src", "--text", "needle", "--ignore-case"],
         vec!["search", "missing.fcbs", "--query", "needle", "--count-all", "--raw-hex", "61", "--ignore-case"],
         vec!["structure", "missing.fcbs", "--mode", "occurrences", "--name", "needle", "--ignore-case"],
-        vec!["structure", "missing.fcbs", "--mode", "symbols", "--name", "needle", "--count-all"],
+        vec!["structure", "missing.fcbs", "--mode", "symbols", "--name", "needle", "--count-all", "--raw-hex", "61"],
         vec!["save", "missing-root", "--output", "unused.fcbs", "--count-all"],
         vec!["index", "search", "missing.fcbs", "--index", "missing.fcbi", "--index-digest",
             "0000000000000000000000000000000000000000000000000000000000000000", "--raw-hex", "61", "--ignore-case"],

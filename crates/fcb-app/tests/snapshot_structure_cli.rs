@@ -32,6 +32,91 @@ fn with_catalog(mut args: Vec<OsString>, f: &Fixture, pin: &str) -> Vec<OsString
 }
 
 #[test]
+fn count_all_structure_reports_exact_totals_with_bounded_rows_and_stable_continuations() {
+    for (mode, first, second, source) in [
+        ("symbols", b"a.rs".as_slice(), b"b.rs".as_slice(), b"fn needle() {}\nfn needle() {}\nfn needle() {}\n".as_slice()),
+        ("headings", b"a.md".as_slice(), b"b.md".as_slice(), b"# needle\n\n## needle\n\n### needle\n".as_slice()),
+        ("occurrences", b"a.txt".as_slice(), b"b.txt".as_slice(), b"needle needle needle\n".as_slice()),
+    ] {
+        let f = Fixture::new(&[entry(first, source), entry(second, source)], true);
+        let (exit, page) = invoke(&args(&f, mode, "needle", &["--limit", "1", "--skip-matches", "1", "--count-all"]), || false);
+        assert_eq!(exit, EXIT_OK); assert_eq!(page.get("state").text(), "complete");
+        assert!(page.get("count_all_matches").flag()); assert!(page.get("case_sensitive").flag());
+        assert_eq!(page.get("name_case").text(), "sensitive");
+        assert!(page.get("workspace_complete").flag()); assert!(page.get("matches_seen_exact").flag());
+        assert_eq!(page.get("matches_seen").number(), 6); assert_eq!(page.get("retained_hits").number(), 1);
+        assert!(page.get("truncated").flag()); assert!(page.get("has_more_matches").flag());
+        assert_eq!(page.get("next_match_offset").number(), 2);
+        let (exit, last) = invoke(&args(&f, mode, "needle", &["--limit", "1", "--skip-matches", "5", "--count-all"]), || false);
+        assert_eq!(exit, EXIT_OK); assert_eq!(last.get("matches_seen").number(), 6);
+        assert!(last.get("truncated").flag(), "CLI truncation includes an omitted prefix");
+        assert!(!last.get("has_more_matches").flag()); assert_eq!(last.get("next_match_offset"), &Json::Null);
+        let (exit, counted) = invoke(&args(&f, mode, "needle", &["--limit", "0", "--count-all"]), || false);
+        assert_eq!(exit, EXIT_OK); assert_eq!(counted.get("matches_seen").number(), 6);
+        assert!(counted.get("matches_seen_exact").flag()); assert!(counted.get("truncated").flag());
+        assert_eq!(counted.get("retained_hits").number(), 0); assert!(counted.get("hits").array().is_empty());
+        assert!(!counted.get("has_more_matches").flag()); assert_eq!(counted.get("next_match_offset"), &Json::Null);
+        let (exit, beyond) = invoke(&args(&f, mode, "needle", &["--count-all", "--skip-matches", "18446744073709551615"]), || false);
+        assert_eq!(exit, EXIT_OK); assert_eq!(beyond.get("matches_seen").number(), 6);
+        assert_eq!(beyond.get("skipped_matches").number(), 6); assert!(beyond.get("hits").array().is_empty());
+        assert!(!beyond.get("has_more_matches").flag()); assert_eq!(beyond.get("next_match_offset"), &Json::Null);
+        let (exit, absent) = invoke(&args(&f, mode, "absent", &["--limit", "0", "--count-all"]), || false);
+        assert_eq!(exit, EXIT_NO_MATCH); assert!(absent.get("matches_seen_exact").flag());
+        assert_eq!(absent.get("matches_seen").number(), 0); assert!(!absent.get("truncated").flag());
+    }
+}
+
+#[test]
+fn insensitive_structure_keeps_original_names_and_utf16_source_bytes() {
+    let text = "// 🚀\nfn Run() {}\nfn Runner() {}\nfn preRun() {}\n";
+    let mut bytes = vec![0xff, 0xfe]; bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+    let f = Fixture::new(&[entry(b"saved.rs", &bytes)], true);
+    for (mode, count) in [("exact", 1), ("prefix", 2), ("contains", 3)] {
+        let (exit, result) = invoke(&args(&f, "symbols", "rUN", &["--name-mode", mode, "--ignore-case", "--count-all"]), || false);
+        assert_eq!(exit, EXIT_OK); assert_eq!(result.get("matches_seen").number(), count);
+        assert_eq!(result.get("name_case").text(), "unicode-lowercase");
+        assert!(!result.get("case_sensitive").flag()); assert!(result.get("count_all_matches").flag());
+        assert!(result.get("matches_seen_exact").flag()); assert!(!result.get("live_roots_accessed").flag());
+        for hit in result.get("hits").array() {
+            let name = hit.get("name").text();
+            let expected: Vec<_> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            let range = hit.get("original_range");
+            assert_eq!(&bytes[range.get("start").number() as usize..range.get("end").number() as usize], expected);
+        }
+    }
+    let (exit, default) = invoke(&args(&f, "symbols", "run", &[]), || false);
+    assert_eq!(exit, EXIT_NO_MATCH); assert!(default.get("case_sensitive").flag());
+    assert!(!default.get("count_all_matches").flag()); assert_eq!(default.get("name_case").text(), "sensitive");
+    let headings = Fixture::new(&[entry(b"guide.md", "# İDEA\n\n# Straße\n\n# École\n".as_bytes())], true);
+    for (mode, name, expected) in [("exact", "i\u{307}dea", 1), ("prefix", "i", 1),
+        ("contains", "\u{307}d", 1), ("exact", "STRASSE", 0), ("exact", "e\u{301}cole", 0)] {
+        let (exit, result) = invoke(&args(&headings, "headings", name,
+            &["--name-mode", mode, "--ignore-case", "--count-all"]), || false);
+        assert_eq!(exit, if expected == 0 { EXIT_NO_MATCH } else { EXIT_OK });
+        assert_eq!(result.get("matches_seen").number(), expected); assert!(result.get("matches_seen_exact").flag());
+        if expected > 0 { assert_eq!(result.get("hits").array()[0].get("name").text(), "İDEA"); }
+    }
+}
+
+#[test]
+fn count_all_never_upgrades_incomplete_coverage_and_occurrence_case_is_rejected_before_io() {
+    let f = Fixture::new(&[entry(b"a.txt", b"needle"), entry(b"b.txt", b"needle")], true);
+    let (exit, work) = invoke(&args(&f, "occurrences", "needle", &["--limit", "0", "--count-all", "--max-source-bytes", "6"]), || false);
+    assert_eq!(exit, EXIT_PARTIAL); assert_eq!(work.get("state").text(), "work-limit");
+    assert_eq!(work.get("matches_seen").number(), 1); assert!(!work.get("matches_seen_exact").flag());
+    assert!(!work.get("workspace_complete").flag()); assert_eq!(work.get("next_match_offset"), &Json::Null);
+    let partial = Fixture::new(&[entry(b"a.rs", b"fn needle() {}\n"),
+        SnapshotEntry { path: b"b.rs", observed_bytes: 1, data: SnapshotData::Unavailable("missing") }], false);
+    let (exit, result) = invoke(&args(&partial, "symbols", "needle", &["--limit", "0", "--count-all"]), || false);
+    assert_eq!(exit, EXIT_PARTIAL); assert_eq!(result.get("matches_seen").number(), 1);
+    assert!(!result.get("matches_seen_exact").flag()); assert_eq!(result.get("unavailable_files").number(), 1);
+    let mut bad = args(&f, "occurrences", "needle", &["--ignore-case", "--count-all"]);
+    bad[2] = f.root.join("missing.fcbs").into_os_string();
+    let (exit, result) = invoke(&bad, || false);
+    assert_eq!(exit, EXIT_ERROR); assert_eq!(result.get("error").get("code").text(), "CLI_INCOMPATIBLE_OPTIONS");
+}
+
+#[test]
 fn saved_declarations_and_headings_share_name_modes_and_original_ranges() {
     let code = b"fn target() {}\nfn target_extra() {}\n";
     let f = Fixture::new(&[entry(b"src/source.rs", code)], true);

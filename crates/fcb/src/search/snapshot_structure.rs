@@ -11,6 +11,8 @@
 //! never consults a path from the archived workspace.
 
 use std::{io::{Read, Seek}, mem::size_of};
+use fcb_search::{SearchMode, UnicodeNormalization};
+use fcb_search::normalized::{NormalizedCursor, SourceScalar, matched_text_capacity};
 use fcb_core::{ByteLength, ByteRange, FileId, QueryGeneration, ResourceAllocationId,
     ResourceBudget, ResourceLease, SourceRevision};
 use super::{CaptureRequest, SymbolLanguage, SymbolNameMode};
@@ -178,6 +180,9 @@ pub struct StructureQuery<'archive, R: Read + Seek> {
     hits: Vec<StructureHit>,
     seen: u64,
     skip_matches: u64,
+    case_sensitive: bool,
+    count_all_matches: bool,
+    first_unretained: Option<u64>,
     next: usize,
     metadata_limit: usize,
     state: StructureState,
@@ -198,6 +203,17 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
     pub fn new_page(archive: &'archive mut PagedSnapshot<R>, needle: &str, options: StructureOptions,
         skip_matches: u64, budget: &ResourceBudget, allocations: [ResourceAllocationId; 5])
         -> Result<Self, StructureError> {
+        Self::new_matching_page(archive, needle, options, skip_matches, true, false, budget, allocations)
+    }
+    /// Select the name-matching and counting policy without changing legacy
+    /// constructors. Insensitive symbol/heading names use Unicode scalar
+    /// lowercase, not full case folding or normalization. Occurrences keep their
+    /// exact whole-token semantics. Counting visits the admitted saved scope
+    /// after the retained window fills; coverage and stored rows stay distinct.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_matching_page(archive: &'archive mut PagedSnapshot<R>, needle: &str, options: StructureOptions,
+        skip_matches: u64, case_sensitive: bool, count_all_matches: bool,
+        budget: &ResourceBudget, allocations: [ResourceAllocationId; 5]) -> Result<Self, StructureError> {
         let owner = archive.directory().owner();
         if options.generation.owner() != owner || options.first_file.owner() != owner
             || options.first_revision.owner() != owner { return Err(PagedSearchError::OwnerMismatch.into()); }
@@ -207,7 +223,7 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
             return Err(StructureError::InvalidLimits);
         }
         if options.mode == StructureMode::Occurrences {
-            if options.name_mode != SymbolNameMode::Exact { return Err(StructureError::InvalidLimits); }
+            if options.name_mode != SymbolNameMode::Exact || !case_sensitive { return Err(StructureError::InvalidLimits); }
             validate_reference_name(needle)?;
         }
         #[cfg(not(feature = "markdown"))]
@@ -217,15 +233,26 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
         options.first_revision.get().checked_add(last).ok_or(StructureError::IdentityExhausted)?;
         let metadata_limit = options.max_matches.checked_mul(MAX_STRUCTURE_NAME_BYTES * 2)
             .ok_or(StructureError::ResourceDenied)?.min(MAX_STRUCTURE_METADATA_BYTES);
+        // Contains reuses the shared incremental matcher one name at a time.
+        // Reserve its needle-sized tables/ring and transient growth before any
+        // allocation; never build a source-sized lowercase string.
+        let matching_charge = if !case_sensitive && options.name_mode == SymbolNameMode::Contains {
+            matched_text_capacity(needle, lowercase_mode()).map_err(|_| StructureError::ResourceDenied)?
+                .checked_mul(size_of::<char>() + size_of::<usize>() + size_of::<SourceScalar>())
+                .and_then(|n| n.checked_add(size_of::<NormalizedCursor>()))
+                .ok_or(StructureError::ResourceDenied)?
+        } else { 0 };
         let charge = options.max_matches.checked_mul(size_of::<StructureHit>())
             .and_then(|n| n.checked_add(metadata_limit + needle.len() + size_of::<Self>() + size_of::<StructureReport>()))
+            .and_then(|n| n.checked_add(matching_charge))
             .ok_or(StructureError::ResourceDenied)?;
         let lease = budget.try_reserve_managed(owner, allocations[0], ByteLength::new(charge as u64))
             .map_err(|_| StructureError::ResourceDenied)?;
         let mut hits = Vec::new();
         hits.try_reserve_exact(options.max_matches).map_err(|_| StructureError::ResourceDenied)?;
         if hits.capacity() > options.max_matches { return Err(StructureError::ResourceDenied); }
-        Ok(Self { archive, options, needle: copy_text(needle)?, allocations, hits, seen: 0, skip_matches, next: 0,
+        Ok(Self { archive, options, needle: copy_text(needle)?, allocations, hits, seen: 0, skip_matches,
+            case_sensitive, count_all_matches, first_unretained: None, next: 0,
             metadata_limit, state: StructureState::Pending, stats: StructureStats::default(), _lease: lease })
     }
     pub const fn state(&self) -> StructureState { self.state }
@@ -298,7 +325,9 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
                 if symbols.output_limited() { self.stats.extraction_limited_files += 1; }
                 for symbol in symbols.candidates() {
                     check(canceled)?;
-                    if !symbol.matches_name(&self.needle, self.options.name_mode) { continue; }
+                    if !matches_name(symbol.name(), &self.needle, self.options.name_mode, self.case_sensitive, canceled)? {
+                        continue;
+                    }
                     if !self.append(identity, symbol.name_range().unwrap_or(symbol.original_range()),
                         symbol.original_range(), symbol.name(), symbol.kind().label(), language.name(), symbol.id(), None)? { break; }
                 }
@@ -306,8 +335,8 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
             StructureMode::Occurrences => {
                 let remaining = self.options.max_matches - self.hits.len();
                 let file_skip = self.skip_matches.saturating_sub(self.seen);
-                let references = match CapturedReferences::build_page(source.bytes(), request, self.options.generation,
-                    &self.needle, None, remaining, file_skip, budget, self.allocations[3], &mut *canceled) {
+                let references = match CapturedReferences::build_window(source.bytes(), request, self.options.generation,
+                    &self.needle, None, remaining, file_skip, self.count_all_matches, budget, self.allocations[3], &mut *canceled) {
                     Ok(references) => references,
                     Err(ReferenceError::Canceled) => return Err(StructureError::Canceled),
                     Err(ReferenceError::ResourceDenied) => return Err(StructureError::ResourceDenied),
@@ -322,9 +351,13 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
                     let range = occurrence.original_range();
                     self.append(identity, range, range, references.name(), "identifier-occurrence", "text", occurrence.id(), None)?;
                 }
-                if references.output_limited() {
-                    self.seen = self.seen.checked_add(1).ok_or(StructureError::IdentityExhausted)?;
-                    self.state = StructureState::Truncated;
+                let later = (references.total_matches_counted() as u64)
+                    .checked_sub(skipped).and_then(|n| n.checked_sub(references.candidates().len() as u64))
+                    .ok_or(StructureError::InvalidHit)?;
+                if later > 0 {
+                    self.first_unretained.get_or_insert(self.seen);
+                    self.seen = self.seen.checked_add(later).ok_or(StructureError::IdentityExhausted)?;
+                    if !self.count_all_matches { self.state = StructureState::Truncated; }
                 }
             }
             StructureMode::Headings => self.headings(identity, request, source.bytes(), budget, canceled)?,
@@ -362,7 +395,9 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
         self.stats.files_searched += 1;
         for (ordinal, heading) in document.headings().iter().enumerate() {
             check(canceled)?;
-            if !matches_name(&heading.title, &self.needle, self.options.name_mode) { continue; }
+            if !matches_name(&heading.title, &self.needle, self.options.name_mode, self.case_sensitive, canceled)? {
+                continue;
+            }
             let range = document.original_span(heading.source_span).map_err(|_| StructureError::InvalidHit)?;
             if !self.append(identity, range, range, &heading.title, "heading", "markdown",
                 ordinal as u64 + 1, Some(&heading.slug))? { break; }
@@ -395,7 +430,11 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
         }
         self.seen = self.seen.checked_add(1).ok_or(StructureError::IdentityExhausted)?;
         if self.seen <= self.skip_matches { return Ok(true); }
-        if self.hits.len() == self.options.max_matches { self.state = StructureState::Truncated; return Ok(false); }
+        if self.hits.len() == self.options.max_matches {
+            self.first_unretained.get_or_insert(self.seen - 1);
+            if !self.count_all_matches { self.state = StructureState::Truncated; }
+            return Ok(self.count_all_matches);
+        }
         let bytes = name.len().checked_add(slug.map_or(0, str::len)).ok_or(StructureError::ResourceDenied)?;
         if name.is_empty() || name.len() > MAX_STRUCTURE_NAME_BYTES
             || slug.is_some_and(|s| s.is_empty() || s.len() > MAX_STRUCTURE_NAME_BYTES)
@@ -418,8 +457,9 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
             StructureState::Failed(error) => Err(error),
             _ => Ok(StructureReport { archive: self.archive.directory().digest(),
                 discovery_complete: self.archive.directory().discovery_complete(), options: self.options,
-                needle: self.needle, hits: self.hits, seen: self.seen, skip_matches: self.skip_matches, state: self.state,
-                stats: self.stats, _lease: self._lease }),
+                needle: self.needle, hits: self.hits, seen: self.seen, skip_matches: self.skip_matches,
+                case_sensitive: self.case_sensitive, count_all_matches: self.count_all_matches,
+                first_unretained: self.first_unretained, state: self.state, stats: self.stats, _lease: self._lease }),
         }
     }
 }
@@ -436,6 +476,9 @@ pub struct StructureReport {
     hits: Vec<StructureHit>,
     seen: u64,
     skip_matches: u64,
+    case_sensitive: bool,
+    count_all_matches: bool,
+    first_unretained: Option<u64>,
     state: StructureState,
     stats: StructureStats,
     _lease: ResourceLease,
@@ -445,11 +488,17 @@ impl StructureReport {
     pub const fn matches_seen(&self) -> u64 { self.seen }
     pub const fn skip_matches(&self) -> u64 { self.skip_matches }
     pub fn skipped_matches(&self) -> u64 { self.skip_matches.min(self.seen) }
-    pub fn has_more_matches(&self) -> bool { self.state == StructureState::Truncated }
-    /// Omitted post-offset metadata still consumed a qualified match position.
-    /// Advancing only by stored rows would replay earlier retained candidates.
+    pub const fn case_sensitive(&self) -> bool { self.case_sensitive }
+    pub const fn count_all_matches(&self) -> bool { self.count_all_matches }
+    /// Later matches omitted by the retained-row cap, independent of coverage.
+    /// A skipped prefix alone does not set this flag.
+    pub const fn truncated(&self) -> bool { self.first_unretained.is_some() }
+    /// Zero-row probes/counts never offer a continuation that cannot progress.
+    pub fn has_more_matches(&self) -> bool { self.options.max_matches > 0 && self.truncated() }
+    /// Metadata omitted before the retained window fills still consumes match
+    /// positions. Counting later matches never moves this first omitted offset.
     pub fn next_match_offset(&self) -> Option<u64> {
-        self.has_more_matches().then(|| self.seen - 1)
+        if self.has_more_matches() { self.first_unretained } else { None }
     }
     pub const fn stats(&self) -> StructureStats { self.stats }
     pub const fn mode(&self) -> StructureMode { self.options.mode }
@@ -457,12 +506,17 @@ impl StructureReport {
     pub fn needle(&self) -> &str { &self.needle }
     pub const fn state(&self) -> StructureState { self.state }
     pub const fn archive_digest(&self) -> Sha256Digest { self.archive }
-    /// Extraction-processing completeness, never compiler semantic completeness.
-    pub fn is_complete(&self) -> bool {
+    /// Whether the count covers all admitted extraction work. Row caps and
+    /// metadata-only omissions do not make an otherwise complete count inexact.
+    /// This never claims compiler semantic completeness.
+    pub fn matches_seen_exact(&self) -> bool {
         self.state == StructureState::Complete && self.discovery_complete
             && self.stats.unsupported_files == 0 && self.stats.unavailable_files == 0
             && self.stats.source_limited_files == 0 && self.stats.extraction_limited_files == 0
-            && self.stats.metadata_omitted == 0
+    }
+    /// Extraction-processing completeness, never compiler semantic completeness.
+    pub fn is_complete(&self) -> bool {
+        self.matches_seen_exact() && self.stats.metadata_omitted == 0
     }
     pub fn validate_delivery(&self, archive: Sha256Digest, generation: QueryGeneration) -> Result<(), StructureError> {
         if archive != self.archive || generation != self.options.generation { return Err(StructureError::StaleQuery); }
@@ -479,10 +533,34 @@ fn copy_text(text: &str) -> Result<String, StructureError> {
 fn check(canceled: &mut impl FnMut() -> bool) -> Result<(), StructureError> {
     if canceled() { Err(StructureError::Canceled) } else { Ok(()) }
 }
-#[cfg(feature = "markdown")]
-fn matches_name(name: &str, needle: &str, mode: SymbolNameMode) -> bool {
-    match mode { SymbolNameMode::Exact => name == needle, SymbolNameMode::Prefix => name.starts_with(needle),
-        SymbolNameMode::Contains => name.contains(needle) }
+fn lowercase_mode() -> SearchMode {
+    SearchMode::DecodedText { case_sensitive: false, normalization: UnicodeNormalization::Exact }
+}
+fn matches_name(name: &str, needle: &str, mode: SymbolNameMode, case_sensitive: bool,
+    canceled: &mut impl FnMut() -> bool) -> Result<bool, StructureError> {
+    if case_sensitive {
+        return Ok(match mode { SymbolNameMode::Exact => name == needle,
+            SymbolNameMode::Prefix => name.starts_with(needle), SymbolNameMode::Contains => name.contains(needle) });
+    }
+    if mode != SymbolNameMode::Contains {
+        let mut source = name.chars().flat_map(char::to_lowercase);
+        for unit in needle.chars().flat_map(char::to_lowercase) {
+            if source.next() != Some(unit) { return Ok(false); }
+        }
+        return Ok(mode == SymbolNameMode::Prefix || source.next().is_none());
+    }
+    let mut cursor = NormalizedCursor::new(needle, lowercase_mode())
+        .map_err(|_| StructureError::ResourceDenied)?.ok_or(StructureError::InvalidLimits)?;
+    for (index, (start, ch)) in name.char_indices().enumerate() {
+        if index % 256 == 0 { check(canceled)?; }
+        let end = (start + ch.len_utf8()) as u64;
+        let scalar = SourceScalar { ch, raw_start: start as u64, raw_end: end,
+            decoded_start: start as u64, decoded_end: end };
+        for unit in cursor.units(ch) {
+            if cursor.push(unit, scalar).is_some() { return Ok(true); }
+        }
+    }
+    Ok(false)
 }
 fn is_markdown(path: &[u8]) -> bool {
     let name = path.rsplit(|&byte| byte == b'/').next().unwrap_or(path);

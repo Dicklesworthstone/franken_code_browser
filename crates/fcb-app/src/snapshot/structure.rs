@@ -27,7 +27,8 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
     let options = StructureOptions { generation: generation(), first_file: file_id(),
         first_revision: revision(), mode, name_mode: settings.name_mode,
         max_matches: settings.limit, max_source_bytes: settings.max_structure_source_bytes };
-    let mut query = StructureQuery::new_page(&mut archive, name, options, settings.skip_matches, budget,
+    let mut query = StructureQuery::new_matching_page(&mut archive, name, options, settings.skip_matches,
+        !settings.ignore_case, settings.count_all_matches, budget,
         [allocation(160), allocation(161), allocation(162), allocation(163), allocation(164)])?;
     while query.state() == StructureState::Pending {
         query.step(generation(), budget, &mut *canceled)?;
@@ -43,8 +44,11 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
         out.literal(",\"requested_mode\":")?; out.quoted(mode.requested())?;
         out.literal(",\"realized_mode\":")?; out.quoted(mode.realized())?;
         out.literal(",\"evidence_level\":")?; out.quoted(mode.realized())?;
-        out.literal(",\"semantic_complete\":false,\"completeness_basis\":\"admitted-extraction-processing\",\"name_case\":\"sensitive\",\"name\":")?;
-        out.quoted(name)?;
+        out.literal(",\"semantic_complete\":false,\"completeness_basis\":\"admitted-extraction-processing\",\"name_case\":")?;
+        out.quoted(if report.case_sensitive() { "sensitive" } else { "unicode-lowercase" })?;
+        out.literal(",\"case_sensitive\":")?; out.boolean(report.case_sensitive())?;
+        out.literal(",\"count_all_matches\":")?; out.boolean(report.count_all_matches())?;
+        out.literal(",\"name\":")?; out.quoted(name)?;
         out.literal(",\"name_mode\":")?; out.quoted(match settings.name_mode {
             SymbolNameMode::Exact => "exact", SymbolNameMode::Prefix => "prefix", SymbolNameMode::Contains => "contains",
         })?;
@@ -53,9 +57,9 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
         }
         out.literal(",\"discovery_complete\":")?; out.boolean(archive.directory().discovery_complete())?;
         out.literal(",\"workspace_complete\":")?; out.boolean(report.is_complete())?;
-        out.literal(",\"matches_seen_exact\":")?; out.boolean(report.is_complete())?;
+        out.literal(",\"matches_seen_exact\":")?; out.boolean(report.matches_seen_exact())?;
         out.literal(",\"truncated\":")?;
-        out.boolean(report.state() == StructureState::Truncated || report.skipped_matches() > 0)?;
+        out.boolean(report.truncated() || report.skipped_matches() > 0)?;
         matching::window_fields(out, report.skip_matches(), report.skipped_matches(),
             report.hits().len(), report.has_more_matches(), report.next_match_offset())?;
         out.literal(",\"work_limited\":")?; out.boolean(report.state() == StructureState::WorkLimit)?;
@@ -89,6 +93,8 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
         out.literal(if report.is_complete() { "Complete saved-scope structural search; no live roots accessed.\n" }
             else { "PARTIAL saved-scope structural search; no live roots accessed.\n" })?;
         out.literal("Evidence: ")?; out.literal(mode.realized())?; out.literal(". Name: ")?; out.human_text(name)?; out.literal("\n")?;
+        out.literal(if report.case_sensitive() { "Name matching: case sensitive.\n" }
+            else { "Name matching: Unicode scalar lowercase; no full case folding or normalization.\n" })?;
         matching::window_human(out, report.skip_matches(), report.skipped_matches(),
             report.hits().len(), report.has_more_matches(), report.next_match_offset())?;
         if mode == StructureMode::Occurrences {
@@ -126,7 +132,9 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
     }
     if settings.json { out.literal("]}\n")?; }
     else {
-        out.literal("Matching candidates seen: ")?; out.literal(&report.matches_seen().to_string())?;
+        out.literal(if report.matches_seen_exact() { "Matching candidates (exact total): " }
+            else { "Matching candidates seen (lower bound): " })?;
+        out.literal(&report.matches_seen().to_string())?;
         out.literal("; source bytes loaded: ")?; out.literal(&stats.loaded_bytes.to_string())?;
         out.literal("; retained source bytes: 0.\n")?;
         out.literal("Coverage: unsupported=")?; out.literal(&stats.unsupported_files.to_string())?;
@@ -138,6 +146,6 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
             out.literal("Aggregate source allowance exhausted; no exhaustive-negative claim.\n")?;
         }
     }
-    Ok(if !report.is_complete() || report.skipped_matches() > 0 { EXIT_PARTIAL }
+    Ok(if !report.is_complete() || (!report.count_all_matches() && report.skipped_matches() > 0) { EXIT_PARTIAL }
         else if report.matches_seen() == 0 { EXIT_NO_MATCH } else { EXIT_OK })
 }
