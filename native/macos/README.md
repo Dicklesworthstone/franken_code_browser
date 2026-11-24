@@ -89,22 +89,33 @@ launching and sandboxed macOS handoff still require native qualification.
 
 ## Returning to atlas folders
 
-The **Atlas folder** bar now has **Folder Back** and **Folder Forward**
-(**⇧⌘[** and **⇧⌘]**). These return through accepted folder and file-filter
-changes, including the camera position where you left each map. **Up one
+In **Project Files**, open a current row's context menu and choose **Focus this
+file** to build an exact single-file atlas. This also reaches files discovered
+after the initial 20,000-file atlas prefix, including files in a flat folder
+whose containing-folder atlas is still capped. **Focus containing folder**
+remains available. The file scope uses the current discovery policy and the
+original project root; it performs metadata discovery without reading source
+payloads. A file receipt can contain zero or one entry. Its completeness applies
+only to that selected file, never to its folder or the whole project.
+
+The bar identifies the accepted **Atlas file** or **Atlas folder**. Its
+**Previous file or folder** and **Next file or folder** buttons (**⇧⌘[** and
+**⇧⌘]**) return through accepted scopes and file-filter changes, including the
+camera position where you left each map. **Containing folder**, **Up one
 folder**, **Whole project**, and **Focus selected folder** enter the same
 history. The existing **Atlas Back/Forward** controls still navigate camera
-locations within one map.
+locations within one map. Two files sharing a folder remain separate destinations,
+and a root-level file remains distinct from the whole-project view.
 
-Use **Landmarks → Save current view…** to name a folder, its file filter and
+Use **Landmarks → Save current view…** to name a file or folder, its file filter and
 its map position. The menu keeps up to **32 landmarks** for the project and
 discovery policy; choose a name to return, or use **Remove landmark** to remove
-it. Accepted folder moves, landmark edits and settled map positions save
+it. Accepted scope changes, landmark edits and settled map positions save
 automatically. **Landmarks → Save current view now** explicitly saves the
-current view. Folder history and landmarks survive project closure and later
+current view. File and folder history and landmarks survive project closure and later
 application launches.
 
-Reopening the project restores its saved folder, filter and map position after
+Reopening the project restores its saved file or folder, filter and map position after
 current project access is accepted. A startup file choice or newer map/filter
 interaction takes precedence; **Landmarks → Return to saved view** remains
 available to apply the saved map explicitly. Discovery policies keep separate
@@ -112,15 +123,18 @@ records. Replacing a root or access grant clears the old in-memory routes
 before restoration under the newly opened project. Saved paths remain locators
 and never grant source access.
 
-A return prepares its bounded folder catalog and layout under the original
-project root. The current map, Back/Forward routes and independent source
+A return prepares the saved exact-file or bounded folder catalog and layout
+under the original project root. Refresh and optional preview rebuilding retain
+that same target; they do not widen a single file to its containing folder.
+Visible-file search also retains the file catalog target, so a late-discovered
+file is not lost by reopening the capped parent catalog. The current map, Back/Forward routes and independent source
 readers stay available if preparation fails or is canceled. Filters are
 published with the accepted destination; editing a filter while a return is
 pending prevents the older request from overwriting that edit.
 
 Camera positions are relative to a raw-path file parcel and the viewport,
 so a return can resolve the parcel in a newly built layout. A missing parcel
-falls back to the folder overview with an explicit notice; it never opens a
+falls back to the scope overview with an explicit notice; it never opens a
 different source or treats a current pathname as an old exact capture. Project
 Files stays open if it owns a reader. Choose **Show text atlas** to see the
 accepted destination; deferred camera restoration waits for usable geometry.
@@ -135,8 +149,12 @@ the current window even when they exceed persistence admission.
 Another window's newer save is preserved. **Reload saved views…** explicitly
 reloads that record after reviewing replacement of this window's unsaved views;
 **Retry saving** is available after retryable failures. Corrupt current or prior
-records are kept intact and block overwrite. A missing or inaccessible saved
-folder preserves the current map and source reader for an explicit retry.
+records are kept intact and block overwrite. An unavailable saved file or folder
+leaves the current map and source reader available for an explicit retry. File
+targets use the atlas admission limits of 2,048 raw path bytes and 32 path
+components. Saved records containing file targets use version 2, so older
+applications refuse them instead of restoring a broader folder; existing
+folder-only records remain compatible.
 
 The production regression sources are in `AtlasFolderNavigationTests.swift`,
 `AtlasFolderPersistenceTests.swift` and `AtlasCameraTests.swift`, with

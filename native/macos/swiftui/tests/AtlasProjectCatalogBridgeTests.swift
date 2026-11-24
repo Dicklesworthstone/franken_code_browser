@@ -2,6 +2,8 @@ import Foundation
 @_silgen_name("project_fixture_set") private func configure(_ text: UnsafePointer<CChar>?, _ cancel: Int32)
 @_silgen_name("project_fixture_count") private func count(_ kind: UInt32) -> UInt32
 @_silgen_name("project_fixture_policy") private func requestedPolicy() -> UInt64
+@_silgen_name("project_fixture_file_length") private func fileLength() -> UInt64
+@_silgen_name("project_fixture_file_byte") private func fileByte(_ index: UInt64) -> UInt8
 @_cdecl("project_fixture_cancel") func projectFixtureCancel(_ context: UnsafeMutableRawPointer?) {
     guard let context else { preconditionFailure("Missing cancellation context") }
     Unmanaged<AtlasSearchCancellation>.fromOpaque(context).takeUnretainedValue().cancel()
@@ -11,7 +13,72 @@ import Foundation
     @MainActor private static func check(_ value: @autoclosure () -> Bool, _ message: String) {
         precondition(value(), message); checks += 1
     }
+    @MainActor private static func exactFileCatalog() throws {
+        let raw: [UInt8] = [0xff, 46, 114, 115]
+        let focus = try AtlasFileFocus(rawPath: raw)
+        let path = ["encoding": "unix-bytes", "hex": "ff2e7273", "display": "escaped file"]
+        let row: [String: Any] = ["file_id": "9007199254740993", "path": path,
+            "observed_bytes": "17", "x": 0, "y": 0, "w": 1, "h": 1]
+        let valid: [String: Any] = ["schema": "fcb.project-file-catalog/1", "status": "ok", "command": "file-catalog",
+            "identity_scope": "response-local", "native_presented": false, "source_payload_read": false,
+            "payload_bytes_read": "0", "read_calls": "0", "discovery_complete": true, "catalogued_files": "1",
+            "policy": "repository-rules-v1", "path_basis": "project-root", "file": path,
+            "world": ["w": 4096, "h": 4096], "files": [row]]
+        func configureWire(_ wire: [String: Any], cancel: Int32 = 0) throws {
+            let json = String(decoding: try JSONSerialization.data(withJSONObject: wire), as: UTF8.self)
+            json.withCString { configure($0, cancel) }
+        }
+        try configureWire(valid)
+        let report = try AtlasProjectWorker.catalogReport(root: "/project", target: .file(focus),
+            cancellation: AtlasSearchCancellation())
+        check(fileLength() == UInt64(raw.count) && (0..<raw.count).map { fileByte(UInt64($0)) } == raw,
+              "Exact raw root-level filename reaches file-specific C endpoint")
+        check(report.requestedTarget == .file(focus) && report.requestedTarget != .project
+              && report.requestedRoot == "/project" && report.entries[0].rawPath == raw,
+              "File receipt cannot become a whole-project catalog through its empty parent")
+        check(count(0) == 1 && count(1) == 1 && count(2) == 1, "File endpoint returns one owned released response")
+        var included = valid; included["policy"] = "all-regular-files/no-rule-files-v1"
+        try configureWire(included)
+        let all = try AtlasProjectWorker.catalogReport(root: "/project", target: .file(focus),
+            discoveryPolicy: .includeExcluded, cancellation: AtlasSearchCancellation())
+        check(requestedPolicy() == 1 && all.requestedTarget == .file(focus)
+              && all.matchesDiscoveryPolicy(AtlasDiscoveryPolicy.includeExcluded.wireName), "File policy stays request-bound")
+        var wrongScope = valid
+        wrongScope["file"] = ["encoding": "unix-bytes", "hex": "612e7273", "display": "another file"]
+        for bad in [wrongScope, included] {
+            try configureWire(bad)
+            do {
+                _ = try AtlasProjectWorker.catalogReport(root: "/project", target: .file(focus),
+                    cancellation: AtlasSearchCancellation())
+                preconditionFailure("Wrong file receipt admitted")
+            } catch AtlasProjectCatalog.DecodeError.invalidResponse {
+                check(count(1) == 1 && count(2) == 1, "Refused file receipt releases its foreign allocation")
+            }
+        }
+        let canceled = AtlasSearchCancellation(); canceled.cancel()
+        try configureWire(valid)
+        do {
+            _ = try AtlasProjectWorker.catalogReport(root: "/project", target: .file(focus), cancellation: canceled)
+            preconditionFailure("Pre-canceled file request entered C")
+        } catch AtlasProjectIOError.canceled { check(count(0) == 0, "Pre-cancel prevents exact-file work") }
+        try configureWire(valid, cancel: 1)
+        do {
+            _ = try AtlasProjectWorker.catalogReport(root: "/project", target: .file(focus),
+                cancellation: AtlasSearchCancellation())
+            preconditionFailure("Canceled file receipt published")
+        } catch AtlasProjectIOError.canceled {
+            check(count(1) == 1 && count(2) == 1, "Cancellation after file reply frees its allocation")
+        }
+        configure(nil, 0)
+        do {
+            _ = try AtlasProjectWorker.catalogReport(root: "/project", target: .file(focus),
+                cancellation: AtlasSearchCancellation())
+            preconditionFailure("Null file receipt established absence")
+        } catch AtlasProjectIOError.unavailable { check(count(1) == 0 && count(2) == 0, "Null file result is unavailable") }
+    }
+
     @MainActor static func main() throws {
+        try exactFileCatalog()
         let json = #"{"schema":"fcb.project-catalog/1","status":"ok","command":"catalog","identity_scope":"response-local","native_presented":false,"source_payload_read":false,"payload_bytes_read":"0","read_calls":"0","discovery_complete":false,"catalogued_files":"1","policy":"repository-rules-v1","world":{"w":4096,"h":4096},"files":[{"file_id":"9007199254740993","path":{"encoding":"unix-bytes","hex":"ff2e7273","display":"escaped raw name"},"observed_bytes":"5","x":0,"y":0,"w":1,"h":1}]}"#
         json.withCString { configure($0, 0) }
         let report = try AtlasProjectWorker.catalogReport(root: "/project", cancellation: AtlasSearchCancellation())

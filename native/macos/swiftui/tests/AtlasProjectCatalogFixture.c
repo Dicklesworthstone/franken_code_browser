@@ -8,12 +8,15 @@ static char *response;
 static unsigned calls, allocated, freed;
 static uint64_t requested_policy, requested_directory_length;
 static uint8_t requested_directory[2048];
+static uint64_t requested_file_length;
+static uint8_t requested_file[2048];
 static int cancel_during_call;
 extern void project_fixture_cancel(void *);
 void project_fixture_set(const char *json, int cancel) {
     free(response); response = json ? strdup(json) : NULL;
     calls = allocated = freed = 0; cancel_during_call = cancel;
     requested_policy = UINT64_MAX; requested_directory_length = 0;
+    requested_file_length = 0;
 }
 unsigned project_fixture_count(unsigned kind) { return kind == 0 ? calls : (kind == 1 ? allocated : freed); }
 uint64_t project_fixture_policy(void) { return requested_policy; }
@@ -22,11 +25,16 @@ uint8_t project_fixture_directory_byte(uint64_t index) {
     assert(index < requested_directory_length);
     return requested_directory[index];
 }
+uint64_t project_fixture_file_length(void) { return requested_file_length; }
+uint8_t project_fixture_file_byte(uint64_t index) {
+    assert(index < requested_file_length);
+    return requested_file[index];
+}
 static char *metadata_reply(const char *root, uint64_t limit, uint64_t policy,
         int32_t (*poll)(void *), void *context) {
     ++calls; requested_policy = policy;
     assert(policy <= 1);
-    assert(strcmp(root, "/project") == 0 && limit == 20000 && poll && context);
+    assert(strcmp(root, "/project") == 0 && limit == (requested_file_length ? 1 : 20000) && poll && context);
     assert(poll(context) == 0);
     if (cancel_during_call) { project_fixture_cancel(context); assert(poll(context) != 0); }
     if (!response) return NULL;
@@ -35,6 +43,7 @@ static char *metadata_reply(const char *root, uint64_t limit, uint64_t policy,
 char *fcb_project_catalog_with_policy_cancelable(const char *root, uint64_t limit, uint64_t policy,
         int32_t (*poll)(void *), void *context) {
     requested_directory_length = 0;
+    requested_file_length = 0;
     return metadata_reply(root, limit, policy, poll, context);
 }
 char *fcb_project_directory_catalog_cancelable(const char *root, const uint8_t *directory,
@@ -42,6 +51,14 @@ char *fcb_project_directory_catalog_cancelable(const char *root, const uint8_t *
     assert(directory && directory_len > 0 && directory_len <= sizeof requested_directory);
     memcpy(requested_directory, directory, (size_t)directory_len);
     requested_directory_length = directory_len;
+    requested_file_length = 0;
+    return metadata_reply(root, limit, policy, poll, context);
+}
+char *fcb_project_file_catalog_cancelable(const char *root, const uint8_t *file,
+        uint64_t file_len, uint64_t limit, uint64_t policy, int32_t (*poll)(void *), void *context) {
+    assert(file && file_len > 0 && file_len <= sizeof requested_file);
+    memcpy(requested_file, file, (size_t)file_len);
+    requested_file_length = file_len; requested_directory_length = 0;
     return metadata_reply(root, limit, policy, poll, context);
 }
 void fcb_free_string(char *p) { if (p) { ++freed; free(p); } }

@@ -20,6 +20,12 @@ char *fcb_project_directory_catalog_cancelable(const char *root, const uint8_t *
     assert(0 && "directory catalog used during viewport source test");
     return 0;
 }
+char *fcb_project_file_catalog_cancelable(const char *root, const uint8_t *file,
+        uint64_t file_len, uint64_t max_files, uint64_t policy, int32_t (*poll)(void *), void *context) {
+    (void)root; (void)file; (void)file_len; (void)max_files; (void)policy; (void)poll; (void)context;
+    assert(0 && "file catalog used during viewport source test");
+    return 0;
+}
 
 char *fcb_atlas_layout_cancelable(const char *root, poll_fn poll, void *context) {
     (void)root; (void)poll; (void)context; return NULL;

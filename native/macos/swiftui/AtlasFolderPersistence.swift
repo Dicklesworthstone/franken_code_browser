@@ -129,11 +129,13 @@ struct AtlasFolderViewStore: Sendable {
     }
     private struct Place: Codable {
         let directory: Data
+        let file: Data?
         let scope, extensions: String
         let parcel: Data?
         let camera: Camera?
         init(_ destination: AtlasFolderDestination) {
             directory = Data(destination.directory.rawPath)
+            file = destination.catalogTarget.file.map { Data($0.rawPath) }
             switch destination.fileScope {
             case .all: scope = "all"
             case .markdown: scope = "markdown"
@@ -162,11 +164,20 @@ struct AtlasFolderViewStore: Sendable {
                 }
                 anchor = valid
             }
-            return try AtlasFolderDestination(directory: AtlasDirectoryFocus(rawPath: Array(directory)),
+            let directory = try AtlasDirectoryFocus(rawPath: Array(directory))
+            let target: AtlasCatalogTarget
+            if let file {
+                let focus = try AtlasFileFocus(rawPath: Array(file))
+                guard focus.directory == directory else { throw AtlasFolderPersistenceError.corrupt }
+                target = .file(focus)
+            } else {
+                target = .directory(directory)
+            }
+            return try AtlasFolderDestination(catalogTarget: target,
                 fileScope: fileScope, customExtensions: extensions,
                 anchorRawPath: parcel.map(Array.init), cameraAnchor: anchor)
         }
-        var rawBytes: Int { directory.count + scope.utf8.count + extensions.utf8.count + (parcel?.count ?? 0) + 64 }
+        var rawBytes: Int { directory.count + (file?.count ?? 0) + scope.utf8.count + extensions.utf8.count + (parcel?.count ?? 0) + 64 }
     }
     private struct Camera: Codable { let x, y, zoom: Double }
 
@@ -174,7 +185,12 @@ struct AtlasFolderViewStore: Sendable {
         revision: UUID) throws -> Data {
         var check = AtlasFolderNavigation()
         do { try check.restore(snapshot) } catch { throw AtlasFolderPersistenceError.invalidState }
-        let record = Record(version: 1, root: Data(context.root.utf8), policy: context.policy, revision: revision,
+        let destinations = snapshot.history.previous + snapshot.history.following
+            + snapshot.landmarks.map(\.destination) + (snapshot.history.current.map { [$0] } ?? [])
+        // Old readers refuse version 2 instead of silently widening a saved
+        // file to its parent. Folder-only records stay compatible with v1.
+        let version = destinations.contains(where: { $0.catalogTarget.file != nil }) ? 2 : 1
+        let record = Record(version: version, root: Data(context.root.utf8), policy: context.policy, revision: revision,
             current: snapshot.history.current.map(Place.init),
             previous: snapshot.history.previous.map(Place.init), following: snapshot.history.following.map(Place.init),
             landmarks: snapshot.landmarks.map { Landmark(id: $0.id, label: $0.label, destination: Place($0.destination)) })
@@ -199,8 +215,14 @@ struct AtlasFolderViewStore: Sendable {
                 throw AtlasFolderPersistenceError.corrupt
             }
             let record = try decoder.decode(Record.self, from: seal.body)
-            guard record.version == 1, record.root == Data(context.root.utf8), record.policy == context.policy else {
+            guard (record.version == 1 || record.version == 2),
+                  record.root == Data(context.root.utf8), record.policy == context.policy else {
                 throw AtlasFolderPersistenceError.corrupt
+            }
+            if record.version == 1 {
+                let places = record.previous + record.following + record.landmarks.map(\.destination)
+                    + (record.current.map { [$0] } ?? [])
+                guard places.allSatisfy({ $0.file == nil }) else { throw AtlasFolderPersistenceError.corrupt }
             }
             try validateSize(record)
             let snapshot = AtlasFolderNavigation.Snapshot(
@@ -540,7 +562,7 @@ struct AtlasFolderViewStore: Sendable {
             case (.load, .success(let receipt)):
                 isLoading = false; canSave = true; revision = receipt.revision
                 confirmed = receipt.snapshot; desired = receipt.snapshot
-                notice = receipt.snapshot == nil ? "" : "Saved atlas landmarks and folder history restored."
+                notice = receipt.snapshot == nil ? "" : "Saved atlas landmarks and map history restored."
                 let publish = accepted; accepted = nil
                 publish?(receipt.snapshot)
             case (.load, .failure(let error)):
@@ -550,7 +572,7 @@ struct AtlasFolderViewStore: Sendable {
                 revision = receipt.revision; confirmed = receipt.snapshot
                 hasUnsavedChanges = desired != confirmed
                 notice = receipt.synchronizationConfirmed
-                    ? "Atlas landmarks and folder history saved on this Mac."
+                    ? "Atlas landmarks and map history saved on this Mac."
                     : "The atlas view was written, but storage synchronization could not be confirmed."
             case (.save, .failure(let error)):
                 hasUnsavedChanges = true

@@ -22,6 +22,8 @@ import Foundation
 
     static func main() throws {
         try directoryIdentityFollowsTheAcceptedView()
+        try exactFileIdentityCannotWidenToItsContainingFolder()
+        try fileIdentityKeepsByteDistinctUnicodeNames()
         try geometryUsesAllParcelsAndExactIntersections()
         try rawMembershipIsFrozenAndNotAPathLabel()
         try boundsRefuseWholeScopeAndEmptyRemainsEmpty()
@@ -51,6 +53,61 @@ import Foundation
         precondition(!unicode.belongs(to: "/repo", project: project, layout: layout, directory: decomposed))
         let empty = try capture([], in: accepted)
         precondition(empty.paths.isEmpty && empty.view.directory == directory)
+    }
+
+    private static func exactFileIdentityCannotWidenToItsContainingFolder() throws {
+        let project = UUID(), layout = UUID()
+        let viewport = try AtlasVisibleSearchScope.Viewport(x: 0, y: 0, width: 100, height: 100)
+        for raw in [Array("late.rs".utf8), Array("src/deep/late.rs".utf8), [122, 255, 92, 47, 254, 46, 114, 115]] {
+            let focus = try AtlasFileFocus(rawPath: raw)
+            let target = AtlasCatalogTarget.file(focus)
+            let accepted = try AtlasVisibleSearchScope.View(root: "/repo", project: project, layout: layout,
+                viewport: viewport, catalogTarget: target)
+            let frozen = try capture([entry(1, raw, x: 0)], in: accepted)
+            precondition(frozen.paths == [raw] && frozen.view.catalogTarget == target)
+            precondition(frozen.view.directory == focus.directory)
+            precondition(frozen.view.belongs(to: "/repo", project: project, layout: layout, catalogTarget: target))
+            precondition(frozen.view.represents(root: "/repo", project: project, layout: layout,
+                viewport: viewport, catalogTarget: target))
+            // A root-level file has .project as its containing directory, but
+            // neither the default view identity nor its parent can authorize it.
+            precondition(!frozen.view.belongs(to: "/repo", project: project, layout: layout))
+            precondition(!frozen.view.belongs(to: "/repo", project: project, layout: layout,
+                directory: focus.directory))
+            precondition(!frozen.view.represents(root: "/repo", project: project, layout: layout,
+                viewport: viewport, catalogTarget: .directory(focus.directory)))
+            precondition(!frozen.view.belongs(to: "/other", project: project, layout: layout, catalogTarget: target))
+            precondition(!frozen.view.belongs(to: "/repo", project: UUID(), layout: layout, catalogTarget: target))
+            precondition(!frozen.view.belongs(to: "/repo", project: project, layout: UUID(), catalogTarget: target))
+            let sibling = focus.directory.isProject ? Array("other.rs".utf8)
+                : focus.directory.rawPath + Array("/other.rs".utf8)
+            let siblingTarget = AtlasCatalogTarget.file(try AtlasFileFocus(rawPath: sibling))
+            precondition(!frozen.view.belongs(to: "/repo", project: project, layout: layout, catalogTarget: siblingTarget))
+            reject("an exact-file view accepted a visible sibling from its containing folder") {
+                _ = try capture([entry(1, raw, x: 0), entry(2, sibling, x: 20)], in: accepted)
+            }
+            let empty = try capture([], in: accepted)
+            precondition(empty.paths.isEmpty && empty.view.catalogTarget == target)
+            precondition(!empty.view.belongs(to: "/repo", project: project, layout: layout,
+                catalogTarget: .directory(focus.directory)))
+        }
+    }
+
+    private static func fileIdentityKeepsByteDistinctUnicodeNames() throws {
+        let first = Array("src/café.rs".utf8), second = Array("src/cafe\u{301}.rs".utf8)
+        let firstTarget = AtlasCatalogTarget.file(try AtlasFileFocus(rawPath: first))
+        let secondTarget = AtlasCatalogTarget.file(try AtlasFileFocus(rawPath: second))
+        let project = UUID(), layout = UUID()
+        let accepted = try AtlasVisibleSearchScope.View(root: "/repo", project: project, layout: layout,
+            viewport: .init(x: 0, y: 0, width: 100, height: 100), catalogTarget: firstTarget)
+        precondition(String(decoding: first, as: UTF8.self) == String(decoding: second, as: UTF8.self))
+        precondition(firstTarget != secondTarget)
+        precondition(!accepted.belongs(to: "/repo", project: project, layout: layout, catalogTarget: secondTarget))
+        reject("a canonically equivalent display name replaced the exact selected file") {
+            _ = try capture([entry(1, second, x: 0)], in: accepted)
+        }
+        let frozen = try capture([entry(1, first, x: 0)], in: accepted)
+        precondition(frozen.paths == [first] && frozen.view.catalogTarget == firstTarget)
     }
 
     private static func geometryUsesAllParcelsAndExactIntersections() throws {

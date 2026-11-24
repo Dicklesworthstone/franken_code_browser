@@ -52,6 +52,12 @@ for the selected file's documentation links or import candidates. Follow a
 neighbor while keeping the exact evidence list and captured readers available;
 the map reports omitted and unresolved records explicitly.
 
+In **Project Files**, **Focus this file** gives a selected file its own atlas,
+including files discovered beyond a folder's 20,000-file map limit. Refresh,
+Back/Forward, saved landmarks and visible-file search preserve that exact file
+target and the selected discovery policy. The native integration and its
+regression sources await independent executable and physical-Mac verification.
+
 The global search sidebar also offers **Occurrences** for exact whole-token
 identifier text across the selected workspace, folder, file or visible scope.
 Results include comments and strings and open their retained source with exact

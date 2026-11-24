@@ -1,11 +1,12 @@
 import Foundation
 
 /// A place in the current project session. Identity is the original root-relative
-/// directory and optional parcel path, never a response-local ID or source capture.
+/// catalog target and optional parcel path, never a response-local ID or source capture.
 /// The owner binds this value to its current root/grant and discovery policy.
 struct AtlasFolderDestination: Equatable, Sendable {
     enum ValidationError: Error { case invalidScope, invalidAnchor }
-    let directory: AtlasDirectoryFocus
+    let catalogTarget: AtlasCatalogTarget
+    var directory: AtlasDirectoryFocus { catalogTarget.directory }
     let fileScope: AtlasFileScope
     let customExtensions: String
     let anchorRawPath: [UInt8]?
@@ -13,15 +14,21 @@ struct AtlasFolderDestination: Equatable, Sendable {
 
     init(directory: AtlasDirectoryFocus, fileScope: AtlasFileScope, customExtensions: String,
         anchorRawPath: [UInt8]? = nil, cameraAnchor: AtlasParcelCameraAnchor? = nil) throws {
+        try self.init(catalogTarget: .directory(directory), fileScope: fileScope, customExtensions: customExtensions,
+            anchorRawPath: anchorRawPath, cameraAnchor: cameraAnchor)
+    }
+
+    init(catalogTarget: AtlasCatalogTarget, fileScope: AtlasFileScope, customExtensions: String,
+        anchorRawPath: [UInt8]? = nil, cameraAnchor: AtlasParcelCameraAnchor? = nil) throws {
         guard customExtensions.utf8.count <= 1024,
               (try? fileScope.searchScope(custom: customExtensions)) != nil else {
             throw ValidationError.invalidScope
         }
         guard (anchorRawPath == nil) == (cameraAnchor == nil),
-              anchorRawPath.map({ directory.containsFile($0) }) != false else {
+              anchorRawPath.map({ catalogTarget.containsFile($0) }) != false else {
             throw ValidationError.invalidAnchor
         }
-        self.directory = directory; self.fileScope = fileScope
+        self.catalogTarget = catalogTarget; self.fileScope = fileScope
         self.customExtensions = customExtensions
         self.anchorRawPath = anchorRawPath; self.cameraAnchor = cameraAnchor
     }
@@ -31,7 +38,7 @@ struct AtlasFolderDestination: Equatable, Sendable {
     }
 
     static func == (left: Self, right: Self) -> Bool {
-        left.directory == right.directory
+        left.catalogTarget == right.catalogTarget
             && left.matchesScope(fileScope: right.fileScope, customExtensions: right.customExtensions)
             && left.anchorRawPath == right.anchorRawPath && left.cameraAnchor == right.cameraAnchor
     }
@@ -116,9 +123,9 @@ struct AtlasFolderNavigation {
     func accepts(_ move: Move) -> Bool { move.revision == revision }
 
     /// The accepted parcel may have disappeared or changed, so its anchor may
-    /// resolve to an overview. Directory and file-type scope must still match.
+    /// resolve to an overview. Catalog target and file-type scope must still match.
     @discardableResult mutating func commit(_ move: Move, resolved: AtlasFolderDestination) -> Bool {
-        guard accepts(move), move.target.directory == resolved.directory,
+        guard accepts(move), move.target.catalogTarget == resolved.catalogTarget,
               move.target.matchesScope(fileScope: resolved.fileScope, customExtensions: resolved.customExtensions) else {
             return false
         }

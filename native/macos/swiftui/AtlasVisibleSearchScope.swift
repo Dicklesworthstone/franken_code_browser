@@ -51,26 +51,42 @@ struct AtlasVisibleSearchScope: Sendable {
         let id: UUID
         let root: String
         let project, layout: UUID
-        let directory: AtlasDirectoryFocus
+        let catalogTarget: AtlasCatalogTarget
+        var directory: AtlasDirectoryFocus { catalogTarget.directory }
         let viewport: Viewport
 
         init(root: String, project: UUID, layout: UUID, viewport: Viewport,
              directory: AtlasDirectoryFocus = .project, id: UUID = UUID()) throws {
+            try self.init(root: root, project: project, layout: layout, viewport: viewport,
+                catalogTarget: .directory(directory), id: id)
+        }
+
+        init(root: String, project: UUID, layout: UUID, viewport: Viewport,
+             catalogTarget: AtlasCatalogTarget, id: UUID = UUID()) throws {
             guard root.hasPrefix("/"), root.utf8.count <= 16_384, !root.utf8.contains(0) else {
                 throw Failure.invalidView
             }
             self.id = id; self.root = root; self.project = project; self.layout = layout; self.viewport = viewport
-            self.directory = directory
+            self.catalogTarget = catalogTarget
         }
 
         func belongs(to root: String, project: UUID, layout: UUID, directory: AtlasDirectoryFocus = .project) -> Bool {
-            self.project == project && self.layout == layout && self.directory == directory
+            belongs(to: root, project: project, layout: layout, catalogTarget: .directory(directory))
+        }
+
+        func belongs(to root: String, project: UUID, layout: UUID, catalogTarget: AtlasCatalogTarget) -> Bool {
+            self.project == project && self.layout == layout && self.catalogTarget == catalogTarget
                 && self.root.utf8.elementsEqual(root.utf8)
         }
 
         func represents(root: String, project: UUID, layout: UUID, viewport: Viewport,
                         directory: AtlasDirectoryFocus = .project) -> Bool {
-            belongs(to: root, project: project, layout: layout, directory: directory) && self.viewport == viewport
+            represents(root: root, project: project, layout: layout, viewport: viewport, catalogTarget: .directory(directory))
+        }
+
+        func represents(root: String, project: UUID, layout: UUID, viewport: Viewport,
+                        catalogTarget: AtlasCatalogTarget) -> Bool {
+            belongs(to: root, project: project, layout: layout, catalogTarget: catalogTarget) && self.viewport == viewport
         }
     }
 
@@ -105,7 +121,7 @@ struct AtlasVisibleSearchScope: Sendable {
             guard view.viewport.intersects(entry) else { continue }
             let raw = entry.rawPath
             guard raw.count <= maximumPathBytes else { throw Failure.pathTooLong }
-            guard view.directory.containsFile(raw), !raw.isEmpty, !raw.contains(0),
+            guard view.catalogTarget.containsFile(raw), !raw.isEmpty, !raw.contains(0),
                   !raw.split(separator: 47, omittingEmptySubsequences: false).contains(where: {
                       $0.isEmpty || $0.elementsEqual([46]) || $0.elementsEqual([46, 46])
                   }) else { throw Failure.invalidMetadata }

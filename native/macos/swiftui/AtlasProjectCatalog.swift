@@ -31,8 +31,9 @@ struct AtlasDirectoryFocus: Hashable, Sendable {
         return isProject || (path.count > rawPath.count + 1 && path.starts(with: rawPath)
             && path[rawPath.count] == 47)
     }
-    var display: String {
-        guard !isProject else { return "Project" }
+    var display: String { Self.display(rawPath: rawPath) }
+    fileprivate static func display(rawPath: [UInt8]) -> String {
+        guard !rawPath.isEmpty else { return "Project" }
         if let text = String(bytes: rawPath, encoding: .utf8) {
             return text.unicodeScalars.map { scalar in
                 switch scalar.properties.generalCategory {
@@ -47,11 +48,58 @@ struct AtlasDirectoryFocus: Hashable, Sendable {
                 : "\\x" + (byte < 16 ? "0" : "") + String(byte, radix: 16)
         }.joined()
     }
-    private static func isRelativePath(_ raw: [UInt8]) -> Bool {
+    fileprivate static func isRelativePath(_ raw: [UInt8]) -> Bool {
         !raw.isEmpty && raw.first != 47 && !raw.contains(0)
             && !raw.split(separator: 47, omittingEmptySubsequences: false).contains(where: {
                 $0.isEmpty || $0.elementsEqual([46]) || $0.elementsEqual([46, 46])
             })
+    }
+}
+
+/// One exact file within the granted project. Its containing directory is
+/// presentation context, never a substitute for this catalog's raw identity.
+struct AtlasFileFocus: Hashable, Sendable {
+    enum ValidationError: Error { case invalidPath, limit }
+    static let maximumPathBytes = 2048
+    static let maximumComponents = 32
+    let rawPath: [UInt8]
+    let directory: AtlasDirectoryFocus
+
+    init(rawPath: [UInt8]) throws {
+        guard rawPath.count <= Self.maximumPathBytes,
+              rawPath.split(separator: 47, omittingEmptySubsequences: false).count <= Self.maximumComponents else {
+            throw ValidationError.limit
+        }
+        guard AtlasDirectoryFocus.isRelativePath(rawPath) else { throw ValidationError.invalidPath }
+        directory = try AtlasDirectoryFocus.containingFile(rawPath: rawPath)
+        self.rawPath = rawPath
+    }
+    var display: String { AtlasDirectoryFocus.display(rawPath: rawPath) }
+}
+
+/// The metadata scan's exact scope, independently of the current file-type
+/// filter. A file and its parent folder remain distinct through all navigation.
+enum AtlasCatalogTarget: Hashable, Sendable {
+    case directory(AtlasDirectoryFocus)
+    case file(AtlasFileFocus)
+    static let project = Self.directory(.project)
+
+    var directory: AtlasDirectoryFocus {
+        switch self { case .directory(let value): return value; case .file(let value): return value.directory }
+    }
+    var file: AtlasFileFocus? { if case .file(let value) = self { return value }; return nil }
+    var isProject: Bool { self == .project }
+    var display: String {
+        switch self { case .directory(let value): return value.display; case .file(let value): return value.display }
+    }
+    var parentDirectory: AtlasDirectoryFocus? {
+        switch self { case .directory(let value): return value.parent; case .file(let value): return value.directory }
+    }
+    func containsFile(_ rawPath: [UInt8]) -> Bool {
+        switch self {
+        case .directory(let value): return value.containsFile(rawPath)
+        case .file(let value): return value.rawPath == rawPath
+        }
     }
 }
 
@@ -73,16 +121,26 @@ struct AtlasProjectCatalog: Sendable {
     /// Supplied by the requesting worker, NOT decoded from the response. This
     /// correlates startup selection with a catalog; it is not a native grant.
     let requestedRoot: String?
-    let requestedDirectory: AtlasDirectoryFocus
+    let requestedTarget: AtlasCatalogTarget
+    var requestedDirectory: AtlasDirectoryFocus { requestedTarget.directory }
     init(entries: [Entry], discoveryComplete: Bool, policy: String, requestedRoot: String? = nil,
         requestedDirectory: AtlasDirectoryFocus = .project) {
+        self.init(entries: entries, discoveryComplete: discoveryComplete, policy: policy,
+            requestedRoot: requestedRoot, requestedTarget: .directory(requestedDirectory))
+    }
+    init(entries: [Entry], discoveryComplete: Bool, policy: String, requestedRoot: String? = nil,
+        requestedTarget: AtlasCatalogTarget) {
         self.entries = entries; self.discoveryComplete = discoveryComplete
-        self.policy = policy; self.requestedRoot = requestedRoot; self.requestedDirectory = requestedDirectory
+        self.policy = policy; self.requestedRoot = requestedRoot; self.requestedTarget = requestedTarget
     }
     var openableCount: Int { entries.reduce(0) { $0 + ($1.sourcePath == nil ? 0 : 1) } }
     var summary: String {
         let unavailable = entries.count - openableCount
         var text = discoveryComplete ? "\(entries.count) catalogued files." : "Partial catalog: \(entries.count) known files; more may exist."
+        if requestedTarget.file != nil {
+            text = discoveryComplete ? "Single-file scope: \(entries.count) catalogued file."
+                : "Single-file scope: discovery is incomplete; \(entries.count) known file."
+        }
         if unavailable > 0 { text += " \(unavailable) filenames cannot be opened by this UTF-8 host." }
         return text + " Source previews are separate; files can be opened now."
     }
@@ -114,30 +172,46 @@ struct AtlasProjectCatalog: Sendable {
 
     static func decode(_ data: Data, requestedRoot: String? = nil,
         requestedPolicy: String? = nil) throws -> Self {
-        try decodeReport(data, requestedRoot: requestedRoot, requestedPolicy: requestedPolicy, directory: .project)
+        try decodeReport(data, requestedRoot: requestedRoot, requestedPolicy: requestedPolicy, target: .project)
     }
 
     static func decodeDirectory(_ data: Data, requestedRoot: String, directory: AtlasDirectoryFocus,
         requestedPolicy: String? = nil) throws -> Self {
         guard !directory.isProject, !requestedRoot.isEmpty, requestedRoot.utf8.count <= 16_384,
               !requestedRoot.utf8.contains(0) else { throw DecodeError.invalidResponse }
-        return try decodeReport(data, requestedRoot: requestedRoot, requestedPolicy: requestedPolicy, directory: directory)
+        return try decodeReport(data, requestedRoot: requestedRoot, requestedPolicy: requestedPolicy, target: .directory(directory))
+    }
+
+    static func decodeFile(_ data: Data, requestedRoot: String, file: AtlasFileFocus,
+        requestedPolicy: String? = nil) throws -> Self {
+        guard !requestedRoot.isEmpty, requestedRoot.utf8.count <= 16_384,
+              !requestedRoot.utf8.contains(0) else { throw DecodeError.invalidResponse }
+        return try decodeReport(data, requestedRoot: requestedRoot, requestedPolicy: requestedPolicy, target: .file(file))
     }
 
     private static func decodeReport(_ data: Data, requestedRoot: String?, requestedPolicy: String?,
-        directory: AtlasDirectoryFocus) throws -> Self {
+        target: AtlasCatalogTarget) throws -> Self {
         guard data.count <= maximumResponseBytes else { throw DecodeError.invalidResponse }
         do {
             let wire = try JSONDecoder().decode(Wire.self, from: data)
-            if directory.isProject {
-                guard wire.schema == "fcb.project-catalog/1", wire.command == "catalog" else {
+            switch target {
+            case .directory(let directory) where directory.isProject:
+                guard wire.schema == "fcb.project-catalog/1", wire.command == "catalog",
+                      wire.file == nil else {
                     throw DecodeError.invalidResponse
                 }
-            } else {
+            case .directory(let directory):
                 guard wire.schema == "fcb.project-directory-catalog/1", wire.command == "directory-catalog",
-                      wire.path_basis == "project-root", let echoed = wire.directory,
+                      wire.file == nil, wire.path_basis == "project-root", let echoed = wire.directory,
                       echoed.encoding == "unix-bytes", !echoed.display.isEmpty, echoed.display.utf8.count <= 16_384,
                       try decodePath(echoed.hex) == directory.rawPath else { throw DecodeError.invalidResponse }
+            case .file(let file):
+                guard wire.schema == "fcb.project-file-catalog/1", wire.command == "file-catalog",
+                      wire.directory == nil, wire.path_basis == "project-root", let echoed = wire.file,
+                      echoed.encoding == "unix-bytes", !echoed.display.isEmpty, echoed.display.utf8.count <= 16_384,
+                      try decodePath(echoed.hex) == file.rawPath, wire.files.count <= 1 else {
+                    throw DecodeError.invalidResponse
+                }
             }
             guard wire.status == "ok",
                   wire.identity_scope == "response-local", !wire.native_presented, !wire.source_payload_read,
@@ -156,7 +230,7 @@ struct AtlasProjectCatalog: Sendable {
                 let id = try integer(file.file_id), bytes = try integer(file.observed_bytes)
                 let raw = try decodePath(file.path.hex)
                 guard id > 0, ids.insert(id).inserted, paths.insert(raw).inserted,
-                      directory.containsFile(raw),
+                      target.containsFile(raw),
                       file.path.encoding == "unix-bytes", file.path.display.utf8.count <= 65_536,
                       [file.x, file.y, file.w, file.h].allSatisfy({ $0.isFinite && $0 >= 0 }),
                       file.x + file.w <= 4096.000001, file.y + file.h <= 4096.000001 else {
@@ -172,7 +246,7 @@ struct AtlasProjectCatalog: Sendable {
                     x: file.x, y: file.y, width: file.w, height: file.h))
             }
             return Self(entries: entries, discoveryComplete: wire.discovery_complete,
-                policy: wire.policy, requestedRoot: requestedRoot, requestedDirectory: directory)
+                policy: wire.policy, requestedRoot: requestedRoot, requestedTarget: target)
         } catch let error as DecodeError { throw error }
         catch { throw DecodeError.invalidResponse }
     }
@@ -198,14 +272,14 @@ struct AtlasProjectCatalog: Sendable {
     private struct Wire: Decodable {
         let schema, status, command, identity_scope, payload_bytes_read, read_calls, catalogued_files, policy: String
         let native_presented, source_payload_read, discovery_complete: Bool
-        let directory: NativePath?
+        let directory, file: NativePath?
         let path_basis: String?
         let world: World
         let files: [File]
         enum CodingKeys: String, CodingKey {
             case schema, status, command, identity_scope, payload_bytes_read, read_calls, catalogued_files, policy
             case native_presented, source_payload_read, discovery_complete, world, files
-            case directory, path_basis
+            case directory, file, path_basis
         }
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -216,6 +290,7 @@ struct AtlasProjectCatalog: Sendable {
             native_presented = try c.decode(Bool.self, forKey: .native_presented); source_payload_read = try c.decode(Bool.self, forKey: .source_payload_read)
             discovery_complete = try c.decode(Bool.self, forKey: .discovery_complete); world = try c.decode(World.self, forKey: .world)
             directory = try c.decodeIfPresent(NativePath.self, forKey: .directory)
+            file = try c.decodeIfPresent(NativePath.self, forKey: .file)
             path_basis = try c.decodeIfPresent(String.self, forKey: .path_basis)
             var rows = try c.nestedUnkeyedContainer(forKey: .files), files: [File] = []
             if let count = rows.count, count > maximumFiles { throw DecodeError.limit }

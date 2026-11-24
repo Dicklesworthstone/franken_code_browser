@@ -19,6 +19,8 @@ import SwiftUI
     var changeDiscoveryPolicy: ((AtlasDiscoveryPolicy) -> Void)? = nil
     var canFocusDirectory = false
     var focusDirectory: ((AtlasProjectBrowserFile, AtlasProjectBrowserPage) throws -> Void)? = nil
+    var canFocusFile = false
+    var focusFile: ((AtlasProjectBrowserFile, AtlasProjectBrowserPage) throws -> Void)? = nil
     @State private var capture: AtlasProjectBrowserCapture?
     @State private var readerTask: Task<Void, Never>?
     @State private var readerNotice = ""
@@ -45,9 +47,9 @@ import SwiftUI
                     set: { changeDiscoveryPolicy($0 ? .includeExcluded : .repositoryRules) }))
                     .toggleStyle(.checkbox)
                     .disabled(!canChangeDiscoveryPolicy || !model.canOperate || preparing || readerTask != nil)
-                    .help("Restart Project Files with the selected discovery policy. Existing readers keep their captured bytes. The text atlas keeps its separate default exclusions.")
+                    .help("Refresh Project Files and the atlas with the selected discovery policy. Existing readers keep their captured bytes.")
                 if model.discoveryPolicy.includesExcluded {
-                    Text("Project Files includes ignored and generated files. The text atlas keeps its default exclusions; Quick Open and large-file search offer their own Include ignored control.")
+                    Text("Project Files and focused atlas scopes include ignored and generated files. Quick Open and large-file search offer their own Include ignored control.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
@@ -107,6 +109,11 @@ import SwiftUI
                                     .accessibilityLabel("Read current ranges of " + file.display)
                                     .help("Open bounded observations of this current project file, including files larger than 32 MiB")
                             }.contextMenu {
+                                if focusFile != nil {
+                                    Button("Focus this file") { focusExactFile(file, from: page) }
+                                        .disabled(!canFocusFile || !model.canOperate || readerTask != nil)
+                                        .help("Build a single-file atlas, including a file beyond a large folder's atlas limit.")
+                                }
                                 if focusDirectory != nil {
                                     Button("Focus containing folder") { focus(file, from: page) }
                                         .disabled(!canFocusDirectory || !model.canOperate || readerTask != nil)
@@ -147,7 +154,7 @@ import SwiftUI
             Divider()
             Text(readerNotice.isEmpty ? model.notice : readerNotice)
                 .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
-            Text("Browsing and Quick Open can continue beyond 20,000 files. Text-atlas preparation retains its separate 20,000-file limit; workspace search reports its own coverage.")
+            Text("Browsing and Quick Open can continue beyond 20,000 files. Choose Focus this file for an exact single-file atlas, or focus its containing folder. Workspace search reports its own coverage.")
                 .font(.caption2).foregroundStyle(.secondary)
         }.padding(12).frame(maxWidth: .infinity, maxHeight: .infinity)
         .sheet(item: $capture) { capture in
@@ -173,6 +180,16 @@ import SwiftUI
         } catch {
             readerNotice = (error as? AtlasProjectBrowserError)?.message
                 ?? "This folder cannot be focused. Choose a current file page or a shallower folder."
+        }
+    }
+    private func focusExactFile(_ file: AtlasProjectBrowserFile, from page: AtlasProjectBrowserPage) {
+        guard canFocusFile, readerTask == nil, let focusFile else { return }
+        do {
+            try focusFile(file, page)
+            readerNotice = "Preparing this file's atlas."
+        } catch {
+            readerNotice = (error as? AtlasProjectBrowserError)?.message
+                ?? "This file cannot be focused. Choose a current file page with a path within the atlas limit."
         }
     }
     private func observe(_ file: AtlasProjectBrowserFile, from page: AtlasProjectBrowserPage) {

@@ -8,6 +8,10 @@ private typealias ProjectPoll = @convention(c) (UnsafeMutableRawPointer?) -> Int
     _ root: UnsafePointer<CChar>, _ directory: UnsafePointer<UInt8>?, _ directoryLength: UInt64,
     _ maxFiles: UInt64, _ discoveryPolicy: UInt64,
     _ poll: ProjectPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_project_file_catalog_cancelable") private func projectFileMetadata(
+    _ root: UnsafePointer<CChar>, _ file: UnsafePointer<UInt8>?, _ fileLength: UInt64,
+    _ maxFiles: UInt64, _ discoveryPolicy: UInt64,
+    _ poll: ProjectPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_layout_cancelable") private func projectCatalog(
     _ root: UnsafePointer<CChar>, _ poll: ProjectPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_source_document_cancelable") private func projectSource(
@@ -58,16 +62,30 @@ enum AtlasProjectWorker {
     static func catalogReport(root: String, directory: AtlasDirectoryFocus = .project,
         discoveryPolicy: AtlasDiscoveryPolicy = .repositoryRules,
         cancellation: AtlasSearchCancellation) throws -> AtlasProjectCatalog {
+        try catalogReport(root: root, target: .directory(directory), discoveryPolicy: discoveryPolicy,
+            cancellation: cancellation)
+    }
+
+    static func catalogReport(root: String, target: AtlasCatalogTarget,
+        discoveryPolicy: AtlasDiscoveryPolicy = .repositoryRules,
+        cancellation: AtlasSearchCancellation) throws -> AtlasProjectCatalog {
         try validate(root); try check(cancellation)
         let pointer = withExtendedLifetime(cancellation) {
             root.withCString { root in
                 let context = Unmanaged.passUnretained(cancellation).toOpaque()
-                if directory.isProject {
+                switch target {
+                case .directory(let directory) where directory.isProject:
                     return projectMetadata(root, UInt64(AtlasProjectCatalog.maximumFiles), discoveryPolicy.rawValue, poll, context)
-                }
-                return directory.rawPath.withUnsafeBufferPointer {
-                    projectDirectoryMetadata(root, $0.baseAddress, UInt64($0.count),
-                        UInt64(AtlasProjectCatalog.maximumFiles), discoveryPolicy.rawValue, poll, context)
+                case .directory(let directory):
+                    return directory.rawPath.withUnsafeBufferPointer {
+                        projectDirectoryMetadata(root, $0.baseAddress, UInt64($0.count),
+                            UInt64(AtlasProjectCatalog.maximumFiles), discoveryPolicy.rawValue, poll, context)
+                    }
+                case .file(let file):
+                    return file.rawPath.withUnsafeBufferPointer {
+                        projectFileMetadata(root, $0.baseAddress, UInt64($0.count), 1,
+                            discoveryPolicy.rawValue, poll, context)
+                    }
                 }
             }
         }
@@ -78,10 +96,14 @@ enum AtlasProjectWorker {
         guard length <= AtlasProjectCatalog.maximumResponseBytes else { throw AtlasProjectIOError.limit }
         let data = Data(bytes: pointer, count: length)
         let report: AtlasProjectCatalog
-        if directory.isProject {
+        switch target {
+        case .directory(let directory) where directory.isProject:
             report = try AtlasProjectCatalog.decode(data, requestedRoot: root, requestedPolicy: discoveryPolicy.wireName)
-        } else {
+        case .directory(let directory):
             report = try AtlasProjectCatalog.decodeDirectory(data, requestedRoot: root, directory: directory,
+                requestedPolicy: discoveryPolicy.wireName)
+        case .file(let file):
+            report = try AtlasProjectCatalog.decodeFile(data, requestedRoot: root, file: file,
                 requestedPolicy: discoveryPolicy.wireName)
         }
         try check(cancellation)

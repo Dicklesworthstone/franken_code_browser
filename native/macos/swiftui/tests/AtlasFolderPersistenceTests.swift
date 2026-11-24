@@ -224,7 +224,87 @@ import CryptoKit
         model.close()
     }
 
+    static func exactFileTargetsRoundTripWithoutWidening() throws {
+        let store = store(), context = try AtlasFolderPersistenceContext(root: "/FileTargets", policy: 0)
+        func body(_ sealed: Data) throws -> [String: Any] {
+            let seal = try JSONSerialization.jsonObject(with: sealed) as! [String: Any]
+            return try JSONSerialization.jsonObject(with: Data(base64Encoded: seal["body"] as! String)!) as! [String: Any]
+        }
+        let legacy = try snapshot("Legacy folder")
+        let previous = try store.save(legacy, context: context, expecting: nil)
+        let legacyBytes = try data(store, context)
+        let legacyBody = try body(legacyBytes)
+        check(legacyBody["version"] as? Int == 1
+            && (legacyBody["current"] as! [String: Any])["file"] == nil,
+            "folder-only views retain the original wire format")
+        try check(store.load(context).snapshot == legacy, "legacy folder records remain readable")
+
+        let fileA = try AtlasFileFocus(rawPath: Array("late.rs".utf8))
+        let fileB = try AtlasFileFocus(rawPath: [0xff, 46, 114, 115])
+        let camera = AtlasParcelCameraAnchor(relativeX: 0.2, relativeY: 0.8, zoomFactor: 3)!
+        func place(_ file: AtlasFileFocus) throws -> AtlasFolderDestination {
+            try AtlasFolderDestination(catalogTarget: .file(file), fileScope: .all, customExtensions: "",
+                anchorRawPath: file.rawPath, cameraAnchor: camera)
+        }
+        let a = try place(fileA), b = try place(fileB)
+        let root = try AtlasFolderDestination(directory: .project, fileScope: .all, customExtensions: "")
+        var navigation = AtlasFolderNavigation()
+        for destination in [root, a, b] {
+            check(navigation.commit(navigation.visit(destination), resolved: destination))
+        }
+        let back = navigation.back()!
+        check(navigation.commit(back, resolved: back.target))
+        _ = try navigation.addLandmark(label: "Raw file", destination: b)
+        let saved = navigation.snapshot()
+        let receipt = try store.save(saved, context: context, expecting: previous.revision)
+        let accepted = try data(store, context), acceptedBody = try body(accepted)
+        check(acceptedBody["version"] as? Int == 2,
+            "older readers must refuse file scopes instead of treating them as folders")
+        try check(store.load(context).snapshot == saved && data(store, context, suffix: ".previous") == legacyBytes)
+        var restored = AtlasFolderNavigation()
+        try restored.restore(try store.load(context).snapshot!)
+        check(restored.current == a && restored.back()?.target == root && restored.forward()?.target == b
+            && restored.landmarks[0].destination == b, "saved file history, raw names and camera anchors survive")
+
+        var marksOnly = AtlasFolderNavigation()
+        marksOnly.rebaseCurrent(root)
+        _ = try marksOnly.addLandmark(label: "Only file landmark", destination: b)
+        var historyOnly = AtlasFolderNavigation()
+        historyOnly.rebaseCurrent(b)
+        check(historyOnly.commit(historyOnly.visit(root), resolved: root))
+        for (name, value) in [("LandmarkOnly", marksOnly.snapshot()), ("HistoryOnly", historyOnly.snapshot())] {
+            let other = try AtlasFolderPersistenceContext(root: "/FileTargets/" + name, policy: 0)
+            _ = try store.save(value, context: other, expecting: nil)
+            let encoded = try body(data(store, other))
+            check(encoded["version"] as? Int == 2, "a file anywhere in the record requires version 2")
+            try check(store.load(other).snapshot == value)
+        }
+
+        var malformed: [Data] = []
+        malformed.append(try rewriting(accepted) { $0["version"] = 1 })
+        for (key, value) in [
+            ("directory", Data("other".utf8).base64EncodedString() as Any),
+            ("file", Data("../escape".utf8).base64EncodedString() as Any),
+            ("parcel", Data("sibling.rs".utf8).base64EncodedString() as Any),
+            ("camera", NSNull() as Any), ("parcel", NSNull() as Any)
+        ] {
+            malformed.append(try rewriting(accepted) {
+                var current = $0["current"] as! [String: Any]
+                current[key] = value; $0["current"] = current
+            })
+        }
+        for bytes in malformed {
+            try bytes.write(to: store.directory.appendingPathComponent(context.filename))
+            expect(.corrupt) { _ = try store.load(context) }
+            expect(.corrupt) { _ = try store.save(saved, context: context, expecting: receipt.revision) }
+            try check(data(store, context) == bytes,
+                "refused file target preserves the existing saved bytes and accepted in-memory view")
+            check(restored.current == a && restored.forward()?.target == b)
+        }
+    }
+
     @MainActor static func main() async throws {
+        try exactFileTargetsRoundTripWithoutWidening()
         try roundTripRawIdentityAndPolicy()
         try conflictAndPreviousGeneration()
         try corruptRecordsRemainUntouched()
@@ -232,6 +312,6 @@ import CryptoKit
         try await staleLoadsCannotPublish()
         try await latestSaveDrainsAcrossRootClose()
         try await acceptedLoadMayImmediatelySave()
-        print("7 durable atlas-view regression groups passed")
+        print("8 durable atlas-view regression groups passed")
     }
 }

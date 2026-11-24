@@ -25,7 +25,63 @@ import Foundation
         do { _ = try decode(object, requestedPolicy: requestedPolicy); preconditionFailure("Accepted: " + reason) }
         catch is AtlasProjectCatalog.DecodeError { checks += 1 }
     }
+    @MainActor private static func exactFileScope() throws {
+        let raw: [UInt8] = [0xff, 47, 97, 46, 114, 115]
+        let focus = try AtlasFileFocus(rawPath: raw), target = AtlasCatalogTarget.file(focus)
+        check(target != .directory(focus.directory) && target.containsFile(raw)
+              && !target.containsFile([0xff, 47, 98, 46, 114, 115]), "File scope is exact, not its containing folder")
+        let rootFile = try AtlasFileFocus(rawPath: Array("late.rs".utf8))
+        check(rootFile.directory.isProject && !AtlasCatalogTarget.file(rootFile).isProject
+              && AtlasCatalogTarget.file(rootFile).parentDirectory == .project, "Root-level file keeps a distinct target")
+        let atLimit = try AtlasFileFocus(rawPath: Array(repeating: 97, count: 2048))
+        check(atLimit.rawPath.count == 2048, "Exact file byte boundary is admitted")
+        let deepest = Array(repeating: "a", count: 32).joined(separator: "/")
+        _ = try AtlasFileFocus(rawPath: Array(deepest.utf8))
+        _ = try AtlasFileFocus(rawPath: [92, 58, 0xff])
+        for invalid in [[UInt8](), Array("/file".utf8), Array("../file".utf8), Array("a//b".utf8),
+                        Array("a/./b".utf8), Array("a/".utf8), [97, 0, 98], Array(repeating: 97, count: 2049),
+                        Array((deepest + "/a").utf8)] {
+            do { _ = try AtlasFileFocus(rawPath: invalid); preconditionFailure("Invalid file target admitted") }
+            catch { checks += 1 }
+        }
+        var valid = wire([file(hex: "ff2f612e7273")])
+        valid["schema"] = "fcb.project-file-catalog/1"; valid["command"] = "file-catalog"
+        valid["path_basis"] = "project-root"
+        valid["file"] = ["encoding": "unix-bytes", "hex": "ff2f612e7273", "display": "escaped file"]
+        func decodeFile(_ value: [String: Any]) throws -> AtlasProjectCatalog {
+            try AtlasProjectCatalog.decodeFile(JSONSerialization.data(withJSONObject: value),
+                requestedRoot: "/project", file: focus, requestedPolicy: "repository-rules-v1")
+        }
+        let accepted = try decodeFile(valid)
+        check(accepted.requestedTarget == target && accepted.requestedRoot == "/project"
+              && accepted.entries[0].rawPath == raw && accepted.entries[0].sourcePath == nil,
+              "Exact non-UTF8 scope and request root survive without lossy path conversion")
+        check(accepted.summary.contains("Single-file scope"), "File completeness is never labeled as folder completeness")
+        var empty = valid; empty["files"] = [[String: Any]](); empty["catalogued_files"] = "0"
+        let completeEmpty = try decodeFile(empty)
+        check(completeEmpty.discoveryComplete, "Policy-excluded exact file can have a complete empty receipt")
+        empty["discovery_complete"] = false
+        let partialEmpty = try decodeFile(empty)
+        check(!partialEmpty.discoveryComplete, "Incomplete ancestor discovery remains qualified")
+        var corrupt: [[String: Any]] = []
+        for (key, value) in [("schema", "fcb.project-catalog/1" as Any), ("command", "catalog" as Any),
+                             ("path_basis", "directory" as Any), ("policy", "all-regular-files/no-rule-files-v1" as Any),
+                             ("file", ["encoding": "unix-bytes", "hex": "ff2f622e7273", "display": "sibling"] as Any),
+                             ("directory", ["encoding": "unix-bytes", "hex": "ff", "display": "parent"] as Any)] {
+            var valueWire = valid; valueWire[key] = value; corrupt.append(valueWire)
+        }
+        var missing = valid; missing.removeValue(forKey: "file"); corrupt.append(missing)
+        var sibling = valid; sibling["files"] = [file(hex: "ff2f622e7273")]; corrupt.append(sibling)
+        var extra = valid; extra["files"] = [file(hex: "ff2f612e7273"), file("2", hex: "ff2f622e7273")]
+        extra["catalogued_files"] = "2"; corrupt.append(extra)
+        for bad in corrupt {
+            do { _ = try decodeFile(bad); preconditionFailure("Wrong exact-file receipt admitted") }
+            catch AtlasProjectCatalog.DecodeError.invalidResponse { checks += 1 }
+        }
+    }
+
     @MainActor static func main() throws {
+        try exactFileScope()
         let r = try decode(wire())
         check(r.entries.count == 1 && r.entries[0].sourcePath == "a.rs", "Native path comes from reversible bytes, not label")
         check(r.entries[0].displayPath == "label only" && r.entries[0].observedBytes == 17, "Metadata labels and exact sizes retained")

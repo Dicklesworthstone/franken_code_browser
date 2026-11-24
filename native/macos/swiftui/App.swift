@@ -233,11 +233,11 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     let addedBounds: CGRect?
     let retainingPreviousMembership: Bool
 
-    static func prepare(root: String, directory: AtlasDirectoryFocus, discoveryPolicy: AtlasDiscoveryPolicy,
+    static func prepare(root: String, target: AtlasCatalogTarget, discoveryPolicy: AtlasDiscoveryPolicy,
         previous: [AtlasProjectCatalog.Entry], previousBounds: CGRect, retainingPreviousMembership: Bool,
         scope: AtlasSearchFileScope, includesUnsupportedNames: Bool,
         cancellation: AtlasSearchCancellation) throws -> Self {
-        let catalog = try AtlasProjectWorker.catalogReport(root: root, directory: directory, discoveryPolicy: discoveryPolicy,
+        let catalog = try AtlasProjectWorker.catalogReport(root: root, target: target, discoveryPolicy: discoveryPolicy,
             cancellation: cancellation)
         let visible = catalog.entries.filter {
             $0.sourcePath == nil ? includesUnsupportedNames : scope.admitsRawPath($0.rawPath)
@@ -408,7 +408,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     @State private var atlasEntries: [AtlasProjectCatalog.Entry] = []
     @State private var showsCity = false
     @State private var atlasScopeLabel = "All"
-    @State private var atlasDirectoryTarget: AtlasDirectoryFocus?
+    @State private var atlasDirectoryTarget: AtlasCatalogTarget?
     @State private var atlasFolderNavigation = AtlasFolderNavigation()
     @State private var atlasFolderPersistence = AtlasFolderPersistence()
     @State private var atlasSavedDestination: AtlasFolderDestination?
@@ -445,7 +445,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         return camera
     }()
 
-    private var atlasDirectory: AtlasDirectoryFocus { projectOpening.catalog?.requestedDirectory ?? .project }
+    private var atlasCatalogTarget: AtlasCatalogTarget { projectOpening.catalog?.requestedTarget ?? .project }
     private var loadingProject: Bool { projectOpening.isDiscovering }
     private var loadGeneration: UUID { projectOpening.projectID }
     private var atlasDocuments: [String: AtlasDocument] { atlasResidency.documents }
@@ -585,7 +585,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     private var currentVisibleSearch: AtlasFrozenViewportSearch? {
         guard !atlasLayoutPending, hasMetadataAtlas, !hasRetainedAtlas, let frozenVisibleSearch,
               frozenVisibleSearch.snapshot.view.belongs(to: root, project: loadGeneration,
-                layout: atlasRevision, directory: atlasDirectory) else { return nil }
+                layout: atlasRevision, catalogTarget: atlasCatalogTarget) else { return nil }
         return frozenVisibleSearch
     }
 
@@ -593,7 +593,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         !loadingProject && !showsCatalog && !showsCity && !atlasLayoutPending && hasMetadataAtlas
             && !hasRetainedAtlas && visibleSearchTask == nil
             && visibleSearchView?.belongs(to: root, project: loadGeneration,
-                layout: atlasRevision, directory: atlasDirectory) == true
+                layout: atlasRevision, catalogTarget: atlasCatalogTarget) == true
     }
 
     private var openFileSearchPath: String? {
@@ -1130,7 +1130,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                         .accessibilityLabel("\(frozen.snapshot.count) files in the frozen atlas search scope")
                     if let visibleSearchView,
                        !frozen.snapshot.view.represents(root: root, project: loadGeneration,
-                            layout: atlasRevision, viewport: visibleSearchView.viewport, directory: atlasDirectory) {
+                            layout: atlasRevision, viewport: visibleSearchView.viewport, catalogTarget: atlasCatalogTarget) {
                         Text("The atlas view has moved. Search still uses these frozen files; use the current view to change the scope.")
                             .font(.caption2).foregroundStyle(.secondary)
                     }
@@ -1606,7 +1606,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             current: atlasSavedDestination ?? currentAtlasDestination()))
     }
 
-    /// A place is a directory/filter plus a position relative to one current
+    /// A place is a catalog target/filter plus a position relative to one current
     /// file parcel. It grants no source access and retains no catalog or capture.
     /// Resolve paths again after rebuilding; never reuse response-local file IDs.
     private func currentAtlasDestination(usingCurrentFilter: Bool = false) -> AtlasFolderDestination? {
@@ -1615,21 +1615,21 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         let extensions = hasMetadataAtlas && !usingCurrentFilter ? (accepted?.customExtensions ?? customExtensions) : customExtensions
         var anchorPath: [UInt8]?
         var anchor: AtlasParcelCameraAnchor?
-        if hasMetadataAtlas, !hasRetainedAtlas, let accepted, accepted.directory == atlasDirectory,
+        if hasMetadataAtlas, !hasRetainedAtlas, let accepted, accepted.catalogTarget == atlasCatalogTarget,
            let path = accepted.anchorRawPath, let entry = atlasEntries.first(where: { $0.rawPath == path }),
            let position = camera.pendingPresentationAnchor(relativeTo: CGRect(x: entry.x, y: entry.y,
                 width: entry.width, height: entry.height), revision: atlasRevision) {
             // Keep a pending hidden view relative to its original parcel even
             // when its center lies nearer a neighbor. No viewport is invented.
-            return try? AtlasFolderDestination(directory: atlasDirectory, fileScope: scope,
+            return try? AtlasFolderDestination(catalogTarget: atlasCatalogTarget, fileScope: scope,
                 customExtensions: extensions, anchorRawPath: path, cameraAnchor: position)
         }
         if hasMetadataAtlas, !hasRetainedAtlas, camera.presentationCenter(revision: atlasRevision) == nil,
-           let accepted, accepted.directory == atlasDirectory {
+           let accepted, accepted.catalogTarget == atlasCatalogTarget {
             // A landmark can be accepted while Project Files owns the visible
             // surface. Its deferred camera intent is still the current place.
             let resolved = resolvedAtlasDestination(accepted, entries: atlasEntries)
-            return try? AtlasFolderDestination(directory: atlasDirectory, fileScope: scope,
+            return try? AtlasFolderDestination(catalogTarget: atlasCatalogTarget, fileScope: scope,
                 customExtensions: extensions, anchorRawPath: resolved.anchorRawPath, cameraAnchor: resolved.cameraAnchor)
         }
         if hasMetadataAtlas, !hasRetainedAtlas,
@@ -1651,7 +1651,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 anchorPath = entry.rawPath; anchor = position
             }
         }
-        return try? AtlasFolderDestination(directory: atlasDirectory, fileScope: scope,
+        return try? AtlasFolderDestination(catalogTarget: atlasCatalogTarget, fileScope: scope,
             customExtensions: extensions, anchorRawPath: anchorPath, cameraAnchor: anchor)
     }
 
@@ -1663,7 +1663,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         }
         // The folder can still be visited when its old parcel is absent. A
         // current pathname is only a map locator, never an exact source anchor.
-        return (try? AtlasFolderDestination(directory: destination.directory, fileScope: destination.fileScope,
+        return (try? AtlasFolderDestination(catalogTarget: destination.catalogTarget, fileScope: destination.fileScope,
             customExtensions: destination.customExtensions)) ?? destination
     }
 
@@ -1690,7 +1690,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
               hasMetadataAtlas, !hasRetainedAtlas, !showsCity,
               let destination = currentAtlasDestination() else { return }
         atlasLandmarkDraft = (projectViewIdentity, destination)
-        atlasLandmarkName = destination.directory.display
+        atlasLandmarkName = destination.catalogTarget.display
         showsAtlasLandmarkName = true
     }
 
@@ -1701,7 +1701,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         do {
             _ = try atlasFolderNavigation.addLandmark(label: atlasLandmarkName, destination: draft.destination)
             persistAtlasFolderNavigation()
-            status = "Atlas landmark added. Use Landmarks to return to its folder and map position."
+            status = "Atlas landmark added. Use Landmarks to return to its file or folder and map position."
                 + (atlasFolderViewsReady && atlasFolderPersistence.canSave ? "" : " It remains in this window; saved views are currently unavailable.")
         } catch {
             status = "The landmark was not saved. Use a short, nonempty name without control characters; this window can keep 32 landmarks."
@@ -1718,25 +1718,25 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     @ViewBuilder private var atlasDirectoryControls: some View {
         if projectOpening.canBrowse {
             let project = loadGeneration, revision = atlasRevision
-            let catalogRevision = projectOpening.catalogRevision, directory = atlasDirectory
+            let catalogRevision = projectOpening.catalogRevision, target = atlasCatalogTarget
             HStack(spacing: 10) {
                 Button {
                     navigateAtlasFolder(back: true, project: project, revision: revision)
-                } label: { Label("Folder Back", systemImage: "chevron.backward") }
+                } label: { Label("Previous file or folder", systemImage: "chevron.backward") }
                     .labelStyle(.iconOnly)
                     .disabled(!canChangeAtlasDirectory || !atlasFolderNavigation.canBack)
                     .keyboardShortcut("[", modifiers: [.command, .shift])
-                    .help("Return to the previous folder, file filter and map position (⇧⌘[)")
+                    .help("Return to the previous file or folder, file filter and map position (⇧⌘[)")
                 Button {
                     navigateAtlasFolder(back: false, project: project, revision: revision)
-                } label: { Label("Folder Forward", systemImage: "chevron.forward") }
+                } label: { Label("Next file or folder", systemImage: "chevron.forward") }
                     .labelStyle(.iconOnly)
                     .disabled(!canChangeAtlasDirectory || !atlasFolderNavigation.canForward)
                     .keyboardShortcut("]", modifiers: [.command, .shift])
-                    .help("Return to the next folder, file filter and map position (⇧⌘])")
+                    .help("Return to the next file or folder, file filter and map position (⇧⌘])")
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Atlas folder").font(.caption).foregroundStyle(.secondary)
-                    Text(verbatim: directory.display).font(.callout.weight(.semibold))
+                    Text(target.file == nil ? "Atlas folder" : "Atlas file").font(.caption).foregroundStyle(.secondary)
+                    Text(verbatim: target.display).font(.callout.weight(.semibold))
                         .lineLimit(2).textSelection(.enabled)
                 }.frame(maxWidth: .infinity, alignment: .leading)
                 Menu {
@@ -1772,17 +1772,17 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                     }
                 } label: { Label("Landmarks", systemImage: "mappin.and.ellipse") }
                     .help("Save and revisit up to 32 named atlas locations on this Mac")
-                if let parent = directory.parent {
-                    Button("Up one folder") {
-                        guard atlasRevision == revision, atlasDirectory == directory else { return }
+                if let parent = target.parentDirectory {
+                    Button(target.file == nil ? "Up one folder" : "Containing folder") {
+                        guard atlasRevision == revision, atlasCatalogTarget == target else { return }
                         requestAtlasDirectory(parent, project: project, catalogRevision: catalogRevision)
                     }.disabled(!canChangeAtlasDirectory)
                     Button("Whole project") {
-                        guard atlasRevision == revision, atlasDirectory == directory else { return }
+                        guard atlasRevision == revision, atlasCatalogTarget == target else { return }
                         requestAtlasDirectory(.project, project: project, catalogRevision: catalogRevision)
                     }.disabled(!canChangeAtlasDirectory)
                 }
-                if let selected = selectedAtlasDirectory, selected != directory {
+                if let selected = selectedAtlasDirectory, AtlasCatalogTarget.directory(selected) != target {
                     Button("Focus selected folder") {
                         guard atlasRevision == revision, selectedAtlasDirectory == selected else { return }
                         requestAtlasDirectory(selected, project: project, catalogRevision: catalogRevision)
@@ -1790,7 +1790,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 }
                 if let target = atlasDirectoryTarget {
                     ProgressView().controlSize(.small)
-                        .accessibilityLabel("Preparing folder atlas")
+                        .accessibilityLabel("Preparing focused atlas")
                     Text(verbatim: target.display).font(.caption).lineLimit(1)
                     Button("Cancel focus", action: cancelAtlasDirectory)
                 }
@@ -2124,6 +2124,11 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 guard let accepted = browser.currentFile(file, from: page) else { throw AtlasProjectBrowserError.stale }
                 let directory = try AtlasDirectoryFocus.containingFile(rawPath: accepted.rawPath)
                 requestAtlasDirectory(directory, project: project)
+            }, canFocusFile: canChangeAtlasDirectory, focusFile: { file, page in
+                guard projectBrowser === browser, loadGeneration == project, canChangeAtlasDirectory,
+                      let accepted = browser.currentFile(file, from: page) else { throw AtlasProjectBrowserError.stale }
+                let target = try AtlasFileFocus(rawPath: accepted.rawPath)
+                requestAtlasTarget(.file(target), project: project)
             })
             .id(projectViewIdentity)
     }
@@ -2517,7 +2522,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         let previous = projectBrowser, previousProject = browserProject
         let requestedDiscoveryPolicy = discoveryPolicy ?? previous.discoveryPolicy
         let retainingPreviousMembership = requestedDiscoveryPolicy == previous.discoveryPolicy
-        let requestedRoot = root, requestedDirectory = atlasDirectory
+        let requestedRoot = root, requestedTarget = atlasCatalogTarget
         let previousRevision = atlasRevision, previousRequest = atlasLayoutRequest
         let requestedScope = fileScope, requestedExtensions = Array(customExtensions.utf8)
         guard let scope = try? fileScope.searchScope(custom: customExtensions) else {
@@ -2544,7 +2549,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 guard refreshAtlas else { return }
                 stagedAtlas = try await projectRefreshIO.perform(cancellation: cancellation,
                     keepingAlive: accessLease.map { [$0] } ?? []) {
-                    try AtlasPreparedProjectRefresh.prepare(root: requestedRoot, directory: requestedDirectory,
+                    try AtlasPreparedProjectRefresh.prepare(root: requestedRoot, target: requestedTarget,
                         discoveryPolicy: requestedDiscoveryPolicy,
                         previous: previousEntries, previousBounds: previousBounds,
                         retainingPreviousMembership: retainingPreviousMembership, scope: scope,
@@ -2557,7 +2562,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                           projectChanges.acceptsAutomaticRefresh(automatic) else { return false }
                 }
                 guard atlasRevision == previousRevision, atlasLayoutRequest == previousRequest,
-                      atlasDirectory == requestedDirectory,
+                      atlasCatalogTarget == requestedTarget,
                       fileScope == requestedScope, Array(customExtensions.utf8) == requestedExtensions,
                       hasMetadataAtlas == refreshAtlas, !atlasLayoutPending, !projectOpening.isPreparing,
                       candidate.browser.discoveryPolicy == requestedDiscoveryPolicy else { return false }
@@ -2602,7 +2607,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         if let atlas {
             guard atlas.layout.root.utf8.elementsEqual(candidate.root.utf8),
                   atlas.catalog.requestedRoot?.utf8.elementsEqual(candidate.root.utf8) == true,
-                  atlas.catalog.requestedDirectory == atlasDirectory,
+                  atlas.catalog.requestedTarget == atlasCatalogTarget,
                   atlas.catalog.matchesDiscoveryPolicy(candidate.browser.discoveryPolicy.wireName),
                   replacementOpening.acceptPreparedAtlas(atlas.catalog, in: candidate.project,
                     hasOpenableFiles: !atlas.files.isEmpty),
@@ -2813,19 +2818,19 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         if AtlasFileStartup.isPending { openStartupFile() }
     }
 
-    private func loadPreviewCatalog(root requestedRoot: String, directory: AtlasDirectoryFocus,
+    private func loadPreviewCatalog(root requestedRoot: String, target: AtlasCatalogTarget,
         discoveryPolicy: AtlasDiscoveryPolicy,
         ticket: AtlasProjectOpening.Ticket, cancellation: AtlasSearchCancellation, accessLease: AnyObject?) async throws {
         let catalog = try await projectIO.perform(cancellation: cancellation,
             keepingAlive: accessLease.map { [$0] } ?? []) {
-            try AtlasProjectWorker.catalogReport(root: requestedRoot, directory: directory, discoveryPolicy: discoveryPolicy,
+            try AtlasProjectWorker.catalogReport(root: requestedRoot, target: target, discoveryPolicy: discoveryPolicy,
                 cancellation: cancellation)
         }
         guard !Task.isCancelled, !cancellation.isCanceled, projectOpening.accepts(ticket),
               browserProject == ticket.project, projectBrowser.discoveryPolicy == discoveryPolicy,
-              root.utf8.elementsEqual(requestedRoot.utf8), atlasDirectory == directory,
+              root.utf8.elementsEqual(requestedRoot.utf8), atlasCatalogTarget == target,
               catalog.requestedRoot?.utf8.elementsEqual(requestedRoot.utf8) == true,
-              catalog.requestedDirectory == directory,
+              catalog.requestedTarget == target,
               projectOpening.acceptPreviewCatalog(catalog, for: ticket) else { throw AtlasProjectIOError.canceled }
         // A retained map remains one coherent layout while its replacement is
         // prepared. Publish the fresh files with the new layout, never beneath
@@ -2873,7 +2878,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         accessLease = nil
 #endif
         guard let ticket = projectOpening.beginPreviews() else { return }
-        let requestedRoot = root, requestedDirectory = atlasDirectory
+        let requestedRoot = root, requestedTarget = atlasCatalogTarget
         let requestedDiscoveryPolicy = projectBrowser.discoveryPolicy
         let cancellation = AtlasSearchCancellation()
         loadCancellation = cancellation
@@ -2883,18 +2888,18 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         loadProgress = projectOpening.catalog == nil ? "Collecting the bounded text-atlas catalog…"
             : "Preparing the file atlas…"
         loadTask = Task {
-            await prepareAtlas(root: requestedRoot, directory: requestedDirectory,
+            await prepareAtlas(root: requestedRoot, target: requestedTarget,
                 discoveryPolicy: requestedDiscoveryPolicy, ticket: ticket,
                 cancellation: cancellation, accessLease: accessLease)
         }
     }
 
-    private func prepareAtlas(root requestedRoot: String, directory: AtlasDirectoryFocus,
+    private func prepareAtlas(root requestedRoot: String, target: AtlasCatalogTarget,
         discoveryPolicy: AtlasDiscoveryPolicy,
         ticket: AtlasProjectOpening.Ticket, cancellation: AtlasSearchCancellation, accessLease: AnyObject?) async {
         guard !Task.isCancelled, !cancellation.isCanceled, projectOpening.accepts(ticket),
               browserProject == ticket.project, projectBrowser.discoveryPolicy == discoveryPolicy,
-              root.utf8.elementsEqual(requestedRoot.utf8), atlasDirectory == directory else { return }
+              root.utf8.elementsEqual(requestedRoot.utf8), atlasCatalogTarget == target else { return }
         defer {
             if projectOpening.accepts(ticket) {
                 projectOpening.fail(ticket)
@@ -2902,9 +2907,9 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             }
         }
         if projectOpening.catalog?.matchesDiscoveryPolicy(discoveryPolicy.wireName) != true
-            || projectOpening.catalog?.requestedDirectory != directory {
+            || projectOpening.catalog?.requestedTarget != target {
             do {
-                try await loadPreviewCatalog(root: requestedRoot, directory: directory,
+                try await loadPreviewCatalog(root: requestedRoot, target: target,
                     discoveryPolicy: discoveryPolicy, ticket: ticket,
                     cancellation: cancellation, accessLease: accessLease)
             } catch {
@@ -2916,7 +2921,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         }
         guard !cancellation.isCanceled, projectOpening.accepts(ticket),
               browserProject == ticket.project, projectBrowser.discoveryPolicy == discoveryPolicy,
-              atlasDirectory == directory else { return }
+              atlasCatalogTarget == target else { return }
         // The viewport worker borrows this owner for Rust source captures and
         // immutable prepared glyph/pixel artifacts. Its legacy hot document
         // table never retains the viewport's evicted source documents.
@@ -2949,24 +2954,29 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         atlasLayoutCancellation?.cancel(); atlasLayoutTask?.cancel(); atlasLayoutIO.cancel()
         atlasLayoutTask = nil; atlasLayoutCancellation = nil
         atlasLayoutPending = false; atlasDirectoryTarget = nil
-        status = "Folder focus canceled. The current atlas remains available."
+        status = "Atlas focus canceled. The current atlas remains available."
     }
 
     /// Discover and lay out a bounded directory while the accepted project,
     /// atlas and readers remain usable. Directory paths stay project-relative.
     private func requestAtlasDirectory(_ directory: AtlasDirectoryFocus, project: UUID,
         catalogRevision: UUID? = nil) {
+        requestAtlasTarget(.directory(directory), project: project, catalogRevision: catalogRevision)
+    }
+
+    private func requestAtlasTarget(_ target: AtlasCatalogTarget, project: UUID,
+        catalogRevision: UUID? = nil) {
         guard project == loadGeneration, canChangeAtlasDirectory,
               catalogRevision.map({ $0 == projectOpening.catalogRevision }) != false else { return }
-        if directory == atlasDirectory, hasMetadataAtlas, !hasRetainedAtlas {
+        if target == atlasCatalogTarget, hasMetadataAtlas, !hasRetainedAtlas {
             showsCity = false
-            status = "Atlas already focused on \(directory.display)."
-                + (showsCatalog ? " Choose Show text atlas to view this folder." : "")
+            status = "Atlas already focused on \(target.display)."
+                + (showsCatalog ? " Choose Show text atlas to view this location." : "")
             return
         }
-        guard let destination = try? AtlasFolderDestination(directory: directory, fileScope: fileScope,
+        guard let destination = try? AtlasFolderDestination(catalogTarget: target, fileScope: fileScope,
             customExtensions: customExtensions) else {
-            status = "Choose valid file types before changing the atlas folder."
+            status = "Choose valid file types before changing the atlas scope."
             return
         }
         let move = atlasFolderNavigation.visit(destination, from: currentAtlasDestination())
@@ -2979,10 +2989,10 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         move: AtlasFolderNavigation.Move) {
         guard project == loadGeneration, canChangeAtlasDirectory,
               atlasFolderNavigation.accepts(move) else { return }
-        let directory = destination.directory
-        if directory == atlasDirectory, hasMetadataAtlas, !hasRetainedAtlas,
+        let target = destination.catalogTarget
+        if target == atlasCatalogTarget, hasMetadataAtlas, !hasRetainedAtlas,
            destination.matchesScope(fileScope: fileScope, customExtensions: customExtensions),
-           atlasFolderNavigation.current?.directory == directory,
+           atlasFolderNavigation.current?.catalogTarget == target,
            atlasFolderNavigation.current?.matchesScope(fileScope: destination.fileScope,
                 customExtensions: destination.customExtensions) == true {
             let resolved = resolvedAtlasDestination(destination, entries: atlasEntries)
@@ -2993,14 +3003,14 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             addedFilesFocusRevision = nil
             atlasPreservesNavigation = true
             showsCity = false
-            status = "Returned to \(directory.display)."
+            status = "Returned to \(target.display)."
                 + (destination.anchorRawPath != nil && resolved.anchorRawPath == nil
-                    ? " The saved file is not in this catalog; showing the folder overview." : "")
+                    ? " The saved file is not in this catalog; showing the scope overview." : "")
                 + (showsCatalog ? " Choose Show text atlas to view this location." : "")
             persistAtlasFolderNavigation()
             return
         }
-        let browser = projectBrowser, requestedRoot = root, previousDirectory = atlasDirectory
+        let browser = projectBrowser, requestedRoot = root, previousTarget = atlasCatalogTarget
         let previousCatalogRevision = projectOpening.catalogRevision
         let currentCatalog = projectOpening.catalog
         let originalScope = fileScope, originalExtensions = Array(customExtensions.utf8)
@@ -3022,7 +3032,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         // reader-owning view mounted when the first focused atlas is published.
         if !hasMetadataAtlas { showsCatalog = true }
         atlasLayoutRequest = request; atlasLayoutCancellation = cancellation
-        atlasLayoutPending = true; atlasDirectoryTarget = directory
+        atlasLayoutPending = true; atlasDirectoryTarget = target
         atlasLayoutTask = Task {
             defer {
                 if atlasLayoutRequest == request {
@@ -3032,36 +3042,36 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             }
             do {
                 let catalog: AtlasProjectCatalog
-                if directory == previousDirectory, let currentCatalog {
+                if target == previousTarget, let currentCatalog {
                     catalog = currentCatalog
                 } else {
                     catalog = try await atlasLayoutIO.perform(cancellation: cancellation,
                         keepingAlive: accessLease.map { [$0] } ?? []) {
-                        try AtlasProjectWorker.catalogReport(root: requestedRoot, directory: directory,
+                        try AtlasProjectWorker.catalogReport(root: requestedRoot, target: target,
                             discoveryPolicy: discoveryPolicy, cancellation: cancellation)
                     }
                 }
                 guard !Task.isCancelled, !cancellation.isCanceled, atlasLayoutRequest == request,
                       loadGeneration == project, projectBrowser === browser, !browser.closed,
-                      root.utf8.elementsEqual(requestedRoot.utf8), atlasDirectory == previousDirectory,
+                      root.utf8.elementsEqual(requestedRoot.utf8), atlasCatalogTarget == previousTarget,
                       projectOpening.catalogRevision == previousCatalogRevision,
                       browser.discoveryPolicy == discoveryPolicy,
                       fileScope == originalScope, Array(customExtensions.utf8) == originalExtensions else { return }
                 let installed = await installAtlasScope(root: requestedRoot, project: project, request: request,
                     cancellation: cancellation, accessLease: accessLease,
-                    preservingCaptures: directory == previousDirectory,
+                    preservingCaptures: target == previousTarget,
                     replacementCatalog: catalog, folderMove: move)
                 guard installed, atlasLayoutRequest == request else { return }
                 // Keep Project Files mounted: a reader may have opened while
                 // focus was preparing. Show text atlas remains an explicit action.
                 showsCity = false
-                status = "Atlas focused on \(directory.display). \(catalog.summary)"
+                status = "Atlas focused on \(target.display). \(catalog.summary)"
                     + (destination.anchorRawPath != nil && atlasFolderNavigation.current?.anchorRawPath == nil
-                        ? " The saved file is not in this catalog; showing the folder overview." : "")
-                    + (showsCatalog ? " Choose Show text atlas to view this folder." : "")
+                        ? " The saved file is not in this catalog; showing the scope overview." : "")
+                    + (showsCatalog ? " Choose Show text atlas to view this location." : "")
             } catch {
                 guard !Task.isCancelled, !cancellation.isCanceled, atlasLayoutRequest == request else { return }
-                status = "The folder atlas could not be prepared. The current map and source readers remain available."
+                status = "The focused atlas could not be prepared. The current map and source readers remain available."
             }
         }
     }
@@ -3073,17 +3083,17 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         replacementCatalog: AtlasProjectCatalog? = nil,
         folderMove: AtlasFolderNavigation.Move? = nil) async -> Bool {
         let browser = projectBrowser, requestedDiscoveryPolicy = browser.discoveryPolicy
-        let previousDirectory = atlasDirectory, previousCatalogRevision = projectOpening.catalogRevision
+        let previousTarget = atlasCatalogTarget, previousCatalogRevision = projectOpening.catalogRevision
         guard let catalog = replacementCatalog ?? projectOpening.catalog,
               catalog.requestedRoot?.utf8.elementsEqual(requestedRoot.utf8) == true,
               catalog.matchesDiscoveryPolicy(requestedDiscoveryPolicy.wireName),
-              replacementCatalog != nil || catalog.requestedDirectory == previousDirectory else { return false }
+              replacementCatalog != nil || catalog.requestedTarget == previousTarget else { return false }
         let originalScope = fileScope, originalExtensions = Array(customExtensions.utf8)
         let requestedScope = folderMove?.target.fileScope ?? fileScope
         let requestedExtensions = folderMove?.target.customExtensions ?? customExtensions
         guard let destination = folderMove?.target ?? (try? AtlasFolderDestination(
-            directory: catalog.requestedDirectory, fileScope: requestedScope,
-            customExtensions: requestedExtensions)), destination.directory == catalog.requestedDirectory else { return false }
+            catalogTarget: catalog.requestedTarget, fileScope: requestedScope,
+            customExtensions: requestedExtensions)), destination.catalogTarget == catalog.requestedTarget else { return false }
         let scopeLabel = requestedScope == .custom ? requestedExtensions : requestedScope.rawValue
         let entries = catalog.entries.filter { entry in
             entry.sourcePath.map { requestedScope.includes($0, custom: requestedExtensions) } ?? (requestedScope == .all)
@@ -3111,7 +3121,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         guard !Task.isCancelled, !cancellation.isCanceled, projectViewActive, loadGeneration == project,
               projectBrowser === browser, !browser.closed, browserProject == project,
               atlasLayoutRequest == request, root.utf8.elementsEqual(requestedRoot.utf8),
-              browser.discoveryPolicy == requestedDiscoveryPolicy, atlasDirectory == previousDirectory,
+              browser.discoveryPolicy == requestedDiscoveryPolicy, atlasCatalogTarget == previousTarget,
               projectOpening.catalogRevision == previousCatalogRevision,
               fileScope == originalScope, Array(customExtensions.utf8) == originalExtensions else { return false }
 #if FCB_APP_STORE
@@ -3177,7 +3187,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     }
 
     private func requestAtlasScopeLayout() {
-        guard let destination = try? AtlasFolderDestination(directory: atlasDirectory,
+        guard let destination = try? AtlasFolderDestination(catalogTarget: atlasCatalogTarget,
             fileScope: fileScope, customExtensions: customExtensions) else {
             status = "Choose valid file types before rebuilding the atlas."
             return
@@ -3211,9 +3221,9 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         if let viewport = try? AtlasVisibleSearchScope.Viewport(x: Double(world.minX), y: Double(world.minY),
             width: Double(world.width), height: Double(world.height)),
            visibleSearchView?.represents(root: root, project: loadGeneration,
-                layout: atlasRevision, viewport: viewport, directory: atlasDirectory) != true {
+                layout: atlasRevision, viewport: viewport, catalogTarget: atlasCatalogTarget) != true {
             visibleSearchView = try? AtlasVisibleSearchScope.View(root: root,
-                project: loadGeneration, layout: atlasRevision, viewport: viewport, directory: atlasDirectory)
+                project: loadGeneration, layout: atlasRevision, viewport: viewport, catalogTarget: atlasCatalogTarget)
         }
         atlasResidency.updateViewport(world, scale: scale, selectedPath: selectedPath)
     }
@@ -3270,13 +3280,19 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                         id: request, canceled: { cancellation.isCanceled })
                     let pathScope = try AtlasSearchPathScope(visiblePaths: snapshot.paths)
                     guard !cancellation.isCanceled else { throw AtlasVisibleSearchScope.Failure.canceled }
-                    let catalogScope = try AtlasSearchCatalogScope(directory: snapshot.view.directory.rawPath)
+                    let catalogScope: AtlasSearchCatalogScope
+                    switch snapshot.view.catalogTarget {
+                    case .directory(let directory):
+                        catalogScope = try AtlasSearchCatalogScope(directory: directory.rawPath)
+                    case .file(let file):
+                        catalogScope = try AtlasSearchCatalogScope(file: file.rawPath)
+                    }
                     return AtlasFrozenViewportSearch(snapshot: snapshot, pathScope: pathScope, catalogScope: catalogScope)
                 }
                 guard !Task.isCancelled, !cancellation.isCanceled, visibleSearchRequest == request,
                       searchPathKind == .visible, !atlasLayoutPending, hasMetadataAtlas,
                       acceptedView.belongs(to: root, project: loadGeneration,
-                        layout: atlasRevision, directory: atlasDirectory) else { return }
+                        layout: atlasRevision, catalogTarget: atlasCatalogTarget) else { return }
                 frozenVisibleSearch = frozen
                 visibleSearchNotice = ""
                 if query.isEmpty {

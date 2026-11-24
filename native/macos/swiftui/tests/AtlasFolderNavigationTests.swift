@@ -222,7 +222,53 @@ import Foundation
         precondition(navigation.snapshot() == retained, "refused restore cannot replace an accepted history")
     }
 
+    static func exactFileTargetsKeepIndependentHistory() throws {
+        let folder = place("src")
+        let aFile = try AtlasFileFocus(rawPath: Array("src/late-a.rs".utf8))
+        let bFile = try AtlasFileFocus(rawPath: Array("src/late-b.rs".utf8))
+        let a = try AtlasFolderDestination(catalogTarget: .file(aFile), fileScope: .all, customExtensions: "")
+        let b = try AtlasFolderDestination(catalogTarget: .file(bFile), fileScope: .all, customExtensions: "")
+        precondition(a.directory == b.directory && a.directory == folder.directory
+            && a != b && a != folder, "same-parent files and their folder are distinct places")
+        var navigation = AtlasFolderNavigation()
+        navigation.reset(to: folder)
+        let move = navigation.visit(a)
+        precondition(!navigation.commit(move, resolved: folder) && !navigation.commit(move, resolved: b)
+            && navigation.current == folder && !navigation.canBack,
+            "a parent or sibling receipt cannot consume exact-file navigation")
+        precondition(navigation.commit(move, resolved: a))
+        let anchor = AtlasParcelCameraAnchor(relativeX: 0.25, relativeY: 0.75, zoomFactor: 3)!
+        let exploredA = try AtlasFolderDestination(catalogTarget: .file(aFile), fileScope: .all,
+            customExtensions: "", anchorRawPath: aFile.rawPath, cameraAnchor: anchor)
+        precondition(navigation.commit(navigation.visit(b, from: exploredA), resolved: b))
+        let abandoned = navigation.back()!
+        precondition(abandoned.target == exploredA && navigation.current == b && !navigation.canForward,
+            "preparing or canceling Back leaves the accepted file and history intact")
+        navigation.rebaseCurrent(b)
+        precondition(!navigation.commit(abandoned, resolved: exploredA),
+            "refresh retires a pending exact-file navigation")
+        let back = navigation.back()!
+        precondition(navigation.commit(back, resolved: back.target)
+            && navigation.current == exploredA && navigation.forward()?.target == b,
+            "Back preserves exact target and paired parcel camera")
+        _ = try navigation.addLandmark(label: "Late file", destination: b)
+        let snapshot = navigation.snapshot()
+        navigation.reset()
+        try navigation.restore(snapshot)
+        precondition(navigation.current == exploredA && navigation.forward()?.target == b
+            && navigation.landmarks[0].destination == b, "restoring routes keeps exact file identity")
+        reject("another file in the same folder cannot be an exact-file camera anchor") {
+            _ = try AtlasFolderDestination(catalogTarget: .file(aFile), fileScope: .all,
+                customExtensions: "", anchorRawPath: bFile.rawPath, cameraAnchor: anchor)
+        }
+        let rootFile = try AtlasFileFocus(rawPath: Array("late.rs".utf8))
+        let rootPlace = try AtlasFolderDestination(catalogTarget: .file(rootFile), fileScope: .all, customExtensions: "")
+        precondition(rootPlace.directory.isProject && rootPlace != place(),
+            "root-level exact-file history cannot collapse into whole-project history")
+    }
+
     static func main() throws {
+        try exactFileTargetsKeepIndependentHistory()
         transactionalOriginAndRoundTrip()
         failureCancellationAndBranching()
         try proposalIsolationAndRefresh()
@@ -231,6 +277,6 @@ import Foundation
         try boundedNamedLandmarks()
         boundedHistoryAndNoOpVisit()
         try savedSnapshotRoundTripAndValidation()
-        print("8 folder navigation regression groups passed")
+        print("9 atlas navigation regression groups passed")
     }
 }
