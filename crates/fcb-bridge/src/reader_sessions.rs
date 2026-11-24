@@ -427,7 +427,7 @@ impl ReaderSessions {
         Ok(())
     }
     #[cfg(all(test, unix))]
-    fn supply(&self, handle: u64, bytes: &[u8]) -> Result<HostResponse, AccessError> {
+    pub(super) fn supply(&self, handle: u64, bytes: &[u8]) -> Result<HostResponse, AccessError> {
         self.initialize(handle, |owner, stop| ReaderSession::from_bytes(owner, Path::new("retained.rs"), bytes, stop), || false)
     }
 }

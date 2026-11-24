@@ -126,7 +126,7 @@ fn ascii_name(name: &str) -> bool {
 
 fn module_prefix(source: &[u8]) -> &[u8] {
     let directory_len = source.iter().rposition(|&byte| byte == b'/').unwrap_or(0);
-    let mut offset = 0;
+    let mut offset = 0usize;
     let mut conventional = None;
     let mut plain = None;
     for component in source[..directory_len].split(|&byte| byte == b'/') {

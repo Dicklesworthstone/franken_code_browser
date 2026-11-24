@@ -251,7 +251,7 @@ impl CatalogStructureSearchSession {
         check(canceled)?; self.validate_active()?;
         self.revision = add(self.revision, 1)?;
         self.replay_after_revision = Some(after_revision);
-        let result = (|| {
+        let result: Result<(), CatalogStructureSearchError> = (|| {
             for _ in 0..max_steps {
                 check(canceled)?; self.validate_active()?;
                 if !self.more() { break; }

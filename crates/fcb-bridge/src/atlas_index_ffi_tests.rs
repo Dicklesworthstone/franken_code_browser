@@ -68,7 +68,7 @@ fn null_and_valid_foreign_queries_on_unknown_handles_never_produce_success_or_so
 #[test]
 fn counted_index_abi_preserves_rows_scope_cancellation_and_original_captures() {
     use crate::atlas_ffi::{fcb_atlas_create, fcb_atlas_open, fcb_atlas_close, fcb_atlas_cancel};
-    use crate::atlas_search_ffi::{fcb_atlas_search_step, fcb_atlas_search_page, fcb_atlas_search_open_reader};
+    use super::super::{fcb_atlas_search_step, fcb_atlas_search_page, fcb_atlas_search_open_reader};
     use crate::reader_ffi::{fcb_reader_create, fcb_reader_copy_range, fcb_reader_close, FFI_TEST_LOCK};
     use std::fs;
 
@@ -139,7 +139,7 @@ fn window_entrypoint_type_and_header_match() {
 #[test]
 fn indexed_window_abi_reuses_captures_and_preserves_results_on_rejection_and_cancel() {
     use crate::atlas_ffi::{fcb_atlas_create, fcb_atlas_open, fcb_atlas_close, fcb_atlas_cancel};
-    use crate::atlas_search_ffi::{fcb_atlas_search_step, fcb_atlas_search_page, fcb_atlas_search_open_reader};
+    use super::super::{fcb_atlas_search_step, fcb_atlas_search_page, fcb_atlas_search_open_reader};
     use crate::reader_ffi::{fcb_reader_create, fcb_reader_copy_range, fcb_reader_close, FFI_TEST_LOCK};
     use std::fs;
     let _guard = FFI_TEST_LOCK.lock().unwrap();

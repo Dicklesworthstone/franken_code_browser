@@ -228,7 +228,7 @@ fn open_file_arguments(bundle: &Path, mode: BundleMode, root: &Path, name: &OsSt
     }
     arguments.push("-fcb.file-hex".into());
     arguments.push(filename_hex(name)?.into());
-    if let line = line {
+    if let Some(line) = line {
         if line == 0 { return Err(Failure::Options); }
         if mode != BundleMode::ProjectFileAndLineArgument { return Err(Failure::Line); }
         arguments.push("-fcb.line".into());

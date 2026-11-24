@@ -74,7 +74,7 @@ fn saved_inline_rust_modules_keep_exact_nested_evidence_and_offline_targets() {
     }
     let row = link(&page, b"src/lib.rs", "super::child::Thing");
     let before = reads(&mut saved);
-    let incoming = json(&saved.import_page(1, Some(row.get("target_member").number()), Direction::Incoming, 0, 64, || false).unwrap());
+    let incoming = json(&saved.import_page(1, Some(row.get("target_member").number().try_into().unwrap()), Direction::Incoming, 0, 64, || false).unwrap());
     assert_eq!(incoming.get("links").array(), page.get("links").array());
     assert_eq!(reads(&mut saved), before);
     fs::rename(&f.path, f.root.join("held-inline.fcbs")).unwrap();
@@ -107,7 +107,7 @@ fn saved_rust_path_modules_preserve_utf16_attribute_evidence_and_offline_readers
         assert_eq!(range(&source, row.get("specifier_range")), &utf16("platform/custom.rs", big)[2..]);
         assert_eq!(row.get("target_path").get("hex").text(), hex(b"src/platform/custom.rs"));
         let before = reads(&mut saved);
-        let incoming = json(&saved.import_page(1, Some(row.get("target_member").number()),
+        let incoming = json(&saved.import_page(1, Some(row.get("target_member").number().try_into().unwrap()),
             Direction::Incoming, 0, 64, || false).unwrap());
         assert_eq!(incoming.get("links").array(), page.get("links").array());
         assert_eq!(reads(&mut saved), before);
@@ -158,7 +158,7 @@ fn saved_typescript_extension_candidates_keep_utf16_evidence_and_offline_readers
         assert_eq!(range(&source, row.get("evidence_range")), &utf16(statement, big)[2..]);
         assert_eq!(range(&source, row.get("specifier_range")), &utf16("./child.js", big)[2..]);
         let before = reads(&mut saved);
-        let incoming = json(&saved.import_page(1, Some(row.get("target_member").number()),
+        let incoming = json(&saved.import_page(1, Some(row.get("target_member").number().try_into().unwrap()),
             Direction::Incoming, 0, 64, || false).unwrap());
         assert_eq!(incoming.get("links").array(), page.get("links").array());
         assert_eq!(reads(&mut saved), before);
@@ -218,7 +218,7 @@ fn saved_java_imports_preserve_utf16_evidence_and_offline_source_readers() {
         assert_eq!(wildcard.get("resolution_basis").text(), "unresolved-java-wildcard");
         assert_eq!(wildcard.get("target_member"), &Json::Null);
         let before = reads(&mut saved);
-        let incoming = json(&saved.import_page(1, Some(row.get("target_member").number()),
+        let incoming = json(&saved.import_page(1, Some(row.get("target_member").number().try_into().unwrap()),
             Direction::Incoming, 0, 64, || false).unwrap());
         assert_eq!(incoming.get("matching_links").number(), 2);
         assert_eq!(reads(&mut saved), before);
@@ -280,7 +280,7 @@ fn saved_go_imports_keep_utf16_evidence_module_candidates_and_offline_readers() 
         assert_eq!(range(&source, row.get("evidence_range")), &utf16(statement, big)[2..]);
         assert_eq!(range(&source, row.get("specifier_range")), &utf16("example.local/project/pkg", big)[2..]);
         let before = reads(&mut saved);
-        let incoming = json(&saved.import_page(1, Some(row.get("target_member").number()),
+        let incoming = json(&saved.import_page(1, Some(row.get("target_member").number().try_into().unwrap()),
             Direction::Incoming, 0, 64, || false).unwrap());
         assert_eq!(incoming.get("matching_links").number(), 1);
         assert_eq!(&incoming.get("links").array()[0], row);
@@ -368,7 +368,7 @@ fn saved_cpp_includes_preserve_utf16_evidence_and_independent_offline_readers() 
         assert_eq!(range(&source, row.get("evidence_range")), &utf16(statement, big)[2..]);
         assert_eq!(range(&source, row.get("specifier_range")), &utf16("detail/café.h", big)[2..]);
         let before = reads(&mut saved);
-        let incoming = json(&saved.import_page(1, Some(row.get("target_member").number()), Direction::Incoming, 0, 64, || false).unwrap());
+        let incoming = json(&saved.import_page(1, Some(row.get("target_member").number().try_into().unwrap()), Direction::Incoming, 0, 64, || false).unwrap());
         assert_eq!(incoming.get("matching_links").number(), 1);
         assert_eq!(&incoming.get("links").array()[0], row);
         assert_eq!(reads(&mut saved), before);
@@ -644,7 +644,7 @@ fn saved_python_absolute_imports_keep_utf16_evidence_and_raw_package_roots() {
         assert_eq!(range(&source, row.get("specifier_range")), &utf16("project.worker", big)[2..]);
         assert_eq!(row.get("target_path").get("hex").text(), hex(b"packages/\xff/project/worker.py"));
         let before = reads(&mut saved);
-        let incoming = json(&saved.import_page(1, Some(row.get("target_member").number()),
+        let incoming = json(&saved.import_page(1, Some(row.get("target_member").number().try_into().unwrap()),
             Direction::Incoming, 0, 64, || false).unwrap());
         assert_eq!(incoming.get("links").array().len(), 1);
         assert_eq!(&incoming.get("links").array()[0], row);
@@ -1069,7 +1069,7 @@ fn large_saved_imports_keep_exact_utf16_evidence_after_cancel_and_archive_detach
         assert_eq!(row.get("evidence_range").get("start").number(), expected_start as u64);
         assert_eq!(range(&source, row.get("evidence_range")), &expected[2..]);
         let before = reads(&mut saved);
-        let incoming = json(&saved.import_page(1, Some(row.get("target_member").number()),
+        let incoming = json(&saved.import_page(1, Some(row.get("target_member").number().try_into().unwrap()),
             Direction::Incoming, 0, 64, || false).unwrap());
         assert_eq!(incoming.get("links"), page.get("links"));
         assert_eq!(reads(&mut saved), before);
