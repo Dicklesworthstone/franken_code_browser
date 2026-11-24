@@ -128,6 +128,8 @@ private final class ReleaseProbe {
     static func main() async throws {
         try await coldOverviewAndLateParcel()
         try await denseRegionHasNoPrefixStarvation()
+        try await readerOnlyMetadataDoesNotCrowdOutSource()
+        try await stationaryViewportBackfillsUnavailableSource()
         try await newestDemandWaitsForEnteredCapture()
         try await replacedRootDrainsItsGrant()
         try await selectedProtectionCapacityRetryAndEviction()
@@ -150,7 +152,7 @@ private final class ReleaseProbe {
         try await preparedArtifactCancellationRetainsEnteredLease()
         try await preparedFontChangeRejectsEnteredCandidate()
         try await preparedCacheRefusalAndDecoderBudgetsPreserveSource()
-        print("AtlasViewportResidency: 24 real worker/demand/placement/lifetime/cache scenarios passed")
+        print("AtlasViewportResidency: 26 real worker/demand/placement/lifetime/cache scenarios passed")
     }
 
     static func coldOverviewAndLateParcel() async throws {
@@ -199,6 +201,41 @@ private final class ReleaseProbe {
         try await ready(model, target)
         precondition(fixture.snapshot.paths.contains("/fixture/dense-4999.rs"))
         precondition(!fixture.snapshot.paths.contains("/fixture/dense-0.rs"))
+        model.close()
+        try await until { model.retainedNativeSlots == 0 }
+    }
+
+    static func readerOnlyMetadataDoesNotCrowdOutSource() async throws {
+        let fixture = ViewportFixture(), model = AtlasViewportResidency(transport: fixture.transport)
+        // More than an entire spatial candidate window of reader-only parcels
+        // near the viewport center must leave the visible source reachable.
+        let oversized = UInt64(AtlasViewportLimits.sourceFileBytes) + 1
+        var files = (1...5000).map { entry(UInt64($0), "asset-\($0).bin", bytes: oversized) }
+        let source = entry(5001, "source.rs", x: 170)
+        files.append(source)
+        precondition(model.install(root: "/fixture", entries: files, layoutRevision: UUID(), accessLease: nil))
+        model.updateViewport(CGRect(x: -170, y: 0, width: 500, height: 120), scale: 1, selectedPath: nil)
+        try await ready(model, source)
+        precondition(fixture.snapshot.paths == ["/fixture/source.rs"] && model.previewStates[1] == .readerOnly)
+        model.close()
+        try await until { model.retainedNativeSlots == 0 }
+    }
+
+    static func stationaryViewportBackfillsUnavailableSource() async throws {
+        var limits = AtlasViewportLimits(); limits.maximumDemand = 1
+        let fixture = ViewportFixture(initiallyUnavailable: true)
+        let model = AtlasViewportResidency(limits: limits, transport: fixture.transport)
+        let first = entry(1, "first.rs"), second = entry(2, "second.rs", x: 160)
+        precondition(model.install(root: "/fixture", entries: [first, second], layoutRevision: UUID(), accessLease: nil))
+        model.updateViewport(rect(first).union(rect(second)), scale: 1, selectedPath: first.sourcePath)
+        try await ready(model, second)
+        precondition(model.previewStates[first.id] == .unavailable && fixture.snapshot.maximum == 1)
+        precondition(fixture.snapshot.paths == ["/fixture/first.rs", "/fixture/second.rs"])
+        // Explicit retry restores the original selection's priority even though
+        // its slot was filled and the viewport has remained stationary.
+        model.retryUnavailable()
+        try await ready(model, first)
+        precondition(fixture.snapshot.paths == ["/fixture/first.rs", "/fixture/second.rs", "/fixture/first.rs"])
         model.close()
         try await until { model.retainedNativeSlots == 0 }
     }

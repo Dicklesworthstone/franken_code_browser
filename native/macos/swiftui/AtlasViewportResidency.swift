@@ -42,7 +42,7 @@ fileprivate struct AtlasViewportIndex: Sendable {
     static func rect(_ entry: AtlasProjectCatalog.Entry) -> CGRect {
         CGRect(x: entry.x, y: entry.y, width: entry.width, height: entry.height)
     }
-    func candidates(in viewport: CGRect, scale: Double) -> [UInt64] {
+    func candidates(in viewport: CGRect, scale: Double, eligible: (UInt64) -> Bool) -> [UInt64] {
         guard !nodes.isEmpty else { return [] }
         var stack = [0], result: [UInt64] = [], visits = 0
         while let index = stack.popLast(), visits < 16_384, result.count < 4096 {
@@ -56,7 +56,7 @@ fileprivate struct AtlasViewportIndex: Sendable {
                     let rect = leaf.rect
                     guard rect.intersects(viewport), rect.width * scale >= 48, rect.height * scale >= 32,
                           rect.width * scale * rect.height * scale >= 4096 else { continue }
-                    result.append(leaf.id)
+                    if eligible(leaf.id) { result.append(leaf.id) }
                 }
             }
             else {
@@ -115,7 +115,7 @@ struct AtlasViewportLayout: Sendable {
             states[entry.id] = .readerOnly
         }
         return Self(root: root, revision: revision, entries: entries, rawIDs: rawIDs,
-            index: AtlasViewportIndex(entries: next), previewStates: states)
+            index: AtlasViewportIndex(entries: next.filter { states[$0.id] == nil }), previewStates: states)
     }
 }
 
@@ -146,6 +146,9 @@ struct AtlasViewportLayout: Sendable {
     @ObservationIgnored private var rawIDs: [[UInt8]: UInt64] = [:]
     @ObservationIgnored private var residents: [UInt64: Resident] = [:]
     @ObservationIgnored private var wanted: [UInt64] = []
+    // Ranked alternates from the last accepted viewport. Final file refusals
+    // can fill a vacant slot without another camera event or spatial traversal.
+    @ObservationIgnored private var remainingDemand: ArraySlice<UInt64> = []
     @ObservationIgnored private var blocked = Set<UInt64>()
     @ObservationIgnored private var selectedID: UInt64?
     @ObservationIgnored private var active: AtlasViewportWork?
@@ -253,7 +256,7 @@ struct AtlasViewportLayout: Sendable {
         entries = layout.entries; rawIDs = layout.rawIDs; index = layout.index
         self.accessLease = accessLease; self.cacheLease = cacheLease; self.sourceCacheHandle = sourceCacheHandle
         isInstalled = true; isSuspended = false; selectedID = nil
-        wanted = []; blocked = []; pendingCount = 0; lastViewport = nil; lastSelected = nil
+        wanted = []; remainingDemand = []; blocked = []; pendingCount = 0; lastViewport = nil; lastSelected = nil
         previewStates = layout.previewStates; readerOnlyCount = layout.previewStates.count
         unavailableCount = 0; capacityLimitedCount = 0
         publish()
@@ -274,7 +277,10 @@ struct AtlasViewportLayout: Sendable {
         lastViewport = worldRect; lastScale = scale; lastSelected = selected
         selectedID = selected.flatMap { rawIDs[$0] }
         var candidates: [(id: UInt64, area: Double, distance: Double)] = []
-        for id in index.candidates(in: worldRect, scale: scale) {
+        let eligible = index.candidates(in: worldRect, scale: scale) { id in
+            previewStates[id] != .readerOnly && previewStates[id] != .unavailable
+        }
+        for id in eligible {
             guard let entry = entries[id] else { continue }
             let rect = AtlasViewportIndex.rect(entry), visible = rect.intersection(worldRect)
             guard !visible.isNull, rect.width * scale >= 48, rect.height * scale >= 32,
@@ -288,20 +294,20 @@ struct AtlasViewportLayout: Sendable {
             if $0.distance != $1.distance { return $0.distance < $1.distance }
             return $0.id < $1.id
         }
-        var next: [UInt64] = []
-        if let selectedID { next.append(selectedID) }
-        for candidate in candidates where candidate.id != selectedID {
-            guard next.count < limits.maximumDemand else { break }
-            guard previewStates[candidate.id] != .readerOnly else { continue }
-            next.append(candidate.id)
+        var ranked: [UInt64] = []
+        if let selectedID, previewStates[selectedID] != .readerOnly, previewStates[selectedID] != .unavailable {
+            ranked.append(selectedID)
         }
-        setDemand(next)
+        for candidate in candidates where candidate.id != selectedID { ranked.append(candidate.id) }
+        let next = ranked.prefix(limits.maximumDemand)
+        remainingDemand = ranked.dropFirst(next.count)
+        setDemand(Array(next))
     }
 
     func suspend() {
         isSuspended = true; active?.cancellation.cancel()
         for id in wanted where previewStates[id] == .queued || previewStates[id] == .capacityLimited { setState(id, .cold) }
-        wanted = []; pendingCount = 0; lastViewport = nil
+        wanted = []; remainingDemand = []; pendingCount = 0; lastViewport = nil
     }
 
     func close() {
@@ -309,7 +315,7 @@ struct AtlasViewportLayout: Sendable {
         isInstalled = false; isSuspended = true; root = ""; layoutRevision = UUID()
         entries = [:]; rawIDs = [:]; index = AtlasViewportIndex(entries: [])
         accessLease = nil; cacheLease = nil; sourceCacheHandle = 0
-        wanted = []; blocked = []; selectedID = nil; previewStates = [:]
+        wanted = []; remainingDemand = []; blocked = []; selectedID = nil; previewStates = [:]
         readerOnlyCount = 0; unavailableCount = 0; capacityLimitedCount = 0
         lastViewport = nil; lastSelected = nil; pendingCount = 0
         residents = [:]
@@ -323,7 +329,12 @@ struct AtlasViewportLayout: Sendable {
             setState(id, .cold)
         }
         blocked = []
-        pump()
+        if !isSuspended, let viewport = lastViewport {
+            lastViewport = nil
+            updateViewport(viewport, scale: lastScale, selectedPath: lastSelected.flatMap { String(bytes: $0, encoding: .utf8) })
+        } else {
+            pump()
+        }
     }
 
     func document(forRawPath raw: [UInt8]) -> AtlasDocument? {
@@ -336,6 +347,17 @@ struct AtlasViewportLayout: Sendable {
         guard let id = rawIDs[raw], let resident = residents[id], resident.layoutRevision == layoutRevision,
               resident.prepared.rawPath == raw else { return nil }
         return resident.prepared.preparation
+    }
+
+    private func backfillRefused(_ id: UInt64) {
+        guard let slot = wanted.firstIndex(of: id) else { return }
+        wanted.remove(at: slot)
+        while let next = remainingDemand.popFirst() {
+            guard previewStates[next] != .readerOnly, previewStates[next] != .unavailable else { continue }
+            wanted.append(next)
+            if previewStates[next] == nil || previewStates[next] == .cold { setState(next, .queued) }
+            break
+        }
     }
 
     private func setDemand(_ next: [UInt64]) {
@@ -398,12 +420,13 @@ struct AtlasViewportLayout: Sendable {
         case .refused(let state):
             setState(entry.id, state)
             if state == .capacityLimited { blocked.insert(entry.id) }
+            if state == .readerOnly || state == .unavailable { backfillRefused(entry.id) }
         case .prepared(let prepared):
             guard prepared.rawPath == entry.rawPath,
                   prepared.document.source.path.utf8.elementsEqual(entry.rawPath),
                   prepared.document.renderTiles.allSatisfy({
                       $0.path.utf8.elementsEqual(entry.rawPath) && $0.parcelRect == AtlasViewportIndex.rect(entry)
-                  }) else { setState(entry.id, .unavailable); pump(); return }
+                  }) else { setState(entry.id, .unavailable); backfillRefused(entry.id); pump(); return }
             if admit(prepared, for: entry.id) {
                 setState(entry.id, publishedState(prepared))
                 publish()
