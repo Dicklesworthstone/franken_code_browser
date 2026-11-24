@@ -9,7 +9,7 @@
 //! targets and dynamically created declarations are outside this route.
 //! Header/name/body evidence always maps back to the original captured bytes.
 
-use fcb_source::CaptureEncodingMap;
+use super::source_map::SourceMap;
 use franken_markdown::highlight::{Span, Tok, highlight_into};
 
 use super::{MAX_RECURSIVE_SCOPES, SymbolCandidate, SymbolError, mapped};
@@ -325,7 +325,7 @@ impl<'text> Tokens<'text> {
 fn close(
     scope: Scope,
     end: usize,
-    map: &CaptureEncodingMap,
+    map: &SourceMap<'_>,
     out: &mut [SymbolCandidate],
 ) -> Result<(), SymbolError> {
     if !scope.body_seen {
@@ -338,7 +338,7 @@ fn close(
 }
 
 pub(super) fn extract(
-    map: &CaptureEncodingMap,
+    map: &SourceMap<'_>,
     line_starts: &[usize],
     max_items: usize,
     canceled: &mut impl FnMut() -> bool,
@@ -374,14 +374,7 @@ pub(super) fn extract(
                 limited = true;
                 None
             } else {
-                let mut owned = String::new();
-                owned
-                    .try_reserve_exact(name.end - name.start)
-                    .map_err(|_| SymbolError::ResourceDenied)?;
-                if owned.capacity() > name.end - name.start {
-                    return Err(SymbolError::ResourceDenied);
-                }
-                owned.push_str(tokens.word(header.name));
+                let owned = map.copy_name(tokens.word(header.name))?;
                 let parent = scopes
                     .last()
                     .and_then(|scope| scope.candidate)
@@ -661,7 +654,7 @@ mod tests {
         );
         drop(symbols);
         assert_eq!(budget.accounting().reserved().get(), 0);
-        let map = CaptureEncodingMap::build(source).unwrap();
+        let map = SourceMap::build(source, fcb_source::detect_encoding(source), &mut || false).unwrap();
         let mut calls = 0;
         assert!(matches!(
             extract(&map, &[0], 32, &mut || {

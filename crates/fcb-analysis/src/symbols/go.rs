@@ -9,7 +9,7 @@
 //! resolved to types, and candidates never claim compiler binding/completeness.
 //! Delimiter traversal and declaration walking are iterative and bounded.
 
-use fcb_source::CaptureEncodingMap;
+use super::source_map::SourceMap;
 use franken_markdown::highlight::{Span, Tok, highlight_into};
 
 use super::{MAX_RECURSIVE_SCOPES, SymbolCandidate, SymbolError, mapped};
@@ -334,15 +334,15 @@ impl<'text> Tokens<'text> {
     }
 }
 
-struct Output<'a> {
-    map: &'a CaptureEncodingMap,
-    line_starts: &'a [usize],
+struct Output<'map, 'source> {
+    map: &'map SourceMap<'source>,
+    line_starts: &'map [usize],
     candidates: Vec<SymbolCandidate>,
     limit: usize,
     limited: bool,
 }
 
-impl Output<'_> {
+impl Output<'_, '_> {
     fn add(
         &mut self,
         tokens: &Tokens<'_>,
@@ -359,14 +359,7 @@ impl Output<'_> {
             return Ok(());
         }
         let span = tokens.spans[name];
-        let mut spelling = String::new();
-        spelling
-            .try_reserve_exact(span.end - span.start)
-            .map_err(|_| SymbolError::ResourceDenied)?;
-        if spelling.capacity() > span.end - span.start {
-            return Err(SymbolError::ResourceDenied);
-        }
-        spelling.push_str(tokens.word(name));
+        let spelling = self.map.copy_name(tokens.word(name))?;
         self.candidates.push(SymbolCandidate {
             id: self.candidates.len() as u64 + 1,
             parent: None,
@@ -457,7 +450,7 @@ impl Output<'_> {
 }
 
 pub(super) fn extract(
-    map: &CaptureEncodingMap,
+    map: &SourceMap<'_>,
     line_starts: &[usize],
     limit: usize,
     canceled: &mut impl FnMut() -> bool,

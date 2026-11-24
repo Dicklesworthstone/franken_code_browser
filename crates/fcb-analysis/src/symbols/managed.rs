@@ -14,7 +14,7 @@
 //! All delimiters and source/name ranges are checked before publication.
 
 use franken_markdown::highlight::{Span, Tok, highlight_into};
-use fcb_source::CaptureEncodingMap;
+use super::source_map::SourceMap;
 
 use super::{MAX_RECURSIVE_SCOPES, SymbolCandidate, SymbolError, SymbolLanguage, mapped};
 use crate::OutlineItemKind;
@@ -79,6 +79,7 @@ impl<'text> Tokens<'text> {
         checkpoint(canceled)?;
         highlight_into(language.name(), text, &mut spans);
         checkpoint(canceled)?;
+        if spans.capacity() > text.len().max(1) { return Err(SymbolError::ResourceDenied); }
         let mut previous = 0;
         for span in &spans {
             checkpoint(canceled)?;
@@ -509,7 +510,7 @@ impl<'text> Tokens<'text> {
     }
 }
 
-pub(super) fn extract(map: &CaptureEncodingMap, language: SymbolLanguage, line_starts: &[usize], limit: usize,
+pub(super) fn extract(map: &SourceMap<'_>, language: SymbolLanguage, line_starts: &[usize], limit: usize,
     canceled: &mut impl FnMut() -> bool) -> Result<(Vec<SymbolCandidate>, bool), SymbolError> {
     let tokens = Tokens::new(map.decoded_text(), language, canceled)?;
     let mut candidates = reserved(limit)?;
@@ -529,7 +530,7 @@ pub(super) fn extract(map: &CaptureEncodingMap, language: SymbolLanguage, line_s
             if name.end - name.start > 4096 { return Err(SymbolError::ComplexityLimit); }
             let id = candidates.len() as u64 + 1;
             candidates.push(SymbolCandidate { id, parent: scope.parent, depth: scopes.len() - 1,
-                name: tokens.text[name.start..name.end].to_owned(), kind: declaration.kind,
+                name: map.copy_name(&tokens.text[name.start..name.end])?, kind: declaration.kind,
                 range: mapped(map, start as u64, declaration.end as u64)?,
                 name_range: Some(mapped(map, name.start as u64, name.end as u64)?),
                 line: line_starts.partition_point(|&line| line <= start) as u64 });

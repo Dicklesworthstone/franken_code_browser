@@ -9,7 +9,7 @@
 //! evaluated, and every result retains the heuristic candidate evidence label.
 
 use franken_markdown::highlight::{Span, Tok, highlight_into};
-use fcb_source::CaptureEncodingMap;
+use super::source_map::SourceMap;
 
 use super::{MAX_RECURSIVE_SCOPES, SymbolCandidate, SymbolError, mapped};
 use crate::OutlineItemKind;
@@ -61,6 +61,7 @@ impl<'text> Tokens<'text> {
         checkpoint(canceled)?;
         highlight_into("rust", text, &mut spans);
         checkpoint(canceled)?;
+        if spans.capacity() > text.len().max(1) { return Err(SymbolError::ResourceDenied); }
         let mut previous = 0;
         for span in &spans {
             checkpoint(canceled)?;
@@ -269,20 +270,16 @@ impl<'text> Tokens<'text> {
         Ok(Item { declaration: None, next: self.skip_item(scope.cursor, scope.end, canceled)?, body: None })
     }
 
-    fn display_name(&self, declaration: &Declaration, canceled: &mut impl FnMut() -> bool)
+    fn display_name(&self, declaration: &Declaration, map: &SourceMap<'_>, canceled: &mut impl FnMut() -> bool)
         -> Result<String, SymbolError> {
         if let Some(name) = declaration.name {
-            let mut value = String::new();
-            value.try_reserve_exact(name.end - name.start).map_err(|_| SymbolError::ResourceDenied)?;
-            value.push_str(&self.text[name.start..name.end]);
-            return Ok(value);
+            return map.copy_name(&self.text[name.start..name.end]);
         }
         // Impl blocks have a synthesized label, so deliberately no exact name
         // evidence. Their whole declaration still has an exact original range.
         let capacity = (declaration.keyword..declaration.end).try_fold(0usize, |size, i|
             size.checked_add(self.word(i).len() + 1).ok_or(SymbolError::ResourceDenied))?;
-        let mut value = String::new();
-        value.try_reserve_exact(capacity).map_err(|_| SymbolError::ResourceDenied)?;
+        let mut value = map.name_buffer(capacity)?;
         for i in declaration.keyword..declaration.end {
             checkpoint(canceled)?;
             if !value.is_empty() { value.push(' '); }
@@ -292,7 +289,7 @@ impl<'text> Tokens<'text> {
     }
 }
 
-pub(super) fn extract(map: &CaptureEncodingMap, line_starts: &[usize], max_items: usize,
+pub(super) fn extract(map: &SourceMap<'_>, line_starts: &[usize], max_items: usize,
     canceled: &mut impl FnMut() -> bool) -> Result<(Vec<SymbolCandidate>, bool), SymbolError> {
     let tokens = Tokens::new(map.decoded_text(), canceled)?;
     let mut out = reserved(max_items)?;
@@ -312,7 +309,7 @@ pub(super) fn extract(map: &CaptureEncodingMap, line_starts: &[usize], max_items
             let start = tokens.spans[declaration.keyword].start;
             let end = tokens.spans[tokens.after_group(declaration.end) - 1].end;
             let name_range = declaration.name.map(|name| mapped(map, name.start as u64, name.end as u64)).transpose()?;
-            let name = tokens.display_name(&declaration, canceled)?;
+            let name = tokens.display_name(&declaration, map, canceled)?;
             let id = out.len() as u64 + 1;
             out.push(SymbolCandidate { id, parent: scope.parent, depth: scope.depth, name,
                 kind: declaration.kind, range: mapped(map, start as u64, end as u64)?, name_range,

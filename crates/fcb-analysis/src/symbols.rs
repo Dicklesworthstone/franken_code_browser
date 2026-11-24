@@ -15,10 +15,13 @@
 //! iteratively without inspecting the contents of opaque multiline strings.
 
 use std::mem::size_of;
-use fcb_core::{ByteLength, ByteRange, DecodedUtf8Offset, DecodedUtf8Range, FileId,
+use fcb_core::{ByteLength, ByteRange, FileId,
     QueryGeneration, ResourceAllocationId, ResourceBudget, ResourceLease, SourceRevision};
-use fcb_source::{CaptureEncodingMap, CaptureRequest, DetectedEncoding, SpanKind, detect_encoding};
+use fcb_source::{CaptureRequest, DetectedEncoding, detect_encoding};
 use crate::OutlineItemKind;
+
+mod source_map;
+use source_map::SourceMap;
 
 mod swift;
 mod managed;
@@ -143,24 +146,17 @@ impl<'source> CapturedSymbols<'source> {
         if source.len() > MAX_SYMBOL_SOURCE_BYTES { return Err(SymbolError::SourceLimit); }
         if !(1..=MAX_SYMBOL_ITEMS).contains(&max_items) { return Err(SymbolError::InvalidLimits); }
         if canceled() { return Err(SymbolError::Canceled); }
-        // Conservative envelope: decoder spans and Vec reallocation overlap,
-        // token/name buffers, both outline trees, mapping traversal and output.
-        // Borrowed source bytes retain their host's separate source reservation.
-        let charge = source.len().checked_add(1).and_then(|n| n.checked_mul(768))
-            .and_then(|n| max_items.checked_mul(size_of::<SymbolCandidate>() + 32).and_then(|m| n.checked_add(m)))
-            .and_then(|n| n.checked_add(size_of::<Self>() + MAX_LINES * size_of::<usize>() + 4096))
-            .ok_or(SymbolError::ResourceDenied)?;
-        let lease = budget.try_reserve_managed(request.file().owner(), allocation, ByteLength::new(charge as u64))
-            .map_err(|_| SymbolError::ResourceDenied)?;
         let encoding = encoding.unwrap_or_else(|| detect_encoding(source));
         if encoding == DetectedEncoding::Unsupported { return Err(SymbolError::UnsupportedEncoding); }
-        let map = CaptureEncodingMap::build_with_encoding(source, encoding).map_err(|_| SymbolError::UnsupportedEncoding)?;
-        if map.spans().iter().any(|span| matches!(span.kind, SpanKind::ReplacementMalformed | SpanKind::EscapedByte)) {
-            return Err(SymbolError::UnsupportedEncoding);
-        }
-        let text = map.decoded_text();
-        if text.len() > MAX_SYMBOL_SOURCE_BYTES { return Err(SymbolError::SourceLimit); }
-        let line_starts = source_line_starts(text, &mut canceled)?;
+        let decoded_capacity = SourceMap::decoded_capacity(source.len(), encoding)?;
+        let charge = build_charge(source.len(), decoded_capacity, max_items)?;
+        // Borrowed source bytes retain their host's separate source reservation.
+        // This lease admits transient decode/lexical work and output together;
+        // it shrinks to retained output only after all scratch has been dropped.
+        let lease = budget.try_reserve_managed(request.file().owner(), allocation, ByteLength::new(charge as u64))
+            .map_err(|_| SymbolError::ResourceDenied)?;
+        let map = SourceMap::build(source, encoding, &mut canceled)?;
+        let line_starts = source_line_starts(map.decoded_text(), &mut canceled)?;
         if canceled() { return Err(SymbolError::Canceled); }
         let (candidates, limited) = match language {
             SymbolLanguage::Rust => rust::extract(&map, &line_starts, max_items, &mut canceled)?,
@@ -174,6 +170,16 @@ impl<'source> CapturedSymbols<'source> {
             SymbolLanguage::Cpp => cpp::extract(&map, &line_starts, max_items, &mut canceled)?,
         };
         let fallback = candidates.is_empty() && !source.is_empty();
+        if canceled() { return Err(SymbolError::Canceled); }
+        drop(line_starts);
+        drop(map);
+        let retained = candidates.iter().try_fold(
+            candidates.capacity().checked_mul(size_of::<SymbolCandidate>())
+                .and_then(|bytes| bytes.checked_add(size_of::<Self>()))
+                .ok_or(SymbolError::ResourceDenied)?,
+            |bytes, candidate| bytes.checked_add(candidate.name.capacity()).ok_or(SymbolError::ResourceDenied))?;
+        if retained > charge { return Err(SymbolError::ResourceDenied); }
+        lease.reconcile(ByteLength::new(retained as u64)).map_err(|_| SymbolError::ResourceDenied)?;
         if canceled() { return Err(SymbolError::Canceled); }
         Ok(Self { source, request, generation, language, encoding, candidates, limited, fallback, _lease: lease })
     }
@@ -219,6 +225,28 @@ impl<'source> CapturedSymbols<'source> {
     }
 }
 
+/// Conservative peak for the pinned upstream lexers and these adapters.
+/// The 128-byte lexical allowance per decoded byte covers a pre-reserved Span
+/// vector, JSX/TSX mode, interpolation and template stacks with old/new growth overlap,
+/// and the separate Span/Terminal or two-Span validation phases. Upstream
+/// whole-block calls remain bounded worker jobs with cancellation around them;
+/// this adapter does not claim to make those calls resumable.
+fn build_charge(source_bytes: usize, decoded_capacity: usize, max_items: usize)
+    -> Result<usize, SymbolError> {
+    SourceMap::workspace_bytes(source_bytes, decoded_capacity)?
+        .checked_add(decoded_capacity.max(1).checked_mul(128).ok_or(SymbolError::ResourceDenied)?)
+        // The common name allocator enforces this aggregate output allowance,
+        // including synthesized Rust impl labels, before allocating any name.
+        .and_then(|bytes| decoded_capacity.checked_mul(2).and_then(|names| bytes.checked_add(names)))
+        .and_then(|bytes| max_items.checked_mul(size_of::<SymbolCandidate>() + 32)
+            .and_then(|items| bytes.checked_add(items)))
+        .and_then(|bytes| MAX_LINES.checked_mul(size_of::<usize>()).and_then(|lines| bytes.checked_add(lines)))
+        .and_then(|bytes| (MAX_RECURSIVE_SCOPES + 1).checked_mul(12 * size_of::<usize>())
+            .and_then(|scopes| bytes.checked_add(scopes)))
+        .and_then(|bytes| bytes.checked_add(size_of::<CapturedSymbols<'_>>() + 4096))
+        .ok_or(SymbolError::ResourceDenied)
+}
+
 /// Decoded offsets for the same physical source lines as fcb-source's reader:
 /// LF, CRLF and bare CR terminate one line; a terminal delimiter does not create
 /// another line without a following byte. These are location receipts, not
@@ -254,15 +282,8 @@ fn source_line_starts(text: &str, canceled: &mut impl FnMut() -> bool)
     Ok(starts)
 }
 
-fn mapped(map: &CaptureEncodingMap, start: u64, end: u64) -> Result<ByteRange, SymbolError> {
-    let start_index = usize::try_from(start).map_err(|_| SymbolError::InvalidEvidence)?;
-    let end_index = usize::try_from(end).map_err(|_| SymbolError::InvalidEvidence)?;
-    if start_index >= end_index || map.decoded_text().get(start_index..end_index).is_none() {
-        return Err(SymbolError::InvalidEvidence);
-    }
-    let decoded = DecodedUtf8Range::new(DecodedUtf8Offset::new(start), DecodedUtf8Offset::new(end))
-        .map_err(|_| SymbolError::InvalidEvidence)?;
-    map.decoded_utf8_range_to_byte_range(decoded).map_err(|_| SymbolError::InvalidEvidence)
+fn mapped(map: &SourceMap<'_>, start: u64, end: u64) -> Result<ByteRange, SymbolError> {
+    map.mapped(start, end)
 }
 #[cfg(test)]
 mod tests {
@@ -351,4 +372,64 @@ mod tests {
         assert_eq!(outline.validate_source(b"fn new() {}", request(1).file(), request(1).revision(), generation()), Err(SymbolError::StaleSource));
         assert!(outline.validate_source(b"fn old() {}", request(1).file(), request(1).revision(), generation()).is_ok());
     }
+    #[test]
+    fn scalar_dense_source_uses_bounded_scratch_and_retains_only_candidate_capacity() {
+        let limit = 64 * 1024;
+        let tail = b"*/\nfn kept() {}\n";
+        let mut source = b"/*".to_vec();
+        while source.len() + "中".len() + tail.len() <= limit {
+            source.extend_from_slice("中".as_bytes());
+        }
+        source.resize(limit - tail.len(), b' ');
+        source.extend_from_slice(tail);
+        let budget = ResourceBudget::new(owner(), ByteLength::new(16 * 1024 * 1024)).unwrap();
+        // The old whole-capture map charged over 48 MiB for these same 64 KiB.
+        let outline = build(&source, SymbolLanguage::Rust, 32, &budget);
+        assert_eq!(outline.candidates().len(), 1);
+        assert_eq!(outline.candidates()[0].name(), "kept");
+        assert_eq!(outline.name_bytes(1).unwrap().unwrap(), b"kept");
+        let retained = size_of::<CapturedSymbols<'_>>()
+            + outline.candidates.capacity() * size_of::<SymbolCandidate>()
+            + outline.candidates.iter().map(|candidate| candidate.name.capacity()).sum::<usize>();
+        assert_eq!(budget.accounting().managed().get(), retained as u64);
+        assert!(budget.accounting().peak_reserved().get() > retained as u64 * 100);
+        assert!(budget.accounting().peak_reserved().get() <= 16 * 1024 * 1024);
+        drop(outline);
+        assert_eq!(budget.accounting().reserved().get(), 0);
+    }
+
+    #[test]
+    fn limited_results_still_validate_the_complete_malformed_suffix() {
+        let mut source = b"fn first() {}\n".to_vec();
+        source.extend_from_slice(&b" ".repeat(8192));
+        source.push(0xf0);
+        let budget = budget();
+        assert!(matches!(CapturedSymbols::build(&source, request(1), generation(),
+            SymbolLanguage::Rust, None, 1, &budget, ResourceAllocationId::new(1).unwrap(), || false),
+            Err(SymbolError::UnsupportedEncoding)));
+        assert_eq!(budget.accounting().reserved().get(), 0);
+        let outline = build(b"fn retry() {}", SymbolLanguage::Rust, 1, &budget);
+        assert_eq!(outline.candidates()[0].name(), "retry");
+    }
+
+    #[test]
+    fn admission_and_decode_cancellation_release_the_allocation_for_retry() {
+        let source = b" ".repeat(64 * 1024);
+        let budget = ResourceBudget::new(owner(), ByteLength::new(2 * 1024 * 1024)).unwrap();
+        assert!(matches!(CapturedSymbols::build(&source, request(1), generation(),
+            SymbolLanguage::Rust, None, 1, &budget, ResourceAllocationId::new(1).unwrap(), || false),
+            Err(SymbolError::ResourceDenied)));
+        assert_eq!(budget.accounting().reserved().get(), 0);
+        let mut polls = 0;
+        assert!(matches!(CapturedSymbols::build(b"fn retry() {}", request(1), generation(),
+            SymbolLanguage::Rust, None, 1, &budget, ResourceAllocationId::new(1).unwrap(), || {
+                polls += 1; polls == 4
+            }), Err(SymbolError::Canceled)));
+        assert_eq!(budget.accounting().reserved().get(), 0);
+        let outline = build(b"fn retry() {}", SymbolLanguage::Rust, 1, &budget);
+        assert_eq!(outline.candidates()[0].name(), "retry");
+        drop(outline);
+        assert_eq!(budget.accounting().reserved().get(), 0);
+    }
+
 }
