@@ -11,6 +11,9 @@
 //! Every result remains lexical evidence; closed-catalog navigation is explicit.
 //! UTF-8/UTF-16 decoding and evidence conversion use the common source map.
 
+#[cfg(test)]
+mod mapping_tests;
+
 mod javascript;
 mod python;
 mod cpp;
@@ -24,9 +27,10 @@ pub use resolve::{CapturedGoModule, GoModuleLocation, find_go_module, go_package
     resolve_go_import, MAX_GO_MODULE_SOURCE_BYTES};
 
 use std::mem::size_of;
-use fcb_core::{ByteLength, ByteRange, DecodedUtf8Offset, DecodedUtf8Range, FileId,
+use fcb_core::{ByteLength, ByteRange, FileId,
     QueryGeneration, ResourceAllocationId, ResourceBudget, ResourceLease, SourceRevision};
-use fcb_source::{CaptureEncodingMap, CaptureRequest, DetectedEncoding, SpanKind, detect_encoding};
+use fcb_source::{CaptureRequest, DetectedEncoding, detect_encoding};
+use crate::source_map::{SourceMap, SourceMapError};
 use franken_markdown::highlight::{self, Span, Tok};
 
 pub const MAX_IMPORT_SOURCE_BYTES: usize = 128 * 1024;
@@ -143,22 +147,19 @@ impl<'source> CapturedImports<'source> {
         if source.len() > MAX_IMPORT_SOURCE_BYTES { return Err(ImportError::SourceLimit); }
         if max_items > MAX_IMPORT_ITEMS { return Err(ImportError::InvalidLimits); }
         check(&mut canceled)?;
-        // This covers decoder old/new overlap, full decoded lexical span/terminal
-        // buffers, all retained specifiers and result rows before allocation.
-        let charge = source.len().checked_add(1).and_then(|n| n.checked_mul(768))
-            .and_then(|n| max_items.checked_mul(size_of::<ImportFact>() + MAX_IMPORT_SPECIFIER_BYTES).and_then(|m| n.checked_add(m)))
-            .and_then(|n| n.checked_add(size_of::<Self>() + 4096 + MAX_STATEMENT_TERMINALS * size_of::<usize>()))
-            .ok_or(ImportError::ResourceDenied)?;
-        let lease = budget.try_reserve_managed(generation.owner(), allocation, ByteLength::new(charge as u64))
-            .map_err(|_| ImportError::ResourceDenied)?;
         let encoding = detect_encoding(source);
         if encoding == DetectedEncoding::Unsupported { return Err(ImportError::UnsupportedEncoding); }
-        let map = CaptureEncodingMap::build_with_encoding(source, encoding).map_err(|_| ImportError::UnsupportedEncoding)?;
-        if map.spans().iter().any(|span| matches!(span.kind, SpanKind::ReplacementMalformed | SpanKind::EscapedByte)) {
-            return Err(ImportError::UnsupportedEncoding);
-        }
+        let decoded_limit = MAX_IMPORT_SOURCE_BYTES * 4;
+        let decoded_capacity = SourceMap::decoded_capacity(source.len(), encoding, decoded_limit)
+            .map_err(source_map_error)?;
+        let charge = build_charge(source.len(), decoded_capacity, language, max_items)?;
+        // Source bytes remain borrowed and charged by the capture's owner.
+        // The admitted peak includes scratch and output before either is built.
+        let lease = budget.try_reserve_managed(generation.owner(), allocation, ByteLength::new(charge as u64))
+            .map_err(|_| ImportError::ResourceDenied)?;
+        let map = SourceMap::build(source, encoding, MAX_IMPORT_SOURCE_BYTES,
+            decoded_limit, &mut canceled).map_err(source_map_error)?;
         let text = map.decoded_text();
-        if text.len() > MAX_IMPORT_SOURCE_BYTES * 4 { return Err(ImportError::SourceLimit); }
         if language == ImportLanguage::Cpp { cpp::check_source(text, &mut canceled)?; }
         if language == ImportLanguage::Java { java::check_source(text, &mut canceled)?; }
         check(&mut canceled)?;
@@ -192,8 +193,20 @@ impl<'source> CapturedImports<'source> {
             _ => parser.javascript(&mut canceled)?,
         }
         check(&mut canceled)?;
-        Ok(Self { source, request, generation, language, facts: parser.facts, seen: parser.seen,
-            diagnostics: parser.diagnostics, truncated: parser.truncated, _lease: lease })
+        let Statements { facts, seen, diagnostics, truncated, .. } = parser;
+        drop(terminals);
+        drop(spans);
+        drop(map);
+        let retained = facts.iter().try_fold(
+            facts.capacity().checked_mul(size_of::<ImportFact>())
+                .and_then(|bytes| bytes.checked_add(size_of::<Self>()))
+                .ok_or(ImportError::ResourceDenied)?,
+            |bytes, fact| bytes.checked_add(fact.destination.capacity()).ok_or(ImportError::ResourceDenied))?;
+        if retained > charge { return Err(ImportError::ResourceDenied); }
+        lease.reconcile(ByteLength::new(retained as u64)).map_err(|_| ImportError::ResourceDenied)?;
+        check(&mut canceled)?;
+        Ok(Self { source, request, generation, language, facts, seen,
+            diagnostics, truncated, _lease: lease })
     }
     pub fn facts(&self) -> &[ImportFact] { &self.facts }
     pub const fn language(&self) -> ImportLanguage { self.language }
@@ -234,6 +247,42 @@ pub(crate) fn validate_javascript_context(text: &str, spans: &[Span],
     canceled: &mut impl FnMut() -> bool) -> Result<(), ImportError> {
     let tokens = terminals(text, spans, canceled)?;
     javascript::check_context(text, &tokens, canceled)
+}
+
+fn source_map_error(error: SourceMapError) -> ImportError {
+    match error {
+        SourceMapError::SourceLimit => ImportError::SourceLimit,
+        SourceMapError::UnsupportedEncoding => ImportError::UnsupportedEncoding,
+        SourceMapError::InvalidEvidence => ImportError::InvalidEvidence,
+        SourceMapError::ResourceDenied | SourceMapError::ComplexityLimit => ImportError::ResourceDenied,
+        SourceMapError::Canceled => ImportError::Canceled,
+    }
+}
+
+fn build_charge(source_bytes: usize, decoded_capacity: usize, language: ImportLanguage, max_items: usize)
+    -> Result<usize, ImportError> {
+    // Ordinary pinned lexers peak at simultaneous Span/Terminal buffers or
+    // Span output plus JS interpolation/template stack growth (at most 48 bytes
+    // per decoded byte on 64-bit); 64 admits their growth floors and slack. JSX
+    // composition also owns an input-sized mode stack, requiring 128. Decoded
+    // text, bounded decoder maps and final facts are charged separately below.
+    // Whole-block owner calls remain bounded worker jobs, not resumable lexers.
+    let lexical_bytes_per_byte = match language {
+        ImportLanguage::Jsx | ImportLanguage::Tsx => 128,
+        ImportLanguage::Rust | ImportLanguage::Python | ImportLanguage::Cpp
+            | ImportLanguage::Go | ImportLanguage::Java | ImportLanguage::JavaScript
+            | ImportLanguage::TypeScript => 64,
+    };
+    SourceMap::workspace_bytes(source_bytes, decoded_capacity).map_err(source_map_error)?
+        .checked_add(decoded_capacity.max(1).checked_mul(lexical_bytes_per_byte).ok_or(ImportError::ResourceDenied)?)
+        .and_then(|bytes| max_items.checked_mul(size_of::<ImportFact>() + MAX_IMPORT_SPECIFIER_BYTES)
+            .and_then(|facts| bytes.checked_add(facts)))
+        .and_then(|bytes| MAX_STATEMENT_TERMINALS.checked_mul(size_of::<usize>())
+            .and_then(|terminals| bytes.checked_add(terminals)))
+        // Fixed grammar arrays and bounded recursion, with no source-sized
+        // temporary path strings. Each retained specifier is separately capped.
+        .and_then(|bytes| bytes.checked_add(size_of::<CapturedImports<'_>>() + 16 * 1024))
+        .ok_or(ImportError::ResourceDenied)
 }
 
 #[derive(Clone, Copy)]
@@ -279,7 +328,7 @@ fn terminals(text: &str, spans: &[Span], canceled: &mut impl FnMut() -> bool) ->
 }
 fn punctuation(scalar: char) -> bool { scalar.is_ascii_punctuation() && scalar != '_' && scalar != '$' }
 struct Statements<'a> {
-    text: &'a str, map: &'a CaptureEncodingMap, tokens: &'a [Terminal], facts: Vec<ImportFact>,
+    text: &'a str, map: &'a SourceMap<'a>, tokens: &'a [Terminal], facts: Vec<ImportFact>,
     max_items: usize, seen: u64, diagnostics: usize, truncated: bool,
 }
 impl<'a> Statements<'a> {
@@ -288,9 +337,7 @@ impl<'a> Statements<'a> {
         self.tokens.get(at).is_some_and(|token| token.kind == Tok::Keyword && token.text(self.text) == word)
     }
     fn range(&self, start: usize, end: usize) -> Result<ByteRange, ImportError> {
-        let range = DecodedUtf8Range::new(DecodedUtf8Offset::new(start as u64), DecodedUtf8Offset::new(end as u64))
-            .map_err(|_| ImportError::InvalidEvidence)?;
-        self.map.decoded_utf8_range_to_byte_range(range).map_err(|_| ImportError::InvalidEvidence)
+        self.map.mapped(start as u64, end as u64).map_err(source_map_error)
     }
     fn add(&mut self, kind: ImportKind, start: usize, end: usize, spec_start: usize,
         spec_end: usize, destination: &str, allowed: bool) -> Result<(), ImportError> {

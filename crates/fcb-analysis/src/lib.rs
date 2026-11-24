@@ -7,6 +7,8 @@
 //! languages, and fact capability boundary enforcement ensuring highlighters and
 //! heuristic candidates never masquerade as proven compiler semantics.
 
+mod source_map;
+
 pub mod comparison;
 pub mod extractor;
 pub mod facts;
