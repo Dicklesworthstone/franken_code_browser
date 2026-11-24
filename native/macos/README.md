@@ -1137,6 +1137,37 @@ archive supplies the source. The native attachment, authoring, reader navigation
 and Desk handoff have host, C-boundary and Swift regression fixtures. Independent
 execution and physical-Mac qualification remain pending.
 
+### Editing an attached reading trail
+
+In **Saved Repository → Reading trail**, choose **Rename trail…** to change the
+title. Each visit has an **Edit visit** menu with **Edit rationale…**,
+**Move visit…** and **Remove visit…**. Move uses the visit's **final one-based
+position** in the result: moving visit 2 to position 5 places it fifth, while
+the other visits keep their relative order. Removing the last visit produces
+an empty trail with the same title.
+
+Choose **Save edited trail as…** to apply the reviewed edit to a new FCBT file.
+Each save applies one edit to the complete retained parent, preserving visits
+on other pages, repeated visits, exact source references and untouched notes.
+A visit can be edited even when its source is unavailable or belongs to another
+archive; metadata edits perform no source payload reads. The result records the
+parent digest. Title and rationale limits remain 256 and 4,096 UTF-8 bytes.
+
+The save panel freezes the reviewed edit and parent identity. If the attached
+trail changes, the draft stays available and saving requires reopening the
+editor for the current parent. Existing files are never overwritten, and the
+accepted attachment remains unchanged until you explicitly choose **Open reading
+trail…** for the saved revision. Open that revision before making a cumulative
+second edit.
+
+**Cancel write** requests cancellation and waits for entered work to drain.
+A late cancellation or lost reply may follow a complete or partial destination
+write. **Reload write receipt** retrieves the actual retained outcome without
+repeating the edit; uncertain outcomes preserve the form and require a different
+new filename for another write. Native admission, lifecycle and public-header
+marshaling fixtures are included in source. Execution and physical-Mac
+qualification remain pending the independent strict-RCH verification campaign.
+
 ### Exporting a saved trail with its source
 
 In **Saved Repository → Reading trail**, choose **Export source pack…** to save

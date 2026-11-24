@@ -139,3 +139,132 @@ fn actual_c_canceled_effect_and_existing_destination_have_recoverable_owned_rece
     assert!(write(saved, 2, &root.join("stale.fcbt")).contains("SAVED_TRAIL_STALE_WRITE"));
     assert!(!root.join("stale.fcbt").exists()); assert_eq!(fcb_saved_close(saved), 1);
 }
+
+#[test]
+fn actual_c_edits_all_four_metadata_actions_without_reopening_source_or_parent_paths() {
+    let _guard = crate::reader_ffi::FFI_TEST_LOCK.lock().unwrap();
+    let _: unsafe extern "C" fn(u64, u64, u64, *const c_char, u32, u64, u64,
+        *const u8, u64, *const c_char) -> *mut c_char = fcb_saved_trail_edit;
+    let _: unsafe extern "C" fn(u64, u64, u64, *const c_char, u32, u64, u64,
+        *const u8, u64, *const c_char, Option<crate::SearchCancellationCallback>,
+        *mut c_void) -> *mut c_char = fcb_saved_trail_edit_cancelable;
+    let header = include_str!("../include/fcb_saved_repository.h");
+    for name in ["trail_edit", "trail_edit_cancelable"] {
+        assert_eq!(header.matches(&format!("fcb_saved_{name}(")).count(), 1);
+    }
+    let (root, archive) = fixture(); let saved = fcb_saved_create();
+    take(unsafe { fcb_saved_open(saved, archive.as_ptr()) });
+    let parent = root.join("parent.fcbt"); let created = write(saved, 41, &parent);
+    let before = std::fs::read(&parent).unwrap(); let view = TrailView::open(&before, || false).unwrap();
+    let digest = CString::new(value(&created, "trail_digest")).unwrap();
+    take(unsafe { fcb_saved_trail_attach(saved, 7, path_text(&parent).as_ptr()) });
+    std::fs::rename(&parent, root.join("held-parent.fcbt")).unwrap();
+    std::fs::rename(root.join("saved.fcbs"), root.join("held-archive.fcbs")).unwrap();
+    let reads = count(&take(fcb_saved_info(saved)), "member_bytes_read");
+    let text = b"Revised\0rationale\n";
+    for (kind, operation) in [(0, 42), (1, 43), (2, 44), (3, 45)] {
+        let destination = root.join(format!("edit-{kind}.fcbt"));
+        let length = if kind < 2 { text.len() as u64 } else { 0 };
+        let response = take(unsafe { fcb_saved_trail_edit(saved, operation, 7, digest.as_ptr(),
+            kind, 0, 0, text.as_ptr(), length, path_text(&destination).as_ptr()) });
+        assert!(response.contains("\"command\":\"trail-edit\""));
+        assert!(response.contains("\"status\":\"ok\"")); assert!(response.contains("\"source_verified\":false"));
+        assert!(response.contains("\"source_anchors_unchanged\":true"));
+        assert_eq!(count(&response, "member_bytes_read"), 0); assert_eq!(count(&response, "member_read_calls"), 0);
+        assert_eq!(count(&response, "parent_generation"), 7); assert_eq!(value(&response, "parent_digest"), view.digest().to_hex());
+        let bytes = std::fs::read(destination).unwrap(); let result = TrailView::open(&bytes, || false).unwrap();
+        assert_eq!(result.parent_digest(), Some(view.digest()));
+        match kind {
+            0 => { assert_eq!(result.title(), "Revised\0rationale\n"); assert_eq!(result.entry(0).unwrap(), view.entry(0).unwrap()); }
+            1 => {
+                assert_eq!(result.title(), view.title()); assert_eq!(result.entry(0).unwrap().rationale, "Revised\0rationale\n");
+                assert_eq!(result.entry(0).unwrap().path, b"raw-\xff.rs");
+                assert_eq!(result.entry(0).unwrap().archive, view.entry(0).unwrap().archive);
+                assert_eq!(result.entry(0).unwrap().source, view.entry(0).unwrap().source);
+                assert_eq!(result.entry(0).unwrap().range, view.entry(0).unwrap().range);
+            }
+            2 => assert_eq!(result.entry(0).unwrap(), view.entry(0).unwrap()),
+            _ => { assert!(result.is_empty()); assert_eq!(result.reference_bytes(), 0); }
+        }
+        assert_eq!(take(fcb_saved_trail_write_receipt(saved, operation)), response);
+        assert_eq!(count(&take(fcb_saved_trail_page(saved, 7, 0, 32)), "total_items"), 1);
+        let info = take(fcb_saved_info(saved));
+        assert_eq!(count(&info, "member_bytes_read"), reads);
+        assert_eq!(count(&info, "last_trail_write_attempt"), operation);
+    }
+    assert_eq!(std::fs::read(root.join("held-parent.fcbt")).unwrap(), before);
+    assert_eq!(fcb_saved_close(saved), 1);
+}
+
+#[test]
+fn actual_c_edit_rejects_bad_text_parent_and_reserved_fields_before_host_entry() {
+    let _guard = crate::reader_ffi::FFI_TEST_LOCK.lock().unwrap();
+    let (root, archive) = fixture(); let saved = fcb_saved_create();
+    take(unsafe { fcb_saved_open(saved, archive.as_ptr()) });
+    let parent = root.join("parent.fcbt"); let created = write(saved, 1, &parent);
+    take(unsafe { fcb_saved_trail_attach(saved, 7, path_text(&parent).as_ptr()) });
+    let digest = CString::new(value(&created, "trail_digest")).unwrap();
+    let destination = root.join("not-created.fcbt"); let target = path_text(&destination);
+    let text = b"T"; let invalid_utf8 = [255];
+    for (kind, pointer, length) in [
+        (0, std::ptr::null(), 1), (0, text.as_ptr(), 257), (0, text.as_ptr(), u64::MAX),
+        (0, invalid_utf8.as_ptr(), 1), (1, text.as_ptr(), 4097), (1, invalid_utf8.as_ptr(), 1),
+    ] {
+        let result = take(unsafe { fcb_saved_trail_edit(saved, 2, 7, digest.as_ptr(), kind,
+            0, 0, pointer, length, target.as_ptr()) });
+        assert!(result.contains("INVALID_ARGUMENT"));
+    }
+    for (kind, item, position, length) in [
+        (0, 1, 0, 0), (0, 0, 1, 0), (1, 0, 1, 0),
+        (2, 0, 0, 1), (3, 0, 1, 0), (3, 0, 0, 1), (4, 0, 0, 0),
+    ] {
+        let result = take(unsafe { fcb_saved_trail_edit(saved, 2, 7, digest.as_ptr(), kind,
+            item, position, text.as_ptr(), length, target.as_ptr()) });
+        assert!(result.contains("INVALID_ARGUMENT"));
+    }
+    for (generation, pin) in [(0, digest.as_ptr()), (7, c"".as_ptr()), (7, std::ptr::null())] {
+        let result = take(unsafe { fcb_saved_trail_edit(saved, 2, generation, pin, 0,
+            0, 0, text.as_ptr(), 1, target.as_ptr()) });
+        assert!(result.contains("INVALID_ARGUMENT"));
+    }
+    let info = take(fcb_saved_info(saved));
+    assert_eq!(count(&info, "last_trail_write_attempt"), 1);
+    assert_eq!(count(&info, "member_bytes_read"), SOURCE.len() as u64);
+    assert_eq!(take(fcb_saved_trail_write_receipt(saved, 1)), created);
+    assert!(!destination.exists());
+    // A canonical but absent visit reaches the host and consumes its operation,
+    // while preserving the prior receipt and original accepted attachment.
+    let invalid = take(unsafe { fcb_saved_trail_edit(saved, 2, 7, digest.as_ptr(), 3,
+        1, 0, std::ptr::null(), 0, target.as_ptr()) });
+    assert!(invalid.contains("TRAIL_ITEM_NOT_FOUND")); assert!(!destination.exists());
+    assert_eq!(take(fcb_saved_trail_write_receipt(saved, 1)), created);
+    assert_eq!(count(&take(fcb_saved_info(saved)), "last_trail_write_attempt"), 2);
+    assert_eq!(fcb_saved_close(saved), 1);
+}
+
+#[test]
+fn actual_c_edit_create_effect_survives_cancellation_receipt_recovery_and_close() {
+    let _guard = crate::reader_ffi::FFI_TEST_LOCK.lock().unwrap();
+    let (root, archive) = fixture(); let saved = fcb_saved_create();
+    take(unsafe { fcb_saved_open(saved, archive.as_ptr()) });
+    let parent = root.join("parent.fcbt"); let created = write(saved, 1, &parent);
+    let before = std::fs::read(&parent).unwrap();
+    take(unsafe { fcb_saved_trail_attach(saved, 7, path_text(&parent).as_ptr()) });
+    let digest = CString::new(value(&created, "trail_digest")).unwrap();
+    let refused = take(unsafe { fcb_saved_trail_edit(saved, 2, 7, digest.as_ptr(), 0,
+        0, 0, std::ptr::null(), 0, path_text(&parent).as_ptr()) });
+    assert!(refused.contains("SAVED_TRAIL_DESTINATION_EXISTS")); assert!(refused.contains("\"effect\":\"none\""));
+    assert_eq!(std::fs::read(&parent).unwrap(), before);
+    let mut destination = root.join("canceled.fcbt"); let target = path_text(&destination);
+    let response = take(unsafe { fcb_saved_trail_edit_cancelable(saved, 3, 7, digest.as_ptr(), 0,
+        0, 0, std::ptr::null(), 0, target.as_ptr(), Some(cancel_when_created),
+        (&mut destination as *mut PathBuf).cast::<c_void>()) });
+    assert!(response.contains("SAVED_TRAIL_WRITE_CANCELED"));
+    assert!(response.contains("\"effect\":\"destination-created-incomplete\""));
+    assert_eq!(count(&response, "bytes_written"), 0);
+    assert_eq!(std::fs::metadata(&destination).unwrap().len(), 0);
+    assert_eq!(take(fcb_saved_trail_write_receipt(saved, 3)), response);
+    let held_reply = fcb_saved_trail_write_receipt(saved, 3);
+    assert_eq!(fcb_saved_close(saved), 1); assert_eq!(take(held_reply), response);
+    assert_eq!(std::fs::read(&parent).unwrap(), before);
+}

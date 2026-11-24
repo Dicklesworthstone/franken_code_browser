@@ -10,6 +10,7 @@ private final class SavedTrailWriteFixture: @unchecked Sendable {
     private var attempts: [UInt64: UInt64] = [:]
     private var receipts: [UInt64: (UInt64, String)] = [:]
     private var writes: [AtlasSavedTrailWriteRequest] = []
+    private var edits: [AtlasSavedTrailEditRequest] = []
     private var lookups: [UInt64] = []
     private var fault: String?
     private var loseReceipts = false
@@ -17,6 +18,7 @@ private final class SavedTrailWriteFixture: @unchecked Sendable {
     private var entered = false
     private func locked<T>(_ work: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return work() }
     var requests: [AtlasSavedTrailWriteRequest] { locked { writes } }
+    var editRequests: [AtlasSavedTrailEditRequest] { locked { edits } }
     var receiptReads: [UInt64] { locked { lookups } }
     var didEnter: Bool { locked { entered } }
     func next(_ value: String) { locked { fault = value } }
@@ -70,6 +72,33 @@ private final class SavedTrailWriteFixture: @unchecked Sendable {
             "power_loss_qualified": false, "truncated": false]) { _, new in new }
         return value
     }
+    func editReply(_ request: AtlasSavedTrailEditRequest, failure: String? = nil) -> [String: Any] {
+        let encoded = failure != "encode", complete = failure == nil
+        let effect = failure == "partial" ? "destination-created-incomplete"
+            : complete ? "complete-file-and-parent-sync-requested" : "none"
+        let edit = request.edit
+        var value = trail.base.header(request.identity.owner, "trail-edit")
+        value.merge(["operation": String(request.operation), "last_trail_write_attempt": String(request.operation),
+            "destination": trail.base.path(Array(request.destination.utf8), request.destination), "mode": "edit",
+            "parent_generation": String(request.parent.generation), "parent_digest": request.parent.digest,
+            "parent_items": String(request.parent.items), "title": request.title,
+            "edit": ["kind": edit.kind.wireName, "ordinal": edit.item.map { String($0) as Any } ?? NSNull(),
+                "destination_ordinal": edit.position.map { String($0) as Any } ?? NSNull(),
+                "title": edit.kind == .rename ? edit.text as Any : NSNull(),
+                "rationale": edit.kind == .rationale ? edit.text as Any : NSNull()],
+            "source_verified": false, "source_anchors_unchanged": true, "member_bytes_read": "0", "member_read_calls": "0",
+            "trail_bytes": encoded ? "8192" : "0", "trail_digest": encoded ? String(repeating: "c", count: 64) as Any : NSNull(),
+            "total_items": encoded ? String(request.totalItems) as Any : NSNull(),
+            "reference_bytes": encoded ? String(request.referenceBytes) as Any : NSNull(),
+            "effect": effect, "bytes_written": complete ? "8192" : failure == "partial" ? "77" : "0",
+            "complete_artifact": complete, "attach_eligible": complete, "status": complete ? "ok" : "error",
+            "error": complete ? NSNull() : ["code": "TRAIL_\(failure!)", "next_action": "inspect-and-choose-new-destination"],
+            "archive_path_reopened": false, "live_source_reopened": false, "source_payload_embedded": false,
+            "trail_attached": false, "accepted_trail_unchanged": true, "accepted_query_unchanged": true,
+            "source_derived_sensitive": true, "encrypted": false, "overwritten": false,
+            "power_loss_qualified": false, "truncated": false]) { _, new in new }
+        return value
+    }
     var transport: AtlasSavedTrailTransport {
         AtlasSavedTrailTransport(run: trail.trails.run, write: { [self] owner, request in
             precondition(!Thread.isMainThread && owner == request.identity.owner)
@@ -94,6 +123,23 @@ private final class SavedTrailWriteFixture: @unchecked Sendable {
                 lookups.append(operation)
                 guard !loseReceipts, let receipt = receipts[owner], receipt.0 == operation else { return nil }
                 return receipt.1
+            }
+        }, edit: { [self] owner, request, cancellation in
+            precondition(!Thread.isMainThread && owner == request.identity.owner && !cancellation.isCanceled)
+            let current = locked { () -> (String?, Bool) in
+                precondition(request.operation > attempts[owner, default: 0])
+                attempts[owner] = request.operation; edits.append(request)
+                let pause = block; block = false; entered = pause
+                let current = fault; fault = nil
+                return (current, pause)
+            }
+            if current.1 { precondition(resume.wait(timeout: .now() + .seconds(5)) == .success) }
+            let failure = ["exists", "partial", "encode"].contains(current.0 ?? "") ? current.0 : nil
+            let json = trail.base.encode(editReply(request, failure: failure))
+            return locked {
+                receipts[owner] = (request.operation, json)
+                if current.0 == "unknown" { loseReceipts = true }
+                return current.0 == "lost" || current.0 == "unknown" ? nil : json
             }
         })
     }
@@ -254,6 +300,125 @@ enum AtlasSavedTrailAuthoringTests {
         precondition(!model.canAuthorTrail(from: capture) && selected.validation(in: model) != nil)
         precondition(selected.rationale.isEmpty && !base.calls.contains("LIVE-OPEN"))
         capture.reader.close(); hit.reader.close(); model.close()
-        print("Saved trail authoring bounds, exact ranges, immutable parents, publication effects, recovery and grant-drain fixtures passed")
+        try await runEdits()
+        print("Saved trail authoring and edits: exact ranges, immutable parents, metadata-only curation, recovery and grant-drain fixtures passed")
+    }
+    @MainActor private static func runEdits() async throws {
+        let fixture = SavedTrailWriteFixture(), base = fixture.trail.base
+        let model = AtlasSavedRepositoryModel(transport: fixture.saved, trails: fixture.transport)
+        model.open(path: "/saved/repository.fcbs", accessLease: nil)
+        await wait("edit archive") { !model.busy }
+        model.attachTrail(path: "/saved/parent.fcbt", accessLease: nil)
+        await wait("edit parent") { !model.busy }
+        let page = model.trailPage!, parent = AtlasSavedTrailParent(page), foreign = page.items[1], unavailable = page.items[2]
+        precondition(model.canEditTrail && foreign.readiness == .otherArchive && unavailable.readiness == .unavailableMember)
+        let rename = try model.trailEditDraft(kind: .rename)
+        rename.text = "e\u{301}\0Revised"
+        let renameRequest = try AtlasSavedTrailEditRequest(operation: .max, parent: parent, entry: nil,
+            edit: try rename.edit(), destination: "/saved/rename.fcbt")
+        let decode: ([String: Any]) throws -> AtlasSavedTrailEditReceipt = {
+            try AtlasSavedTrailEditReceipt.decode(base.encode($0), request: renameRequest)
+        }
+        let good = try decode(fixture.editReply(renameRequest))
+        precondition(good.succeeded && good.totalItems == parent.items && good.referenceBytes == parent.referenceBytes)
+        for (key, value) in [("command", "trail-write" as Any), ("mode", "append"),
+            ("operation", "01"), ("parent_generation", "2"), ("parent_digest", String(repeating: "f", count: 64)),
+            ("title", "é\0Revised"), ("source_verified", true), ("source_anchors_unchanged", false),
+            ("member_bytes_read", "1"), ("member_read_calls", "1"), ("reference_bytes", "0"), ("total_items", "33"),
+            ("trail_attached", true), ("accepted_trail_unchanged", false), ("accepted_query_unchanged", false),
+            ("complete_artifact", false), ("attach_eligible", false), ("overwritten", true), ("archive_path_reopened", true)] {
+            var bad = fixture.editReply(renameRequest); bad[key] = value; reject { _ = try decode(bad) }
+        }
+        var malformed = fixture.editReply(renameRequest)
+        malformed["edit"] = ["kind": "rename", "ordinal": "0", "destination_ordinal": NSNull(),
+            "title": rename.text, "rationale": NSNull()]
+        reject { _ = try decode(malformed) }
+        for failure in ["exists", "partial", "encode"] {
+            let receipt = try decode(fixture.editReply(renameRequest, failure: failure))
+            precondition(!receipt.succeeded && !receipt.completeArtifact)
+        }
+        for edit in [AtlasSavedTrailEdit.rationale(item: foreign.id, text: "Retain e\u{301}\0notes"),
+            .move(item: foreign.id, to: 33), .remove(item: foreign.id)] {
+            let request = try AtlasSavedTrailEditRequest(operation: .max, parent: parent, entry: foreign,
+                edit: edit, destination: "/saved/foreign.fcbt")
+            let receipt = try AtlasSavedTrailEditReceipt.decode(base.encode(fixture.editReply(request)), request: request)
+            precondition(receipt.succeeded && receipt.totalItems == (edit.kind == .remove ? 33 : 34))
+            precondition(receipt.referenceBytes == parent.referenceBytes - (edit.kind == .remove ? foreign.range.end - foreign.range.start : 0))
+        }
+        let single = try AtlasSavedTrailPage.decode(base.encode(fixture.trail.page(parent.identity.owner, total: 1)),
+            identity: parent.identity, generation: 1, start: 0)
+        let last = try AtlasSavedTrailEditRequest(operation: 1, parent: AtlasSavedTrailParent(single),
+            entry: single.items[0], edit: .remove(item: 0), destination: "/saved/empty-child.fcbt")
+        precondition(last.totalItems == 0 && last.referenceBytes == 0)
+        reject { _ = try AtlasSavedTrailEditRequest(operation: 1, parent: parent, entry: foreign,
+            edit: .move(item: foreign.id, to: 34), destination: "/saved/out-of-range.fcbt") }
+        reject { _ = try AtlasSavedTrailEditRequest(operation: 1, parent: parent, entry: foreign,
+            edit: .remove(item: 0), destination: "/saved/wrong-visit.fcbt") }
+        rename.text = String(repeating: "é", count: 129)
+        precondition(rename.validation(in: model) != nil && rename.text.count == 129)
+        rename.text = "e\u{301}\0Revised"
+        fixture.next("lost")
+        let submitted = model.editTrail(parent: parent, entry: nil, edit: try rename.edit(),
+            destination: "/saved/rename.fcbt", accessLease: nil)!
+        rename.submitted(submitted)
+        await wait("edit receipt recovered") { !model.busy }
+        rename.accept(model.trailEditReceipt)
+        precondition(rename.closeProtectionRevision == nil && model.trailWriteOutcomeKnown && model.trailWriteRequest == nil)
+        precondition(fixture.editRequests.count == 1 && fixture.receiptReads == [1] && model.trailPage!.matchesAttachment(page))
+        rename.text += " later"; precondition(rename.closeProtectionRevision != nil)
+
+        let move = try model.trailEditDraft(kind: .move, entry: foreign)
+        move.positionInput = "0"; precondition(move.validation(in: model) != nil)
+        move.positionInput = "34"
+        model.loadTrailPage(start: 32); await wait("edit across unseen pages") { !model.busy }
+        precondition(move.validation(in: model) == nil, "paging the same parent must not erase or retarget a frozen visit")
+        fixture.next("unknown")
+        let moved = model.editTrail(parent: move.parent, entry: move.entry, edit: try move.edit(),
+            destination: "/saved/uncertain-edit.fcbt", accessLease: nil)!
+        move.submitted(moved)
+        await wait("unknown edit") { !model.busy }
+        precondition(!model.trailWriteOutcomeKnown && moved.edit.item == 1 && moved.edit.position == 33)
+        precondition(model.editTrail(parent: parent, entry: foreign, edit: try move.edit(),
+            destination: moved.destination, accessLease: nil) == nil)
+        precondition(fixture.editRequests.count == 2 && move.closeProtectionRevision != nil)
+        fixture.restoreReceipts(); model.reloadTrailWriteReceipt()
+        await wait("retained edit recovery") { !model.busy }
+        move.accept(model.trailEditReceipt)
+        precondition(model.trailWriteOutcomeKnown && move.closeProtectionRevision == nil && fixture.editRequests.count == 2)
+
+        // A visit's unavailable source does not remove metadata-edit authority.
+        model.loadTrailPage(start: 0); await wait("unavailable visit page") { !model.busy }
+        let note = try model.trailEditDraft(kind: .rationale, entry: unavailable)
+        note.text = String(repeating: "é", count: 2049)
+        precondition(note.validation(in: model) != nil && note.text.count == 2049)
+        note.text = "Keep this unavailable source in the route."
+        fixture.next("exists")
+        let refused = model.editTrail(parent: note.parent, entry: note.entry, edit: try note.edit(),
+            destination: "/saved/existing.fcbt", accessLease: nil)!
+        note.submitted(refused); await wait("edit create-only refusal") { !model.busy }
+        note.accept(model.trailEditReceipt)
+        precondition(note.receipt?.effect == .none && note.closeProtectionRevision != nil)
+        precondition(note.text == "Keep this unavailable source in the route." && model.trailPage!.matchesAttachment(page))
+        model.attachTrail(path: "/saved/replacement.fcbt", accessLease: nil); await wait("changed edit parent") { !model.busy }
+        precondition(note.validation(in: model) != nil)
+        precondition(model.editTrail(parent: note.parent, entry: note.entry, edit: try note.edit(),
+            destination: "/saved/stale-edit.fcbt", accessLease: nil) == nil && fixture.editRequests.count == 3)
+
+        final class Grant { }
+        var grant: Grant? = Grant(); weak var weakGrant = grant
+        let removing = try model.trailEditDraft(kind: .remove, entry: model.trailPage!.items[1])
+        fixture.blockNext()
+        _ = model.editTrail(parent: removing.parent, entry: removing.entry, edit: try removing.edit(),
+            destination: "/saved/canceled-edit.fcbt", accessLease: grant)
+        grant = nil; await wait("edit writer entered") { fixture.didEnter }
+        model.cancel(); precondition(model.busy && model.trailWriteCancellationRequested && weakGrant != nil)
+        fixture.resume.signal(); await wait("edit writer drained") { !model.busy }
+        await wait("edit grant drained") { weakGrant == nil }
+        precondition(model.trailWriteOutcomeKnown && model.trailEditReceipt?.completeArtifact == true)
+        precondition(fixture.editRequests.map(\.operation) == [1, 2, 3, 4])
+        precondition(!fixture.trail.calls.contains { $0.hasPrefix("reader:") } && !base.calls.contains("LIVE-OPEN"))
+        model.closeArchive()
+        precondition(!model.canEditTrail && removing.validation(in: model) != nil)
+        model.close()
     }
 }

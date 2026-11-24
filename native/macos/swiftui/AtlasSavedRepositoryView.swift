@@ -66,6 +66,7 @@ private final class AtlasSavedTrailArchiveAccess {
         var id: String { rawValue }
     }
     @State private var readerCapture: AtlasSavedReaderCapture?
+    @State private var trailEditDraft: AtlasSavedTrailEditDraft?
     @State private var readerTask: Task<Void, Never>?
     @State private var showsComparison = false
     @State private var pins = AtlasPinnedReaders<AtlasPagedReaderModel>(
@@ -118,6 +119,7 @@ private final class AtlasSavedTrailArchiveAccess {
             AtlasSavedReaderView(capture: capture, archive: model, desk: desk, pins: pins)
         }
         .sheet(isPresented: $showsComparison) { AtlasSnapshotComparisonView(desk: desk) }
+        .sheet(item: $trailEditDraft) { draft in AtlasSavedTrailEditView(model: model, desk: desk, draft: draft) }
         .onDisappear {
             readerTask?.cancel(); readerCapture?.reader.close(); pins.closeAll()
             model.cancel(); exporter.cancel()
@@ -411,9 +413,27 @@ private final class AtlasSavedTrailArchiveAccess {
                         .controlSize(.small).disabled(!model.canOperate)
                 }
             }
+            if let request = model.trailEditRequest {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Edited trail destination: \(String(reflecting: request.destination))")
+                        .font(.caption).lineLimit(2).textSelection(.enabled)
+                    Text(verbatim: model.trailWriteNotice).font(.caption)
+                        .foregroundStyle(model.trailWriteOutcomeKnown ? Color.secondary : Color.orange).textSelection(.enabled)
+                    if let digest = model.trailEditReceipt?.digest {
+                        Text("Trail digest: \(digest)").font(.caption2.monospaced()).textSelection(.enabled)
+                    }
+                    Button("Reload write receipt", action: model.reloadTrailWriteReceipt)
+                        .controlSize(.small).disabled(!model.canOperate)
+                }
+            }
             if let page = model.trailPage {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(verbatim: page.title.isEmpty ? "Untitled trail" : page.title).font(.title3.weight(.semibold))
+                    HStack {
+                        Text(verbatim: page.title.isEmpty ? "Untitled trail" : page.title).font(.title3.weight(.semibold))
+                        Spacer()
+                        Button("Rename trail…") { beginTrailEdit(.rename) }
+                            .controlSize(.small).disabled(!model.canEditTrail || readerTask != nil)
+                    }
                     Text(verbatim: page.path.display).font(.caption).lineLimit(2).textSelection(.enabled)
                     Text("\(page.total) ordered items · \(page.ready) ready in this archive · \(page.unavailable) unavailable here")
                         .font(.caption)
@@ -482,6 +502,12 @@ private final class AtlasSavedTrailArchiveAccess {
                         Text(verbatim: entry.path.display).multilineTextAlignment(.leading)
                     }.frame(maxWidth: .infinity, alignment: .leading)
                 }.buttonStyle(.plain).disabled(!model.canOperate || !model.trailIsCurrent || readerTask != nil)
+                Menu("Edit visit") {
+                    Button("Edit rationale…") { beginTrailEdit(.rationale, entry: entry) }
+                    Button("Move visit…") { beginTrailEdit(.move, entry: entry) }
+                    Button("Remove visit…") { beginTrailEdit(.remove, entry: entry) }
+                }.disabled(!model.canEditTrail || readerTask != nil)
+                .accessibilityLabel("Edit trail visit \(entry.id + 1)")
                 Button(entry.readiness == .otherArchive ? "Choose archive and open…" : "Open source") { openTrail(entry, from: page) }
                     .disabled(readerTask != nil || (entry.readiness == .otherArchive
                         ? !model.canOpenTrailArchive(entry, from: page) : !entry.canOpen || !model.canOperate || !model.trailIsCurrent))
@@ -498,6 +524,11 @@ private final class AtlasSavedTrailArchiveAccess {
         .clipShape(RoundedRectangle(cornerRadius: 7))
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Trail item \(entry.id + 1), \(entry.path.display), \(entry.readiness.label)")
+    }
+
+    private func beginTrailEdit(_ kind: AtlasSavedTrailEditKind, entry: AtlasSavedTrailEntry? = nil) {
+        do { trailEditDraft = try model.trailEditDraft(kind: kind, entry: entry); panelNotice = "" }
+        catch { panelNotice = "The attached trail changed or is busy. Reload it before editing this visit." }
     }
 
     private var searchPane: some View {

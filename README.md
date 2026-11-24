@@ -237,8 +237,8 @@ workflow. This source implementation still requires
 independent native verification.
 
 **Saved trails can be revised without reopening their source archives.**
-The CLI can rename a trail, revise one visit's rationale, move a visit to a final
-position, or remove a visit. Each edit creates a new FCBT file linked to the
+The native Reading trail panel offers **Rename trail…** and an **Edit visit** menu
+for rationale changes, moves and removals. The CLI offers the same four edits. Each edit creates a new FCBT file linked to the
 previous digest; retained visits keep their exact source references, including
 repeated visits and references to unavailable archives. Positions are one-based:
 
@@ -251,7 +251,10 @@ fcb trail edit reordered.fcbt --item 2 --remove --output shortened.fcbt
 
 Removing the last visit leaves a valid empty trail. Existing destinations are
 refused; `--json` includes the edit, parent digest, resulting trail identity and
-filesystem effect. This source addition awaits independent executable verification.
+filesystem effect. In the native app, open the saved revision explicitly to follow
+it or make a cumulative edit; the current attachment and draft remain available.
+See [editing a saved trail](native/macos/README.md#following-saved-reading-trails).
+This source addition awaits independent executable and physical-Mac verification.
 
 **Native trail exports can include several saved repository versions.**
 Choose **Export source pack… → Include other saved archives…** and select the

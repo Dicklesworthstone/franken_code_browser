@@ -133,6 +133,36 @@ import Foundation
             precondition(transport.openArchiveReader!(owner, reader, visit, AtlasSearchCancellation()) == nil)
         }
         precondition(count(10) == beforeVisits + 5 && count(4) == beforeVisitFrees + 4)
-        print("Saved trail public-header ABI, full-width IDs, exact archive arrays/visits, cancellation and response ownership fixtures passed")
+        // Full-width operation/parent IDs, typed zero-based ordinals, embedded
+        // NUL and decomposed UTF-8 text all survive the edit's length-delimited ABI.
+        let editParent = AtlasSavedTrailParent(AtlasSavedTrailPage(identity: identity, generation: generation, lastAttempt: generation,
+            digest: parent.digest, path: member.path, title: title, parentDigest: nil,
+            total: 1024, referenceBytes: 6, retainedBytes: 512, ready: 0, unavailable: 1024, readCalls: 1,
+            start: 0, limit: 32, items: [otherEntry], next: 32))
+        let edits: [AtlasSavedTrailEdit] = [.rename(title), .rationale(item: 0, text: rationale),
+            .move(item: 0, to: 1023), .remove(item: 0), .rename("")]
+        let editRequests = try edits.map {
+            try AtlasSavedTrailEditRequest(operation: .max, parent: editParent, entry: $0.item == nil ? nil : otherEntry,
+                edit: $0, destination: "/edit-e\u{301}.fcbt")
+        }
+        let beforeEdits = count(11), beforeEditFrees = count(4)
+        mode(0)
+        for request in editRequests {
+            precondition(transport.edit!(owner, request, AtlasSearchCancellation()) == "{}")
+        }
+        precondition(count(11) == beforeEdits + 5 && count(4) == beforeEditFrees + 5)
+        let editRequest = editRequests[0]
+        precondition(transport.edit!(0, editRequest, AtlasSearchCancellation()) == nil)
+        precondition(transport.edit!(owner - 1, editRequest, AtlasSearchCancellation()) == nil)
+        precondition(transport.edit!(owner, editRequest, canceled) == nil && count(11) == beforeEdits + 5)
+        mode(1)
+        precondition(transport.edit!(owner, editRequest, AtlasSearchCancellation()) == nil && count(4) == beforeEditFrees + 5)
+        for invalidMode in [Int32(2), 3, 4] {
+            mode(invalidMode)
+            precondition(transport.edit!(owner, editRequest, AtlasSearchCancellation()) == nil)
+        }
+        precondition(count(11) == beforeEdits + 9 && count(4) == beforeEditFrees + 8,
+            "every nonnull edit response must be freed exactly once")
+        print("Saved trail public-header ABI, full-width IDs, exact archive visits and edits, cancellation and response ownership fixtures passed")
     }
 }

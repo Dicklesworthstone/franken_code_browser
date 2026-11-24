@@ -208,6 +208,7 @@ struct AtlasSavedTrailTransport: Sendable {
     var exportReceipt: (@Sendable (UInt64, UInt64) -> String?)? = nil
     var exportWithArchives: (@Sendable (UInt64, AtlasSavedTrailExportRequest, AtlasSearchCancellation) -> String?)? = nil
     var openArchiveReader: (@Sendable (UInt64, UInt64, AtlasSavedTrailArchiveReaderRequest, AtlasSearchCancellation) -> String?)? = nil
+    var edit: (@Sendable (UInt64, AtlasSavedTrailEditRequest, AtlasSearchCancellation) -> String?)? = nil
 }
 
 /// A single explicit archive grant for one frozen other-archive trail visit.

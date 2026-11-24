@@ -10,7 +10,7 @@ use fcb_app::host::{HostResponse, saved_repository::{SavedRepositorySession, Sav
     SnapshotLimits, Sha256Digest}};
 use fcb_app::host::saved_repository::relationships::{SavedRelationshipError, RelationshipDirection, RelationshipSide};
 use fcb_app::host::saved_repository::imports::{SavedImportError, SavedImportDirection, SavedImportSide};
-use fcb_app::host::saved_repository::trail::{SavedTrailError, SavedTrailWriteRequest, SavedTrailExportRequest, SavedTrailArchiveRequest};
+use fcb_app::host::saved_repository::trail::{SavedTrailError, SavedTrailWriteRequest, SavedTrailEditRequest, SavedTrailExportRequest, SavedTrailArchiveRequest};
 use fcb_app::host::saved_repository::paths::SavedPathOptions;
 use fcb_app::host::saved_repository::index_build::SavedIndexBuildLimits;
 use fcb_app::host::saved_repository::desk::SavedDeskError;
@@ -316,6 +316,18 @@ impl SavedSessions {
         let session = state.as_mut().ok_or(AccessError::NotOpen)?;
         let mut stop = || cell.validate(epoch).is_err() || canceled();
         session.write_trail(request, &mut stop).map_err(AccessError::from)
+    }
+    /// Edits share create/append publication and retained receipt recovery.
+    /// Keep a drained effect-bearing reply even if the handle was canceled.
+    pub(super) fn edit_trail(&self, handle: u64, request: SavedTrailEditRequest<'_>,
+        mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
+        let cell = self.get(handle)?;
+        let epoch = cell.epoch.load(Ordering::Acquire);
+        let mut state = lock(&cell.state)?;
+        cell.validate(epoch)?;
+        let session = state.as_mut().ok_or(AccessError::NotOpen)?;
+        let mut stop = || cell.validate(epoch).is_err() || canceled();
+        session.edit_trail(request, &mut stop).map_err(AccessError::from)
     }
     /// Effect-bearing export replies survive cancellation/close after create.
     /// The locked cell retains the original descriptor through writer drain.

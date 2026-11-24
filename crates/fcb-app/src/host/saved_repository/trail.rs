@@ -19,7 +19,7 @@ const MAX_READ_CALLS: usize = 131_072;
 
 /// Explicit immutable trail authoring and retained create-only write receipts.
 pub mod write;
-pub use write::{SavedTrailWriteParent, SavedTrailWriteRequest};
+pub use write::{SavedTrailEditRequest, SavedTrailWriteParent, SavedTrailWriteRequest};
 /// Self-contained evidence export from the explicitly retained archive.
 pub mod export;
 pub use export::{SavedTrailExportLimits, SavedTrailExportRequest};

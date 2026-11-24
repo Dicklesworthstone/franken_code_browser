@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
 
-//! Pin one exact saved-source selection into a NEW immutable FCBT file. The
-//! canonical trail engine verifies the retained archive descriptor and encodes
-//! all visits; the shared create-only writer owns filesystem publication. No
+//! Create or edit a NEW immutable FCBT reading trail. New source selections
+//! verify the retained archive descriptor; edits preserve existing exact source
+//! anchors without loading any source payload. The canonical trail engine
+//! encodes every retained visit and the shared create-only writer publishes. No
 //! accepted trail, reader or search is replaced, and no pathname is reopened to
 //! acquire source authority. One retained terminal receipt reconciles lost
 //! replies without replaying a write, including partial and canceled effects.
@@ -12,7 +13,7 @@ use fcb::{ArenaOwnerId, ByteLength, ByteRange};
 use fcb::search::{RawPath, ResourceAllocationId, ResourceBudget};
 use fcb_core::ResourceLease;
 use fcb::search::paged_snapshot::PagedMemberData;
-use fcb::search::trail::{append_selection, pin_selection, TrailBytes, TrailError,
+use fcb::search::trail::{append_selection, edit_trail as edit_reference_trail, pin_selection, TrailBytes, TrailEdit, TrailError,
     TrailReadError, TrailView, MAX_TRAIL_BYTES, MAX_TRAIL_ITEMS};
 use fcb::store::{Sha256Digest, trail::{MAX_RATIONALE_BYTES, MAX_TRAIL_PATH_BYTES, MAX_TRAIL_TITLE_BYTES}};
 use crate::{AppError, EXIT_CANCELED, EXIT_ERROR, EXIT_OK, input};
@@ -39,6 +40,19 @@ pub struct SavedTrailWriteRequest<'a> {
     pub selection: ByteRange,
     pub title: &'a str,
     pub rationale: &'a str,
+    pub destination: &'a Path,
+}
+
+/// Edit only the exact currently attached immutable parent. All remaining
+/// visits retain their original source anchors, including unavailable and other-
+/// archive visits. Publication creates a new file; attachment is a separate act.
+/// Create, append and edit operations share one monotonic write namespace and
+/// the same retained terminal receipt.
+#[derive(Clone, Copy)]
+pub struct SavedTrailEditRequest<'a> {
+    pub operation: u64,
+    pub parent: SavedTrailWriteParent,
+    pub edit: TrailEdit<'a>,
     pub destination: &'a Path,
 }
 
@@ -171,18 +185,69 @@ impl SavedRepositorySession {
         encode_artifact(&mut out, built.as_ref().ok(), result_items, result_reference_bytes, source_verified,
             after.bytes_read.saturating_sub(before.bytes_read),
             after.read_calls.saturating_sub(before.read_calls))?;
+        self.publish_trail_write(request.operation, &destination, built, out, reply, reply_lease, &mut canceled)
+    }
+
+    /// Curate a retained trail without reading any saved source payload or
+    /// reopening the parent path. Ordinals identify visits, not unique sources;
+    /// repeated selections and their distinct notes remain distinct. The parent
+    /// generation and digest must both match the currently accepted attachment.
+    ///
+    /// A rename, rationale change, move or removal creates one new immutable
+    /// generation. Empty trails are valid. Attachment, query and readers remain
+    /// unchanged until the caller explicitly attaches the newly saved artifact.
+    pub fn edit_trail(&mut self, request: SavedTrailEditRequest<'_>,
+        mut canceled: impl FnMut() -> bool) -> Result<HostResponse, SavedTrailError> {
+        if request.operation == 0 || request.operation <= self.last_trail_write_attempt {
+            return Err(SavedTrailError::StaleWrite);
+        }
+        self.last_trail_write_attempt = request.operation;
+        check(&mut canceled)?;
+        if request.destination.as_os_str().is_empty() || request.destination.as_os_str().len() > 16_384
+            || matches!(request.edit, TrailEdit::Rename { title } if title.len() > MAX_TRAIL_TITLE_BYTES)
+            || matches!(request.edit, TrailEdit::SetRationale { rationale, .. } if rationale.len() > MAX_RATIONALE_BYTES) {
+            return Err(SavedTrailError::InvalidLimits);
+        }
+        if !input::NATIVE_FILE_SUPPORTED { return Err(AppError::UnsupportedPlatform.into()); }
+        let owner = self.owner();
+        let archive_digest = self.archive_digest();
+        let [output_id, reply_id, path_id, entries_id, artifact_id] = self.allocations()?;
+        let _paths = self.budget.try_reserve_managed(owner, path_id, ByteLength::new(64 * 1024))
+            .map_err(|_| AppError::Admission)?;
+        let destination = input::absolute(request.destination)?;
+        if destination.as_os_str().len() > 16_384 { return Err(SavedTrailError::InvalidLimits); }
+        let trail = self.trail.as_ref().ok_or(SavedTrailError::MissingTrail)?;
+        trail.validate(owner, archive_digest, request.parent.generation)?;
+        if trail.digest != request.parent.digest { return Err(SavedTrailError::ParentMismatch); }
+        let parent = TrailView::open(&trail.bytes, &mut canceled)?;
+        let (title, result_items, result_reference_bytes) = edit_result(parent, request.edit)?;
+        let mut out = Output::new(owner, MAX_RECEIPT_BYTES, &self.budget, output_id)?;
+        let (reply, reply_lease) = reply_storage(owner, &self.budget, reply_id)?;
+        encode_edit_prefix(self, &mut out, request, &destination, parent, title)?;
+        let built = edit_reference_trail(owner, parent, request.edit, &self.budget,
+            [entries_id, artifact_id], &mut canceled).map_err(SavedTrailError::from);
+        encode_artifact(&mut out, built.as_ref().ok(), result_items, result_reference_bytes, false, 0, 0)?;
+        self.publish_trail_write(request.operation, &destination, built, out, reply, reply_lease, &mut canceled)
+    }
+
+    /// Every authoring route uses the same create-only publication boundary.
+    /// All receipt/reply capacity is admitted before this function can create a
+    /// destination, and its effect is retained before any fallible delivery.
+    #[allow(clippy::too_many_arguments)]
+    fn publish_trail_write(&mut self, operation: u64, destination: &Path,
+        built: Result<TrailBytes, SavedTrailError>, out: Output, reply: String,
+        reply_lease: ResourceLease, canceled: &mut impl FnMut() -> bool)
+        -> Result<HostResponse, SavedTrailError> {
         if out.remaining_bytes() < 4096 { return Err(AppError::Admission.into()); }
         let tail_start = out.checkpoint();
-        let mut retained = RetainedTrailWrite { operation: request.operation, receipt: out, tail_start,
+        let mut retained = RetainedTrailWrite { operation, receipt: out, tail_start,
             tail_complete: false, effect: CheckpointSaveEffect::None, bytes_written: 0,
             encoded: built.is_ok(), failure: None };
         match built {
-            Ok(artifact) => retained.failure = publish_new_bytes(&destination, artifact.bytes(),
-                &mut retained.effect, &mut retained.bytes_written, &mut canceled).err().map(WriteFailure::Write),
+            Ok(artifact) => retained.failure = publish_new_bytes(destination, artifact.bytes(),
+                &mut retained.effect, &mut retained.bytes_written, canceled).err().map(WriteFailure::Write),
             Err(error) => retained.failure = Some(WriteFailure::Trail(error)),
         }
-        // Retain the effect before allocation, cancellation or any fallible
-        // delivery operation can intervene. The registry must also preserve it.
         self.trail_write = Some(retained);
         self.trail_write_response(reply, reply_lease)
     }
@@ -224,21 +289,9 @@ fn reply_storage(owner: ArenaOwnerId, budget: &ResourceBudget, id: ResourceAlloc
 fn encode_prefix(session: &SavedRepositorySession, out: &mut Output, request: SavedTrailWriteRequest<'_>,
     destination: &Path, parent: Option<TrailView<'_>>, path: &[u8], source_bytes: u64,
     source_digest: Sha256Digest) -> Result<(), OutputError> {
-    out.literal("{\"schema\":\"fcb.saved-repository/1\",\"command\":\"trail-write\",\"owner\":")?;
-    out.integer(session.owner().get())?;
-    out.literal(",\"archive_digest\":")?; out.quoted(&session.archive_digest().to_hex())?;
-    out.literal(",\"members_total\":")?; out.integer(session.archive.directory().len() as u64)?;
-    out.literal(",\"captured_members\":")?; out.integer(session.archive.directory().captured_files() as u64)?;
-    out.literal(",\"discovery_complete\":")?; out.boolean(session.archive.directory().discovery_complete())?;
-    out.literal(",\"live_root_authority\":false,\"native_presented\":false,\"operation\":")?;
-    out.integer(request.operation)?;
-    out.literal(",\"last_trail_write_attempt\":")?; out.integer(request.operation)?;
-    out.literal(",\"destination\":")?; out.path(destination)?;
+    encode_receipt_identity(session, out, "trail-write", request.operation, destination)?;
     out.literal(",\"mode\":")?; out.quoted(if parent.is_some() { "append" } else { "new" })?;
-    out.literal(",\"parent_generation\":")?; optional(out, request.parent.map(|p| p.generation))?;
-    out.literal(",\"parent_digest\":")?;
-    if let Some(view) = parent { out.quoted(&view.digest().to_hex())?; } else { out.literal("null")?; }
-    out.literal(",\"parent_items\":")?; out.integer(parent.map_or(0, |view| view.len() as u64))?;
+    encode_parent(out, request.parent.map(|p| p.generation), parent)?;
     out.literal(",\"member\":")?; out.integer(request.member as u64)?;
     out.literal(",\"file_id\":")?; out.integer(request.member as u64 + 1)?;
     out.literal(",\"source_revision\":")?; out.integer(request.member as u64 + 1)?;
@@ -248,6 +301,82 @@ fn encode_prefix(session: &SavedRepositorySession, out: &mut Output, request: Sa
     out.literal(",\"selection\":")?; out.range(request.selection)?;
     out.literal(",\"title\":")?; out.quoted(request.title)?;
     out.literal(",\"rationale\":")?; out.quoted(request.rationale)?;
+    encode_policy(out)
+}
+
+fn encode_receipt_identity(session: &SavedRepositorySession, out: &mut Output, command: &str,
+    operation: u64, destination: &Path) -> Result<(), OutputError> {
+    out.literal("{\"schema\":\"fcb.saved-repository/1\",\"command\":")?; out.quoted(command)?;
+    out.literal(",\"owner\":")?; out.integer(session.owner().get())?;
+    out.literal(",\"archive_digest\":")?; out.quoted(&session.archive_digest().to_hex())?;
+    out.literal(",\"members_total\":")?; out.integer(session.archive.directory().len() as u64)?;
+    out.literal(",\"captured_members\":")?; out.integer(session.archive.directory().captured_files() as u64)?;
+    out.literal(",\"discovery_complete\":")?; out.boolean(session.archive.directory().discovery_complete())?;
+    out.literal(",\"live_root_authority\":false,\"native_presented\":false,\"operation\":")?;
+    out.integer(operation)?;
+    out.literal(",\"last_trail_write_attempt\":")?; out.integer(operation)?;
+    out.literal(",\"destination\":")?; out.path(destination)?;
+    Ok(())
+}
+
+fn encode_parent(out: &mut Output, generation: Option<u64>, parent: Option<TrailView<'_>>)
+    -> Result<(), OutputError> {
+    out.literal(",\"parent_generation\":")?; optional(out, generation)?;
+    out.literal(",\"parent_digest\":")?;
+    if let Some(view) = parent { out.quoted(&view.digest().to_hex())?; } else { out.literal("null")?; }
+    out.literal(",\"parent_items\":")?; out.integer(parent.map_or(0, |view| view.len() as u64))?;
+    Ok(())
+}
+
+fn encode_edit_prefix(session: &SavedRepositorySession, out: &mut Output,
+    request: SavedTrailEditRequest<'_>, destination: &Path, parent: TrailView<'_>, title: &str)
+    -> Result<(), OutputError> {
+    encode_receipt_identity(session, out, "trail-edit", request.operation, destination)?;
+    out.literal(",\"mode\":\"edit\"")?;
+    encode_parent(out, Some(request.parent.generation), Some(parent))?;
+    out.literal(",\"title\":")?; out.quoted(title)?;
+    let (kind, ordinal, destination_ordinal, edited_title, rationale) = match request.edit {
+        TrailEdit::Rename { title } => ("rename", None, None, Some(title), None),
+        TrailEdit::SetRationale { ordinal, rationale } => ("set-rationale", Some(ordinal), None, None, Some(rationale)),
+        TrailEdit::Move { ordinal, destination } => ("move", Some(ordinal), Some(destination), None, None),
+        TrailEdit::Remove { ordinal } => ("remove", Some(ordinal), None, None, None),
+    };
+    out.literal(",\"edit\":{\"kind\":")?; out.quoted(kind)?;
+    out.literal(",\"ordinal\":")?; optional(out, ordinal.map(|n| n as u64))?;
+    out.literal(",\"destination_ordinal\":")?; optional(out, destination_ordinal.map(|n| n as u64))?;
+    out.literal(",\"title\":")?;
+    if let Some(value) = edited_title { out.quoted(value)?; } else { out.literal("null")?; }
+    out.literal(",\"rationale\":")?;
+    if let Some(value) = rationale { out.quoted(value)?; } else { out.literal("null")?; }
+    out.literal("},\"source_anchors_unchanged\":true")?;
+    encode_policy(out)
+}
+
+/// Validate ordinal identity before admitting a replacement receipt. No source
+/// lookup participates: removal changes only the explicit visit count/byte sum.
+fn edit_result<'a>(parent: TrailView<'a>, edit: TrailEdit<'a>) -> Result<(&'a str, u64, u64), SavedTrailError> {
+    let count = parent.len() as u64;
+    let bytes = parent.reference_bytes();
+    match edit {
+        TrailEdit::Rename { title } => Ok((title, count, bytes)),
+        TrailEdit::SetRationale { ordinal, .. } => {
+            parent.entry(ordinal)?;
+            Ok((parent.title(), count, bytes))
+        }
+        TrailEdit::Move { ordinal, destination } => {
+            parent.entry(ordinal)?;
+            if destination >= parent.len() { return Err(TrailError::MissingItem.into()); }
+            Ok((parent.title(), count, bytes))
+        }
+        TrailEdit::Remove { ordinal } => {
+            let removed = parent.entry(ordinal)?;
+            let bytes = bytes.checked_sub(removed.range.len().get()).ok_or(TrailError::Limit)?;
+            Ok((parent.title(), count - 1, bytes))
+        }
+    }
+}
+
+fn encode_policy(out: &mut Output) -> Result<(), OutputError> {
     for (key, value) in [("max_trail_bytes", MAX_TRAIL_BYTES as u64), ("max_trail_items", MAX_TRAIL_ITEMS as u64),
         ("max_title_bytes", MAX_TRAIL_TITLE_BYTES as u64), ("max_rationale_bytes", MAX_RATIONALE_BYTES as u64)] {
         out.literal(",")?; out.quoted(key)?; out.literal(":")?; out.integer(value)?;

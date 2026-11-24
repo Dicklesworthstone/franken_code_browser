@@ -147,6 +147,41 @@ char *fcb_saved_trail_write_cancelable(uint64_t handle, uint64_t operation,
     const uint8_t *title, uint64_t title_length,
     const uint8_t *rationale, uint64_t rationale_length, const char *destination,
     int32_t (*poll)(void *), void *context);
+/* Edit one exact accepted trail, writing a NEW immutable FCBT. Parent generation
+ * must be nonzero and the digest must match the current attachment. Kinds:
+ *   0 = rename: text is the new title (<=256 UTF-8 bytes); item=position=0.
+ *   1 = set rationale: item is the visit; text <=4096 bytes; position=0.
+ *   2 = move: item moves to final position, both zero-based and < visit count.
+ *   3 = remove: remove item; position=0. Removing the last visit is valid.
+ * Move/remove require text_length=0. Unknown kinds/reserved nonzero arguments
+ * are rejected. Text may be empty and include embedded NUL; null is valid only
+ * with zero length. All pointers obey the write contract above.
+ *
+ * Retained source digests, lengths, raw paths and original-byte ranges are
+ * unchanged. Other-archive/unavailable/repeated visits need no source access.
+ * Edits never open source payloads or the parent pathname. Every edit records
+ * the exact parent digest, including an edit that leaves metadata unchanged.
+ * The output remains separate until explicitly attached.
+ *
+ * Shares write's strictly increasing operation IDs, create-only effects,
+ * cancellation/drain rules and fcb_saved_trail_write_receipt recovery. The
+ * receipt has command=trail-edit, mode=edit, common parent/artifact/effect fields
+ * and edit={kind,ordinal,destination_ordinal,title,rationale}; ordinals are
+ * zero-based decimal strings and unused fields are null. kind is rename,
+ * set-rationale, move or remove. source_anchors_unchanged=true,
+ * source_verified=false and member read counters=0. Never retry an uncertain
+ * delivery automatically; recover the exact operation first.
+ */
+char *fcb_saved_trail_edit(uint64_t handle, uint64_t operation,
+    uint64_t expected_trail_generation, const char *expected_trail_digest,
+    uint32_t kind, uint64_t item, uint64_t position,
+    const uint8_t *text, uint64_t text_length, const char *destination);
+char *fcb_saved_trail_edit_cancelable(uint64_t handle, uint64_t operation,
+    uint64_t expected_trail_generation, const char *expected_trail_digest,
+    uint32_t kind, uint64_t item, uint64_t position,
+    const uint8_t *text, uint64_t text_length, const char *destination,
+    int32_t (*poll)(void *), void *context);
+/* Recover the last admitted create, append or edit without source/output I/O. */
 char *fcb_saved_trail_write_receipt(uint64_t handle, uint64_t operation);
 
 /* Export the exact accepted FCBT generation/digest against this retained FCBS

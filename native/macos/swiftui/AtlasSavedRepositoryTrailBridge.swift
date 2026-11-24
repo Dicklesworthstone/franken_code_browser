@@ -21,6 +21,11 @@ import Foundation
     _ entries: UInt64, _ verificationBytes: UInt64, _ selectedBytes: UInt64,
     _ outputBytes: UInt64, _ outputScalars: UInt64) -> UnsafeMutablePointer<CChar>?
 private typealias SavedTrailExportPoll = @convention(c) (UnsafeMutableRawPointer?) -> Int32
+@_silgen_name("fcb_saved_trail_edit_cancelable") private func savedTrailEdit(_ handle: UInt64,
+    _ operation: UInt64, _ parentGeneration: UInt64, _ parentDigest: UnsafePointer<CChar>?,
+    _ kind: UInt32, _ item: UInt64, _ position: UInt64, _ text: UnsafePointer<UInt8>?, _ textBytes: UInt64,
+    _ destination: UnsafePointer<CChar>?, _ poll: SavedTrailExportPoll?,
+    _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_open_trail_reader_with_archive_cancelable") private func savedTrailArchiveReader(_ handle: UInt64,
     _ reader: UInt64, _ generation: UInt64, _ item: UInt64, _ digest: UnsafePointer<CChar>?,
     _ path: UnsafePointer<CChar>?, _ validationBytes: UInt64,
@@ -112,6 +117,25 @@ extension AtlasSavedTrailTransport {
                 request.path.withCString { path in
                     take(savedTrailArchiveReader(handle, reader, request.trail.generation, request.entry.id,
                         digest, path, request.validationBytes, poll, Unmanaged.passUnretained(cancellation).toOpaque()))
+                }
+            }
+        }
+    }, edit: { handle, request, cancellation in
+        guard handle > 0, handle == request.identity.owner, !cancellation.isCanceled else { return nil }
+        let poll: SavedTrailExportPoll = { context in
+            guard let context else { return 1 }
+            return Unmanaged<AtlasSearchCancellation>.fromOpaque(context).takeUnretainedValue().isCanceled ? 1 : 0
+        }
+        let text = Array(request.edit.text.utf8)
+        return withExtendedLifetime(cancellation) {
+            request.parent.digest.withCString { digest in
+                request.destination.withCString { destination in
+                    text.withUnsafeBufferPointer { text in
+                        take(savedTrailEdit(handle, request.operation, request.parent.generation, digest,
+                            request.edit.kind.rawValue, request.edit.item ?? 0, request.edit.position ?? 0,
+                            text.baseAddress, UInt64(text.count), destination, poll,
+                            Unmanaged.passUnretained(cancellation).toOpaque()))
+                    }
                 }
             }
         }

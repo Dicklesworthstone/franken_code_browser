@@ -5,10 +5,10 @@
 
 /* Header-checked marshaling and owned-response fixture. Real FCBT/archive
  * resolution and payload verification remain in the Rust service fixtures. */
-static uint64_t calls[11];
+static uint64_t calls[12];
 static int result_mode;
 void fixture_saved_trail_mode(int mode) { result_mode = mode; }
-uint64_t fixture_saved_trail_count(uint64_t index) { assert(index < 11); return calls[index]; }
+uint64_t fixture_saved_trail_count(uint64_t index) { assert(index < 12); return calls[index]; }
 static char *reply(void) {
     if (result_mode == 1) return NULL;
     if (result_mode == 2) {
@@ -117,4 +117,24 @@ char *fcb_saved_open_trail_reader_with_archive_cancelable(uint64_t handle, uint6
     assert(path && strcmp(path, "/visit-e\xcc\x81.fcbs") == 0);
     assert(validation_bytes == 256 * 1024 * 1024 && poll && context && poll(context) == 0);
     calls[10]++; return reply();
+}
+
+char *fcb_saved_trail_edit_cancelable(uint64_t handle, uint64_t operation,
+    uint64_t parent_generation, const char *parent_digest, uint32_t kind,
+    uint64_t item, uint64_t position, const uint8_t *text, uint64_t text_length,
+    const char *destination, int32_t (*poll)(void *), void *context) {
+    assert(handle == UINT64_MAX - 10 && operation == UINT64_MAX);
+    assert(parent_generation == UINT64_MAX - 9 && parent_digest && strlen(parent_digest) == 64);
+    for (size_t i = 0; i < 64; i++) assert(parent_digest[i] == 'a');
+    assert(destination && strcmp(destination, "/edit-e\xcc\x81.fcbt") == 0);
+    assert(poll && context && poll(context) == 0);
+    assert(kind <= 3 && item == 0 && position == (kind == 2 ? 1023 : 0));
+    static const uint8_t title[] = {'e', 0xcc, 0x81, 0, 'T'};
+    static const uint8_t rationale[] = {'w', 'h', 'y', 0, 0xc3, 0xa9, '\n'};
+    if (kind == 0 && text_length != 0) {
+        assert(text && text_length == sizeof title && memcmp(text, title, sizeof title) == 0);
+    } else if (kind == 1) {
+        assert(text && text_length == sizeof rationale && memcmp(text, rationale, sizeof rationale) == 0);
+    } else { assert(text_length == 0); }
+    calls[11]++; return reply();
 }

@@ -288,3 +288,259 @@ struct AtlasSavedTrailPreset: Identifiable {
             request.rationale.utf8.elementsEqual(rationale.utf8)
     }
 }
+
+/// One explicit revision of the attached trail. The host edits its retained
+/// canonical document; native pages never stand in for the full item inventory.
+enum AtlasSavedTrailEditKind: UInt32, Sendable {
+    case rename = 0, rationale = 1, move = 2, remove = 3
+    var label: String {
+        switch self {
+        case .rename: return "Rename reading trail"
+        case .rationale: return "Edit visit rationale"
+        case .move: return "Move trail visit"
+        case .remove: return "Remove trail visit"
+        }
+    }
+    var wireName: String {
+        switch self {
+        case .rename: return "rename"
+        case .rationale: return "set-rationale"
+        case .move: return "move"
+        case .remove: return "remove"
+        }
+    }
+}
+enum AtlasSavedTrailEdit: Sendable {
+    case rename(String)
+    case rationale(item: UInt64, text: String)
+    case move(item: UInt64, to: UInt64)
+    case remove(item: UInt64)
+    var kind: AtlasSavedTrailEditKind {
+        switch self {
+        case .rename: return .rename
+        case .rationale: return .rationale
+        case .move: return .move
+        case .remove: return .remove
+        }
+    }
+    var item: UInt64? {
+        switch self {
+        case .rename: return nil
+        case .rationale(let item, _), .move(let item, _), .remove(let item): return item
+        }
+    }
+    var position: UInt64? { if case .move(_, let to) = self { return to }; return nil }
+    var text: String {
+        switch self {
+        case .rename(let title), .rationale(_, let title): return title
+        case .move, .remove: return ""
+        }
+    }
+    func matches(_ other: Self) -> Bool {
+        kind == other.kind && item == other.item && position == other.position && text.utf8.elementsEqual(other.text.utf8)
+    }
+}
+struct AtlasSavedTrailEditRequest: Sendable {
+    let operation: UInt64
+    let parent: AtlasSavedTrailParent
+    let entry: AtlasSavedTrailEntry?
+    let edit: AtlasSavedTrailEdit
+    let destination: String
+    let totalItems, referenceBytes: UInt64
+    var identity: AtlasSavedIdentity { parent.identity }
+    var title: String { edit.kind == .rename ? edit.text : parent.title }
+
+    init(operation: UInt64, parent: AtlasSavedTrailParent, entry: AtlasSavedTrailEntry?,
+        edit: AtlasSavedTrailEdit, destination: String) throws {
+        guard operation > 0, parent.generation > 0, AtlasSavedWire.digest(parent.digest),
+              parent.items <= 1024, parent.title.utf8.count <= 256,
+              AtlasSavedIndexBuildRequest.validDestination(destination) else { throw AtlasSavedError.invalidInput }
+        if let item = edit.item {
+            guard let entry, entry.id == item, item < parent.items else { throw AtlasSavedError.invalidInput }
+            try entry.validate(in: parent.identity)
+        } else if entry != nil { throw AtlasSavedError.invalidInput }
+        switch edit {
+        case .rename(let title):
+            guard title.utf8.count <= 256 else { throw AtlasSavedError.invalidInput }
+        case .rationale(_, let rationale):
+            guard rationale.utf8.count <= 4096 else { throw AtlasSavedError.invalidInput }
+        case .move(_, let to):
+            guard to < parent.items else { throw AtlasSavedError.invalidInput }
+        case .remove: break
+        }
+        let removedBytes = edit.kind == .remove ? entry!.range.end - entry!.range.start : 0
+        guard removedBytes <= parent.referenceBytes else { throw AtlasSavedError.invalidInput }
+        self.operation = operation; self.parent = parent; self.entry = entry; self.edit = edit; self.destination = destination
+        totalItems = parent.items - (edit.kind == .remove ? 1 : 0)
+        referenceBytes = parent.referenceBytes - removedBytes
+    }
+}
+
+/// Edit receipts share the create/append operation clock and retained receipt
+/// endpoint. They prove a metadata-only transformation without claiming source
+/// verification, reopening archives, or changing the accepted attachment.
+struct AtlasSavedTrailEditReceipt: Sendable {
+    let identity: AtlasSavedIdentity
+    let operation: UInt64
+    let destination: AtlasSavedPath
+    let effect: AtlasSavedIndexBuildEffect
+    let succeeded, completeArtifact: Bool
+    let trailBytes, bytesWritten: UInt64
+    let digest: String?
+    let totalItems, referenceBytes: UInt64?
+    let errorCode, nextAction: String?
+    var message: String {
+        if succeeded { return "Saved the edited reading trail to a new file. Open that file explicitly to follow it or make another edit." }
+        let code = errorCode ?? "unknown outcome"
+        switch effect {
+        case .none: return "No edited trail file was created (\(code)). Your draft remains available; choose a new filename for an explicit retry."
+        case .incomplete: return "An incomplete edited trail remains at the destination (\(code)). Inspect it and choose a different new filename."
+        case .fileSyncUnconfirmed: return "Complete edited trail bytes were written, but synchronization was not confirmed (\(code)). Inspect the destination explicitly."
+        case .fileSyncRequested: return "Complete edited trail bytes were written and file synchronization was requested (\(code)). Inspect the destination explicitly."
+        case .fileAndParentSyncRequested: return "The edited trail and its parent directory were synchronized, but the operation reported \(code). Inspect the destination explicitly."
+        }
+    }
+    static func decode(_ json: String?, request: AtlasSavedTrailEditRequest) throws -> Self {
+        guard let json, !json.isEmpty, json.utf8.count <= 256 * 1024 else { throw AtlasSavedError.unavailable }
+        do {
+            let data = Data(json.utf8)
+            let w = try JSONDecoder().decode(Wire.self, from: data)
+            let identity = try JSONDecoder().decode(AtlasSavedIdentity.self, from: data)
+            guard identity == request.identity, w.schema == "fcb.saved-repository/1", w.command == "trail-edit",
+                  w.status == "ok" || w.status == "error", w.mode == "edit",
+                  w.operation.value == request.operation, w.last_trail_write_attempt.value == request.operation,
+                  w.destination.bytes == Array(request.destination.utf8),
+                  w.parent_generation.value == request.parent.generation, w.parent_digest == request.parent.digest,
+                  w.parent_items.value == request.parent.items, w.title.utf8.elementsEqual(request.title.utf8),
+                  w.edit.kind == request.edit.kind.wireName, w.edit.ordinal.value?.value == request.edit.item,
+                  w.edit.destination_ordinal.value?.value == request.edit.position,
+                  sameText(w.edit.title.value, request.edit.kind == .rename ? request.edit.text : nil),
+                  sameText(w.edit.rationale.value, request.edit.kind == .rationale ? request.edit.text : nil),
+                  !w.source_verified, w.source_anchors_unchanged, w.member_bytes_read.value == 0, w.member_read_calls.value == 0,
+                  !w.archive_path_reopened, !w.live_source_reopened, !w.source_payload_embedded,
+                  !w.trail_attached, w.accepted_trail_unchanged, w.accepted_query_unchanged,
+                  w.source_derived_sensitive, !w.encrypted, !w.overwritten, !w.power_loss_qualified, !w.truncated,
+                  w.trail_bytes.value <= 4 * 1024 * 1024, w.bytes_written.value <= w.trail_bytes.value else {
+                throw AtlasSavedError.invalidResponse
+            }
+            let succeeded = w.status == "ok", error = w.error.value
+            guard succeeded == (error == nil), !succeeded ||
+                    w.effect == .fileSyncRequested || w.effect == .fileAndParentSyncRequested else {
+                throw AtlasSavedError.invalidResponse
+            }
+            if let error {
+                guard !error.code.isEmpty, error.code.utf8.count <= 512,
+                      error.code.unicodeScalars.allSatisfy({ $0.value >= 32 && $0.value != 127 }),
+                      !error.next_action.isEmpty, error.next_action.utf8.count <= 4096,
+                      error.next_action.unicodeScalars.allSatisfy({ $0.value >= 32 && $0.value != 127 }) else {
+                    throw AtlasSavedError.invalidResponse
+                }
+            }
+            let digest = w.trail_digest.value, items = w.total_items.value?.value, references = w.reference_bytes.value?.value
+            if w.trail_bytes.value == 0 {
+                guard digest == nil, items == nil, references == nil else { throw AtlasSavedError.invalidResponse }
+            } else {
+                guard let digest, AtlasSavedWire.digest(digest), items == request.totalItems,
+                      references == request.referenceBytes else { throw AtlasSavedError.invalidResponse }
+            }
+            guard w.effect != .none || w.bytes_written.value == 0,
+                  w.effect == .none || (w.trail_bytes.value > 0 && digest != nil),
+                  !w.effect.completeFile || (w.trail_bytes.value > 0 && w.bytes_written.value == w.trail_bytes.value),
+                  w.complete_artifact == w.effect.completeFile, w.attach_eligible == w.complete_artifact,
+                  !succeeded || w.complete_artifact else { throw AtlasSavedError.invalidResponse }
+            return Self(identity: identity, operation: request.operation, destination: w.destination, effect: w.effect,
+                succeeded: succeeded, completeArtifact: w.complete_artifact, trailBytes: w.trail_bytes.value,
+                bytesWritten: w.bytes_written.value, digest: digest, totalItems: items, referenceBytes: references,
+                errorCode: error?.code, nextAction: error?.next_action)
+        } catch let error as AtlasSavedError { throw error }
+        catch { throw AtlasSavedError.invalidResponse }
+    }
+    private static func sameText(_ actual: String?, _ expected: String?) -> Bool {
+        switch (actual, expected) {
+        case (nil, nil): return true
+        case (let actual?, let expected?): return actual.utf8.elementsEqual(expected.utf8)
+        default: return false
+        }
+    }
+    private struct Failure: Decodable { let code, next_action: String }
+    private struct Edit: Decodable {
+        let kind: String
+        let ordinal, destination_ordinal: AtlasSavedSearchOptional<AtlasSavedNumber>
+        let title, rationale: AtlasSavedSearchOptional<String>
+    }
+    private struct Wire: Decodable {
+        let schema, status, command, mode, title: String
+        let operation, last_trail_write_attempt, parent_generation, parent_items: AtlasSavedNumber
+        let destination: AtlasSavedPath
+        let parent_digest: String
+        let edit: Edit
+        let source_verified, source_anchors_unchanged: Bool
+        let member_bytes_read, member_read_calls, trail_bytes, bytes_written: AtlasSavedNumber
+        let trail_digest: AtlasSavedSearchOptional<String>
+        let total_items, reference_bytes: AtlasSavedSearchOptional<AtlasSavedNumber>
+        let effect: AtlasSavedIndexBuildEffect
+        let complete_artifact, attach_eligible: Bool
+        let archive_path_reopened, live_source_reopened, source_payload_embedded, trail_attached: Bool
+        let accepted_trail_unchanged, accepted_query_unchanged, source_derived_sensitive: Bool
+        let encrypted, overwritten, power_loss_qualified, truncated: Bool
+        let error: AtlasSavedSearchOptional<Failure>
+    }
+}
+
+@Observable @MainActor final class AtlasSavedTrailEditDraft: Identifiable {
+    let id = UUID()
+    let parent: AtlasSavedTrailParent
+    let entry: AtlasSavedTrailEntry?
+    let kind: AtlasSavedTrailEditKind
+    var text: String { didSet { revision = UUID() } }
+    var positionInput: String { didSet { revision = UUID() } }
+    private(set) var submission: AtlasSavedTrailEditRequest?
+    private(set) var receipt: AtlasSavedTrailEditReceipt?
+    private var revision = UUID()
+
+    init(page: AtlasSavedTrailPage, entry: AtlasSavedTrailEntry?, kind: AtlasSavedTrailEditKind) throws {
+        if kind == .rename {
+            guard entry == nil else { throw AtlasSavedError.invalidInput }
+        } else {
+            guard let entry, page.items.contains(where: { $0.matches(entry) }) else { throw AtlasSavedError.invalidInput }
+        }
+        parent = AtlasSavedTrailParent(page); self.entry = entry; self.kind = kind
+        text = kind == .rename ? page.title : entry?.rationale ?? ""
+        positionInput = String((entry?.id ?? 0) + 1)
+    }
+    func edit() throws -> AtlasSavedTrailEdit {
+        switch kind {
+        case .rename: return .rename(text)
+        case .rationale:
+            guard let entry else { throw AtlasSavedError.invalidInput }
+            return .rationale(item: entry.id, text: text)
+        case .move:
+            guard let entry, let position = AtlasReaderWire.integer(positionInput), position > 0,
+                  position <= parent.items else { throw AtlasSavedError.invalidInput }
+            return .move(item: entry.id, to: position - 1)
+        case .remove:
+            guard let entry else { throw AtlasSavedError.invalidInput }
+            return .remove(item: entry.id)
+        }
+    }
+    var closeProtectionRevision: UUID? {
+        if let submission, receipt?.operation == submission.operation, receipt?.succeeded == true,
+           let edit = try? edit(), submission.edit.matches(edit) { return nil }
+        return revision
+    }
+    func validation(in model: AtlasSavedRepositoryModel) -> String? {
+        guard model.trailIsCurrent, let current = model.trailPage, parent.matches(current) else {
+            return "The attached trail changed. Your draft is preserved; reopen the editor for the current trail before saving."
+        }
+        guard model.canEditTrail else { return "Keep this saved archive open and wait for the current operation to finish. Your draft is preserved." }
+        if kind == .rename && text.utf8.count > 256 { return "The title exceeds 256 UTF-8 bytes. Your full text remains in this draft." }
+        if kind == .rationale && text.utf8.count > 4096 { return "The rationale exceeds 4,096 UTF-8 bytes. Your full text remains in this draft." }
+        if (try? edit()) == nil { return "Enter the visit's final position from 1 through \(parent.items)." }
+        return nil
+    }
+    func submitted(_ request: AtlasSavedTrailEditRequest) { submission = request; receipt = nil; revision = UUID() }
+    func accept(_ receipt: AtlasSavedTrailEditReceipt?) {
+        guard let receipt, receipt.operation == submission?.operation, receipt.identity == parent.identity else { return }
+        self.receipt = receipt; revision = UUID()
+    }
+}
