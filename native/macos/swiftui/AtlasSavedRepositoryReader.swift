@@ -10,7 +10,7 @@ enum AtlasSavedReaderOrigin: Sendable {
     case expressionHit(generation: UInt64, expression: String, primaryNeedle: String, hit: AtlasSavedHit,
         caseSensitive: Bool = true)
     case structureHit(generation: UInt64, mode: AtlasSavedSearchMode, nameMode: AtlasSearchNameMode,
-        needle: String, hit: AtlasSavedStructureHit)
+        needle: String, hit: AtlasSavedStructureHit, policy: AtlasSavedStructurePolicy = .standard)
     var matchingCaseSensitive: Bool {
         switch self {
         case .hit(_, _, _, let caseSensitive), .expressionHit(_, _, _, _, let caseSensitive): return caseSensitive
@@ -20,7 +20,7 @@ enum AtlasSavedReaderOrigin: Sendable {
     var searchHit: AtlasSavedHit? {
         switch self {
         case .hit(_, _, let hit, _), .expressionHit(_, _, _, let hit, _): return hit
-        case .structureHit(_, _, _, _, let item): return item.hit
+        case .structureHit(_, _, _, _, let item, _): return item.hit
         case .member, .trail, .relationship, .importLink, .pathHit: return nil
         }
     }
@@ -250,10 +250,17 @@ struct AtlasSavedReaderReceipt: Sendable {
                 } else if !(object["selection"] is NSNull) { throw AtlasSavedError.invalidResponse }
                 request = .window(offset: side == .evidence ? link.evidence.contextStart : 0, bytes: 16 * 1024)
                 match = nil
-            case .structureHit(let generation, let mode, let nameMode, let needle, let item):
+            case .structureHit(let generation, let mode, let nameMode, let needle, let item, let policy):
                 let hit = item.hit
                 try item.validate(mode: mode, needle: needle)
-                guard generation > 0, AtlasSavedSearchWire.validNeedle(needle),
+                struct Receipt: Decodable {
+                    let case_sensitive, count_all_matches: Bool?
+                    let name_case: String?
+                }
+                let receipt = try JSONDecoder().decode(Receipt.self, from: data)
+                guard try AtlasSavedStructurePolicy.admit(caseSensitive: receipt.case_sensitive,
+                        countAll: receipt.count_all_matches, nameCase: receipt.name_case, mode: mode) == policy,
+                      generation > 0, AtlasSavedSearchWire.validNeedle(needle),
                       mode != .occurrences || nameMode == .exact,
                       object["selection_namespace"] as? String == "saved-structure",
                       (object["structure_generation"] as? String).flatMap(AtlasReaderWire.integer) == generation,
@@ -555,7 +562,7 @@ final class AtlasSavedReaderReceiptBox: @unchecked Sendable {
             return "Saved search \(generation), occurrence \(hit.id) · \(caseSensitive ? "match case" : "Unicode lowercase matching") · original bytes \(hit.start)..<\(hit.end)"
         case .expressionHit(let generation, _, _, let hit, let caseSensitive):
             return "Saved expression \(generation), occurrence \(hit.id) · \(caseSensitive ? "match case" : "Unicode lowercase matching") · original bytes \(hit.start)..<\(hit.end)"
-        case .structureHit(_, _, _, _, let item):
+        case .structureHit(_, _, _, _, let item, _):
             return "\(item.structure.label) · original bytes \(item.hit.start)..<\(item.hit.end)"
         }
     }

@@ -37,7 +37,7 @@ private final class SavedResultWindowFixture: @unchecked Sendable {
         let omitted: UInt64 = first && scan.namespace == .structure ? 2 : 0
         let continuation = retained + omitted
         let seen: UInt64 = first
-            ? continuation + (scan.namespace != .structure && scan.counting ? 4 : 1)
+            ? continuation + (scan.counting ? 4 : 1)
             : scan.offset + retained
         let end = min(retained, start + limit)
         precondition(start <= retained)
@@ -67,7 +67,7 @@ private final class SavedResultWindowFixture: @unchecked Sendable {
         out["next_match_offset"] = first ? String(continuation) as Any : NSNull()
         out["matches_seen_exact"] = false
         if scan.namespace == .structure {
-            out["state"] = first ? "truncated" : "complete"
+            out["state"] = first && !scan.counting ? "truncated" : "complete"
             out["truncated"] = first; out["complete"] = false
             out["metadata_omitted"] = String(omitted)
             if first { out["metadata_bytes"] = "1048576" }
@@ -150,15 +150,15 @@ private final class SavedResultWindowFixture: @unchecked Sendable {
                     mode: nil, nameMode: nil), request: .matchingExpressionSearch(generation: generation,
                         query: query, caseSensitive: matching, countAllMatches: counting,
                         matches: maximum, scanBytes: bytes), upstream: upstream)
-            case .structureSearch(let generation, let mode, let nameMode, let query, let maximum, let bytes):
+            case .structureSearch(let generation, let mode, let nameMode, let query, let maximum, let bytes, let policy):
                 return search(owner, scan: Scan(namespace: .structure, generation: generation, offset: 0,
-                    maximum: maximum, bytes: bytes, query: query, matching: true, counting: false,
+                    maximum: maximum, bytes: bytes, query: query, matching: policy.caseSensitive, counting: policy.countAllMatches,
                     mode: mode, nameMode: nameMode), request: request, upstream: upstream)
-            case .structureWindow(let generation, let mode, let nameMode, let query, let maximum, let bytes, let offset):
+            case .structureWindow(let generation, let mode, let nameMode, let query, let maximum, let bytes, let offset, let policy):
                 return search(owner, scan: Scan(namespace: .structure, generation: generation, offset: offset,
-                    maximum: maximum, bytes: bytes, query: query, matching: true, counting: false,
+                    maximum: maximum, bytes: bytes, query: query, matching: policy.caseSensitive, counting: policy.countAllMatches,
                     mode: mode, nameMode: nameMode), request: .structureSearch(generation: generation,
-                        mode: mode, nameMode: nameMode, query: query, matches: maximum, sourceBytes: bytes),
+                        mode: mode, nameMode: nameMode, query: query, matches: maximum, sourceBytes: bytes, policy: policy),
                     upstream: upstream)
             case .results(let generation, let start, let limit):
                 return results(owner, namespace: .literal, generation: generation, start: start, limit: limit,
@@ -316,6 +316,7 @@ enum AtlasSavedResultWindowTests {
         await wait("first occurrence window did not finish") { !model.busy }
         let firstStructure = model.structurePage!
         precondition(firstStructure.nameMode == .exact && firstStructure.metadataOmitted == 2)
+        precondition(firstStructure.policy.caseSensitive && firstStructure.policy.countAllMatches && firstStructure.seen == 4102)
         precondition(firstStructure.window.next == 4098,
             "A continuation must include qualified names omitted from retained metadata")
         model.searchInput += "x"
@@ -329,7 +330,7 @@ enum AtlasSavedResultWindowTests {
         precondition(structure.retained == 2 && structure.window.next == nil && structure.metadataOmitted == 0)
         precondition(structureCall.mode == .occurrences && structureCall.nameMode == .exact
             && structureCall.query == firstStructure.needle && structureCall.bytes == firstStructure.sourceLimit
-            && structureCall.offset == 4098)
+            && structureCall.offset == 4098 && structureCall.matching && structureCall.counting)
         precondition(model.queryGeneration == literalGeneration && model.expressionGeneration == 2)
         precondition(f.metadataCalls.last == "structure:2:0" && f.calls.count == 5)
         let structuralReader = try await model.openStructureHit(structure.hits[1], from: structure,

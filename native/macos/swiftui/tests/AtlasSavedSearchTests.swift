@@ -387,7 +387,7 @@ import Dispatch
             start: 0, limit: 64, resultOffset: 4096)
         precondition(!structureTail.truncated && structureTail.seen == 4098 && structureTail.window.skipped == 4096)
         var omitted = window(structural, offset: 4096, skipped: 4096, seen: 4102, more: true, next: 4101)
-        omitted["metadata_omitted"] = "3"; omitted["state"] = "truncated"; omitted["truncated"] = true
+        omitted["max_hits"] = "2"; omitted["metadata_omitted"] = "3"; omitted["state"] = "truncated"; omitted["truncated"] = true
         let omittedTail = try AtlasSavedStructurePage.decode(f.encode(omitted), identity: structureIdentity,
             generation: 1, mode: .occurrences, nameMode: .exact, needle: f.occurrenceNeedle,
             start: 0, limit: 64, resultOffset: 4096)
@@ -1231,13 +1231,45 @@ import Dispatch
         }
 
         var truncated = f.structurePage(40, generation: 1)
-        truncated["state"] = "truncated"; truncated["truncated"] = true; truncated["matches_seen"] = "2"
+        truncated["max_hits"] = "1"; truncated["state"] = "truncated"; truncated["truncated"] = true; truncated["matches_seen"] = "2"
         let capped = try decode(truncated)
         precondition(capped.truncated)
         var omitted = f.structurePage(40, generation: 1)
         omitted["metadata_omitted"] = "1"; omitted["matches_seen"] = "2"
         let boundedMetadata = try decode(omitted)
         precondition(boundedMetadata.metadataOmitted == 1)
+
+        var counted = truncated
+        counted["count_all_matches"] = true; counted["case_sensitive"] = false; counted["name_case"] = "unicode-lowercase"
+        counted["state"] = "complete"; counted["matches_seen"] = "8"; counted["metadata_omitted"] = "2"
+        counted["members_total"] = "2"; counted["captured_members"] = "2"; counted["members_visited"] = "2"
+        counted["members_loaded"] = "2"; counted["files_searched"] = "2"; counted["member_read_calls"] = "2"
+        counted["unavailable_files"] = "0"; counted["unsupported_files"] = "0"; counted["matches_seen_exact"] = true
+        let fullIdentity = try JSONDecoder().decode(AtlasSavedIdentity.self, from: Data(f.encode(counted).utf8))
+        func countedPage() throws -> AtlasSavedStructurePage {
+            try AtlasSavedStructurePage.decode(f.encode(counted), identity: fullIdentity, generation: 1,
+                mode: .symbols, nameMode: .contains, needle: "banana", start: 0, limit: 64,
+                policy: .init(caseSensitive: false, countAllMatches: true))
+        }
+        let exact = try countedPage()
+        precondition(exact.matchesSeenExact && !exact.complete && exact.truncated && exact.window.next == 3)
+        precondition(exact.policy == .init(caseSensitive: false, countAllMatches: true))
+        counted["metadata_omitted"] = "0"; counted["complete"] = true
+        let navigable = try countedPage()
+        precondition(navigable.complete && navigable.truncated && navigable.window.next == 1)
+        counted["max_hits"] = "0"; counted["retained_hits"] = "0"; counted["hits"] = [[String: Any]]()
+        counted["result_offset"] = "0"; counted["skipped_matches"] = "0"; counted["has_more_matches"] = false
+        counted["next_match_offset"] = NSNull()
+        let total = try countedPage()
+        precondition(total.matchesSeenExact && total.seen == 8 && total.window.next == nil)
+        counted["has_more_matches"] = true; counted["next_match_offset"] = "0"
+        rejected("count-only structural result offers a nonprogressing continuation") { _ = try countedPage() }
+        var legacy = f.structurePage(40, generation: 1)
+        legacy.removeValue(forKey: "case_sensitive"); legacy.removeValue(forKey: "count_all_matches")
+        let legacyPage = try decode(legacy)
+        precondition(legacyPage.policy == .standard)
+        legacy["case_sensitive"] = true
+        rejected("partial structural policy receipt accepted") { _ = try decode(legacy) }
         var zero = f.structurePage(40, generation: 1)
         zero["state"] = "work-limit"; zero["max_source_bytes"] = "0"
         zero["members_visited"] = "2"; zero["unsupported_files"] = "1"; zero["unavailable_files"] = "0"
@@ -1423,13 +1455,21 @@ import Dispatch
         await refused("editing name matching left structural rows actionable") {
             _ = try await model.openStructureHit(symbols.hits[0], from: symbols, readerTransport: f.readerTransport())
         }
-        model.searchMode = .headings; model.searchNameMode = .contains; model.searchInput = "Café"
+        model.searchMode = .headings; model.searchNameMode = .contains; model.searchInput = "CAFÉ"
+        model.searchCaseSensitive = false; model.countAllMatches = true
         await refused("a heading draft authorized stale symbol results") {
             _ = try await model.openStructureHit(symbols.hits[0], from: symbols, readerTransport: f.readerTransport())
         }
         model.search(); await wait("heading query did not finish") { !model.busy }
         let headings = model.structurePage!
         precondition(headings.generation == 2 && headings.hits[0].structure.headingSlug == "caf-details")
+        precondition(headings.policy == .init(caseSensitive: false, countAllMatches: true))
+        model.searchCaseSensitive = true; precondition(!model.structureIsCurrent); model.searchCaseSensitive = false
+        model.countAllMatches = false; precondition(!model.structureIsCurrent); model.countAllMatches = true
+        f.corruptNext("structure-count")
+        await refused("changed structural count policy authorized a reader") {
+            _ = try await model.openStructureHit(headings.hits[0], from: headings, readerTransport: f.readerTransport())
+        }
         let headingReader = try await model.openStructureHit(headings.hits[0], from: headings, readerTransport: f.readerTransport())
         precondition(headingReader.match?.start == 207 && headingReader.match?.end == 223)
         precondition(headingReader.match?.originalHex == f.hex(f.headingBytes[207..<223]))

@@ -767,9 +767,10 @@ enum AtlasSavedRequest: Sendable {
     case clearExpression(generation: UInt64)
     case openExpressionHit(reader: UInt64, generation: UInt64, hit: UInt64)
     case structureSearch(generation: UInt64, mode: AtlasSavedSearchMode, nameMode: AtlasSearchNameMode,
-        query: String, matches: UInt64, sourceBytes: UInt64)
+        query: String, matches: UInt64, sourceBytes: UInt64, policy: AtlasSavedStructurePolicy = .standard)
     case structureWindow(generation: UInt64, mode: AtlasSavedSearchMode, nameMode: AtlasSearchNameMode,
-        query: String, matches: UInt64, sourceBytes: UInt64, skipMatches: UInt64)
+        query: String, matches: UInt64, sourceBytes: UInt64, skipMatches: UInt64,
+        policy: AtlasSavedStructurePolicy = .standard)
     case structureResults(generation: UInt64, start: UInt64, limit: UInt64)
     case clearStructure(generation: UInt64)
     case openStructureHit(reader: UInt64, generation: UInt64, hit: UInt64)

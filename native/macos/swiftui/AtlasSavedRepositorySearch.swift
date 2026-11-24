@@ -38,6 +38,24 @@ enum AtlasSavedSearchWire {
     }
 }
 
+struct AtlasSavedStructurePolicy: Equatable, Sendable {
+    let caseSensitive, countAllMatches: Bool
+    static let standard = Self(caseSensitive: true, countAllMatches: false)
+
+    /// Older pages carry only name_case; older reader receipts omit it.
+    static func admit(caseSensitive: Bool?, countAll: Bool?, nameCase: String?, mode: AtlasSavedSearchMode) throws -> Self {
+        let policy = Self(caseSensitive: caseSensitive ?? true, countAllMatches: countAll ?? false)
+        guard (caseSensitive == nil) == (countAll == nil),
+              mode != .occurrences || policy.caseSensitive else { throw AtlasSavedError.invalidResponse }
+        if caseSensitive != nil || nameCase != nil {
+            guard nameCase == (policy.caseSensitive ? "sensitive" : "unicode-lowercase") else {
+                throw AtlasSavedError.invalidResponse
+            }
+        }
+        return policy
+    }
+}
+
 /// Exhaustive occurrence totals and retained navigation rows are independent.
 /// New receipts must carry their entire count policy; legacy receipts retain
 /// the old one-omitted-match lower bound and cannot satisfy a count request.
@@ -108,7 +126,7 @@ struct AtlasSavedResultWindow: Equatable, Sendable {
     let next: UInt64?
 
     static func decode(_ data: Data, expected: UInt64?, seen: UInt64, retained: UInt64,
-        omitted: UInt64 = 0, legacyMore: Bool) throws -> Self {
+        omitted: UInt64 = 0, legacyMore: Bool, permitsContinuation: Bool = true) throws -> Self {
         let raw = try JSONDecoder().decode(Wire.self, from: data)
         let offset = raw.offset ?? 0
         let skipped = raw.skipped ?? 0
@@ -120,7 +138,7 @@ struct AtlasSavedResultWindow: Equatable, Sendable {
         let end = skipped + retained + omitted
         let more = raw.more ?? legacyMore
         let next = raw.offset == nil ? (more ? end : nil) : raw.next
-        guard more == (seen > end), next == (more ? end : nil) else {
+        guard more == (permitsContinuation && seen > end), next == (more ? end : nil) else {
             throw AtlasSavedError.invalidResponse
         }
         return Self(offset: offset, skipped: skipped, hasMore: more, next: next)
@@ -278,7 +296,8 @@ struct AtlasSavedStructurePage: Sendable {
     let start: UInt64
     let next: UInt64?
     let state: String
-    let complete, truncated: Bool
+    let complete, truncated, matchesSeenExact: Bool
+    let policy: AtlasSavedStructurePolicy
     let retained, seen, visited, loaded, searched, unavailable, unsupported: UInt64
     let sourceLimited, extractionLimited, metadataOmitted, sourceBytes, sourceLimit, metadataBytes: UInt64
     let window: AtlasSavedResultWindow
@@ -286,7 +305,7 @@ struct AtlasSavedStructurePage: Sendable {
     static func decode(_ json: String?, identity: AtlasSavedIdentity, generation: UInt64,
         mode expectedMode: AtlasSavedSearchMode?, nameMode expectedName: AtlasSearchNameMode?,
         needle expectedNeedle: String?, start: UInt64, limit: UInt64,
-        resultOffset expectedOffset: UInt64? = nil) throws -> Self {
+        resultOffset expectedOffset: UInt64? = nil, policy expectedPolicy: AtlasSavedStructurePolicy? = nil) throws -> Self {
         let data = try AtlasSavedWire.admit(json, handle: identity.owner, command: "structure", identity: identity)
         do {
             let w = try JSONDecoder().decode(Wire.self, from: data)
@@ -297,13 +316,16 @@ struct AtlasSavedStructurePage: Sendable {
                   generation > 0, w.structure_generation.value == generation,
                   w.selection_namespace == "saved-structure", w.mode == engine.wireMode,
                   w.realized_mode == engine.evidence, w.evidence_level == engine.evidence,
-                  !w.semantic_complete, w.name_case == "sensitive", w.scope == "whole-saved-archive",
+                  !w.semantic_complete, w.scope == "whole-saved-archive",
                   w.completeness_basis == "admitted-extraction-processing", !w.index_used,
                   w.index_policy == "direct-verified-member-extraction",
                   AtlasSavedSearchWire.validNeedle(w.needle),
                   expectedNeedle == nil || w.needle.utf8.elementsEqual(expectedNeedle!.utf8) else {
                 throw AtlasSavedError.invalidResponse
             }
+            let policy = try AtlasSavedStructurePolicy.admit(caseSensitive: w.case_sensitive, countAll: w.count_all_matches,
+                nameCase: w.name_case, mode: mode)
+            guard expectedPolicy.map({ $0 == policy }) ?? true else { throw AtlasSavedError.invalidResponse }
             if mode == .occurrences {
                 guard w.includes_comments_and_literals == true, w.compiler_resolved == false,
                       w.token_policy == "ascii-alphanumeric-underscore-dollar-plus-nonascii-nonwhitespace-noncontrol-v1",
@@ -313,27 +335,32 @@ struct AtlasSavedStructurePage: Sendable {
             }
             let retained = w.retained_hits.value, omitted = w.metadata_omitted.value
             let window = try AtlasSavedResultWindow.decode(data, expected: expectedOffset,
-                seen: w.matches_seen.value, retained: retained, omitted: omitted, legacyMore: w.truncated)
+                seen: w.matches_seen.value, retained: retained, omitted: omitted, legacyMore: w.truncated && w.max_hits.value > 0,
+                permitsContinuation: w.max_hits.value > 0)
             let visited = w.members_visited.value, loaded = w.members_loaded.value
             let searched = w.files_searched.value, unavailable = w.unavailable_files.value
             let unsupported = w.unsupported_files.value, limited = w.source_limited_files.value
             let extractionLimited = w.extraction_limited_files.value
             let bytes = w.loaded_bytes.value, calls = w.member_read_calls.value
+            let coverage = w.state == "complete" && identity.discoveryComplete && unavailable == 0 &&
+                unsupported == 0 && limited == 0 && extractionLimited == 0
+            // Legacy producers treated omitted row metadata as an inexact count.
+            let expectedExact = w.case_sensitive == nil ? coverage && omitted == 0 : coverage
             guard ["complete", "truncated", "work-limit"].contains(w.state),
                   w.max_hits.value <= AtlasSavedSearchWire.maximumHits, retained <= w.max_hits.value,
                   w.max_source_bytes.value <= AtlasSavedSearchWire.maximumSourceBytes, bytes <= w.max_source_bytes.value,
-                  w.truncated == (w.state == "truncated"), omitted <= identity.members * 4096,
-                  window.hasMore == w.truncated,
-                  w.matches_seen.value - window.skipped == retained + omitted + (w.truncated ? 1 : 0),
+                  omitted <= identity.members * 4096,
+                  w.truncated == (w.matches_seen.value - window.skipped > retained + omitted),
+                  !w.truncated || retained == w.max_hits.value,
+                  (w.state == "truncated") == (w.truncated && !policy.countAllMatches),
+                  policy.countAllMatches || w.matches_seen.value - window.skipped == retained + omitted + (w.truncated ? 1 : 0),
                   visited <= identity.members, loaded <= visited, loaded <= identity.captured,
                   searched <= loaded, unavailable <= visited, unavailable <= identity.members - identity.captured,
                   unsupported <= visited - unavailable, limited <= visited - unavailable - unsupported,
                   searched <= visited - unavailable - unsupported - limited,
                   extractionLimited <= loaded,
                   w.state != "complete" || visited == identity.members,
-                  w.complete == (w.state == "complete" && identity.discoveryComplete && unavailable == 0 &&
-                    unsupported == 0 && limited == 0 && extractionLimited == 0 && omitted == 0),
-                  w.matches_seen_exact == w.complete,
+                  w.matches_seen_exact == expectedExact, w.complete == (coverage && omitted == 0),
                   w.member_bytes_read.value == bytes,
                   w.peak_source_bytes.value <= engine.structureFileByteLimit, w.peak_source_bytes.value <= bytes,
                   (bytes == 0 && calls == 0) || (bytes > 0 && calls > 0), calls <= loaded * 1_048_576,
@@ -366,7 +393,7 @@ struct AtlasSavedStructurePage: Sendable {
             }
             return Self(identity: identity, generation: generation, needle: w.needle, mode: mode, nameMode: nameMode,
                 hits: w.hits.values, start: start, next: next, state: w.state, complete: w.complete, truncated: w.truncated,
-                retained: retained, seen: w.matches_seen.value, visited: visited, loaded: loaded, searched: searched,
+                matchesSeenExact: w.matches_seen_exact, policy: policy, retained: retained, seen: w.matches_seen.value, visited: visited, loaded: loaded, searched: searched,
                 unavailable: unavailable, unsupported: unsupported, sourceLimited: limited, extractionLimited: extractionLimited,
                 metadataOmitted: omitted, sourceBytes: bytes, sourceLimit: w.max_source_bytes.value, metadataBytes: w.metadata_bytes.value,
                 window: window)
@@ -407,6 +434,7 @@ struct AtlasSavedStructurePage: Sendable {
     private struct Wire: Decodable {
         let selection_namespace, needle, mode, requested_mode, realized_mode, evidence_level, name_case, name_mode: String
         let scope, completeness_basis, state, index_policy: String
+        let case_sensitive, count_all_matches: Bool?
         let includes_comments_and_literals, compiler_resolved: Bool?
         let token_policy, name_syntax, unicode_normalization: String?
         let semantic_complete, index_used, complete, matches_seen_exact, truncated: Bool

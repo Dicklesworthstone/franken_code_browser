@@ -601,14 +601,24 @@ member names are labels and never open working-tree paths.
 
 | Mode | Matching and evidence | Per-member source limit |
 | --- | --- | --- |
-| Symbols | Case-sensitive exact, prefix, or contains matching against shared outline names, including qualified names. Rust, Python, JavaScript, TypeScript, Go, C/C++, Swift, Java and C# declarations are heuristic candidates. | 64 KiB |
-| Headings | Case-sensitive exact, prefix, or contains matching against FrankenMarkdown heading titles. Results retain duplicate-aware slugs and qualified original source ranges. | 256 KiB |
+| Symbols | Exact, prefix, or contains matching against shared outline names, including qualified names. Rust, Python, JavaScript, TypeScript, Go, C/C++, Swift, Java and C# declarations are heuristic candidates. | 64 KiB |
+| Headings | Exact, prefix, or contains matching against FrankenMarkdown heading titles. Results retain duplicate-aware slugs and qualified original source ranges. | 256 KiB |
 | Occurrences | One exact identifier token, including spelling matches in declarations, comments and string literals. Supported UTF-8 and BOM-marked UTF-16 keep their original byte coordinates. | 512 KiB |
 
 These evidence levels remain visible in each result. Symbols and occurrences do
 not claim compiler binding or a call graph. Search preserves Unicode spelling
 without normalization. Each request accepts up to 1,024 UTF-8 query bytes,
 retains up to 4,096 results, and reads at most 64 MiB of aggregate member source.
+
+**Match case** controls symbol and heading searches. Turn it off for Unicode
+lowercase matching. The result keeps its original spelling and source range.
+Occurrences always use the exact token spelling.
+
+**Count all matches** keeps scanning after the window fills, within the same
+source and extraction limits. The result shows an exact total when coverage is
+complete and a lower bound otherwise. Omitted row metadata can prevent opening
+a result even when its match was counted. **Later matches** starts at the first
+candidate beyond the retained window.
 
 The coverage summary distinguishes unsupported language or decoding,
 unavailable captures, per-member source limits, extractor limits, omitted
@@ -626,7 +636,7 @@ selection witness; larger targets open a bounded 16 KiB context window and
 retain their full target range for navigation. Opened readers keep their own
 capture after the archive closes, and can be pinned or kept in the Reading Desk.
 
-Editing the query, mode or name-matching option disables actions on earlier
+Editing the query, mode, matching options or count policy disables actions on earlier
 rows. **Use accepted query** restores their exact accepted inputs. Pagination
 and **Reload results** read retained metadata without repeating extraction.
 Failed or canceled replacements preserve the previous accepted structural

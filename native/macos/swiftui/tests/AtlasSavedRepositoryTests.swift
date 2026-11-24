@@ -35,6 +35,7 @@ final class SavedRepositoryFixture: @unchecked Sendable {
         var structureGeneration: UInt64?
         var structureMode: AtlasSavedSearchMode?
         var structureNameMode: AtlasSearchNameMode?
+        var structurePolicy = AtlasSavedStructurePolicy.standard
         var structureNeedle: String?
         var structureAttempt: UInt64 = 0
         var indexGeneration: UInt64?
@@ -380,7 +381,7 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             guard searchVectors, needle == "banana" || needle == "crate::banana" else { return [] }
             return [QueryHit(member: 1, start: 202, end: 208)]
         case .headings:
-            guard headingVectors, needle == (longHeading ? "A" : "Café") else { return [] }
+            guard headingVectors, (needle == (longHeading ? "A" : "Café") || (!longHeading && needle == "CAFÉ")) else { return [] }
             return [QueryHit(member: 3, start: longHeading ? 0 : 207, end: longHeading ? 3003 : 223)]
         case .occurrences:
             guard searchVectors, needle.utf8.elementsEqual(occurrenceNeedle.utf8) else { return [] }
@@ -415,7 +416,7 @@ final class SavedRepositoryFixture: @unchecked Sendable {
     }
     func structurePage(_ owner: UInt64, generation: UInt64, mode: AtlasSavedSearchMode = .symbols,
         nameMode: AtlasSearchNameMode = .contains, needle: String = "banana", start: UInt64 = 0,
-        limit: UInt64 = 64) -> [String: Any] {
+        limit: UInt64 = 64, policy: AtlasSavedStructurePolicy = .standard) -> [String: Any] {
         let hits = structureHits(mode, needle: needle), end = min(UInt64(hits.count), start + limit)
         let indices: [Int] = mode == .symbols ? [1] : (mode == .headings ? [0, 2, 3] : [0, 1, 2, 3])
         let bytes = indices.compactMap { members[$0].bytes }.reduce(0) { $0 + $1.count }
@@ -430,7 +431,8 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             "selection_namespace": "saved-structure", "structure_generation": String(generation),
             "needle": needle, "mode": mode.structure!.wireMode, "requested_mode": mode.rawValue,
             "realized_mode": mode.structure!.evidence, "evidence_level": mode.structure!.evidence,
-            "semantic_complete": false, "name_case": "sensitive", "name_mode": nameMode.rawValue,
+            "semantic_complete": false, "name_case": policy.caseSensitive ? "sensitive" : "unicode-lowercase",
+            "case_sensitive": policy.caseSensitive, "count_all_matches": policy.countAllMatches, "name_mode": nameMode.rawValue,
             "scope": "whole-saved-archive", "completeness_basis": "admitted-extraction-processing",
             "index_used": false, "index_policy": "direct-verified-member-extraction",
             "state": "complete", "complete": false, "matches_seen_exact": false, "truncated": false,
@@ -567,6 +569,8 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             out["command"] = "structure-open-reader"; out["selection_namespace"] = "saved-structure"
             out["structure_generation"] = String(structure); out["needle"] = needle
             out["requested_mode"] = mode.rawValue; out["name_mode"] = nameMode.rawValue
+            out["case_sensitive"] = session.structurePolicy.caseSensitive; out["count_all_matches"] = session.structurePolicy.countAllMatches
+            out["name_case"] = session.structurePolicy.caseSensitive ? "sensitive" : "unicode-lowercase"
             out["structure"] = structureObject(mode, hit: hit)
             out["selection"] = ["structure_generation": String(structure), "hit_id": String(hitID),
                 "domain": "original-source-bytes", "original_range": ["start": String(hit.start), "end": String(hit.end)],
@@ -608,6 +612,7 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             case "inherited-query": nested["accepted_query_generation"] = "1"
             case "many-read-calls": out["member_read_calls"] = "1024" // Interrupted reads can exceed source length.
             case "page-bytes": wrongPage.insert(reader)
+            case "structure-count": out["count_all_matches"] = !(out["count_all_matches"] as! Bool)
             case "structure-namespace": out["selection_namespace"] = "saved-expression"
             case "structure-generation": out["structure_generation"] = String((structure ?? 0) + 1)
             case "structure-mode": out["requested_mode"] = "symbols"
@@ -890,7 +895,7 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                     log.append("expression-open:\(handle):\(generation):\(id)")
                     return handoff(handle, reader: reader, ordinal: hits[Int(id - 1)].member,
                         generation: nil, link: nil, side: nil, hitID: id, expression: generation)
-                case .structureSearch(let generation, let mode, let nameMode, let needle, let matches, let bytes):
+                case .structureSearch(let generation, let mode, let nameMode, let needle, let matches, let bytes, let policy):
                     precondition(matches == 4096 && bytes == AtlasSavedSearchWire.maximumSourceBytes)
                     precondition(mode != .occurrences || nameMode == .exact)
                     log.append("structure:\(handle):\(generation):\(mode.rawValue):\(nameMode.rawValue):\(needle)")
@@ -902,8 +907,8 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                             "error": ["code": "REFERENCE_INVALID_NAME"]])
                     }
                     session.structureGeneration = generation; session.structureMode = mode
-                    session.structureNameMode = nameMode; session.structureNeedle = needle
-                    let page = structurePage(handle, generation: generation, mode: mode, nameMode: nameMode, needle: needle)
+                    session.structureNameMode = nameMode; session.structureNeedle = needle; session.structurePolicy = policy
+                    let page = structurePage(handle, generation: generation, mode: mode, nameMode: nameMode, needle: needle, policy: policy)
                     session.readBytes += UInt64(page["member_bytes_read"] as! String)!
                     session.readCalls += UInt64(page["member_read_calls"] as! String)!
                     sessions[handle] = session
@@ -916,7 +921,7 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                           let needle = session.structureNeedle else { return nil }
                     if fault == "structure-results" { fault = nil; return nil }
                     var page = structurePage(handle, generation: generation, mode: mode, nameMode: nameMode,
-                        needle: needle, start: start, limit: limit)
+                        needle: needle, start: start, limit: limit, policy: session.structurePolicy)
                     if fault == "structure-results-mode" { fault = nil; page["requested_mode"] = "symbols" }
                     return encode(page)
                 case .clearStructure(let generation):

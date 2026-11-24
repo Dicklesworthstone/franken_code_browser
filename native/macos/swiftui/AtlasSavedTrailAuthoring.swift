@@ -231,7 +231,7 @@ struct AtlasSavedTrailPreset: Identifiable {
             initialRationale = entry.rationale
         } else if case .importLink(_, let link, .evidence) = source.origin {
             try add("import", "Import statement", link.evidence.start, link.evidence.end)
-        } else if case .structureHit(_, _, _, _, let item) = source.origin {
+        } else if case .structureHit(_, _, _, _, let item, _) = source.origin {
             try add("saved-structure", "Saved declaration", item.hit.start, item.hit.end)
         }
         try add("page", "Current source page", page.start, page.end)

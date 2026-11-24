@@ -30,11 +30,12 @@ import Foundation
 @_silgen_name("fcb_saved_expression_results") private func savedExpressionResults(_ h: UInt64, _ generation: UInt64, _ start: UInt64, _ limit: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_clear_expression") private func savedClearExpression(_ h: UInt64, _ generation: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_open_expression_hit_reader") private func savedExpressionReader(_ h: UInt64, _ reader: UInt64, _ generation: UInt64, _ hit: UInt64) -> UnsafeMutablePointer<CChar>?
-@_silgen_name("fcb_saved_structure_search") private func savedStructureSearch(_ h: UInt64, _ generation: UInt64,
-    _ mode: UInt64, _ nameMode: UInt64, _ query: UnsafePointer<CChar>?, _ matches: UInt64, _ sourceBytes: UInt64) -> UnsafeMutablePointer<CChar>?
-@_silgen_name("fcb_saved_structure_search_page") private func savedStructureWindow(_ h: UInt64, _ generation: UInt64,
-    _ mode: UInt64, _ nameMode: UInt64, _ query: UnsafePointer<CChar>?,
-    _ matches: UInt64, _ sourceBytes: UInt64, _ skipMatches: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_structure_search_matching") private func savedStructureSearch(_ h: UInt64, _ generation: UInt64,
+    _ mode: UInt64, _ nameMode: UInt64, _ query: UnsafePointer<CChar>?, _ caseSensitive: UInt64,
+    _ countAllMatches: UInt64, _ matches: UInt64, _ sourceBytes: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_structure_search_matching_page") private func savedStructureWindow(_ h: UInt64, _ generation: UInt64,
+    _ mode: UInt64, _ nameMode: UInt64, _ query: UnsafePointer<CChar>?, _ caseSensitive: UInt64,
+    _ countAllMatches: UInt64, _ matches: UInt64, _ sourceBytes: UInt64, _ skipMatches: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_structure_results") private func savedStructureResults(_ h: UInt64, _ generation: UInt64, _ start: UInt64, _ limit: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_clear_structure") private func savedClearStructure(_ h: UInt64, _ generation: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_open_structure_hit_reader") private func savedStructureReader(_ h: UInt64, _ reader: UInt64, _ generation: UInt64, _ hit: UInt64) -> UnsafeMutablePointer<CChar>?
@@ -141,19 +142,20 @@ extension AtlasSavedTransport {
         case .clearExpression(let generation): return take(savedClearExpression(handle, generation))
         case .openExpressionHit(let reader, let generation, let hit):
             return take(savedExpressionReader(handle, reader, generation, hit))
-        case .structureSearch(let generation, let mode, let nameMode, let query, let matches, let bytes):
+        case .structureSearch(let generation, let mode, let nameMode, let query, let matches, let bytes, let policy):
             guard generation > 0, let structure = mode.structure, AtlasSavedSearchWire.validNeedle(query),
-                  mode != .occurrences || nameMode == .exact,
+                  mode != .occurrences || (nameMode == .exact && policy.caseSensitive),
                   (1...AtlasSavedSearchWire.maximumHits).contains(matches),
                   bytes <= AtlasSavedSearchWire.maximumSourceBytes else { return nil }
-            return query.withCString { take(savedStructureSearch(handle, generation, structure.code, nameMode.code, $0, matches, bytes)) }
-        case .structureWindow(let generation, let mode, let nameMode, let query, let matches, let bytes, let skipped):
+            return query.withCString { take(savedStructureSearch(handle, generation, structure.code, nameMode.code,
+                $0, policy.caseSensitive ? 1 : 0, policy.countAllMatches ? 1 : 0, matches, bytes)) }
+        case .structureWindow(let generation, let mode, let nameMode, let query, let matches, let bytes, let skipped, let policy):
             guard generation > 0, let structure = mode.structure, AtlasSavedSearchWire.validNeedle(query),
-                  mode != .occurrences || nameMode == .exact,
+                  mode != .occurrences || (nameMode == .exact && policy.caseSensitive),
                   (1...AtlasSavedSearchWire.maximumHits).contains(matches),
                   bytes <= AtlasSavedSearchWire.maximumSourceBytes else { return nil }
             return query.withCString { take(savedStructureWindow(handle, generation, structure.code, nameMode.code,
-                $0, matches, bytes, skipped)) }
+                $0, policy.caseSensitive ? 1 : 0, policy.countAllMatches ? 1 : 0, matches, bytes, skipped)) }
         case .structureResults(let generation, let start, let limit):
             return take(savedStructureResults(handle, generation, start, limit))
         case .clearStructure(let generation): return take(savedClearStructure(handle, generation))

@@ -177,7 +177,8 @@ extension AtlasReaderTransport {
             .expressionWindow(generation: generation, query: "e\u{301} path:src/", caseSensitive: true,
                 countAllMatches: false, matches: 4096, scanBytes: 67_108_864, skipMatches: UInt64.max),
             .structureWindow(generation: generation, mode: .occurrences, nameMode: .exact, query: "e\u{301}",
-                matches: 4096, sourceBytes: 67_108_864, skipMatches: 9_007_199_254_740_993)
+                matches: 4096, sourceBytes: 67_108_864, skipMatches: 9_007_199_254_740_993,
+                policy: .init(caseSensitive: true, countAllMatches: true))
         ]
         for request in windows { precondition(transport.run(owner, request) == "{}") }
         precondition((21...23).allSatisfy { count(UInt64($0)) == 1 } && count(6) == 51)
@@ -194,6 +195,8 @@ extension AtlasReaderTransport {
                 matches: 4096, sourceBytes: 1, skipMatches: 0),
             .structureWindow(generation: generation, mode: .occurrences, nameMode: .contains, query: "a",
                 matches: 4096, sourceBytes: 1, skipMatches: 0),
+            .structureWindow(generation: generation, mode: .occurrences, nameMode: .exact, query: "a",
+                matches: 1, sourceBytes: 1, skipMatches: 0, policy: .init(caseSensitive: false, countAllMatches: true)),
             .structureWindow(generation: generation, mode: .symbols, nameMode: .exact, query: "a",
                 matches: 0, sourceBytes: 1, skipMatches: 0),
             .structureWindow(generation: generation, mode: .headings, nameMode: .exact, query: "a",
@@ -208,6 +211,11 @@ extension AtlasReaderTransport {
         }
         precondition((21...23).allSatisfy { count(UInt64($0)) == 5 } && count(6) == 60,
             "saved result-window ownership leaked or double-freed")
+        mode(0)
+        precondition(transport.run(owner, .structureSearch(generation: generation, mode: .headings, nameMode: .contains,
+            query: "CAFÉ", matches: 4096, sourceBytes: 67_108_864,
+            policy: .init(caseSensitive: false, countAllMatches: true))) == "{}")
+        precondition(count(24) == 1 && count(6) == 61)
         print("AtlasSavedIndexBridgeTests: public-header signatures, publication/import/path/matching/window requests, native bytes, full-width IDs and offsets, and buffer ownership passed")
     }
 }

@@ -816,9 +816,13 @@ private final class AtlasSavedTrailArchiveAccess {
                     Picker("Name matching", selection: $model.searchNameMode) {
                         ForEach(AtlasSearchNameMode.allCases) { Text($0.label).tag($0) }
                     }.frame(maxWidth: 270).disabled(!model.canOperate)
-                } else { Text("One exact identifier token").font(.caption) }
+                    Toggle("Match case", isOn: $model.searchCaseSensitive).toggleStyle(.checkbox)
+                        .disabled(!model.canOperate)
+                } else { Text("One exact, case-sensitive identifier token").font(.caption) }
+                Toggle("Count all matches", isOn: $model.countAllMatches).toggleStyle(.checkbox)
+                    .disabled(!model.canOperate)
+                    .help("Continue counting after the retained result window fills, within the source limits.")
                 Spacer()
-                Text("Case sensitive · entire saved archive").font(.caption).foregroundStyle(.secondary)
                 Button("Reload results") { panelNotice = ""; model.reloadSearchResults() }
                     .controlSize(.small).disabled(!model.canOperate)
             }
@@ -829,16 +833,18 @@ private final class AtlasSavedTrailArchiveAccess {
             }
             if let page = model.structurePage {
                 VStack(alignment: .leading, spacing: 5) {
-                    Text("Accepted \(page.mode.label.lowercased()) query · \(page.nameMode.label.lowercased())")
+                    Text("Accepted \(page.mode.label.lowercased()) query · \(page.nameMode.label.lowercased()) · \(page.policy.caseSensitive ? "match case" : "ignore case")")
                         .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                     Text(page.needle).font(.body.monospaced()).lineLimit(3).textSelection(.enabled)
                     if !model.structureIsCurrent {
                         HStack {
-                            Text("The draft, mode or name matching differs from these results. Submit it or restore the accepted query to open a result.")
+                            Text("The draft query or search options differ from these results. Submit it or restore the accepted query to open a result.")
                                 .font(.caption).foregroundStyle(.orange)
                             Spacer()
                             Button("Use accepted query") {
                                 model.searchMode = page.mode; model.searchNameMode = page.nameMode
+                                if page.mode.supportsNameMatching { model.searchCaseSensitive = page.policy.caseSensitive }
+                                model.countAllMatches = page.policy.countAllMatches
                                 model.searchInput = page.needle; panelNotice = ""
                             }.controlSize(.small).disabled(!model.canOperate)
                         }
@@ -937,7 +943,9 @@ private final class AtlasSavedTrailArchiveAccess {
             Label(page.complete ? "Complete extraction processing" : "Partial extraction coverage",
                 systemImage: page.complete ? "checkmark.circle" : "exclamationmark.circle")
                 .font(.caption.weight(.semibold)).foregroundStyle(page.complete ? Color.secondary : Color.orange)
-            Text("\(page.retained) results retained · \(page.visited) / \(page.identity.members) members visited · \(page.searched) extracted")
+            Text("\(page.matchesSeenExact ? "" : "At least ")\(page.seen) matches · \(page.retained) retained")
+                .font(.caption)
+            Text("\(page.visited) / \(page.identity.members) members visited · \(page.searched) extracted")
                 .font(.caption)
             Text("Unavailable: \(page.unavailable) · Unsupported language or decoding: \(page.unsupported) · Source size limit: \(page.sourceLimited)")
                 .font(.caption).foregroundStyle(.secondary)
@@ -946,8 +954,8 @@ private final class AtlasSavedTrailArchiveAccess {
             if page.state == "work-limit" {
                 Text("The aggregate source budget stopped extraction. Earlier results remain valid; later members were not examined.")
                     .font(.caption).foregroundStyle(.orange)
-            } else if page.truncated {
-                Text("At least \(page.seen) matches were seen. The retained-result limit stopped extraction.")
+            } else if page.state == "truncated" {
+                Text("Extraction stopped at the result limit. Enable Count all matches to continue counting.")
                     .font(.caption).foregroundStyle(.orange)
             }
             if !page.identity.discoveryComplete {
@@ -1524,7 +1532,7 @@ private final class AtlasSavedTrailArchiveAccess {
                     }.disabled(!capture.reader.canPin)
                 }.controlSize(.small).padding(.horizontal, 12)
             }
-            else if case .structureHit(_, _, _, _, let item) = capture.origin {
+            else if case .structureHit(_, _, _, _, let item, _) = capture.origin {
                 HStack {
                     Text("This result spans more than the bounded selection witness. The reader starts near its original source range.")
                         .font(.caption).foregroundStyle(.secondary)
@@ -1713,7 +1721,7 @@ private final class AtlasSavedTrailArchiveAccess {
                 Text("Saved expression: \(expression)").font(.callout.monospaced()).lineLimit(2).textSelection(.enabled)
                 Text(caseSensitive ? "Match case" : "Unicode lowercase matching").font(.caption).foregroundStyle(.secondary)
                 Text("Primary occurrence: \(primary)").font(.caption.monospaced()).lineLimit(2).textSelection(.enabled)
-            } else if case .structureHit(_, _, _, _, let item) = capture.origin {
+            } else if case .structureHit(_, _, _, _, let item, _) = capture.origin {
                 Text(item.structure.name).font(.callout.monospaced()).lineLimit(2).textSelection(.enabled)
                 Text(item.structure.label).font(.caption).foregroundStyle(.secondary)
             }

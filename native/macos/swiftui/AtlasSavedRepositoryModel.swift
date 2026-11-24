@@ -269,8 +269,12 @@ private final class AtlasSavedSession: @unchecked Sendable {
             && searchCaseSensitive == expressionPage.caseSensitive
     }
 
+    private var structurePolicy: AtlasSavedStructurePolicy {
+        .init(caseSensitive: searchMode == .occurrences || searchCaseSensitive, countAllMatches: countAllMatches)
+    }
+
     var structureIsCurrent: Bool {
-        guard let structurePage, searchMode == structurePage.mode,
+        guard let structurePage, searchMode == structurePage.mode, structurePolicy == structurePage.policy,
               searchMode.effectiveNameMode(searchNameMode) == structurePage.nameMode,
               info?.identity == structurePage.identity, structureGeneration == structurePage.generation else { return false }
         return searchInput.utf8.elementsEqual(structurePage.needle.utf8)
@@ -1521,6 +1525,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
             notice = "Enter 1–1024 UTF-8 bytes without NUL. Occurrences require one exact identifier token."; return
         }
         let needle = searchInput, mode = searchMode, nameMode = searchMode.effectiveNameMode(searchNameMode)
+        let policy = structurePolicy
         perform { model, flag in
             guard let lease = model.session else { throw AtlasSavedError.unavailable }
             let generation = try model.nextStructureGeneration()
@@ -1528,9 +1533,10 @@ private final class AtlasSavedSession: @unchecked Sendable {
             do {
                 let page = try AtlasSavedStructurePage.decode(await model.run(lease,
                     .structureSearch(generation: generation, mode: mode, nameMode: nameMode, query: needle,
-                        matches: AtlasSavedSearchWire.maximumHits, sourceBytes: AtlasSavedSearchWire.maximumSourceBytes), flag: flag),
+                        matches: AtlasSavedSearchWire.maximumHits, sourceBytes: AtlasSavedSearchWire.maximumSourceBytes,
+                        policy: policy), flag: flag),
                     identity: info.identity, generation: generation, mode: mode, nameMode: nameMode,
-                    needle: needle, start: 0, limit: 64)
+                    needle: needle, start: 0, limit: 64, policy: policy)
                 guard page.window.offset == 0 else { throw AtlasSavedError.invalidResponse }
                 guard model.session === lease, !model.closed else { throw AtlasSavedError.canceled }
                 model.structureGeneration = generation; model.structurePage = page
@@ -1567,7 +1573,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
         guard canOperate, structureIsCurrent, let accepted = structurePage,
               page.identity == accepted.identity, page.generation == accepted.generation,
               page.start == accepted.start, page.window == accepted.window,
-              page.mode == accepted.mode, page.nameMode == accepted.nameMode,
+              page.mode == accepted.mode, page.nameMode == accepted.nameMode, page.policy == accepted.policy,
               page.needle.utf8.elementsEqual(accepted.needle.utf8),
               offset != page.window.offset, offset == page.window.next || offset < page.window.offset else { return }
         perform { model, flag in
@@ -1578,9 +1584,9 @@ private final class AtlasSavedSession: @unchecked Sendable {
                 let next = try AtlasSavedStructurePage.decode(await model.run(lease,
                     .structureWindow(generation: generation, mode: page.mode, nameMode: page.nameMode,
                         query: page.needle, matches: AtlasSavedSearchWire.maximumHits,
-                        sourceBytes: page.sourceLimit, skipMatches: offset), flag: flag),
+                        sourceBytes: page.sourceLimit, skipMatches: offset, policy: page.policy), flag: flag),
                     identity: page.identity, generation: generation, mode: page.mode, nameMode: page.nameMode,
-                    needle: page.needle, start: 0, limit: 64, resultOffset: offset)
+                    needle: page.needle, start: 0, limit: 64, resultOffset: offset, policy: page.policy)
                 guard next.sourceLimit == page.sourceLimit else { throw AtlasSavedError.invalidResponse }
                 guard model.session === lease, !model.closed else { throw AtlasSavedError.canceled }
                 model.structureGeneration = generation; model.structurePage = next
@@ -1598,15 +1604,16 @@ private final class AtlasSavedSession: @unchecked Sendable {
     func loadStructureResults(start: UInt64, from page: AtlasSavedStructurePage) {
         guard structureIsCurrent, let accepted = structurePage, page.identity == accepted.identity,
               page.generation == accepted.generation, page.start == accepted.start, page.window == accepted.window,
-              page.mode == accepted.mode, page.nameMode == accepted.nameMode,
+              page.mode == accepted.mode, page.nameMode == accepted.nameMode, page.policy == accepted.policy,
               page.needle.utf8.elementsEqual(accepted.needle.utf8), start <= accepted.retained else { return }
         perform { model, flag in
             guard let lease = model.session else { throw AtlasSavedError.unavailable }
             let next = try AtlasSavedStructurePage.decode(await model.run(lease,
                 .structureResults(generation: page.generation, start: start, limit: 64), flag: flag),
                 identity: page.identity, generation: page.generation, mode: page.mode, nameMode: page.nameMode,
-                needle: page.needle, start: start, limit: 64)
+                needle: page.needle, start: start, limit: 64, policy: page.policy)
             guard next.window == accepted.window, next.retained == accepted.retained, next.seen == accepted.seen,
+                  next.matchesSeenExact == accepted.matchesSeenExact,
                   next.complete == accepted.complete, next.sourceLimit == accepted.sourceLimit else {
                 throw AtlasSavedError.invalidResponse
             }
@@ -1651,13 +1658,14 @@ private final class AtlasSavedSession: @unchecked Sendable {
         guard structureIsCurrent, let accepted = structurePage, info?.identity == page.identity,
               accepted.identity == page.identity, structureGeneration == page.generation, accepted.generation == page.generation,
               accepted.start == page.start, accepted.window == page.window,
-              accepted.mode == page.mode, accepted.nameMode == page.nameMode,
+              accepted.mode == page.mode, accepted.nameMode == page.nameMode, accepted.policy == page.policy,
               accepted.needle.utf8.elementsEqual(page.needle.utf8),
               page.hits.contains(where: { $0.matches(item) }), accepted.hits.contains(where: { $0.matches(item) }) else {
             throw AtlasSavedError.invalidInput
         }
         return try await openReader(saved: page.identity, ordinal: item.hit.member, expected: nil,
-            origin: .structureHit(generation: page.generation, mode: page.mode, nameMode: page.nameMode, needle: page.needle, hit: item),
+            origin: .structureHit(generation: page.generation, mode: page.mode, nameMode: page.nameMode,
+                needle: page.needle, hit: item, policy: page.policy),
             readerTransport: readerTransport, search: search, outline: outline, document: document)
     }
 
@@ -1914,7 +1922,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
                             request = .openHit(reader: destination, generation: generation, hit: hit.id)
                         case .expressionHit(let generation, _, _, let hit, _):
                             request = .openExpressionHit(reader: destination, generation: generation, hit: hit.id)
-                        case .structureHit(let generation, _, _, _, let item):
+                        case .structureHit(let generation, _, _, _, let item, _):
                             request = .openStructureHit(reader: destination, generation: generation, hit: item.id)
                         }
                         response = lease.transport.run(lease.handle, request)
