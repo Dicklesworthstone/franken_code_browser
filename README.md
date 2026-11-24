@@ -196,7 +196,7 @@ Select one parenthesis, square bracket or brace and choose **Go to matching
 bracket**. The reader skips comments and strings, checks the destination in the
 same captured source, and preserves selection and history on failed or canceled
 work. UTF-8 and UTF-16 use original byte offsets. The bounded lexical analysis
-currently admits complete sources up to 512 KiB; see
+currently admits complete sources up to 1 MiB; see
 [matching-bracket navigation](native/macos/README.md#going-to-a-matching-bracket)
 for language limits and pending independent native verification.
 

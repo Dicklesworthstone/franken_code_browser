@@ -248,7 +248,7 @@ struct AtlasReaderTextSelectionTransport: Sendable {
 /// capture. Its mate becomes a native destination only after a fresh retained
 /// window proves the expected bracket at that original range.
 struct AtlasReaderDelimiterMatch: Sendable {
-    static let sourceLimit: UInt64 = 512 * 1024
+    static let sourceLimit: UInt64 = 1024 * 1024
     enum State: String, Decodable, Equatable, Sendable {
         case matched, unmatched, mismatched
         case notCode = "not-code"

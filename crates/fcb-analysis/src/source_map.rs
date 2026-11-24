@@ -8,7 +8,7 @@
 //! scalar-complete maps through the same source decoder. A chunk is never EOF.
 
 use std::{cell::Cell, mem::size_of};
-use fcb_core::{ByteOffset, ByteRange, DecodedUtf8Offset};
+use fcb_core::{ByteOffset, ByteRange, DecodedUtf8Offset, DecodedUtf8Range};
 use fcb_source::{CaptureEncodingMap, DetectedEncoding, MappingSpan, SpanKind, StatefulChunkDecoder};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -167,6 +167,56 @@ impl<'source> SourceMap<'source> {
         Ok(name)
     }
 
+    /// Convert an exact original-source selection back to decoded UTF-8.
+    /// Endpoint chunks are scalar-complete emitted decoder windows, including
+    /// carried scalars. Only positive local ranges are converted; the exact
+    /// reverse mapping rejects BOM bytes and interiors of multibyte scalars.
+    pub(crate) fn decoded_range_for_original(&self, original: ByteRange)
+        -> Result<DecodedUtf8Range, SourceMapError> {
+        let start = original.start().get();
+        let end = original.end().get();
+        if start >= end || end > self.source.len() as u64 {
+            return Err(SourceMapError::InvalidEvidence);
+        }
+        let first_index = self.chunks.partition_point(|chunk| chunk.raw_end <= start);
+        let last_index = self.chunks.partition_point(|chunk| chunk.raw_end < end);
+        let first = self.chunks.get(first_index).ok_or(SourceMapError::InvalidEvidence)?;
+        let last = self.chunks.get(last_index).ok_or(SourceMapError::InvalidEvidence)?;
+        if first_index > last_index || start < first.raw_start || end > last.raw_end {
+            return Err(SourceMapError::InvalidEvidence);
+        }
+        let first_range = ByteRange::new(original.start(), ByteOffset::new(end.min(first.raw_end)))
+            .map_err(|_| SourceMapError::InvalidEvidence)?;
+        // Each helper returns coordinates only, dropping its map before the
+        // second endpoint is decoded. Admission covers one live bounded map.
+        let first_decoded = self.decoded_chunk_range(first, first_range)?;
+        let decoded_end = if first_index == last_index {
+            first_decoded.end()
+        } else {
+            let last_range = ByteRange::new(ByteOffset::new(last.raw_start), original.end())
+                .map_err(|_| SourceMapError::InvalidEvidence)?;
+            self.decoded_chunk_range(last, last_range)?.end()
+        };
+        let decoded_start = first_decoded.start();
+        let start = usize::try_from(decoded_start.get()).map_err(|_| SourceMapError::InvalidEvidence)?;
+        let end = usize::try_from(decoded_end.get()).map_err(|_| SourceMapError::InvalidEvidence)?;
+        if start >= end || self.text.get(start..end).is_none() {
+            return Err(SourceMapError::InvalidEvidence);
+        }
+        DecodedUtf8Range::new(decoded_start, decoded_end).map_err(|_| SourceMapError::InvalidEvidence)
+    }
+
+    fn decoded_chunk_range(&self, chunk: &Chunk, original: ByteRange)
+        -> Result<DecodedUtf8Range, SourceMapError> {
+        let map = self.chunk_map(chunk)?;
+        let decoded = map.byte_range_to_decoded_utf8_range(original)
+            .map_err(|_| SourceMapError::InvalidEvidence)?;
+        if map.decoded_utf8_range_to_byte_range(decoded).map_err(|_| SourceMapError::InvalidEvidence)? != original {
+            return Err(SourceMapError::InvalidEvidence);
+        }
+        Ok(decoded)
+    }
+
     pub(crate) fn mapped(&self, start: u64, end: u64) -> Result<ByteRange, SourceMapError> {
         let start_index = usize::try_from(start).map_err(|_| SourceMapError::InvalidEvidence)?;
         let end_index = usize::try_from(end).map_err(|_| SourceMapError::InvalidEvidence)?;
@@ -186,14 +236,17 @@ impl<'source> SourceMap<'source> {
         let index = self.chunks.partition_point(|chunk| chunk.decoded_end <= offset);
         let chunk = self.chunks.get(index).ok_or(SourceMapError::InvalidEvidence)?;
         if offset < chunk.decoded_start { return Err(SourceMapError::InvalidEvidence); }
+        self.chunk_map(chunk)?.decoded_utf8_to_byte_offset(DecodedUtf8Offset::new(offset))
+            .map_err(|_| SourceMapError::InvalidEvidence)
+    }
+
+    fn chunk_map(&self, chunk: &Chunk) -> Result<CaptureEncodingMap, SourceMapError> {
         let start = usize::try_from(chunk.raw_start).map_err(|_| SourceMapError::InvalidEvidence)?;
         let end = usize::try_from(chunk.raw_end).map_err(|_| SourceMapError::InvalidEvidence)?;
         let raw = self.source.get(start..end).ok_or(SourceMapError::InvalidEvidence)?;
         if raw.len() > MAX_CHUNK_BYTES { return Err(SourceMapError::InvalidEvidence); }
-        let map = CaptureEncodingMap::build_with_base_offset(raw, self.encoding, chunk.raw_start,
+        CaptureEncodingMap::build_with_base_offset(raw, self.encoding, chunk.raw_start,
             chunk.decoded_start, chunk.utf16_start, chunk.scalar_start)
-            .map_err(|_| SourceMapError::InvalidEvidence)?;
-        map.decoded_utf8_to_byte_offset(DecodedUtf8Offset::new(offset))
             .map_err(|_| SourceMapError::InvalidEvidence)
     }
 }
@@ -336,5 +389,106 @@ mod tests {
         assert_eq!(map.name_bytes.get(), 7);
         assert_eq!(map.copy_name("x").unwrap(), "x");
         assert_eq!(map.name_bytes.get(), 8);
+    }
+}
+
+
+#[cfg(test)]
+mod inverse_range_tests {
+    use super::*;
+
+    const LIMIT: usize = 64 * 1024;
+
+    fn range(start: usize, end: usize) -> ByteRange {
+        ByteRange::new(ByteOffset::new(start as u64), ByteOffset::new(end as u64)).unwrap()
+    }
+
+    fn encodings() -> [(DetectedEncoding, bool); 6] {
+        [(DetectedEncoding::Utf8 { has_bom: false }, false),
+            (DetectedEncoding::Utf8 { has_bom: true }, true),
+            (DetectedEncoding::Utf16Le, true), (DetectedEncoding::Utf16Be, true),
+            (DetectedEncoding::Utf16Le, false), (DetectedEncoding::Utf16Be, false)]
+    }
+
+    fn encoded(text: &str, encoding: DetectedEncoding, bom: bool) -> Vec<u8> {
+        match encoding {
+            DetectedEncoding::Utf8 { .. } => {
+                let mut bytes = if bom { vec![0xef, 0xbb, 0xbf] } else { Vec::new() };
+                bytes.extend_from_slice(text.as_bytes()); bytes
+            }
+            DetectedEncoding::Utf16Le | DetectedEncoding::Utf16Be => {
+                let little = encoding == DetectedEncoding::Utf16Le;
+                let mut bytes = if !bom { Vec::new() }
+                    else if little { vec![0xff, 0xfe] } else { vec![0xfe, 0xff] };
+                bytes.extend(text.encode_utf16().flat_map(|unit|
+                    if little { unit.to_le_bytes() } else { unit.to_be_bytes() }));
+                bytes
+            }
+            DetectedEncoding::Unsupported => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn inverse_ranges_match_whole_map_coordinates_across_carried_scalars() {
+        for (encoding, bom) in encodings() {
+            for prefix in [CHUNK_BYTES / 2 - 3, CHUNK_BYTES / 2 - 2, CHUNK_BYTES / 2 - 1,
+                CHUNK_BYTES - 5, CHUNK_BYTES - 3, CHUNK_BYTES - 1] {
+                let text = format!("{}é😀(\r\n){}中[]", " ".repeat(prefix), " ".repeat(CHUNK_BYTES * 2));
+                let raw = encoded(&text, encoding, bom);
+                let sparse = SourceMap::build(&raw, encoding, LIMIT, LIMIT, &mut || false).unwrap();
+                let whole = CaptureEncodingMap::build_with_encoding(&raw, encoding).unwrap();
+                let mut selections: Vec<_> = text.char_indices().filter(|(_, ch)| *ch != ' ')
+                    .map(|(start, ch)| (start, start + ch.len_utf8())).collect();
+                // The enclosing selection spans several independently decoded
+                // windows; the scalar selections exercise each endpoint alone.
+                selections.push((0, text.len()));
+                for (start, end) in selections {
+                    let expected = DecodedUtf8Range::new(DecodedUtf8Offset::new(start as u64),
+                        DecodedUtf8Offset::new(end as u64)).unwrap();
+                    let original = whole.decoded_utf8_range_to_byte_range(expected).unwrap();
+                    assert_eq!(sparse.decoded_range_for_original(original).unwrap(), expected,
+                        "{encoding:?}, bom={bom}, prefix={prefix}, decoded={start}..{end}");
+                    assert_eq!(sparse.mapped(start as u64, end as u64).unwrap(), original);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inverse_ranges_at_exact_window_edges_do_not_create_empty_intersections() {
+        let raw = vec![b'x'; CHUNK_BYTES * 3];
+        let sparse = SourceMap::build(&raw, DetectedEncoding::Utf8 { has_bom: false },
+            LIMIT, LIMIT, &mut || false).unwrap();
+        for (start, end) in [(CHUNK_BYTES - 1, CHUNK_BYTES), (CHUNK_BYTES, CHUNK_BYTES + 1),
+            (CHUNK_BYTES - 1, CHUNK_BYTES + 1), (CHUNK_BYTES, CHUNK_BYTES * 2),
+            (0, raw.len()), (raw.len() - 1, raw.len())] {
+            let decoded = sparse.decoded_range_for_original(range(start, end)).unwrap();
+            assert_eq!((decoded.start().get(), decoded.end().get()), (start as u64, end as u64));
+        }
+    }
+
+    #[test]
+    fn inverse_ranges_reject_bom_bytes_split_scalars_empty_and_out_of_bounds_ranges() {
+        for (encoding, bom) in encodings() {
+            let raw = encoded("é😀()", encoding, bom);
+            let sparse = SourceMap::build(&raw, encoding, LIMIT, LIMIT, &mut || false).unwrap();
+            let base = if !bom { 0 } else if encoding.is_utf16() { 2 } else { 3 };
+            for selected in [range(base + 1, base + 2), range(base + 2, base + 4),
+                range(base + 3, base + 6), range(0, 0), range(0, raw.len() + 1)] {
+                assert_eq!(sparse.decoded_range_for_original(selected), Err(SourceMapError::InvalidEvidence),
+                    "{encoding:?}, bom={bom}, selected={selected:?}");
+            }
+            // Both UTF-8 and UTF-16 encode this supplementary scalar in four
+            // original bytes, after the two-byte é.
+            assert!(sparse.decoded_range_for_original(range(base + 2, base + 6)).is_ok());
+            if bom {
+                assert_eq!(sparse.decoded_range_for_original(range(0, base)),
+                    Err(SourceMapError::InvalidEvidence));
+                let only_bom = encoded("", encoding, true);
+                let empty = SourceMap::build(&only_bom, encoding, LIMIT, LIMIT, &mut || false).unwrap();
+                assert_eq!(empty.decoded_range_for_original(range(0, only_bom.len())),
+                    Err(SourceMapError::InvalidEvidence));
+            }
+        }
     }
 }

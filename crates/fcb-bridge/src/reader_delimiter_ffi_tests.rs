@@ -20,7 +20,8 @@ fn source(bytes: &[u8]) -> (std::path::PathBuf, u64) {
     fs::write(&path, bytes).unwrap();
     let label = CString::new(path.to_str().unwrap()).unwrap();
     let handle = fcb_reader_create(); assert_ne!(handle, 0);
-    let reply = take(unsafe { fcb_reader_open(handle, label.as_ptr(), 4096) });
+    let capture_limit = u64::try_from(bytes.len().max(4096)).unwrap();
+    let reply = take(unsafe { fcb_reader_open(handle, label.as_ptr(), capture_limit) });
     assert!(reply.contains("\"status\":\"ok\""), "{reply}");
     (path, handle)
 }
@@ -78,6 +79,31 @@ fn c_matching_utf16_preserves_original_offsets_after_bom_and_surrogate_pair() {
 }
 
 #[test]
+fn c_matching_reaches_late_utf16_delimiters_without_reopening_the_path() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let text = format!("\u{feff}// 🦀\r\n{}fn x() {{ [1] }}\r\n", " ".repeat(300_000));
+    let start = text[..text.find('[').unwrap()].encode_utf16().count() as u64 * 2;
+    let mate = text[..text.find(']').unwrap()].encode_utf16().count() as u64 * 2;
+    assert!(start > 512 * 1024);
+    for big_endian in [false, true] {
+        let bytes: Vec<u8> = text.encode_utf16().flat_map(|u| {
+            if big_endian { u.to_be_bytes() } else { u.to_le_bytes() }
+        }).collect();
+        let (path, handle) = source(&bytes);
+        fs::write(&path, b"changed live source").unwrap();
+        let reply = take(fcb_reader_matching_delimiter(handle, start, start + 2));
+        assert!(reply.contains("\"status\":\"ok\""), "{reply}");
+        assert!(reply.contains("\"delimiter_state\":\"matched\""));
+        assert!(reply.contains(&field("selected_range", start, start + 2)));
+        assert!(reply.contains(&field("matching_range", mate, mate + 2)));
+        assert!(reply.contains("\"additional_source_bytes_read\":\"0\""));
+        let reverse = take(fcb_reader_matching_delimiter(handle, mate, mate + 2));
+        assert!(reverse.contains(&field("matching_range", start, start + 2)), "{reverse}");
+        assert_eq!(fcb_reader_close(handle), 1);
+    }
+}
+
+#[test]
 fn c_matching_refuses_invalid_ranges_and_keeps_unmatched_separate_from_mismatch() {
     let _guard = FFI_TEST_LOCK.lock().unwrap();
     let empty = fcb_reader_create(); assert_ne!(empty, 0);
@@ -103,6 +129,8 @@ fn c_matching_response_remains_owned_after_close_and_header_matches_signature() 
     let _: extern "C" fn(u64, u64, u64) -> *mut c_char = fcb_reader_matching_delimiter;
     let header = include_str!("../include/fcb_reader_sessions.h");
     assert!(header.contains("char *fcb_reader_matching_delimiter(uint64_t handle, uint64_t start, uint64_t end);"));
+    assert!(header.contains(&format!("#define FCB_READER_MAX_DELIMITER_SOURCE_BYTES UINT64_C({})",
+        fcb::analysis::delimiters::MAX_DELIMITER_SOURCE_BYTES)));
     let _guard = FFI_TEST_LOCK.lock().unwrap();
     let (_, handle) = source(b"[1]");
     assert_eq!(fcb_reader_cancel(handle), 1);

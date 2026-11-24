@@ -166,3 +166,130 @@ fn large_source_depth_admission_extents_and_cancellation_are_explicit() {
         assert_eq!(budget.accounting().reserved().get(), 0);
     }
 }
+
+
+fn delimiter_encoded(text: &str, encoding: DetectedEncoding, bom: bool) -> Vec<u8> {
+    match encoding {
+        DetectedEncoding::Utf8 { .. } => {
+            let mut bytes = if bom { vec![0xef, 0xbb, 0xbf] } else { Vec::new() };
+            bytes.extend_from_slice(text.as_bytes()); bytes
+        }
+        DetectedEncoding::Utf16Le | DetectedEncoding::Utf16Be => {
+            let little = encoding == DetectedEncoding::Utf16Le;
+            let mut bytes = if !bom { Vec::new() }
+                else if little { vec![0xff, 0xfe] } else { vec![0xfe, 0xff] };
+            bytes.extend(text.encode_utf16().flat_map(|unit|
+                if little { unit.to_le_bytes() } else { unit.to_be_bytes() }));
+            bytes
+        }
+        DetectedEncoding::Unsupported => unreachable!(),
+    }
+}
+
+fn delimiter_original_offset(text: &str, decoded: usize, encoding: DetectedEncoding, bom: bool) -> usize {
+    let prefix = if !bom { 0 } else if encoding.is_utf16() { 2 } else { 3 };
+    prefix + if encoding.is_utf16() { text[..decoded].encode_utf16().count() * 2 } else { decoded }
+}
+
+#[test]
+fn one_mib_sources_match_far_tail_pairs_in_both_directions_with_bounded_mapping_admission() {
+    let tail = "fn late() { [1, (2)] }";
+    for encoding in [DetectedEncoding::Utf8 { has_bom: false },
+        DetectedEncoding::Utf16Le, DetectedEncoding::Utf16Be] {
+        let bom = encoding.is_utf16();
+        let prefix = if encoding.is_utf16() { (MAX_DELIMITER_SOURCE_BYTES - 2) / 2 - tail.len() }
+            else { MAX_DELIMITER_SOURCE_BYTES - tail.len() };
+        let text = format!("{}{tail}", " ".repeat(prefix));
+        let raw = delimiter_encoded(&text, encoding, bom);
+        assert_eq!(raw.len(), MAX_DELIMITER_SOURCE_BYTES);
+        let open = delimiter_original_offset(&text, text.find('{').unwrap(), encoding, bom);
+        let close = delimiter_original_offset(&text, text.rfind('}').unwrap(), encoding, bom);
+        let width = if encoding.is_utf16() { 2 } else { 1 };
+        assert!(open > 512 * 1024);
+        // Caller owns source bytes. This admission cannot cover the previous
+        // source-sized provenance charge plus tokenizer allowance at this size.
+        let budget = ResourceBudget::new(owner(), ByteLength::new(128 * 1024 * 1024)).unwrap();
+        for (selected, expected) in [(range(open, open + width), range(close, close + width)),
+            (range(close, close + width), range(open, open + width))] {
+            let result = matching_delimiter(&raw, request(), SymbolLanguage::Rust, Some(encoding),
+                selected, &budget, ResourceAllocationId::new(1).unwrap(), || false).unwrap();
+            assert_eq!(result.state(), DelimiterState::Matched);
+            assert_eq!(result.selected_range(), selected); assert_eq!(result.matching_range(), Some(expected));
+            assert_eq!(result.file(), request().file()); assert_eq!(result.revision(), request().revision());
+            assert_eq!(budget.accounting().reserved().get(), 0);
+        }
+    }
+}
+
+#[test]
+fn explicit_bomless_encodings_keep_scalar_and_bracket_selections_across_decoder_windows() {
+    for encoding in [DetectedEncoding::Utf8 { has_bom: false },
+        DetectedEncoding::Utf16Le, DetectedEncoding::Utf16Be] {
+        let prefix = if encoding.is_utf16() { 4094 / 2 } else { 4094 };
+        let text = format!("//{}😀\r\nfn seam() {{ [1] }}", " ".repeat(prefix - 2));
+        let raw = delimiter_encoded(&text, encoding, false);
+        let budget = budget();
+        let analyze = |selected| matching_delimiter(&raw, request(), SymbolLanguage::Rust, Some(encoding),
+            selected, &budget, ResourceAllocationId::new(1).unwrap(), || false);
+        // The supplementary scalar straddles the 4096-byte decoder INPUT edge,
+        // but is emitted whole in one source-map chunk.
+        let nonbracket = analyze(range(4094, 4098)).unwrap();
+        assert_eq!(nonbracket.state(), DelimiterState::NotDelimiter);
+        assert_eq!(nonbracket.selected_range(), range(4094, 4098));
+        assert_eq!(analyze(range(4094, 4096)), Err(DelimiterError::InvalidSelection));
+        assert_eq!(analyze(range(4095, 4098)), Err(DelimiterError::InvalidSelection));
+        let open = delimiter_original_offset(&text, text.find('{').unwrap(), encoding, false);
+        let close = delimiter_original_offset(&text, text.rfind('}').unwrap(), encoding, false);
+        let width = if encoding.is_utf16() { 2 } else { 1 };
+        assert_eq!(analyze(range(open, open + width)).unwrap().matching_range(), Some(range(close, close + width)));
+        assert_eq!(analyze(range(close, close + width)).unwrap().matching_range(), Some(range(open, open + width)));
+        assert_eq!(budget.accounting().reserved().get(), 0);
+    }
+}
+
+#[test]
+fn original_and_decoded_limits_and_malformed_far_tails_remain_independent() {
+    let budget = ResourceBudget::new(owner(), ByteLength::new(128 * 1024 * 1024)).unwrap();
+    let allocation = ResourceAllocationId::new(1).unwrap();
+    let over = vec![b' '; MAX_DELIMITER_SOURCE_BYTES + 1];
+    assert_eq!(matching_delimiter(&over, request(), SymbolLanguage::Rust, None, range(0, 1),
+        &budget, allocation, || false), Err(DelimiterError::SourceLimit));
+    assert_eq!(budget.accounting().reserved().get(), 0);
+
+    let expanded = format!("{}()", "中".repeat(MAX_DELIMITER_SOURCE_BYTES / 3 + 1));
+    let utf16 = delimiter_encoded(&expanded, DetectedEncoding::Utf16Le, true);
+    assert!(utf16.len() < MAX_DELIMITER_SOURCE_BYTES);
+    assert!(expanded.len() > MAX_DELIMITER_SOURCE_BYTES);
+    assert_eq!(matching_delimiter(&utf16, request(), SymbolLanguage::Rust, Some(DetectedEncoding::Utf16Le),
+        range(utf16.len() - 4, utf16.len() - 2), &budget, allocation, || false), Err(DelimiterError::SourceLimit));
+    assert_eq!(budget.accounting().reserved().get(), 0);
+
+    let mut malformed = vec![b' '; MAX_DELIMITER_SOURCE_BYTES];
+    malformed[..2].copy_from_slice(b"()");
+    let last = malformed.len() - 1; malformed[last] = 0xff;
+    assert_eq!(matching_delimiter(&malformed, request(), SymbolLanguage::Rust,
+        Some(DetectedEncoding::Utf8 { has_bom: false }), range(0, 1), &budget, allocation, || false),
+        Err(DelimiterError::UnsupportedEncoding));
+    assert_eq!(budget.accounting().reserved().get(), 0);
+}
+
+#[test]
+fn cancellation_before_each_successful_state_releases_admission() {
+    let budget = budget();
+    for (source, selected, state) in [
+        (b"x".as_slice(), range(0, 1), DelimiterState::NotDelimiter),
+        (b"\"(\"".as_slice(), range(1, 2), DelimiterState::NotCode),
+        (b"([])".as_slice(), range(0, 1), DelimiterState::Matched),
+    ] {
+        let mut polls = 0;
+        let result = matching_delimiter(source, request(), SymbolLanguage::Rust, None, selected,
+            &budget, ResourceAllocationId::new(1).unwrap(), || { polls += 1; false }).unwrap();
+        assert_eq!(result.state(), state); assert!(polls > 0);
+        assert_eq!(budget.accounting().reserved().get(), 0);
+        let mut attempt = 0;
+        assert_eq!(matching_delimiter(source, request(), SymbolLanguage::Rust, None, selected,
+            &budget, ResourceAllocationId::new(1).unwrap(), || { attempt += 1; attempt == polls }),
+            Err(DelimiterError::Canceled));
+        assert_eq!(attempt, polls); assert_eq!(budget.accounting().reserved().get(), 0);
+    }
+}

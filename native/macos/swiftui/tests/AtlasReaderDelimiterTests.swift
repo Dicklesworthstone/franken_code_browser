@@ -64,7 +64,11 @@ private final class BracketFixture: @unchecked Sendable {
     private var windowReturns = 0
     private var blocked = 0
     let gate = DispatchSemaphore(value: 0)
-    let raw = Array(("(" + String(repeating: "x", count: 70_000) + ")").utf8)
+    let raw: [UInt8]
+
+    init(padding: Int = 70_000) {
+        raw = Array(("(" + String(repeating: "x", count: padding) + ")").utf8)
+    }
 
     private func locked<Value>(_ body: () -> Value) -> Value { lock.lock(); defer { lock.unlock() }; return body() }
     func setMode(_ value: Mode) { locked { mode = value } }
@@ -179,7 +183,9 @@ private final class BracketFixture: @unchecked Sendable {
 
     static func main() async throws {
         try exactOriginalCoordinatesAndReceipts()
+        try sourceLimitAdmission()
         await navigatesAcrossPagesAndBack()
+        await navigatesBeyondFormerLimitAndPreservesAcceptedSelection()
         await refusalsPreserveSelectionAndHistory()
         await cancellationAndStaleDelivery()
         try importedCapabilitySurvives()
@@ -188,53 +194,85 @@ private final class BracketFixture: @unchecked Sendable {
 
     private static func exactOriginalCoordinatesAndReceipts() throws {
         for encoding in ["utf8", "utf16le", "utf16be"] {
-            let text = "(🦀)"
-            let start: UInt64 = encoding == "utf8" ? 0 : 2
-            let raw = Array(encoding == "utf8" ? Data(text.utf8)
-                : text.data(using: encoding == "utf16le" ? .utf16LittleEndian : .utf16BigEndian)!)
-            let width: UInt64 = encoding == "utf8" ? 1 : 2
-            let identity = AtlasReaderIdentity(owner: 2, file: 1, revision: 1,
-                capturedBytes: start + UInt64(raw.count), pathBytes: Array("/project/source".utf8),
-                encoding: encoding, displayPath: "/project/source")
-            let page = AtlasReaderPage(identity: identity, start: start, end: identity.capturedBytes,
-                text: text, originalHex: bracketHex(raw), firstPhysicalLine: nil,
-                rangeLimited: false, boundariesAdjusted: start != 0, hasReplacements: false,
-                highlight: nil, selection: nil, symbolSelection: nil)
-            let selected = try bracketSelection(page: page, range: NSRange(location: 0, length: 1), start: start, end: start + width)
-            let mate = page.end - width
-            let receipt = bracketReceipt(length: page.end, encoding: encoding, start: start, end: start + width,
-                mate: (mate, page.end))
-            let result = try AtlasReaderDelimiterMatch.decode(bracketJSON(receipt), selection: selected)
-            let destination = try result.selection(in: page)
-            check(result.matchingRange?.start == mate && destination.nativeRange == NSRange(location: 3, length: 1),
-                  "original encoding width or supplementary scalar changed bracket destination")
-            check(selected.matchingBracket == ")", "exact selected bracket was not eligible")
-            let closing = try bracketSelection(page: page, range: NSRange(location: 3, length: 1), start: mate, end: page.end)
-            let backward = try AtlasReaderDelimiterMatch.decode(bracketJSON(bracketReceipt(length: page.end,
-                encoding: encoding, start: mate, end: page.end, mate: (start, start + width))), selection: closing)
-            let backwardDestination = try backward.selection(in: page)
-            check(backwardDestination.nativeRange == NSRange(location: 0, length: 1), "closing bracket could not navigate backward")
+            try exactOriginalCoordinatesAndReceipts(encoding: encoding, offset: 0)
+            try exactOriginalCoordinatesAndReceipts(encoding: encoding, offset: 600_000)
+        }
+    }
 
-            for (key, value) in [
-                ("owner", "3" as Any), ("source_revision", "2" as Any), ("command", "window" as Any),
-                ("selected_range", ["start": String(mate), "end": String(page.end)] as Any),
-                ("source_context", "visible-page" as Any), ("semantic_resolution", true as Any),
-                ("evidence_level", "compiler-resolved" as Any), ("language", "unknown" as Any),
-                ("matching_range", NSNull() as Any), ("delimiter_state", "unmatched" as Any),
-                ("matching_range", ["start": String(mate), "end": String(page.end + 1)] as Any),
-                ("matching_range", ["start": "0" + String(mate), "end": String(page.end)] as Any)
-            ] {
-                var corrupt = receipt; corrupt[key] = value
-                rejects("unbound or inflated bracket receipt accepted: \(key)") {
-                    _ = try AtlasReaderDelimiterMatch.decode(bracketJSON(corrupt), selection: selected)
+    private static func exactOriginalCoordinatesAndReceipts(encoding: String, offset: UInt64) throws {
+        let text = "(🦀)"
+        let start: UInt64 = offset + (encoding == "utf8" ? 0 : 2)
+        let raw = Array(encoding == "utf8" ? Data(text.utf8)
+            : text.data(using: encoding == "utf16le" ? .utf16LittleEndian : .utf16BigEndian)!)
+        let width: UInt64 = encoding == "utf8" ? 1 : 2
+        let identity = AtlasReaderIdentity(owner: 2, file: 1, revision: 1,
+            capturedBytes: start + UInt64(raw.count), pathBytes: Array("/project/source".utf8),
+            encoding: encoding, displayPath: "/project/source")
+        let page = AtlasReaderPage(identity: identity, start: start, end: identity.capturedBytes,
+            text: text, originalHex: bracketHex(raw), firstPhysicalLine: nil,
+            rangeLimited: false, boundariesAdjusted: start != 0, hasReplacements: false,
+            highlight: nil, selection: nil, symbolSelection: nil)
+        let selected = try bracketSelection(page: page, range: NSRange(location: 0, length: 1), start: start, end: start + width)
+        let mate = page.end - width
+        let receipt = bracketReceipt(length: page.end, encoding: encoding, start: start, end: start + width,
+            mate: (mate, page.end))
+        let result = try AtlasReaderDelimiterMatch.decode(bracketJSON(receipt), selection: selected)
+        let destination = try result.selection(in: page)
+        check(result.matchingRange?.start == mate && destination.nativeRange == NSRange(location: 3, length: 1),
+              "original encoding width or supplementary scalar changed bracket destination")
+        check(selected.matchingBracket == ")", "exact selected bracket was not eligible")
+        let closing = try bracketSelection(page: page, range: NSRange(location: 3, length: 1), start: mate, end: page.end)
+        let backward = try AtlasReaderDelimiterMatch.decode(bracketJSON(bracketReceipt(length: page.end,
+            encoding: encoding, start: mate, end: page.end, mate: (start, start + width))), selection: closing)
+        let backwardDestination = try backward.selection(in: page)
+        check(backwardDestination.nativeRange == NSRange(location: 0, length: 1), "closing bracket could not navigate backward")
+
+        for (key, value) in [
+            ("owner", "3" as Any), ("source_revision", "2" as Any), ("command", "window" as Any),
+            ("selected_range", ["start": String(mate), "end": String(page.end)] as Any),
+            ("source_context", "visible-page" as Any), ("semantic_resolution", true as Any),
+            ("evidence_level", "compiler-resolved" as Any), ("language", "unknown" as Any),
+            ("matching_range", NSNull() as Any), ("delimiter_state", "unmatched" as Any),
+            ("matching_range", ["start": String(mate), "end": String(page.end + 1)] as Any),
+            ("matching_range", ["start": "0" + String(mate), "end": String(page.end)] as Any)
+        ] {
+            var corrupt = receipt; corrupt[key] = value
+            rejects("unbound or inflated bracket receipt accepted: \(key)") {
+                _ = try AtlasReaderDelimiterMatch.decode(bracketJSON(corrupt), selection: selected)
+            }
+        }
+        var missing = receipt; missing.removeValue(forKey: "matching_range")
+        rejects("missing nullable range accepted") { _ = try AtlasReaderDelimiterMatch.decode(bracketJSON(missing), selection: selected) }
+        var reversed = receipt; reversed["matching_range"] = ["start": String(start), "end": String(start + width)]
+        rejects("selected bracket substituted for its mate") { _ = try AtlasReaderDelimiterMatch.decode(bracketJSON(reversed), selection: selected) }
+        let multiple = try bracketSelection(page: page, range: NSRange(location: 0, length: 4), start: start, end: page.end)
+        check(multiple.matchingBracket == nil, "multiple selected scalars became one bracket")
+    }
+
+    private static func sourceLimitAdmission() throws {
+        for capturedBytes in [UInt64(1_048_576), UInt64(1_048_577)] {
+            let start = capturedBytes - 2
+            let identity = AtlasReaderIdentity(owner: 2, file: 1, revision: 1,
+                capturedBytes: capturedBytes, pathBytes: Array("/project/source".utf8),
+                encoding: "utf8", displayPath: "/project/source")
+            let page = AtlasReaderPage(identity: identity, start: start, end: capturedBytes,
+                text: "()", originalHex: "2829", firstPhysicalLine: nil,
+                rangeLimited: false, boundariesAdjusted: false, hasReplacements: false,
+                highlight: nil, selection: nil, symbolSelection: nil)
+            let selected = try bracketSelection(page: page, range: NSRange(location: 0, length: 1),
+                start: start, end: start + 1)
+            let receipt = bracketJSON(bracketReceipt(length: capturedBytes, start: start, end: start + 1,
+                mate: (start + 1, capturedBytes)))
+            if capturedBytes == 1_048_576 {
+                let result = try AtlasReaderDelimiterMatch.decode(receipt, selection: selected)
+                let destination = try result.selection(in: page)
+                check(destination.nativeRange == NSRange(location: 1, length: 1),
+                      "complete one-MiB capture was refused or changed its exact mate")
+            } else {
+                rejects("capture above one MiB admitted a complete bracket match") {
+                    _ = try AtlasReaderDelimiterMatch.decode(receipt, selection: selected)
                 }
             }
-            var missing = receipt; missing.removeValue(forKey: "matching_range")
-            rejects("missing nullable range accepted") { _ = try AtlasReaderDelimiterMatch.decode(bracketJSON(missing), selection: selected) }
-            var reversed = receipt; reversed["matching_range"] = ["start": String(start), "end": String(start + width)]
-            rejects("selected bracket substituted for its mate") { _ = try AtlasReaderDelimiterMatch.decode(bracketJSON(reversed), selection: selected) }
-            let multiple = try bracketSelection(page: page, range: NSRange(location: 0, length: 4), start: start, end: page.end)
-            check(multiple.matchingBracket == nil, "multiple selected scalars became one bracket")
         }
     }
 
@@ -257,6 +295,55 @@ private final class BracketFixture: @unchecked Sendable {
         check(fixture.calls.opened == 1, "back navigation reread disk")
     }
 
+    private static func navigatesBeyondFormerLimitAndPreservesAcceptedSelection() async {
+        let fixture = BracketFixture(padding: 600_000), model = await open(fixture)
+        defer { model.close() }
+        let opening = await select(model, NSRange(location: 0, length: 1))
+        check(model.goToMatchingBracket(selectionID: opening), "large-source bracket action refused")
+        await wait("mate beyond the former source limit did not install") {
+            !model.busy && model.textSelection?.originalStart == 600_001
+        }
+        check(model.nativeSelectionRange == NSRange(location: 256, length: 1)
+              && model.textSelection?.originalEnd == 600_002 && model.textSelection?.originalHex == "29",
+              "late mate lost its exact original bytes or native selection")
+        let source = model.source!, navigation = model.navigation, closing = model.textSelection!.id
+        let pageStart = model.page!.start
+        check(model.canGoBack && fixture.calls.opened == 1, "large-source navigation lost retained history")
+
+        for mode in [BracketFixture.Mode.wrongMate, .sourceLimit] {
+            fixture.setMode(mode)
+            check(model.goToMatchingBracket(selectionID: closing), "late selection could not request a result")
+            await wait("late bracket refusal did not finish") { !model.busy }
+            check(model.source === source && model.navigation == navigation && model.page?.start == pageStart
+                  && model.textSelection?.id == closing && model.canGoBack,
+                  "late refusal changed the accepted page, exact selection or history")
+        }
+        fixture.setMode(.matched); fixture.failWindow()
+        check(model.goToMatchingBracket(selectionID: closing), "late destination-window refusal did not start")
+        await wait("late destination-window refusal did not finish") { !model.busy }
+        check(model.source === source && model.navigation == navigation && model.textSelection?.id == closing
+              && model.page?.start == pageStart && model.canGoBack,
+              "failed large-source destination committed partial navigation")
+
+        fixture.blockMatch()
+        let returned = fixture.calls.matchReturns
+        check(model.goToMatchingBracket(selectionID: closing), "late canceled matching did not start")
+        await wait("late matching did not block") { fixture.calls.blocked == 1 }
+        model.cancel(); fixture.gate.signal()
+        await wait("late canceled matching did not drain") { fixture.calls.matchReturns == returned + 1 }
+        check(model.source === source && model.navigation == navigation && model.textSelection?.id == closing
+              && model.page?.start == pageStart && model.canGoBack,
+              "cancellation revoked the accepted late selection")
+
+        check(model.goToMatchingBracket(selectionID: closing), "late closing bracket could not navigate backward")
+        await wait("opening bracket did not return after a large-source refusal") {
+            !model.busy && model.textSelection?.originalStart == 0
+        }
+        model.back()
+        await wait("large-source history did not restore the late page") { !model.busy && model.page?.start == pageStart }
+        check(fixture.calls.opened == 1, "late bracket navigation reopened the source")
+    }
+
     private static func refusalsPreserveSelectionAndHistory() async {
         let fixture = BracketFixture(), model = await open(fixture)
         defer { model.close() }
@@ -269,7 +356,7 @@ private final class BracketFixture: @unchecked Sendable {
             check(model.source === source && model.navigation == navigation && model.textSelection?.id == selected
                   && !model.canGoBack && !model.notice.isEmpty, "refusal changed source, selection or history")
         }
-        check(model.notice.contains("512 KiB"), "bounded source refusal had no useful explanation")
+        check(model.notice.contains("1 MiB"), "bounded source refusal had no useful explanation")
         fixture.setMode(.matched); fixture.failWindow()
         check(model.goToMatchingBracket(selectionID: selected), "mate window refusal did not start")
         await wait("mate window refusal did not finish") { !model.busy }

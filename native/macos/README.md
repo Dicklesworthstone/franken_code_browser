@@ -2843,7 +2843,7 @@ Canceled, refused and stale results preserve the current page, exact selection
 and navigation history; the destination is checked against its retained bytes
 before it replaces the page.
 
-The current analysis admits complete captures up to **512 KiB** in both
+The current analysis admits complete captures up to **1 MiB** in both
 original and decoded text, with at most **1,024** nested delimiters. UTF-8 and
 BOM-marked UTF-16 preserve their original byte offsets. Supported filename
 families are Rust, Python, JavaScript, TypeScript, JSX, TSX, Go, C/C++, Swift,

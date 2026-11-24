@@ -60,6 +60,55 @@ fn public_receipt_carries_exact_utf8_utf16_ranges_and_retained_identity() {
 }
 
 #[test]
+fn late_delimiters_keep_exact_ranges_and_accepted_search_in_all_encodings() {
+    for encoding in 0..3 {
+        // Both selected braces are past the former 512-KiB source boundary.
+        // UTF-16 needs half as many ASCII scalars to cross that original-byte
+        // boundary; all fixtures remain inside both one-MiB admission limits.
+        let padding = if encoding == 0 { 600_000 } else { 300_000 };
+        let text = format!("\u{feff}// 🦀 é\r\n{}fn run() {{ let s = \"}}\"; /* }} */ [1, (2)] }}\r\n",
+            " ".repeat(padding));
+        let bytes = encode(&text, encoding);
+        assert!(bytes.len() <= MAX_DELIMITER_SOURCE_BYTES);
+        assert!(text.len() <= MAX_DELIMITER_SOURCE_BYTES);
+        let open = encode(&text[..text.find('{').unwrap()], encoding).len() as u64;
+        let close = encode(&text[..text.rfind('}').unwrap()], encoding).len() as u64;
+        let width = if encoding == 0 { 1 } else { 2 };
+        assert!(open > 512 * 1024 && close > open);
+
+        let mut reader = source("/nonexistent/late.rs", &bytes);
+        reader.search(17, "run", 1, bytes.len() as u64, || false).unwrap();
+        let source_digest = reader.capture_sha256();
+        for (selected, expected) in [(open, close), (close, open)] {
+            let response = reader.matching_delimiter(selected, selected + width, || false).unwrap();
+            let json = parse(response.as_str().as_bytes()).unwrap();
+            assert_eq!(response.exit_code(), EXIT_OK);
+            assert_eq!(json.get("delimiter_state").text(), "matched");
+            assert_eq!(json.get("selected_range").get("start").number(), selected);
+            assert_eq!(json.get("selected_range").get("end").number(), selected + width);
+            assert_eq!(json.get("matching_range").get("start").number(), expected);
+            assert_eq!(json.get("matching_range").get("end").number(), expected + width);
+            assert_eq!(json.get("additional_source_bytes_read").number(), 0);
+        }
+
+        let mut polls = 0;
+        let canceled = reader.matching_delimiter(open, open + width, || {
+            polls += 1;
+            polls >= 8
+        });
+        assert_eq!(canceled.err(), Some(ReaderSessionError::Canceled));
+        assert!(polls >= 8, "cancellation did not reach admitted source processing");
+        assert_eq!(reader.matching_delimiter(open, open + width * 2, || false).err(),
+            Some(ReaderSessionError::Delimiter(DelimiterError::InvalidSelection)));
+        assert_eq!(reader.accepted_generation(), Some(17));
+        assert_eq!(reader.capture_sha256(), source_digest);
+        assert_eq!(reader.capture().bytes(), bytes);
+        assert!(reader.copy_hit(17, 0, || false).is_ok());
+        assert!(reader.matching_delimiter(close, close + width, || false).is_ok());
+    }
+}
+
+#[test]
 fn no_destination_states_and_invalid_requests_preserve_existing_search() {
     for (text, selected, state) in [
         ("([)]", 0, "mismatched"), ("(", 0, "unmatched"),

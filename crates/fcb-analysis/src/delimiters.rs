@@ -13,16 +13,17 @@ mod lexical;
 mod tests;
 
 use std::mem::size_of;
-use fcb_core::{ByteLength, ByteRange, DecodedUtf8Offset, DecodedUtf8Range, FileId,
+use fcb_core::{ByteLength, ByteRange, FileId,
     ResourceAllocationId, ResourceBudget, SourceRevision};
-use fcb_source::{CaptureEncodingMap, CaptureRequest, DetectedEncoding, MappingSpan,
-    SpanKind, detect_encoding};
+use fcb_source::{CaptureRequest, DetectedEncoding, detect_encoding};
 use franken_markdown::highlight::{Span, Tok, highlight_into};
+use crate::source_map::{SourceMap, SourceMapError};
 use crate::symbols::SymbolLanguage;
 
-/// The upstream batch lexer is bracketed by cancellation checks. Larger files
-/// remain readable, but do not receive a whole-capture delimiter claim here.
-pub const MAX_DELIMITER_SOURCE_BYTES: usize = 512 * 1024;
+/// Original bytes and decoded UTF-8 each have this ceiling. The upstream batch
+/// lexer is bracketed by cancellation checks; work is bounded, not resumable.
+/// Larger or expansion-limited captures remain readable without a delimiter claim.
+pub const MAX_DELIMITER_SOURCE_BYTES: usize = 1024 * 1024;
 pub const MAX_DELIMITER_DEPTH: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,34 +101,28 @@ pub fn matching_delimiter(source: &[u8], request: CaptureRequest, language: Symb
     if selected.is_empty() || selected.end().get() > source.len() as u64 {
         return Err(DelimiterError::InvalidSelection);
     }
-    // Reserve before either decoder or upstream tokenizer allocates. Mapping
-    // spans include Vec growth and old/new overlap, including malformed input
-    // which is rejected only after decoding. Three decoded bytes per raw byte
-    // covers replacement expansion; accepted decoded text has its own cap.
-    // Four token-sized buffers cover upstream spans, its working overlap and
-    // the shared JS lexical guard's terminal buffer. No outline tree is built.
-    let decoded_capacity = source.len().checked_mul(3).ok_or(DelimiterError::ResourceDenied)?
-        .min(MAX_DELIMITER_SOURCE_BYTES).max(1);
-    let charge = source.len().checked_add(1)
-        .and_then(|n| n.checked_mul(4 * size_of::<MappingSpan>() + 16))
-        .and_then(|n| decoded_capacity.checked_mul(4 * size_of::<Span>()).and_then(|m| n.checked_add(m)))
-        .and_then(|n| n.checked_add(size_of::<CaptureEncodingMap>() + MAX_DELIMITER_DEPTH + 4096))
+    let encoding = encoding.unwrap_or_else(|| detect_encoding(source));
+    if encoding == DetectedEncoding::Unsupported { return Err(DelimiterError::UnsupportedEncoding); }
+    // Reserve before constructing the sparse source map or upstream tokenizers.
+    // One bounded decoder map replaces the source-sized provenance table. Four
+    // token-sized buffers retain the existing upstream/JS-guard overlap allowance.
+    let decoded_capacity = SourceMap::decoded_capacity(source.len(), encoding, MAX_DELIMITER_SOURCE_BYTES)
+        .map_err(source_map_error)?;
+    let token_bytes = decoded_capacity.max(1).checked_mul(4 * size_of::<Span>())
+        .ok_or(DelimiterError::ResourceDenied)?;
+    let charge = SourceMap::workspace_bytes(source.len(), decoded_capacity).map_err(source_map_error)?
+        .checked_add(token_bytes)
+        .and_then(|n| n.checked_add(MAX_DELIMITER_DEPTH + 4096))
         .ok_or(DelimiterError::ResourceDenied)?;
     let _lease = budget.try_reserve_managed(request.file().owner(), allocation, ByteLength::new(charge as u64))
         .map_err(|_| DelimiterError::ResourceDenied)?;
-    let encoding = encoding.unwrap_or_else(|| detect_encoding(source));
-    if encoding == DetectedEncoding::Unsupported { return Err(DelimiterError::UnsupportedEncoding); }
-    let map = CaptureEncodingMap::build_with_encoding(source, encoding)
-        .map_err(|_| DelimiterError::UnsupportedEncoding)?;
+    let map = SourceMap::build(source, encoding, MAX_DELIMITER_SOURCE_BYTES,
+        MAX_DELIMITER_SOURCE_BYTES, &mut canceled).map_err(source_map_error)?;
     check(&mut canceled)?;
-    if map.spans().iter().any(|span| matches!(span.kind, SpanKind::ReplacementMalformed | SpanKind::EscapedByte)) {
-        return Err(DelimiterError::UnsupportedEncoding);
-    }
     let text = map.decoded_text();
-    if text.len() > MAX_DELIMITER_SOURCE_BYTES { return Err(DelimiterError::SourceLimit); }
-    let decoded = map.byte_range_to_decoded_utf8_range(selected)
+    let decoded = map.decoded_range_for_original(selected)
         .map_err(|_| DelimiterError::InvalidSelection)?;
-    if map.decoded_utf8_range_to_byte_range(decoded).map_err(|_| DelimiterError::InvalidSelection)? != selected {
+    if map.mapped(decoded.start().get(), decoded.end().get()).map_err(|_| DelimiterError::InvalidSelection)? != selected {
         return Err(DelimiterError::InvalidSelection);
     }
     let start = usize::try_from(decoded.start().get()).map_err(|_| DelimiterError::InvalidSelection)?;
@@ -138,7 +133,10 @@ pub fn matching_delimiter(source: &[u8], request: CaptureRequest, language: Symb
     if scalars.next().is_some() { return Err(DelimiterError::InvalidSelection); }
     let receipt = |state, matching| DelimiterMatch { file: request.file(), revision: request.revision(),
         language, state, selected, matching };
-    if !is_delimiter(scalar) { return Ok(receipt(DelimiterState::NotDelimiter, None)); }
+    if !is_delimiter(scalar) {
+        check(&mut canceled)?;
+        return Ok(receipt(DelimiterState::NotDelimiter, None));
+    }
 
     lexical::check_source(text, language, &mut canceled)?;
     let capacity = text.len().max(1);
@@ -153,7 +151,10 @@ pub fn matching_delimiter(source: &[u8], request: CaptureRequest, language: Symb
     let selected_token = spans.get(spans.partition_point(|span| span.end <= start))
         .ok_or(DelimiterError::InvalidEvidence)?;
     if selected_token.start > start || selected_token.end < end { return Err(DelimiterError::InvalidEvidence); }
-    if selected_token.kind != Tok::Punct { return Ok(receipt(DelimiterState::NotCode, None)); }
+    if selected_token.kind != Tok::Punct {
+        check(&mut canceled)?;
+        return Ok(receipt(DelimiterState::NotCode, None));
+    }
 
     // Iterate only upstream punctuation. Do not scan opaque token contents or
     // resynthesize a token stream from stripped source text.
@@ -167,12 +168,20 @@ pub fn matching_delimiter(source: &[u8], request: CaptureRequest, language: Symb
         walk(punctuation.rev().filter(|(offset, _)| *offset < start), scalar, false, &mut canceled)?
     };
     let matching = counterpart.map(|offset| {
-        let decoded = DecodedUtf8Range::new(DecodedUtf8Offset::new(offset as u64),
-            DecodedUtf8Offset::new(offset as u64 + 1)).map_err(|_| DelimiterError::InvalidEvidence)?;
-        map.decoded_utf8_range_to_byte_range(decoded).map_err(|_| DelimiterError::InvalidEvidence)
+        map.mapped(offset as u64, offset as u64 + 1).map_err(source_map_error)
     }).transpose()?;
     check(&mut canceled)?;
     Ok(receipt(state, matching))
+}
+
+fn source_map_error(error: SourceMapError) -> DelimiterError {
+    match error {
+        SourceMapError::SourceLimit => DelimiterError::SourceLimit,
+        SourceMapError::UnsupportedEncoding => DelimiterError::UnsupportedEncoding,
+        SourceMapError::InvalidEvidence => DelimiterError::InvalidEvidence,
+        SourceMapError::ResourceDenied | SourceMapError::ComplexityLimit => DelimiterError::ResourceDenied,
+        SourceMapError::Canceled => DelimiterError::Canceled,
+    }
 }
 
 fn check(canceled: &mut impl FnMut() -> bool) -> Result<(), DelimiterError> {

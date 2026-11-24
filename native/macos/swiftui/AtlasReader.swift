@@ -37,7 +37,7 @@ enum AtlasReaderError: Error, Sendable {
             case "QUERY_SYNTAX_ERROR":
                 return "The expression could not be parsed. Check quotes and provide a required term before exclusions."
             case "DELIMITER_SOURCE_LIMIT":
-                return "Matching brackets currently supports complete retained sources up to 512 KiB in both original and decoded text."
+                return "Matching brackets currently supports complete retained sources up to 1 MiB in both original and decoded text."
             case "DELIMITER_UNSUPPORTED_LANGUAGE":
                 return "Matching brackets is unavailable for this source language."
             case "DELIMITER_UNSUPPORTED_ENCODING":
