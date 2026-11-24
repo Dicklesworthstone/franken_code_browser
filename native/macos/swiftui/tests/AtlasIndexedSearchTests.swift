@@ -109,6 +109,54 @@ import Dispatch
             check(report.capture?.target(report.hits[0]) != nil,
                 "The larger indexed occurrence keeps its exact captured source authority")
         }
+
+        // A late symbol in a full 1 MiB captured source keeps its original
+        // range through index-to-reader transfer, independently of query state.
+        // Scripted receipts do not claim execution of the Rust extractor.
+        for encoding in ["utf8", "utf16le", "utf16be"] {
+            let f = IndexedFixture()
+            f.configure { $0.files = 1; $0.hitCount = 1; $0.captureBytes = 1_048_576; $0.encoding = encoding }
+            let start: UInt64 = encoding == "utf8" ? 1_048_575 : 1_048_574
+            f.patch { phase, original in
+                var value = original
+                if phase == "query-step", value["requested_mode"] as? String == "symbols",
+                   let originalRows = value["hits"] as? [[String: Any]] {
+                    value["hits"] = originalRows.map { originalRow in
+                        var row = originalRow, structure = row["structure"] as! [String: Any]
+                        let range = ["start": String(start), "end": "1048576"]
+                        row["original_range"] = range; structure["evidence_range"] = range
+                        row["structure"] = structure; return row
+                    }
+                }
+                return value
+            }
+            let worker = AtlasIndexedSearch(transport: f.structuralTransport)
+            let report = try search(worker, .symbols)
+            check(report.complete && report.structureCoverage?.fileByteLimit == 1_048_576
+                && report.hits[0].start == start && report.hits[0].end == 1_048_576,
+                "Large captured symbol range or source allowance was rejected")
+            let target = report.capture!.target(report.hits[0])!
+            _ = try run(worker, query: "replacement")
+            let imported = try AtlasIndexWire.decode(target.openReader(100))
+            let capturedBytes = try imported.number("captured_bytes")
+            let actualEncoding = try imported.text("encoding")
+            check(capturedBytes == 1_048_576 && actualEncoding == encoding
+                && target.start == start && target.end == 1_048_576 && f.count("source:") == 1
+                && f.count("build-begin:") == 1,
+                "A replaced query lost the retained large-symbol reader or reread source")
+        }
+        for wrongLimit in ["65536", "1048577"] {
+            let f = IndexedFixture()
+            f.patch { phase, original in
+                var value = original
+                if phase == "query-step" { value["structure_file_byte_limit"] = wrongLimit }
+                return value
+            }
+            do { _ = try search(AtlasIndexedSearch(transport: f.structuralTransport), .symbols)
+                preconditionFailure("Captured symbols admitted an obsolete or excessive extractor limit") }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
+        }
+
         for wrongLimit in ["524288", "33554432"] {
             let f = IndexedFixture()
             f.patch { phase, original in

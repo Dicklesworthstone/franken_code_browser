@@ -7,7 +7,7 @@
 //! against the decoded capture and mapped back to its original bytes. Markdown
 //! stays with its upstream document owner.
 //!
-//! Worker work is bounded by 64 KiB original/decoded source and 4096 lines.
+//! Worker work is bounded by 1 MiB original/decoded source and 65,536 lines.
 //! Rejected files remain available to the ordinary reader. Rust, Python,
 //! JavaScript/JSX, TypeScript/TSX, Go, C/C++, Swift, Java and C# use pinned upstream
 //! lexers and bounded declaration recognizers; they do not introduce lexers or
@@ -31,9 +31,9 @@ mod go;
 mod python;
 mod cpp;
 
-pub const MAX_SYMBOL_SOURCE_BYTES: usize = 64 * 1024;
+pub const MAX_SYMBOL_SOURCE_BYTES: usize = 1024 * 1024;
 pub const MAX_SYMBOL_ITEMS: usize = 4096;
-const MAX_LINES: usize = 4096;
+const MAX_LINES: usize = 65_536;
 const MAX_RECURSIVE_SCOPES: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -430,6 +430,96 @@ mod tests {
         assert_eq!(outline.candidates()[0].name(), "retry");
         drop(outline);
         assert_eq!(budget.accounting().reserved().get(), 0);
+    }
+
+    fn encoded_source(text: &str, little: Option<bool>) -> Vec<u8> {
+        let Some(little) = little else { return text.as_bytes().to_vec(); };
+        let mut source = if little { vec![0xff, 0xfe] } else { vec![0xfe, 0xff] };
+        for unit in text.encode_utf16() {
+            source.extend_from_slice(&if little { unit.to_le_bytes() } else { unit.to_be_bytes() });
+        }
+        source
+    }
+
+    #[test]
+    fn every_language_reaches_declarations_beyond_the_old_byte_and_line_caps() {
+        let budget = ResourceBudget::new(owner(), ByteLength::new(256 * 1024 * 1024)).unwrap();
+        let cases = [
+            (SymbolLanguage::Rust, "//", "fn distant() {}\n", "distant"),
+            (SymbolLanguage::Python, "#", "def distant():\n    pass\n", "distant"),
+            (SymbolLanguage::JavaScript, "//", "function distant() {}\n", "distant"),
+            (SymbolLanguage::TypeScript, "//", "function distant() {}\n", "distant"),
+            (SymbolLanguage::Jsx, "//", "function distant() {}\n", "distant"),
+            (SymbolLanguage::Tsx, "//", "function distant() {}\n", "distant"),
+            (SymbolLanguage::Go, "//", "func distant() {}\n", "distant"),
+            (SymbolLanguage::Cpp, "//", "void distant() {}\n", "distant"),
+            (SymbolLanguage::Swift, "//", "func distant() {}\n", "distant"),
+            (SymbolLanguage::Java, "//", "class Distant {}\n", "Distant"),
+            (SymbolLanguage::CSharp, "//", "class Distant {}\n", "Distant"),
+        ];
+        for (language, comment, declaration, name) in cases {
+            let text = format!("{}{}", format!("{comment} retained padding\n").repeat(5000), declaration);
+            assert!(text.len() > 64 * 1024);
+            for little in [None, Some(false), Some(true)] {
+                let source = encoded_source(&text, little);
+                let outline = build(&source, language, 32, &budget);
+                let candidate = outline.candidates().iter().find(|item| item.name() == name)
+                    .unwrap_or_else(|| panic!("missing {name} in {}", language.name()));
+                assert_eq!(candidate.line(), 5001);
+                assert_eq!(candidate.original_range().start().get(),
+                    encoded_source(&text[..text.len() - declaration.len()], little).len() as u64);
+                let expected = encoded_source(name, little);
+                let expected = if little.is_some() { &expected[2..] } else { &expected[..] };
+                assert_eq!(outline.name_bytes(candidate.id()).unwrap().unwrap(), expected);
+                assert!(!outline.output_limited());
+                drop(outline);
+                assert_eq!(budget.accounting().reserved().get(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn exact_original_and_decoded_mebibyte_boundaries_are_admitted_independently() {
+        let budget = ResourceBudget::new(owner(), ByteLength::new(256 * 1024 * 1024)).unwrap();
+        let tail = "*/\nfn edge() {}\n";
+        let mut text = String::from("/*");
+        while text.len() + "中".len() + tail.len() <= MAX_SYMBOL_SOURCE_BYTES {
+            text.push('中');
+        }
+        while text.len() + tail.len() < MAX_SYMBOL_SOURCE_BYTES { text.push(' '); }
+        text.push_str(tail);
+        assert_eq!(text.len(), MAX_SYMBOL_SOURCE_BYTES);
+        for little in [None, Some(false), Some(true)] {
+            let source = encoded_source(&text, little);
+            assert!(source.len() <= MAX_SYMBOL_SOURCE_BYTES);
+            let outline = build(&source, SymbolLanguage::Rust, 1, &budget);
+            assert_eq!(outline.candidates()[0].name(), "edge");
+            assert_eq!(outline.candidates()[0].line(), 2);
+            assert!(!outline.output_limited());
+            assert!(budget.accounting().peak_reserved().get() <= 160 * 1024 * 1024);
+            drop(outline);
+            assert_eq!(budget.accounting().reserved().get(), 0);
+        }
+        let over = b" ".repeat(MAX_SYMBOL_SOURCE_BYTES + 1);
+        assert!(matches!(CapturedSymbols::build(&over, request(1), generation(),
+            SymbolLanguage::Rust, None, 1, &budget, ResourceAllocationId::new(1).unwrap(), || false),
+            Err(SymbolError::SourceLimit)));
+        assert_eq!(budget.accounting().reserved().get(), 0);
+    }
+
+    #[test]
+    fn larger_line_ceiling_counts_crlf_and_bare_cr_without_a_phantom_final_line() {
+        for delimiter in ["\n", "\r\n", "\r"] {
+            let mut text = delimiter.repeat(MAX_LINES - 1);
+            text.push('x');
+            let starts = source_line_starts(&text, &mut || false).unwrap();
+            assert_eq!(starts.len(), MAX_LINES);
+            assert_eq!(starts[MAX_LINES - 1], text.len() - 1);
+            text.push_str(delimiter);
+            assert_eq!(source_line_starts(&text, &mut || false).unwrap().len(), MAX_LINES);
+            text.push('x');
+            assert_eq!(source_line_starts(&text, &mut || false), Err(SymbolError::ComplexityLimit));
+        }
     }
 
 }

@@ -340,13 +340,16 @@ fn failed_captures_and_build_omissions_remain_separate_from_structural_negatives
 
 #[test]
 fn extractor_caps_bad_encoding_and_work_budget_produce_truthful_partial_coverage() {
-    let oversized = vec![b' '; 65_537];
+    let oversized = vec![b' '; fcb::search::MAX_SYMBOL_SOURCE_BYTES + 1];
     let bad = b"fn needle() {}\xff";
     let good = b"fn needle() {}\n";
-    let fixture = Fixture::new(&[("a.swift", b"func needle() {}\n"), ("b.rs", &oversized),
+    let fixture = Fixture::new(&[("a.kt", b"fun needle() {}\n"), ("b.rs", &oversized),
         ("c.rs", bad), ("d.rs", good)]);
     let atlas = fixture.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
-    search.prepare_index(&atlas, 1, index_options(), || false).unwrap();
+    // Capture the oversized source so this exercises the extractor's ceiling,
+    // independently of the archive/index capture admission limit.
+    let mut capture = index_options(); capture.max_file_bytes = 2 * 1024 * 1024;
+    search.prepare_index(&atlas, 1, capture, || false).unwrap();
     let mut settings = options(AtlasStructureMode::Symbols); settings.max_scan_bytes = 0;
     search.begin_indexed_structure(&atlas, 2, 1, "needle", AtlasSearchScope::all(), settings, || false).unwrap();
     let zero = finish(&mut search, &atlas, 2);
@@ -484,4 +487,36 @@ fn large_captured_occurrences_count_and_activate_after_index_and_live_source_cha
     let refs = reader.prepare_references_window(1, "needle", 1, true, 1, || false).unwrap();
     count(refs.as_str(), "matches_counted", 2);
     assert_eq!(reader.reference_range(1, 1).unwrap(), hit.original_range);
+}
+
+#[test]
+fn large_indexed_symbols_reach_late_lines_and_keep_captures_after_index_release() {
+    let prefix = "// 😀 captured context\r\n".repeat(5_000);
+    let text = format!("\u{feff}{prefix}fn late_target() {{}}\r\n");
+    for little in [true, false] {
+        let source: Vec<_> = text.encode_utf16()
+            .flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect();
+        let fixture = Fixture::new(&[("large.rs", &source)]);
+        let atlas = fixture.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
+        search.prepare_index(&atlas, 1, index_options(), || false).unwrap();
+        fs::write(fixture.0.join("large.rs"), b"fn replacement() {}\n").unwrap();
+        search.begin_indexed_structure(&atlas, 2, 1, "late_target", AtlasSearchScope::all(),
+            options(AtlasStructureMode::Symbols), || false).unwrap();
+        let page = finish(&mut search, &atlas, 2);
+        count(&page, "retained_hits", 1); count(&page, "source_bytes_read", 0);
+        count(&page, "verification_source_bytes", source.len() as u64);
+        assert!(page.contains("\"search_complete\":true"), "{page}");
+        let hit = search.hit(&atlas, 2, 1).unwrap();
+        let expected: Vec<_> = "late_target".encode_utf16()
+            .flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect();
+        assert_eq!(&source[hit.original_range.start().get() as usize..hit.original_range.end().get() as usize], expected);
+        search.clear_index(&atlas, 3, || false).unwrap();
+        let (mut reader, receipt) = search.open_reader(&atlas, ArenaOwnerId::new(31639).unwrap(),
+            2, 1, || false).unwrap();
+        assert_eq!(reader.capture().bytes(), source);
+        assert!(receipt.as_str().contains("\"source_reopened\":false"));
+        let outline = reader.prepare_outline(1, Default::default(), || false).unwrap();
+        assert!(outline.as_str().contains("\"declaration_line\":\"5001\""));
+        assert!(outline.as_str().contains("\"name\":\"late_target\""));
+    }
 }

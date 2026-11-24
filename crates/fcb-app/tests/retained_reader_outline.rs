@@ -369,3 +369,62 @@ struct Widget {
     assert_eq!(reader.symbol_range(1, target, false).err(),
         Some(ReaderSessionError::Symbol(SymbolError::StaleQuery)));
 }
+
+#[test]
+fn large_outlines_keep_late_original_names_across_live_replacement_and_reader_forks() {
+    let prefix = "// 🦀 retained comment\r\n".repeat(5_000);
+    let text = format!("{prefix}fn late_target() {{}}\r\n");
+    for encoding in 0..3 {
+        let encode = |text: &str| -> Vec<u8> {
+            match encoding {
+                0 => text.as_bytes().to_vec(),
+                1 => text.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+                _ => text.encode_utf16().flat_map(u16::to_be_bytes).collect(),
+            }
+        };
+        let source = encode(&format!("\u{feff}{text}"));
+        assert!(source.len() > 64 * 1024 && source.len() < MAX_SYMBOL_SOURCE_BYTES);
+        let root = fixture(); let path = root.join("large.rs");
+        fs::write(&path, &source).unwrap();
+        let mut r = ReaderSession::open(ArenaOwnerId::new(9340 + encoding).unwrap(),
+            &path, MAX_SYMBOL_SOURCE_BYTES, || false).unwrap();
+        fs::write(&path, b"fn replacement() {}\n").unwrap();
+        let outline = r.prepare_outline(1, Default::default(), || false).unwrap();
+        assert_eq!(outline.exit_code(), EXIT_OK);
+        assert!(outline.as_str().contains("\"declaration_line\":\"5001\""));
+        let symbol = id(&mut r, 1, "late_target");
+        let selected = r.symbol_range(1, symbol, false).unwrap();
+        let expected = encode("late_target");
+        assert_eq!(bytes(&r, selected), expected);
+        assert_eq!(selected.start().get(), encode(&format!("\u{feff}{prefix}fn ")).len() as u64);
+        let copied = r.copy_symbol(1, symbol, false, || false).unwrap();
+        assert!(copied.as_str().contains(&format!("\"original_hex\":\"{}\"", hex(&expected))));
+        assert!(copied.as_str().contains("\"additional_source_bytes_read\":\"0\""));
+        assert!(r.prepare_outline(2, Default::default(), || true).is_err());
+        assert_eq!(r.outline_generation(), Some(1));
+        let mut fork = r.fork(ArenaOwnerId::new(9350 + encoding).unwrap(), || false).unwrap();
+        drop(r);
+        prepare(&mut fork, 1);
+        let fork_symbol = id(&mut fork, 1, "late_target");
+        assert_eq!(bytes(&fork, fork.symbol_range(1, fork_symbol, false).unwrap()), expected);
+        assert_eq!(fork.capture().bytes(), source);
+        assert!(copied.as_str().contains("\"outline_generation\":\"1\""));
+    }
+}
+
+#[test]
+fn maximum_outline_source_is_admitted_and_one_more_byte_keeps_plain_reading_available() {
+    assert_eq!(MAX_SYMBOL_SOURCE_BYTES, 1024 * 1024);
+    let declaration = b"fn final_symbol() {}\n";
+    let mut source = vec![b' '; MAX_SYMBOL_SOURCE_BYTES - declaration.len()];
+    source.extend_from_slice(declaration);
+    let mut accepted = reader(&source); prepare(&mut accepted, 1);
+    let symbol = id(&mut accepted, 1, "final_symbol");
+    assert_eq!(bytes(&accepted, accepted.symbol_range(1, symbol, false).unwrap()), b"final_symbol");
+    source.push(b' ');
+    let mut refused = reader(&source);
+    assert_eq!(refused.prepare_outline(1, Default::default(), || false).err(),
+        Some(ReaderSessionError::Symbol(SymbolError::SourceLimit)));
+    assert_eq!(refused.outline_generation(), None);
+    assert!(refused.read_window(0, 128, || false).is_ok());
+}

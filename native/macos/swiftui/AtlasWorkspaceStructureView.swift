@@ -37,7 +37,7 @@ import SwiftUI
                 : "Applies repository ignore rules within this fixed location and file-type scope.")
                 .font(.caption).foregroundStyle(.secondary)
             queryControls
-            Text("Discovery continues beyond the atlas file-count limit. Turn off Match case to compare names using Unicode lowercase. Symbols use complete files up to 64 KiB; Markdown headings use complete files up to 256 KiB. Larger or unsupported files remain explicit incomplete coverage.")
+            Text("Discovery continues beyond the atlas file-count limit. Turn off Match case to compare names using Unicode lowercase. Symbols use complete files up to 1 MiB, with up to 65,536 physical lines; Markdown headings use complete files up to 256 KiB. Larger or unsupported files remain explicit incomplete coverage.")
                 .font(.caption).foregroundStyle(.secondary)
             if let page = model.page {
                 coverage(page)

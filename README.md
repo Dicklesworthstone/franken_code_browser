@@ -58,6 +58,14 @@ Results include comments and strings and open their retained source with exact
 occurrence highlighting. See [workspace identifier occurrences](native/macos/README.md#workspace-identifier-occurrences)
 for encoding, coverage and capture limits.
 
+**Outline and Symbols now admit larger source files.** Retained readers, workspace
+search, saved repositories and CLI declaration lookup share a 1 MiB limit for
+both original and decoded source, with up to 65,536 physical lines. The existing
+4,096-candidate and nesting limits remain explicit. UTF-8 and UTF-16 declarations
+keep exact original-byte selections, and accepted results continue to use their
+retained capture after the live file changes. This source addition awaits
+independent executable and physical-Mac verification.
+
 The retained reader's **Occurrences** tool now reports the complete match count
 and offers **Previous results** / **Next results** beyond its 4,096-row window.
 Later workspace occurrence hits also open their exact range in the same captured

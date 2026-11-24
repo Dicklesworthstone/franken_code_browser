@@ -80,7 +80,7 @@ import Foundation
         rows.swapAt(0, 1); mixedRows["hits"] = rows; refuse(mixedRows, request: request)
         for (key, value) in [
             ("index", "1"), ("occurrence_id", "101"), ("candidate_id", "0"), ("file_id", "0"),
-            ("source_revision", "0"), ("source_length", "65537"), ("name", "Needle"),
+            ("source_revision", "0"), ("source_length", "1048577"), ("name", "Needle"),
             ("capture_sha256", String(repeating: "A", count: 64)), ("encoding", "utf32")
         ] {
             var bad = valid; rows = valid["hits"] as! [[String: Any]]; rows[0][key] = value
@@ -158,6 +158,65 @@ import Foundation
             bad["scope_region_sha256"] = String(repeating: "f", count: 64); refuse(bad, request: scoped)
         }
         #endif
+
+
+        // Native receipt and transfer admission for the expanded symbol cap.
+        // The fixed witness uses the final identifier of a 1 MiB source; it is
+        // independent of the Rust discovery/extraction integration tests.
+        for encoding in ["utf8", "utf16le", "utf16be"] {
+            let utf16 = encoding != "utf8"
+            let width: UInt64 = utf16 ? 12 : 6
+            let hitStart: UInt64 = 1_048_576 - width
+            var large = WorkspaceStructureFixture.page(owner: owner, request: request)
+            var row = (large["hits"] as! [[String: Any]])[0]
+            row["source_length"] = "1048576"; row["encoding"] = encoding
+            row["original_range"] = ["start": String(hitStart), "end": "1048576"]
+            row["evidence_range"] = row["original_range"]
+            large["retained_hits"] = "1"; large["matches_seen"] = "1"
+            large["retained_source_bytes"] = "1048576"; large["payload_bytes_read"] = "1048576"
+            large["structure_metadata_bytes"] = "128"; large["structure_metadata_omitted"] = "0"
+            large["truncated"] = false; large["page_has_more_matches"] = false
+            large["page_count"] = "1"; large["next_offset"] = NSNull(); large["hits"] = [row]
+            let largePage = try decode(large, request: request), target = largePage.target(largePage.rows[0])!
+            precondition(target.hit.sourceBytes == 1_048_576 && target.hit.range.start == hitStart)
+
+            let destination = owner + 100
+            var info = WorkspaceStructureFixture.readerInfo(owner: destination, request: request,
+                path: WorkspaceStructureFixture.relativePath(request))
+            info["captured_bytes"] = "1048576"; info["encoding"] = encoding
+            let text = String(repeating: " ", count: utf16 ? 128 : 256) + "needle"
+            let bytes: [UInt8] = utf16 ? text.utf16.flatMap { unit in
+                encoding == "utf16le" ? [UInt8(unit & 255), UInt8(unit >> 8)]
+                    : [UInt8(unit >> 8), UInt8(unit & 255)]
+            } : Array(text.utf8)
+            var window = info; window["command"] = "window"
+            window["text_kind"] = "logical-captured-text-not-shaped"
+            window["requested_original_range"] = ["start": String(hitStart - 256), "end": "1048576"]
+            window["visible_range"] = window["requested_original_range"]
+            window["range_limited"] = false; window["boundaries_adjusted"] = false
+            window["has_replacements"] = false; window["first_physical_line"] = NSNull()
+            window["next_offset"] = NSNull(); window["text"] = text
+            window["original_hex"] = WorkspaceStructureFixture.hex(bytes); window["selection"] = NSNull()
+            var receipt = large; receipt["command"] = "open-reader"; receipt["hit"] = row
+            receipt["reader_owner"] = String(destination); receipt["activation_source"] = "retained-search-capture"
+            receipt["additional_source_bytes_read"] = "0"; receipt["additional_read_calls"] = "0"
+            receipt["reader"] = info; receipt["window"] = window
+            let imported = try AtlasWorkspaceStructureReaderReceipt.decode(WorkspaceStructureFixture.json(receipt),
+                target: target, summary: largePage.summary, root: root, destination: destination)
+            precondition(imported.initialOffset == hitStart && imported.info.identity.capturedBytes == 1_048_576
+                && imported.info.identity.encoding == encoding,
+                "large symbol lost its retained source identity or exact activation offset")
+
+            var oversized = large; row["source_length"] = "1048577"; oversized["hits"] = [row]
+            refuse(oversized, request: request)
+            var oldLimit = large, limits = large["limits"] as! [String: String]
+            limits["max_file_bytes"] = "65536"; oldLimit["limits"] = limits
+            refuse(oldLimit, request: request)
+        }
+        var excessiveHeading = WorkspaceStructureFixture.page(owner: owner, request: headings)
+        var headingRows = excessiveHeading["hits"] as! [[String: Any]]
+        headingRows[0]["source_length"] = "262145"; excessiveHeading["hits"] = headingRows
+        refuse(excessiveHeading, request: headings)
 
         let readerOwner = owner + 100
         let receipt = WorkspaceStructureFixture.receipt(owner: owner, reader: readerOwner, request: request)

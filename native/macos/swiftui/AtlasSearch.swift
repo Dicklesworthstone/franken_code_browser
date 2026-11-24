@@ -216,7 +216,7 @@ enum AtlasSearchMode: String, CaseIterable, Identifiable, Sendable {
     }
     var structureFileByteLimit: UInt64 {
         switch self {
-        case .symbols: return 65_536
+        case .symbols: return 1024 * 1024
         case .headings: return 262_144
         case .occurrences: return 32 * 1024 * 1024
         case .text, .expression: return 0

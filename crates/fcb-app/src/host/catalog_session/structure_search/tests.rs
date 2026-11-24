@@ -177,7 +177,7 @@ fn unsupported_oversized_unavailable_and_analysis_limited_sources_stay_incomplet
     fs::write(root.join("unsupported.bin"), b"target").unwrap();
     fs::write(root.join("invalid.rs"), b"\xff fn target() {}").unwrap();
     fs::write(root.join("large.rs"), vec![b'x'; MAX_SYMBOL_SOURCE_BYTES + 1]).unwrap();
-    fs::write(root.join("complex.rs"), "\n".repeat(4100)).unwrap();
+    fs::write(root.join("complex.rs"), "\n".repeat(65_537)).unwrap();
     fs::write(root.join("missing.rs"), b"fn target() {}\n").unwrap();
     let mut session = CatalogStructureSearchSession::open(owner(78530), &root, 1, "target", symbols(), || false).unwrap();
     fs::remove_file(root.join("missing.rs")).unwrap();
@@ -402,4 +402,35 @@ fn a_single_post_read_cancel_poll_keeps_its_error_and_actual_io_debits() {
     assert!(matches!(result, Err(SourceError::Canceled)));
     assert_eq!(io.bytes, source.len() as u64);
     assert_eq!(io.calls, 1);
+}
+
+#[test]
+fn progressive_symbols_retain_large_late_line_evidence_after_source_and_query_close() {
+    let prefix = "// 😀 captured context\r\n".repeat(5_000);
+    let text = format!("{prefix}fn late_target() {{}}\r\n");
+    for little in [true, false] {
+        let root = fixture("large-symbols");
+        let source = utf16(&text, little);
+        assert!(source.len() > 64 * 1024 && source.len() < MAX_SYMBOL_SOURCE_BYTES);
+        fs::write(root.join("large.rs"), &source).unwrap();
+        let mut session = CatalogStructureSearchSession::open(owner(78750), &root, 1,
+            "late_target", symbols(), || false).unwrap();
+        drain(&mut session);
+        assert!(session.complete()); assert_eq!(session.matches_seen, 1);
+        assert_eq!(session.hits.len(), 1);
+        let expected = utf16("late_target", little)[2..].to_vec();
+        assert_eq!(selected_bytes(&session.hits[0]), expected);
+        let io = (session.io.bytes, session.io.calls);
+        fs::write(root.join("large.rs"), b"fn replacement() {}\n").unwrap();
+        let (mut reader, receipt) = session.open_hit_reader(owner(78751), 1, session.revision, 0, || false).unwrap();
+        assert_eq!((session.io.bytes, session.io.calls), io);
+        assert!(receipt.as_str().contains("\"additional_source_bytes_read\":\"0\""));
+        drop(session);
+        assert_eq!(reader.capture().bytes(), source);
+        let outline = reader.prepare_outline(1, Default::default(), || false).unwrap();
+        assert!(outline.as_str().contains("\"declaration_line\":\"5001\""), "{}", outline.as_str());
+        let copied = reader.copy_symbol(1, 1, false, || false).unwrap();
+        let expected_hex = expected.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        assert!(copied.as_str().contains(&expected_hex));
+    }
 }

@@ -36,7 +36,7 @@ Preparation generations increase globally across panes, separately for outlines\
 and references. Failed/canceled attempts consume their generation but preserve\n\
 the previous result. Ordinary search, documents and repository work are separate.\n\
 IDs are one-based; page offsets are zero-based and page counts are 1..128.\n\
-Outline input: at most 64 KiB with existing complexity guards, 1..4096 items.\n\
+Outline input: at most 1 MiB original/decoded text and 65536 physical lines, 1..4096 items.\n\
 Reference input: at most 32 MiB, limit 0..4096; a zero limit probes existence.\n\
 Unavailable analysis leaves the exact source readable. Limits/counts/heuristic\n\
 evidence remain explicit; a limited inventory is never an exhaustive negative.\n\

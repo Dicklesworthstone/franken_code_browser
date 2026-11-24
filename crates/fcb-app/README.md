@@ -1383,7 +1383,7 @@ and byte offset to inspect source.
 
 `--limit` accepts 0–4096 (default 100); zero probes existence without retaining
 a row. `--max-source-bytes` accepts 0–67,108,864 bytes (default 64 MiB) across
-all loaded members. Per-member extraction limits remain 64 KiB for symbols,
+all loaded members. Per-member extraction limits are 1 MiB for symbols,
 256 KiB for headings, and 32 MiB for occurrences. Occurrence extraction uses
 bounded decoder windows across each complete captured member, including bytes
 after the displayed result window. Source, extraction and
@@ -1720,6 +1720,27 @@ cancel and owned-string rules. Regression sources cover core matching, public
 reader receipts, C transport ownership and native navigation. Executable
 verification remains pending the independent strict-RCH lane.
 
+## Larger source outlines and symbol search
+
+`symbols`, live and captured workspace Symbols, saved-repository Symbols, and
+retained-reader Outline share the same declaration recognizers. Each complete
+source can now contain up to **1 MiB of original bytes and 1 MiB of decoded
+UTF-8**, with up to **65,536 physical lines**. UTF-8 BOMs and both UTF-16 byte
+orders retain exact original name and declaration ranges. The 4,096-candidate,
+128-level nesting, query, output and aggregate work budgets still apply; these
+are heuristic candidates, not exhaustive compiler definitions.
+
+The extractor decodes through bounded shared-source windows and retains sparse
+mapping checkpoints. Temporary decoding and lexer allocations are released
+before a completed inventory is retained. Larger admission does not raise the
+host's managed-memory budget. Sources refused by any analysis limit remain
+available to ordinary reading and exact text search.
+
+Regression source covers late declarations beyond the former byte and line
+limits, original-byte copying after live replacement, index and query closure,
+UTF-16 and BOM coordinates, cancellation and the new source ceiling. Executable
+verification remains pending the independent strict-RCH lane.
+
 ## C and C++ declaration candidates
 
 File, workspace, saved-repository and retained-reader symbol navigation share
@@ -1747,8 +1768,8 @@ These are `heuristic-outline-candidate` results. Preprocessor directives are not
 expanded, conditional branches are not evaluated and names are not compiler
 resolved. Complex function pointer declarators, overloaded operators, advanced
 constraint forms and complete C/C++ inventories are not claimed. The existing
-64 KiB original/decoded-source, 4,096-line/item and bounded-nesting limits remain
-in force. Line splices, trigraph/digraph spellings, universal-character escapes
+1 MiB original/decoded-source, 65,536-physical-line, 4,096-item and bounded-nesting
+limits remain in force. Line splices, trigraph/digraph spellings, universal-character escapes
 outside literals and raw/directive forms the pinned lexer cannot safely delimit
 are refused. These cases and malformed delimiters return an explicit symbol
 error; workspace and archive coverage stays partial when a source cannot be
@@ -1782,8 +1803,8 @@ Bodies and initializers are opaque, and every candidate keeps the existing
 declarations, conditional compilation evaluation and complete language
 inventories are not claimed.
 
-The existing 64 KiB source/decoded-text, 4,096-line/item and 128 nesting limits
-still apply. Unsupported pre-token Java Unicode escapes and unsupported C#
+The shared 1 MiB source/decoded-text, 65,536-physical-line, 4,096-item and
+128 nesting limits apply. Unsupported pre-token Java Unicode escapes and unsupported C#
 escaped-identifier contexts return `SYMBOL_UNSUPPORTED_LEXICAL_CONTEXT`.
 Workspace/offline responses retain their partial coverage when a source cannot
 be analyzed; no unsupported source becomes a complete empty inventory.

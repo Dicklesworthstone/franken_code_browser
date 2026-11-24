@@ -36,6 +36,8 @@ Options: --language rust|python|javascript|typescript|jsx|tsx|go|cpp|swift|java|
          --include-excluded (workspace only)\n\
 Lists declaration candidates from bounded outline recognition, NOT compiler definitions.\n\
 Default name matching is exact and case-sensitive. Omit --name to list the outline.\n\
+Outline input: at most 1 MiB original/decoded text and 65536 physical lines.\n\
+Declaration inventories remain bounded to 4096 candidates and 128 nesting levels.\n\
 --references searches exact whole tokens in all admitted text files (32 MiB/file).\n\
 The aggregate --max-bytes allowance still defaults to 8 MiB (at most 64 MiB).\n\
 Comments and string literals participate; these are NOT compiler-resolved references.\n\

@@ -447,7 +447,7 @@ fn malformed_delimiters_source_nesting_cancellation_and_budget_limits_release_ad
     let nested = format!("const value = {}0{};", "(".repeat(129), ")".repeat(129));
     assert_eq!(refusal(nested.as_bytes(), SymbolLanguage::JavaScript), SymbolError::ComplexityLimit);
     assert_eq!(refusal(&vec![b' '; MAX_SYMBOL_SOURCE_BYTES + 1], SymbolLanguage::JavaScript), SymbolError::SourceLimit);
-    let too_many_lines = "\n".repeat(4096);
+    let too_many_lines = format!("{}outside", "\n".repeat(65_536));
     assert_eq!(refusal(too_many_lines.as_bytes(), SymbolLanguage::TypeScript), SymbolError::ComplexityLimit);
     let budget = budget();
     let source = b"class Worker { run() {} }\n".repeat(32);

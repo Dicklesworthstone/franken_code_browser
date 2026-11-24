@@ -3,7 +3,7 @@
 use std::{fs::{self, File}, path::PathBuf, sync::atomic::{AtomicU64, Ordering}};
 use fcb::{ArenaOwnerId, ByteLength};
 use fcb::search::{IndexLimits, ResourceAllocationId, ResourceBudget};
-use fcb::search::snapshot::{SnapshotBytes, SnapshotEntry};
+use fcb::search::snapshot::{SnapshotBytes, SnapshotEntry, SnapshotLimits};
 use fcb::search::paged_snapshot::PagedSnapshot;
 use fcb::search::snapshot_index::SnapshotIndex;
 use fcb_app::host::saved_repository::{SavedRepositorySession, Sha256Digest};
@@ -17,6 +17,9 @@ pub fn entry<'a>(path: &'a [u8], bytes: &'a [u8]) -> SnapshotEntry<'a> {
 pub struct Fixture { pub root: PathBuf, pub path: PathBuf, pub bytes: Vec<u8> }
 impl Fixture {
     pub fn new(entries: &[SnapshotEntry<'_>], complete: bool) -> Self {
+        Self::with_limits(entries, complete, SnapshotLimits::default())
+    }
+    pub fn with_limits(entries: &[SnapshotEntry<'_>], complete: bool, limits: SnapshotLimits) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let root = std::env::temp_dir().join(format!("fcb-saved-desk-{}-{stamp}-{}",
@@ -24,7 +27,7 @@ impl Fixture {
         fs::create_dir(&root).unwrap();
         let budget = ResourceBudget::new(owner(55001), ByteLength::new(64 * 1024 * 1024)).unwrap();
         let encoded = SnapshotBytes::encode(owner(55001), complete, "saved-desk-test", entries,
-            Default::default(), &budget, id(1), || false).unwrap();
+            limits, &budget, id(1), || false).unwrap();
         let bytes = encoded.bytes().to_vec(); let path = root.join("repository.fcbs");
         fs::write(&path, &bytes).unwrap(); Self { root, path, bytes }
     }

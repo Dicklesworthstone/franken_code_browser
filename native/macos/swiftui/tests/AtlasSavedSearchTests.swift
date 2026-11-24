@@ -1232,6 +1232,36 @@ import Dispatch
             nameMode: .exact, needle: f.occurrenceNeedle), mode: .occurrences, name: .exact, needle: f.occurrenceNeedle)
         precondition(occurrences.hits.map(\.hit.start) == [0, 2] && occurrences.hits.map(\.hit.end) == [208, 416])
 
+
+        // The saved-search decoder accepts a late declaration in a 1 MiB
+        // member while preserving the independent source-read accounting.
+        var largeSymbols = f.structurePage(40, generation: 1)
+        largeSymbols["loaded_bytes"] = "1048576"; largeSymbols["member_bytes_read"] = "1048576"
+        largeSymbols["peak_source_bytes"] = "1048576"
+        var symbolRows = largeSymbols["hits"] as! [[String: Any]]
+        symbolRows[0]["original_range"] = ["start": "1048570", "end": "1048576"]
+        var symbolEvidence = symbolRows[0]["structure"] as! [String: Any]
+        symbolEvidence["evidence_range"] = ["start": "1048567", "end": "1048576"]
+        symbolRows[0]["structure"] = symbolEvidence; largeSymbols["hits"] = symbolRows
+        let largeSymbol = try decode(largeSymbols)
+        precondition(largeSymbol.peakSourceBytes == 1_048_576
+            && largeSymbol.hits[0].hit.start == 1_048_570 && largeSymbol.hits[0].hit.end == 1_048_576
+            && largeSymbol.hits[0].structure.name == "crate::banana",
+            "saved symbol limit did not retain late qualified declaration evidence")
+        var oversizedSymbol = largeSymbols
+        oversizedSymbol["peak_source_bytes"] = "1048577"
+        oversizedSymbol["loaded_bytes"] = "1048577"; oversizedSymbol["member_bytes_read"] = "1048577"
+        rejected("saved symbol source exceeds the independent 1 MiB extraction cap") {
+            _ = try decode(oversizedSymbol)
+        }
+        oversizedSymbol = largeSymbols
+        symbolRows[0]["original_range"] = ["start": "1048571", "end": "1048577"]
+        symbolEvidence["evidence_range"] = ["start": "1048568", "end": "1048577"]
+        symbolRows[0]["structure"] = symbolEvidence; oversizedSymbol["hits"] = symbolRows
+        rejected("saved symbol evidence exceeds the symbol cap despite a legal peak receipt") {
+            _ = try decode(oversizedSymbol)
+        }
+
         // Admit original UTF-8 and UTF-16 ranges at the end of two retained
         // 32 MiB members; extraction remains the shared engine's responsibility.
         var largeOccurrences = f.structurePage(40, generation: 1, mode: .occurrences,

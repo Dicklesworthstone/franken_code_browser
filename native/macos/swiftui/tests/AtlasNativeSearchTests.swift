@@ -175,7 +175,7 @@ private final class Reports: @unchecked Sendable {
         value["evidence_level"] = mode.evidence; value["semantic_complete"] = false
         value["name_mode"] = nameMode.rawValue; value["name_case"] = "sensitive"
         value["completeness_basis"] = "admitted-extraction-processing"
-        value["structure_file_byte_limit"] = mode == .symbols ? "65536" : "262144"
+        value["structure_file_byte_limit"] = String(mode.atlasStructureFileByteLimit)
         value["unsupported_structure_files"] = "0"; value["extraction_limited_files"] = "0"
         value["structure_metadata_omitted"] = "0"; value["structure_metadata_bytes"] = step == 0 ? "0" : "64"
         if total > 0 {

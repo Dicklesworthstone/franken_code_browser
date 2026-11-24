@@ -601,9 +601,16 @@ member names are labels and never open working-tree paths.
 
 | Mode | Matching and evidence | Per-member source limit |
 | --- | --- | --- |
-| Symbols | Exact, prefix, or contains matching against shared outline names, including qualified names. Rust, Python, JavaScript, TypeScript, Go, C/C++, Swift, Java and C# declarations are heuristic candidates. | 64 KiB |
+| Symbols | Exact, prefix, or contains matching against shared outline names, including qualified names. Rust, Python, JavaScript, TypeScript, Go, C/C++, Swift, Java and C# declarations are heuristic candidates. | 1 MiB |
 | Headings | Exact, prefix, or contains matching against FrankenMarkdown heading titles. Results retain duplicate-aware slugs and qualified original source ranges. | 256 KiB |
 | Occurrences | One exact identifier token, including spelling matches in declarations, comments and string literals. Supported UTF-8 and BOM-marked UTF-16 keep their original byte coordinates. | 32 MiB |
+
+Symbols and retained-reader **Outline** independently admit up to **1 MiB** of
+original bytes and **1 MiB** of decoded UTF-8, with at most **65,536 physical
+lines**. UTF-16 source keeps original byte coordinates. The **4,096-candidate**
+and language-specific complexity limits still apply; refused files remain
+readable and search coverage identifies the omission. This expansion requires
+independent executable and physical-Mac verification.
 
 These evidence levels remain visible in each result. Symbols and occurrences do
 not claim compiler binding or a call graph. Search preserves Unicode spelling
@@ -732,8 +739,8 @@ claimed. Function pointer declarators, overloaded operators and advanced
 constraint syntax are outside the recognized subset. Conditional branches are
 not evaluated; a lexical declaration is not proof that a compiler enables it.
 
-The existing 64 KiB original/decoded-source, 4,096-line/item and bounded-scope
-limits apply. Unsupported lexical transformations and malformed delimiters fail
+The shared limits are 1 MiB each of original and decoded source, 65,536
+physical lines and 4,096 candidates, with bounded scope depth. Unsupported lexical transformations and malformed delimiters fail
 explicitly while ordinary source reading remains available. Authored regressions
 cover comment/raw-string decoys, nested methods, header declarations, exact
 UTF-16 names, saved archives and opening a retained search result after a live
@@ -757,8 +764,9 @@ change. Live projects, saved repositories and retained readers share the route.
 
 These are **heuristic outline candidates**. Decorators are not resolved,
 assignments and dynamically created definitions are not indexed, and no Python
-code is executed. LF/CRLF input, space/tab indentation, 64 KiB source, 4,096
-physical lines, bounded scopes and bounded output define the supported subset.
+code is executed. LF/CRLF input, space/tab indentation, 1 MiB each of original
+and decoded source, 65,536 physical lines, bounded scopes and bounded output
+define the supported subset.
 Incomplete strings, mismatched delimiters, unsupported whitespace and incomplete
 declaration headers fail explicitly while the ordinary source reader remains
 available. Unit regressions and a C-ABI retained-reader journey cover opaque
@@ -787,8 +795,8 @@ copying even after the working-tree file changes. Live workspace search, saved
 repository search and retained outlines use the same adapter.
 
 These remain **heuristic outline candidates**, not compiler definitions or a
-complete package inventory. The existing 64 KiB source, 4,096 physical-line and
-bounded output limits still apply. Unsupported or malformed lexical context is
+complete package inventory. The shared 1 MiB original/decoded-source,
+65,536 physical-line and 4,096-candidate limits apply. Unsupported or malformed lexical context is
 reported explicitly, with the ordinary source reader still available. Focused
 unit and live/saved-to-retained-reader regressions are included; executable and
 physical-Mac qualification remain pending.
@@ -819,7 +827,7 @@ comma-separated bindings, macro expansion and compiler name resolution are
 outside its scope. It does not evaluate conditional compilation or claim a
 complete Swift grammar or symbol inventory.
 
-The shared 64 KiB original/decoded source, 4,096-line and 4,096-candidate limits
+The shared 1 MiB original/decoded-source, 65,536-line and 4,096-candidate limits
 apply. Swift additionally caps delimiter nesting at 128 and a retained name at
 4,096 UTF-8 bytes. Mismatched or unclosed delimiters produce an explicit
 extraction refusal while the source remains readable; reaching the item limit
@@ -861,8 +869,9 @@ C# conditional compilation is not evaluated. Every result remains a
 `heuristic-outline-candidate`, without compiler binding or an exhaustive
 symbol-inventory claim.
 
-The shared limits remain 64 KiB of original and decoded source, 4,096 lines and
-candidates, 128 delimiter/scope levels and 4,096 UTF-8 bytes per retained name.
+The shared limits are 1 MiB each of original and decoded source, 65,536 physical
+lines, 4,096 candidates, 128 delimiter/scope levels and 4,096 UTF-8 bytes per
+retained name.
 Unbalanced delimiters fail closed. Java pre-token Unicode escapes and
 unsupported line terminators, and C# identifier escapes outside opaque
 comments/strings, return `SYMBOL_UNSUPPORTED_LEXICAL_CONTEXT`. Refusal leaves
@@ -1343,8 +1352,9 @@ copy already accepted by the Reading Desk remains independently owned there.
 
 The default total source-read allowance is **256 MiB**, with **1 GiB** and
 **4 GiB** choices. Per-file extraction currently admits complete symbol sources
-up to **64 KiB** and Markdown sources up to **256 KiB**. At most **256 result
-rows** and **32 MiB of matching source** are retained independently of the scan
+up to **1 MiB** of original and decoded text and **65,536 physical lines**, while
+Markdown sources remain limited to **256 KiB**. Symbol output remains bounded
+at **4,096 candidates** per file. At most **256 result rows** and **32 MiB of matching source** are retained independently of the scan
 allowance. Counts continue after row storage fills. Unsupported, oversized,
 unavailable and extraction-limited files, missing visible-scope members,
 discovery limits and stopped work keep coverage explicitly incomplete.

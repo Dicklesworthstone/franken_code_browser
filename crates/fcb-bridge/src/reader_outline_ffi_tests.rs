@@ -15,7 +15,7 @@ fn source(bytes: &[u8]) -> (std::path::PathBuf, u64) {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(), NEXT.fetch_add(1, Ordering::Relaxed)));
     fs::write(&path, bytes).unwrap(); let cpath = CString::new(path.to_str().unwrap()).unwrap();
     let handle = fcb_reader_create(); assert_ne!(handle, 0);
-    let opened = take(unsafe { fcb_reader_open(handle, cpath.as_ptr(), 65536) });
+    let opened = take(unsafe { fcb_reader_open(handle, cpath.as_ptr(), fcb::search::MAX_SYMBOL_SOURCE_BYTES as u64) });
     assert!(opened.contains("\"status\":\"ok\""), "{opened}"); (path, handle)
 }
 
@@ -135,5 +135,35 @@ fn c_python_outline_ignores_docstrings_and_copies_exact_names_from_retained_sour
         assert!(window.contains("ouvrir") && !window.contains("Replacement"), "{window}");
         assert!(window.contains("\"selection_namespace\":\"outline\""));
         assert_eq!(fcb_reader_close(reader), 1);
+    }
+}
+
+#[test]
+fn c_large_outline_keeps_late_utf16_names_and_owned_copy_after_reader_close() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let prefix = "// 😀 retained context\r\n".repeat(5_000);
+    let text = format!("\u{feff}{prefix}fn late_target() {{}}\r\n");
+    for little in [true, false] {
+        let encode = |value: &str| -> Vec<u8> {
+            value.encode_utf16().flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect()
+        };
+        let bytes = encode(&text);
+        assert!(bytes.len() > 65_536);
+        let (path, reader) = source(&bytes);
+        fs::write(&path, b"fn replacement() {}\n").unwrap();
+        let outline = take(unsafe { fcb_reader_outline(reader, 1, std::ptr::null(), 4096) });
+        assert!(outline.contains("\"retained_symbols\":\"1\""), "{outline}");
+        assert!(outline.contains("\"declaration_line\":\"5001\""), "{outline}");
+        let name = CString::new("late_target").unwrap();
+        let page = take(unsafe { fcb_reader_symbols(reader, 1, name.as_ptr(), 0, 0, 128) });
+        assert!(page.contains("\"name\":\"late_target\"") && page.contains("\"symbol_id\":\"1\""), "{page}");
+        let expected_start = encode(&format!("\u{feff}{prefix}fn ")).len();
+        assert!(page.contains(&format!("\"name_range\":{{\"start\":\"{expected_start}\"")), "{page}");
+        let copy = fcb_reader_copy_symbol(reader, 1, 1, 0);
+        assert_eq!(fcb_reader_close(reader), 1);
+        let copied = take(copy);
+        let expected = encode("late_target").iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        assert!(copied.contains(&format!("\"original_hex\":\"{expected}\"")), "{copied}");
+        assert!(copied.contains("\"additional_source_bytes_read\":\"0\""));
     }
 }

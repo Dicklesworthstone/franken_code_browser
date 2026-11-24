@@ -32,9 +32,11 @@ fn entry<'a>(path: &'a [u8], bytes: &'a [u8]) -> SnapshotEntry<'a> {
 }
 fn archive(entries: &[SnapshotEntry<'_>], complete: bool, budget: &ResourceBudget)
     -> PagedSnapshot<Cursor<Vec<u8>>> {
+    // Allow oversized-symbol negative controls to reach extraction admission.
+    let limits = SnapshotLimits { max_file_bytes: 2 * 1024 * 1024, ..SnapshotLimits::default() };
     let saved = SnapshotBytes::encode(owner(), complete, "structure-test-v1", entries,
-        SnapshotLimits::default(), budget, allocation(1), || false).unwrap();
-    PagedSnapshot::open(Cursor::new(saved.bytes().to_vec()), owner(), SnapshotLimits::default(),
+        limits, budget, allocation(1), || false).unwrap();
+    PagedSnapshot::open(Cursor::new(saved.bytes().to_vec()), owner(), limits,
         budget, allocation(2), || false).unwrap()
 }
 fn run<R: Read + Seek>(saved: &mut PagedSnapshot<R>, needle: &str, opts: StructureOptions,
@@ -583,5 +585,28 @@ fn large_saved_occurrences_keep_bounded_windows_and_verified_original_members() 
     drop(saved);
     assert_eq!(opened.bytes(), source);
     assert_eq!(StructureMode::Occurrences.source_limit(), 32 * 1024 * 1024);
-    assert_eq!(StructureMode::Symbols.source_limit(), 64 * 1024);
+    assert_eq!(StructureMode::Symbols.source_limit(), 1024 * 1024);
+}
+
+#[test]
+fn larger_saved_symbol_members_keep_exact_names_and_release_analysis_between_steps() {
+    let prefix = "// 😀 retained context\r\n".repeat(5_000);
+    let text = format!("{prefix}fn late_target() {{}}\r\n");
+    for little in [true, false] {
+        let budget = budget(); let source = encoded(&text, little);
+        assert!(source.len() > 64 * 1024 && source.len() < StructureMode::Symbols.source_limit());
+        let mut saved = archive(&[entry(b"large.rs", &source)], true, &budget);
+        let opts = options(StructureMode::Symbols, 1);
+        let report = run_matching(&mut saved, "late_target", opts, 0, true, true, &budget);
+        assert!(report.is_complete()); assert!(report.matches_seen_exact());
+        assert_eq!(report.matches_seen(), 1); assert_eq!(report.hits().len(), 1);
+        let hit = &report.hits()[0];
+        let range = hit.original_range();
+        let expected = encoded("late_target", little)[2..].to_vec();
+        assert_eq!(&source[range.start().get() as usize..range.end().get() as usize], expected);
+        let capture = hit.open(&mut saved, opts.generation, &budget,
+            [allocation(30), allocation(31)], || false).unwrap();
+        drop(report); drop(saved);
+        assert_eq!(capture.bytes(), source);
+    }
 }

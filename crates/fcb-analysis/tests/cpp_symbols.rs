@@ -257,7 +257,7 @@ fn active_nesting_is_bounded_but_sequential_bodies_and_opaque_braces_are_not_dep
     assert!(outline.candidates().iter().all(|c| c.name() == "next"));
     assert!(!outline.output_limited());
     assert_eq!(refusal(&vec![b'x'; MAX_SYMBOL_SOURCE_BYTES + 1]), SymbolError::SourceLimit);
-    assert_eq!(refusal("\n".repeat(4096).as_bytes()), SymbolError::ComplexityLimit);
+    assert_eq!(refusal(format!("{}int outside();", "\n".repeat(65_536)).as_bytes()), SymbolError::ComplexityLimit);
 }
 
 #[test]

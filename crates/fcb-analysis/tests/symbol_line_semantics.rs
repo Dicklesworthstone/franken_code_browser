@@ -81,16 +81,16 @@ fn mixed_line_endings_preserve_symbol_lines_and_original_evidence_in_every_encod
 }
 
 #[test]
-fn exactly_4096_physical_lines_are_admitted_with_or_without_a_terminal_newline() {
+fn exactly_65536_physical_lines_are_admitted_with_or_without_a_terminal_newline() {
     for separator in ["\n", "\r", "\r\n"] {
         for terminal in ["", separator] {
-            let source = format!("{}fn edge() {{}}{terminal}", separator.repeat(4095));
+            let source = format!("{}fn edge() {{}}{terminal}", separator.repeat(65_535));
             let budget = budget();
             let outline = build(source.as_bytes(), SymbolLanguage::Rust, &budget, || false).unwrap();
             assert_eq!(outline.candidates().len(), 1);
             assert_eq!(outline.candidates()[0].name(), "edge");
-            assert_eq!(outline.candidates()[0].line(), 4096);
-            assert_eq!(outline.candidates()[0].original_range().start().get(), (4095 * separator.len()) as u64);
+            assert_eq!(outline.candidates()[0].line(), 65_536);
+            assert_eq!(outline.candidates()[0].original_range().start().get(), (65_535 * separator.len()) as u64);
             assert!(!outline.output_limited());
             drop(outline);
             assert_eq!(budget.accounting().reserved().get(), 0);
@@ -101,7 +101,7 @@ fn exactly_4096_physical_lines_are_admitted_with_or_without_a_terminal_newline()
 #[test]
 fn bare_cr_cannot_bypass_the_same_line_limit_as_lf_or_crlf() {
     for separator in ["\n", "\r", "\r\n"] {
-        let source = format!("{}fn outside() {{}}", separator.repeat(4096));
+        let source = format!("{}fn outside() {{}}", separator.repeat(65_536));
         let budget = budget();
         assert!(matches!(build(source.as_bytes(), SymbolLanguage::Rust, &budget, || false),
             Err(SymbolError::ComplexityLimit)), "separator {separator:?}");

@@ -103,7 +103,8 @@ struct AtlasOutlineInventory: Sendable {
 
 struct AtlasOutlinePage: Sendable {
     static let maxItems: UInt64 = 4096
-    static let sourceLimit: UInt64 = 64 * 1024
+    static let sourceLimit: UInt64 = 1024 * 1024
+    static let maxLines: UInt64 = 65_536
     let id: UUID
     let inventory: AtlasOutlineInventory
     let request: AtlasOutlinePageRequest
@@ -167,7 +168,7 @@ struct AtlasOutlinePage: Sendable {
             let rows = try wire.symbols.map { row -> AtlasOutlineSymbol in
                 guard let id = AtlasReaderWire.integer(row.symbol_id), id > previous, id <= retained,
                       let depth = AtlasReaderWire.integer(row.depth), depth <= maxItems,
-                      let line = AtlasReaderWire.integer(row.declaration_line), (1...4096).contains(line),
+                      let line = AtlasReaderWire.integer(row.declaration_line), (1...maxLines).contains(line),
                       !row.name.isEmpty, row.name.utf8.count <= Int(sourceLimit),
                       !row.kind.isEmpty, row.kind.utf8.count <= 128 else { throw AtlasReaderError.invalidResponse }
                 previous = id

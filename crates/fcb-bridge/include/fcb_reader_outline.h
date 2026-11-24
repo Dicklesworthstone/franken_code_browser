@@ -18,8 +18,9 @@ extern "C" {
  * language: null to infer the retained label suffix, or a supported UTF-8 name:
  * rust, python, javascript, typescript, go, cpp (existing aliases also accepted).
  * The supplied NUL-terminated string must remain readable until return.
- * Source AND decoded text are capped at 64 KiB by the existing extractor;
- * unsupported/oversized/too-complex sources remain readable without an outline.
+ * Original source AND decoded text are independently capped at 1 MiB;
+ * the shared extractor admits up to 65536 physical lines and 4096 candidates.
+ * Unsupported/oversized/too-complex sources remain readable without an outline.
  * Failed/canceled replacement preserves prior outline and content-search state.
  * Use a strictly increasing outline generation for each admitted attempt.
  * This generation is INDEPENDENT of content-query generations.

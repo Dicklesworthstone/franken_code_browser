@@ -189,9 +189,10 @@ fn zero_capacity_work_limits_and_incomplete_coverage_never_report_exhaustive_neg
     let (exit, work) = invoke(&args(&f, "occurrences", "absent", &["--max-source-bytes", "0"]), || false);
     assert_eq!(exit, EXIT_PARTIAL); assert_eq!(work.get("state").text(), "work-limit");
     assert_eq!(work.get("loaded_source_bytes").number(), 0); assert!(!work.get("matches_seen_exact").flag());
-    let oversized = vec![b'x'; 64 * 1024 + 1];
-    let partial = Fixture::new(&[entry(b"a.rs", &oversized), entry(b"b.bin", b"unsupported"),
-        SnapshotEntry { path: b"c.rs", observed_bytes: 5, data: SnapshotData::Unavailable("not-captured") }], false);
+    let oversized = vec![b'x'; fcb::search::MAX_SYMBOL_SOURCE_BYTES + 1];
+    let partial = Fixture::with_limits(&[entry(b"a.rs", &oversized), entry(b"b.bin", b"unsupported"),
+        SnapshotEntry { path: b"c.rs", observed_bytes: 5, data: SnapshotData::Unavailable("not-captured") }], false,
+        fcb::search::snapshot::SnapshotLimits { max_file_bytes: 2 * 1024 * 1024, ..Default::default() });
     let (exit, omitted) = invoke(&args(&partial, "symbols", "absent", &[]), || false);
     assert_eq!(exit, EXIT_PARTIAL); assert!(!omitted.get("discovery_complete").flag());
     assert_eq!(omitted.get("source_limited_files").number(), 1);

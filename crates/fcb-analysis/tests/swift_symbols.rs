@@ -215,7 +215,7 @@ fn nesting_limits_ignore_opaque_literal_and_comment_braces() {
     let outline = build(source.as_bytes(), 16, &budget);
     assert_eq!(names(&outline), ["text", "visible"]);
     assert_eq!(refusal(&vec![b'x'; MAX_SYMBOL_SOURCE_BYTES + 1]), SymbolError::SourceLimit);
-    let too_many_lines = "\n".repeat(4096);
+    let too_many_lines = format!("{}outside", "\n".repeat(65_536));
     assert_eq!(refusal(too_many_lines.as_bytes()), SymbolError::ComplexityLimit);
 }
 

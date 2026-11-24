@@ -38,7 +38,7 @@ uint64_t fcb_catalog_structure_create(void);
  * max_matches: 1..256, max_scan_bytes: 1..4294967296,
  * max_read_calls: 1..1048576. Counts continue beyond retained rows. start_after
  * skips that many matching ordinals; another window requires a new session and
- * new file observations. Source capture limits are 64 KiB per symbol file and
+ * new file observations. Source capture limits are 1 MiB per symbol file and
  * 256 KiB per Markdown file, intersected with cumulative I/O budgets. Retained
  * complete source is capped at 32 MiB independently of row capacity. Unsupported,
  * oversized, unavailable or analysis-limited sources remain explicit incomplete

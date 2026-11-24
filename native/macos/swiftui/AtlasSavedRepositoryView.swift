@@ -900,7 +900,7 @@ private final class AtlasSavedTrailArchiveAccess {
                 VStack(alignment: .leading, spacing: 10) {
                     Text(model.busy ? "Waiting for saved archive work…" : "Navigate the structure of your saved repository.").font(.headline)
                     Text("Search symbols, Markdown heading titles or exact identifier tokens. Open a result to read its verified captured source; that reader remains available after the archive closes.")
-                    Text("Each result window retains up to 4,096 results within 64 MiB of source reads. Per-member limits: symbols 64 KiB, headings 256 KiB, occurrences 32 MiB. Coverage counts expose omitted and unsupported members.")
+                    Text("Each result window retains up to 4,096 results within 64 MiB of source reads. Per-member limits: symbols 1 MiB, headings 256 KiB, occurrences 32 MiB. Coverage counts expose omitted and unsupported members.")
                         .font(.caption).foregroundStyle(.secondary)
                 }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).padding(.top, 12)
             }

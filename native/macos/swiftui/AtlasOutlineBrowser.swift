@@ -84,7 +84,7 @@ import SwiftUI
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             if !model.notice.isEmpty { Text(model.notice).font(.caption2).foregroundStyle(.secondary) }
-            Text("Heuristic candidates only. The shared extractor currently admits up to 64 KiB source and 4,096 items, with additional complexity limits. Source reading remains available when extraction is refused.")
+            Text("Heuristic candidates only. The shared extractor admits up to 1 MiB each of original and decoded source, 65,536 physical lines and 4,096 candidates, with additional complexity limits. Source reading remains available when extraction is refused.")
                 .font(.caption2).foregroundStyle(.secondary)
         }
         .padding(12)

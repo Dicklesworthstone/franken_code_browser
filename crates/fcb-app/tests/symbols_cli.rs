@@ -124,7 +124,7 @@ fn name_filtering_precedes_display_limits_and_exact_capacity_does_not_imply_trun
 
 #[test]
 fn oversized_and_total_budget_refusals_do_not_read_prefixes_as_complete_files() {
-    let fixture = Fixture::new(); fixture.file("big.rs", &vec![b'x'; 65537]);
+    let fixture = Fixture::new(); fixture.file("big.rs", &vec![b'x'; fcb::search::MAX_SYMBOL_SOURCE_BYTES + 1]);
     let (exit, output) = invoke(&fixture.file_args("big.rs"), || false);
     assert_eq!(exit, EXIT_PARTIAL); assert_eq!(output.get("stats").get("member_payload_bytes_read").number(), 0);
     assert_eq!(output.get("notices").array()[0].get("reason").text(), "SYMBOL_SOURCE_LIMIT");
@@ -462,4 +462,43 @@ class open {};
     let expected: Vec<_> = "open".encode_utf16().flat_map(u16::to_be_bytes).collect();
     assert_eq!(&header[range.get("start").number() as usize..range.get("end").number() as usize], expected);
     assert_eq!(output.get("stats").get("unsupported_language_files").number(), 0);
+}
+
+#[test]
+fn large_symbol_files_keep_late_name_offsets_across_live_and_offline_cli_routes() {
+    let prefix = "// 😀 retained context\r\n".repeat(5_000);
+    let text = format!("{prefix}fn late_target() {{}}\r\n");
+    for encoding in 0..3 {
+        let fixture = Fixture::new();
+        let source = match encoding {
+            0 => [b"\xef\xbb\xbf".as_slice(), text.as_bytes()].concat(),
+            1 => utf16(&text, true),
+            _ => utf16(&text, false),
+        };
+        let expected = match encoding {
+            0 => b"late_target".to_vec(),
+            1 => utf16("late_target", true)[2..].to_vec(),
+            _ => utf16("late_target", false)[2..].to_vec(),
+        };
+        assert!(source.len() > 64 * 1024);
+        fixture.file("large.rs", &source);
+        fixture.save();
+        for mut args in [fixture.file_args("large.rs"), fixture.workspace_args()] {
+            values(&mut args, &["--name", "late_target"]);
+            let (exit, output) = invoke(&args, || false);
+            assert_eq!(exit, EXIT_OK); assert!(output.get("processing_complete").flag());
+            let rows = output.get("candidates").array(); assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get("line").number(), 5001);
+            let range = rows[0].get("name_range");
+            assert_eq!(&source[range.get("start").number() as usize..range.get("end").number() as usize], expected);
+        }
+        fs::rename(fixture.root(), fixture.0.join("retired-root")).unwrap();
+        let mut args = fixture.saved_args(); values(&mut args, &["--name", "late_target"]);
+        let (exit, output) = invoke(&args, || false);
+        assert_eq!(exit, EXIT_OK); assert!(!output.get("live_roots_accessed").flag());
+        let rows = output.get("candidates").array(); assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("line").number(), 5001);
+        let range = rows[0].get("name_range");
+        assert_eq!(&source[range.get("start").number() as usize..range.get("end").number() as usize], expected);
+    }
 }

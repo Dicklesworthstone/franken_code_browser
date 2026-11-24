@@ -169,7 +169,7 @@ fn directory_and_type_scope_exclude_sources_before_file_and_match_quotas() {
 
 #[test]
 fn unsupported_invalid_encoding_and_oversized_sources_are_explicit_partial_coverage() {
-    let oversized = vec![b'a'; 65_537];
+    let oversized = vec![b'a'; fcb::search::MAX_SYMBOL_SOURCE_BYTES + 1];
     let fixture = Fixture::new(&[("a.kt", b"fun wanted() {}\n"), ("b.rs", &oversized),
         ("c.rs", b"fn wanted() {}\xff"), ("d.rs", b"fn wanted() {}\n")]);
     let atlas = fixture.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
@@ -177,7 +177,8 @@ fn unsupported_invalid_encoding_and_oversized_sources_are_explicit_partial_cover
     let json = finish(&mut search, &atlas, 1);
     assert!(json.contains("\"search_complete\":false"));
     count(&json, "retained_hits", 1); count(&json, "unavailable_files", 3);
-    count(&json, "unsupported_structure_files", 1); count(&json, "structure_file_byte_limit", 65_536);
+    count(&json, "unsupported_structure_files", 1);
+    count(&json, "structure_file_byte_limit", fcb::search::MAX_SYMBOL_SOURCE_BYTES as u64);
     assert!(json.contains("STRUCTURE_UNSUPPORTED_LANGUAGE"));
     assert!(json.contains("STRUCTURE_FILE_BYTE_LIMIT"));
     assert!(json.contains("SYMBOL_UNSUPPORTED_ENCODING"));

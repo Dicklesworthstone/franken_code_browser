@@ -6,7 +6,7 @@ enum AtlasWorkspaceStructureMode: String, CaseIterable, Identifiable, Sendable {
     var label: String { self == .symbols ? "Symbols" : "Headings" }
     var code: UInt64 { self == .symbols ? 0 : 1 }
     var evidence: String { self == .symbols ? "heuristic-outline-candidate" : "fmd-heading" }
-    var maximumFileBytes: UInt64 { self == .symbols ? 65_536 : 262_144 }
+    var maximumFileBytes: UInt64 { self == .symbols ? 1024 * 1024 : 262_144 }
 }
 
 enum AtlasWorkspaceStructureLimits {

@@ -101,6 +101,94 @@ private enum Fixture {
     }
 }
 
+
+/// A complete 1 MiB observation with one late declaration at physical line
+/// 65,536. Fixed bridge evidence tests native admission and selected-byte
+/// delivery; the Rust suites own actual declaration extraction.
+private struct LargeOutlineFixture: Sendable {
+    let encoding: String
+    let original: [UInt8]
+    let nameStart, nameEnd, evidenceStart: UInt64
+    let line: UInt64 = 65_536
+    private let stringEncoding: String.Encoding
+    private let bomBytes: Int
+
+    init(encoding: String) {
+        self.encoding = encoding
+        let utf16 = encoding != "utf8"
+        self.stringEncoding = encoding == "utf16le" ? .utf16LittleEndian
+            : encoding == "utf16be" ? .utf16BigEndian : .utf8
+        let bomCount = utf16 ? 2 : 0
+        self.bomBytes = bomCount
+        let unit = utf16 ? 2 : 1
+        func bytes(_ text: String) -> [UInt8] {
+            if !utf16 { return Array(text.utf8) }
+            return text.utf16.flatMap { value in
+                encoding == "utf16le" ? [UInt8(value & 255), UInt8(value >> 8)]
+                    : [UInt8(value >> 8), UInt8(value & 255)]
+            }
+        }
+        let tail = "😀 fn café() {}"
+        let prefixUnits = (1024 * 1024 - bomCount - bytes(tail).count) / unit
+        let prefix = String(repeating: "\n", count: 65_535)
+            + String(repeating: " ", count: prefixUnits - 65_535)
+        let bom: [UInt8] = encoding == "utf16le" ? [255, 254]
+            : encoding == "utf16be" ? [254, 255] : []
+        original = bom + bytes(prefix + tail)
+        evidenceStart = UInt64(bomCount + prefixUnits * unit + bytes("😀 ").count)
+        nameStart = UInt64(bomCount + prefixUnits * unit + bytes("😀 fn ").count)
+        nameEnd = nameStart + UInt64(bytes("café").count)
+        precondition(original.count == 1024 * 1024 && nameStart > 65_536)
+    }
+
+    func header(_ command: String, owner: UInt64 = 7) -> [String: Any] {
+        var value = Fixture.header(command, owner: owner)
+        value["captured_bytes"] = String(original.count); value["encoding"] = encoding
+        return value
+    }
+    func outline(owner: UInt64 = 7, generation: UInt64 = 1) -> [String: Any] {
+        var value = Fixture.outline(owner: owner, generation: generation, total: 1)
+        value.merge(header("outline", owner: owner), uniquingKeysWith: { _, new in new })
+        value["symbols"] = [["symbol_id": "1", "parent_id": NSNull(), "depth": "0",
+            "name": "café", "kind": "function", "declaration_line": String(line),
+            "evidence_range": Fixture.range(evidenceStart, UInt64(original.count)),
+            "name_range": Fixture.range(nameStart, nameEnd)]]
+        return value
+    }
+    private func text(start: UInt64, end: UInt64) -> String {
+        let lower = start == 0 ? bomBytes : Int(start)
+        return String(bytes: original[lower..<Int(end)], encoding: stringEncoding)!
+    }
+    func window(owner: UInt64 = 7, offset: UInt64, bytes: UInt64) -> [String: Any] {
+        let end = min(UInt64(original.count), offset + bytes)
+        let visibleStart = max(offset, UInt64(bomBytes))
+        var value = header("window", owner: owner)
+        value["text_kind"] = "logical-captured-text-not-shaped"
+        value["requested_original_range"] = Fixture.range(offset, end)
+        value["visible_range"] = Fixture.range(visibleStart, end)
+        value["range_limited"] = false; value["boundaries_adjusted"] = visibleStart != offset
+        value["has_replacements"] = false; value["first_physical_line"] = NSNull()
+        value["next_offset"] = end < UInt64(original.count) ? String(end) as Any : NSNull()
+        value["text"] = text(start: visibleStart, end: end)
+        value["original_hex"] = Fixture.hex(original[Int(visibleStart)..<Int(end)])
+        value["selection"] = NSNull()
+        return value
+    }
+    func selected(owner: UInt64 = 7, generation: UInt64 = 1) -> [String: Any] {
+        let start = nameStart - 2052
+        var value = window(owner: owner, offset: start, bytes: UInt64(original.count) - start)
+        value["command"] = "symbol"
+        let decodedStart = UInt64(text(start: start, end: nameStart).utf8.count)
+        value["selection"] = ["original_range": Fixture.range(nameStart, nameEnd),
+            "window_utf8_range": Fixture.range(decodedStart, decodedStart + 5),
+            "original_hex": Fixture.hex(original[Int(nameStart)..<Int(nameEnd)]),
+            "outline_generation": String(generation), "symbol_id": "1",
+            "declaration_line": String(line), "selection_namespace": "outline",
+            "evidence_level": "heuristic-outline-candidate", "semantic_resolution": false]
+        return value
+    }
+}
+
 private final class Driver: @unchecked Sendable {
     private let lock = NSLock()
     private var calls: [String] = []
@@ -109,8 +197,11 @@ private final class Driver: @unchecked Sendable {
     private var failure: String?
     let total: UInt64
     let fallback: Bool
+    let large: LargeOutlineFixture?
     let entered = DispatchSemaphore(value: 0), gate = DispatchSemaphore(value: 0)
-    init(total: UInt64 = 2, fallback: Bool = false) { self.total = total; self.fallback = fallback }
+    init(total: UInt64 = 2, fallback: Bool = false, large: LargeOutlineFixture? = nil) {
+        self.total = total; self.fallback = fallback; self.large = large
+    }
     var log: [String] { lock.lock(); defer { lock.unlock() }; return calls }
     func pause(_ command: String) { lock.lock(); paused = command; lock.unlock() }
     func failNext(_ code: String) { lock.lock(); failure = code; lock.unlock() }
@@ -127,9 +218,11 @@ private final class Driver: @unchecked Sendable {
         AtlasReaderTransport(create: { [self] in
             lock.lock(); defer { lock.unlock() }; let id = next; next += 1; return id
         }, open: { [self] owner, _, _ in
-            record("open:\(owner)"); return Fixture.json(Fixture.header("info", owner: owner))
-        }, window: { [self] owner, _, _ in
-            record("window:\(owner)"); return Fixture.json(Fixture.window(owner: owner))
+            record("open:\(owner)"); return Fixture.json(large?.header("info", owner: owner)
+                ?? Fixture.header("info", owner: owner))
+        }, window: { [self] owner, offset, bytes in
+            record("window:\(owner)"); return Fixture.json(large?.window(owner: owner, offset: offset, bytes: bytes)
+                ?? Fixture.window(owner: owner))
         }, lines: { _, _, _, _ in nil }, cancel: { [self] owner in record("cancel:\(owner)"); return true },
         close: { [self] owner in precondition(!Thread.isMainThread); record("close:\(owner)"); return true },
         retirementFailed: { fatalError("retirement failed") })
@@ -138,6 +231,7 @@ private final class Driver: @unchecked Sendable {
         AtlasReaderOutlineTransport(prepare: { [self] owner, generation, language, items in
             precondition(items == 4096); record("prepare:\(generation)")
             if let failed = step("prepare", owner: owner) { return failed }
+            if let large { return Fixture.json(large.outline(owner: owner, generation: generation)) }
             return Fixture.json(Fixture.outline(owner: owner, generation: generation, total: total,
                 fallback: fallback, language: language ?? "rust"))
         }, symbols: { [self] owner, generation, needle, mode, start, limit in
@@ -149,6 +243,7 @@ private final class Driver: @unchecked Sendable {
         }, symbol: { [self] owner, generation, id, context in
             precondition(context == 2048); record("symbol:\(generation):\(id)")
             if let failed = step("symbol", owner: owner) { return failed }
+            if let large { precondition(id == 1); return Fixture.json(large.selected(owner: owner, generation: generation)) }
             return Fixture.json(Fixture.window(owner: owner, command: "symbol", generation: generation,
                 symbol: id, fallback: fallback))
         })
@@ -315,6 +410,60 @@ private final class Driver: @unchecked Sendable {
         }
         rejects("search namespace borrowed by symbol") {
             _ = try AtlasReaderPage.decode(Fixture.json(Fixture.window(command: "hit")), info: info, request: .symbol(target))
+        }
+
+
+        // The byte and physical-line ceilings are independent of the retained
+        // candidate/page caps. Late UTF-8/UTF-16 source remains directly readable
+        // without opening its live pathname again.
+        for encoding in ["utf8", "utf16le", "utf16be"] {
+            let fixture = LargeOutlineFixture(encoding: encoding)
+            let largeInfo = try AtlasReaderInfo.decode(Fixture.json(fixture.header("info")),
+                handle: 7, path: input.fullPath)
+            let original = fixture.outline()
+            func largePage(_ value: [String: Any], info: AtlasReaderInfo) throws -> AtlasOutlinePage {
+                try AtlasOutlinePage.decode(Fixture.json(value), info: info, generation: 1,
+                    request: .initial, preparing: true)
+            }
+            let admitted = try largePage(original, info: largeInfo)
+            check(admitted.inventory.identity.capturedBytes == 1_048_576
+                && admitted.rows.count == 1 && admitted.rows[0].line == 65_536,
+                "maximum source/line outline refused: \(encoding)")
+            let target = admitted.target(id: 1)!
+            let selected = try AtlasReaderPage.decode(Fixture.json(fixture.selected()),
+                info: largeInfo, request: .symbol(target))
+            let expectedHex = Fixture.hex(fixture.original[Int(fixture.nameStart)..<Int(fixture.nameEnd)])
+            check(selected.start > 65_536 && selected.symbolSelection?.originalHex == expectedHex
+                && selected.symbolSelection?.target.symbol.selectedRange
+                    == AtlasOutlineRange(start: fixture.nameStart, end: fixture.nameEnd),
+                "late declaration lost its exact original-byte selection")
+            var badLine = original, rows = original["symbols"] as! [[String: Any]]
+            rows[0]["declaration_line"] = "65537"; badLine["symbols"] = rows
+            rejects("outline admitted more than 65,536 physical lines") { _ = try largePage(badLine, info: largeInfo) }
+            var tooMany = original; tooMany["retained_symbols"] = "4097"
+            rejects("larger source limit widened the retained candidate cap") { _ = try largePage(tooMany, info: largeInfo) }
+            var badHeader = fixture.header("info"); badHeader["captured_bytes"] = "1048577"
+            let oversizedInfo = try AtlasReaderInfo.decode(Fixture.json(badHeader), handle: 7, path: input.fullPath)
+            var oversized = original; oversized["captured_bytes"] = "1048577"
+            rejects("outline exceeded its 1 MiB source limit") { _ = try largePage(oversized, info: oversizedInfo) }
+
+            let driver = Driver(large: fixture)
+            let model = AtlasPagedReaderModel(transport: driver.source, outline: driver.outline)
+            model.open(root: "/project", path: "lib.rs", accessLease: nil)
+            wait("large outline source open") { !model.busy && model.page != nil }
+            check(model.canBuildOutline, "large captured file lost its Outline action")
+            model.buildOutline()
+            wait("large outline prepare") { !model.busy && model.outlineIsCurrent }
+            model.openSymbol(model.outlinePage!.target(id: 1)!)
+            wait("large outline selected name") { !model.busy && model.symbolHex != nil }
+            check(model.nativeSelectionRange == NSRange(location: encoding == "utf8" ? 2050 : 1026, length: 4)
+                && model.symbolHex == expectedHex && model.page?.symbolSelection?.target.symbol.line == 65_536,
+                "late name was not selectable/copyable in native UTF-16 coordinates")
+            check(driver.log.filter { $0.hasPrefix("open:") }.count == 1
+                && driver.log.filter { $0.hasPrefix("prepare:") }.count == 1,
+                "outline navigation reopened source or repeated extraction")
+            model.close()
+            wait("large outline retirement") { driver.log.contains("close:7") }
         }
 
         // Real coordinator composition over one handle: distinct generations,
