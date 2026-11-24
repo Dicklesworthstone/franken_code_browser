@@ -110,10 +110,12 @@ enum DocumentWireFixture {
         out["max_scan_bytes"] = "16777216"; out["scanned_rendered_bytes"] = "1400"
         out["first_match"] = String(first); out["matches_seen"] = String(total)
         out["match_count_complete"] = true; out["next_match"] = end < total ? String(end) as Any : NSNull()
-        out["matches"] = (first..<end).map { index in
-            ["match_id": String(index + 1),
-             "rendered_utf8_range": range(index * 4, index * 4 + UInt64(needle.utf8.count)),
-             "first_flow_line": String(index / 5)] as [String: Any]
+        let needleBytes = UInt64(needle.utf8.count)
+        out["matches"] = (first..<end).map { index -> [String: Any] in
+            let renderedStart = index * 4
+            return ["match_id": String(index + 1),
+                "rendered_utf8_range": range(renderedStart, renderedStart + needleBytes),
+                "first_flow_line": String(index / 5)]
         }
         return out
     }

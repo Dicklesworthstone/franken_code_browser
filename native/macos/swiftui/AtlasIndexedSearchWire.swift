@@ -585,11 +585,13 @@ struct AtlasIndexedAccumulator {
                           previous.hit.captureSHA256 == row.hit.captureSHA256,
                           previous.hit.captureByteLength == row.hit.captureByteLength else { throw AtlasIndexWire.invalid() }
                 }
-                let charge = row.pathHex.utf8.count + row.rawPathBytes.count
-                    + 2 * row.hit.path.utf8.count + (row.hit.sourcePath?.utf8.count ?? 0)
-                    + 2 * (row.hit.actualText?.utf8.count ?? 0)
-                    + 2 * (row.hit.structure?.name.utf8.count ?? 0)
-                    + 2 * (row.hit.structure?.headingSlug?.utf8.count ?? 0) + 512
+                var charge: Int = row.pathHex.utf8.count + row.rawPathBytes.count
+                charge += 2 * row.hit.path.utf8.count
+                charge += row.hit.sourcePath?.utf8.count ?? 0
+                charge += 2 * (row.hit.actualText?.utf8.count ?? 0)
+                charge += 2 * (row.hit.structure?.name.utf8.count ?? 0)
+                charge += 2 * (row.hit.structure?.headingSlug?.utf8.count ?? 0)
+                charge += 512
                 guard charge <= AtlasSearchRetention.witnessBytes - textBytes else { throw AtlasIndexWire.invalid() }
                 var admitted = row
                 if let excerpt = row.hit.excerpt {

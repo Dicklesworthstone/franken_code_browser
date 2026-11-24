@@ -176,17 +176,32 @@ private final class ObservedSearchProbe: @unchecked Sendable {
     var transport: AtlasObservedReaderTransport {
         let base = lifetime.transport
         let verified: (@Sendable (UInt64, AtlasObservedReaderSearchWitness, AtlasObservedReaderRequest,
-            AtlasSearchCancellation) throws -> String?)? = verifiedNavigation ? { owner, witness, request, _ in
+            AtlasSearchCancellation) throws -> String?)?
+        if verifiedNavigation {
+            verified = { owner, witness, request, _ in
                 try self.verifiedJump(owner, witness, request)
-            } : nil
+            }
+        } else {
+            verified = nil
+        }
         let paged: (@Sendable (UInt64, AtlasObservedReaderSearchRequest,
-            AtlasSearchCancellation) throws -> String?)? = paging ? { owner, request, _ in
+            AtlasSearchCancellation) throws -> String?)?
+        if paging {
+            paged = { owner, request, _ in
                 try self.find(owner, request)
-            } : nil
+            }
+        } else {
+            paged = nil
+        }
         let excerpt: (@Sendable (UInt64, AtlasObservedReaderSearchWitness,
-            AtlasSearchCancellation) throws -> String?)? = capturesContext ? { owner, witness, _ in
+            AtlasSearchCancellation) throws -> String?)?
+        if capturesContext {
+            excerpt = { owner, witness, _ in
                 try self.openExcerpt(owner, witness)
-            } : nil
+            }
+        } else {
+            excerpt = nil
+        }
         return .init(create: base.create,
             open: { owner, input, flag in
                 let reply = try base.open(owner, input, flag)
@@ -439,7 +454,7 @@ private final class ObservedSearchProbe: @unchecked Sendable {
         for generation in [UInt64(0)] {
             rejects("zero generation") { _ = try AtlasObservedReaderSearchRequest(generation: generation, needle: "x", encoding: .utf8) }
         }
-        for bytes in [UInt64(0), (1 << 32) + 1] {
+        for bytes in [UInt64(0), (UInt64(1) << 32) + 1] {
             rejects("scan bounds") { _ = try AtlasObservedReaderSearchRequest(generation: 1, needle: "x", encoding: .utf8, maximumScanBytes: bytes) }
         }
         for matches in [UInt64(0), 257] {

@@ -185,7 +185,9 @@ enum AtlasCityMotion: Sendable, Equatable {
     private var operation = UUID()
     private var task: Task<Void, Never>?
     private var generation: UInt64 = 0
-    private var width = 0.0, height = 0.0, backing = 0.0
+    private var width = 0.0
+    private var height = 0.0
+    private var backing = 0.0
     private var base: AtlasCityFrame?
     private var awaitingPresentation: UInt64?
     private var actual: AtlasCityReceipt?

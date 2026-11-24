@@ -1,6 +1,9 @@
 import Foundation
 
 private final class EditorGrant {}
+@MainActor private final class EditorSourceState {
+    var isCurrent = true
+}
 @MainActor private final class EditorGate {
     private var reply: CheckedContinuation<Void, Never>?
     private(set) var entered = false
@@ -75,12 +78,13 @@ private final class EditorGrant {}
     }
     static func cancellationBeforeEntry() async throws {
         for cancel in [false, true] {
-            var current = true, choices = 0, submissions = 0
-            let source = try AtlasEditorSource(path: "/repo/current.rs", accessLease: nil, isCurrent: { current })
+            let current = EditorSourceState()
+            var choices = 0, submissions = 0
+            let source = try AtlasEditorSource(path: "/repo/current.rs", accessLease: nil, isCurrent: { current.isCurrent })
             let handoff = AtlasEditorHandoff(configuration: .init(),
                 choose: { choices += 1; return try app() }, submit: { _, _ in submissions += 1 })
             handoff.open(source)
-            if cancel { handoff.cancel() } else { current = false }
+            if cancel { handoff.cancel() } else { current.isCurrent = false }
             try await until { !handoff.busy }
             precondition(choices == 0 && submissions == 0,
                 "Closing/canceling before Task entry must never show a late application chooser")
@@ -89,9 +93,10 @@ private final class EditorGrant {}
     static func staleChoiceAndBoundedDrain() async throws {
         for cancel in [false, true] {
             let gate = EditorGate(), configuration = AtlasEditorConfiguration()
-            var current = true, choices = 0, submissions = 0
+            let current = EditorSourceState()
+            var choices = 0, submissions = 0
             var grant: EditorGrant? = EditorGrant(); weak var held = grant
-            var source: AtlasEditorSource? = try .init(path: "/repo/old.rs", accessLease: grant, isCurrent: { current })
+            var source: AtlasEditorSource? = try .init(path: "/repo/old.rs", accessLease: grant, isCurrent: { current.isCurrent })
             let handoff = AtlasEditorHandoff(configuration: configuration,
                 choose: { choices += 1; if choices == 1 { await gate.wait() }; return try app() },
                 submit: { _, _ in submissions += 1 })
@@ -99,7 +104,7 @@ private final class EditorGrant {}
             try await until { gate.entered }
             source = nil; grant = nil
             precondition(held != nil, "Chooser must retain the source grant after reader closure")
-            if cancel { handoff.cancel() } else { current = false }
+            if cancel { handoff.cancel() } else { current.isCurrent = false }
             let other = try AtlasEditorSource(path: "/repo/new.rs", accessLease: nil, isCurrent: { true })
             for _ in 0..<20 { handoff.open(other) }
             precondition(handoff.busy && choices == 1 && held != nil,
@@ -115,17 +120,18 @@ private final class EditorGrant {}
     }
     static func submittedActionKeepsBothGrants() async throws {
         let gate = EditorGate(), configuration = AtlasEditorConfiguration()
-        var current = true, submissions = 0
+        let current = EditorSourceState()
+        var submissions = 0
         var fileGrant: EditorGrant? = EditorGrant(), appGrant: EditorGrant? = EditorGrant()
         weak var heldFile = fileGrant; weak var heldApp = appGrant
-        var source: AtlasEditorSource? = try .init(path: "/repo/current.rs", accessLease: fileGrant, isCurrent: { current })
+        var source: AtlasEditorSource? = try .init(path: "/repo/current.rs", accessLease: fileGrant, isCurrent: { current.isCurrent })
         configuration.application = try .init(selected: URL(fileURLWithPath: "/Applications/Chosen.app", isDirectory: true), accessLease: appGrant)
         let handoff = AtlasEditorHandoff(configuration: configuration,
             choose: { preconditionFailure("Configured action unexpectedly prompted") },
             submit: { _, _ in submissions += 1; await gate.wait() })
         handoff.open(source!)
         try await until { gate.entered }
-        source = nil; fileGrant = nil; appGrant = nil; configuration.forget(); current = false
+        source = nil; fileGrant = nil; appGrant = nil; configuration.forget(); current.isCurrent = false
         handoff.cancel()
         precondition(handoff.phase == .opening && !handoff.canCancel && heldFile != nil && heldApp != nil,
             "An entered OS request cannot be withdrawn or lose either native grant before its completion")

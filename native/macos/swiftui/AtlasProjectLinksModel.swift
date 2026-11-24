@@ -42,7 +42,8 @@ import Observation
         self.root = root; self.transport = transport; self.access = AtlasSearchAccessLease(access)
         self.projection = projection
         indexWorker = AtlasIndexedSearch(transport: transport.index)
-        selectedPath = initialPath.flatMap { AtlasProjectLinkPath.valid($0) ? $0 : nil }
+        let selectedPath = initialPath.flatMap { AtlasProjectLinkPath.valid($0) ? $0 : nil }
+        self.selectedPath = selectedPath
         self.direction = selectedPath == nil ? .all : direction
     }
 

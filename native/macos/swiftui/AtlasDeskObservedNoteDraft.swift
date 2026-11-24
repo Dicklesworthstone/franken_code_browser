@@ -15,13 +15,14 @@ import Observation
     private(set) var saving = false
     private(set) var pending: AtlasDeskObservedNoteSubmission?
     private(set) var message = ""
-    private var acceptedLabel, acceptedBody: String
+    private var acceptedLabel: String
+    private var acceptedBody: String
     private var closeRevision = UUID()
 
     init(target: AtlasDeskObservedTarget) {
         self.target = target
         label = target.passage.label; body = target.passage.body
-        acceptedLabel = label; acceptedBody = body
+        acceptedLabel = target.passage.label; acceptedBody = target.passage.body
     }
     var hasUnsavedChanges: Bool {
         saving || pending != nil || !label.utf8.elementsEqual(acceptedLabel.utf8)

@@ -533,7 +533,7 @@ private final class RecoveryFixture: @unchecked Sendable {
         desk.close()
     }
 
-    @MainActor static func waitForSaves(_ expected: Int, fixture: Fixture, desk: AtlasReadingDeskModel) async {
+    @MainActor private static func waitForSaves(_ expected: Int, fixture: Fixture, desk: AtlasReadingDeskModel) async {
         for _ in 0..<3000 {
             if fixture.saveCount == expected && !desk.busy { return }
             try? await Task.sleep(nanoseconds: 1_000_000)

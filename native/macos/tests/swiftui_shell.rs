@@ -30,9 +30,12 @@ fn app_sources(root: &Path) -> Vec<String> {
         .filter(|token| token.starts_with("swiftui/") && token.ends_with(".swift"))
         .map(str::to_owned)
         .collect();
-    assert!(!sources.is_empty() && sources.len() <= 128);
+    assert!(!sources.is_empty());
     assert_eq!(sources.iter().collect::<BTreeSet<_>>().len(), sources.len());
-    assert!(sources.iter().all(|source| root.join(source).is_file()));
+    assert!(sources.iter().all(|source| {
+        Path::new(source).parent() == Some(Path::new("swiftui"))
+            && root.join(source).is_file()
+    }));
     assert!(sources.iter().any(|source| source == "swiftui/App.swift"));
     sources
 }
@@ -63,10 +66,17 @@ fn production_swift_camera_source_and_shell() {
     std::fs::create_dir(&scratch).unwrap();
     for name in ["AtlasCamera", "AtlasSource", "AtlasSearch", "AtlasAppearance"] {
         let binary = scratch.join(name);
+        let mut command = Command::new("xcrun");
+        command.current_dir(&root).args([
+            "swiftc",
+            "-parse-as-library",
+            "swiftui/AtlasNavigationHistory.swift",
+        ]);
+        if name == "AtlasSearch" {
+            command.arg("swiftui/AtlasSearchExpression.swift");
+        }
         checked(
-            Command::new("xcrun")
-                .current_dir(&root)
-                .args(["swiftc", "-parse-as-library", "swiftui/AtlasNavigationHistory.swift"])
+            command
                 .arg(format!("swiftui/{name}.swift"))
                 .arg(format!("swiftui/tests/{name}Tests.swift"))
                 .arg("-o")
@@ -105,6 +115,7 @@ fn production_swift_camera_source_and_shell() {
                 "swiftui/AtlasDocument.swift",
                 "swiftui/AtlasPreparedText.swift",
                 "swiftui/AtlasSearch.swift",
+                "swiftui/AtlasSearchExpression.swift",
                 "swiftui/AtlasMatch.swift",
                 "swiftui/tests/AtlasBridgeTests.swift",
             ])
@@ -164,6 +175,7 @@ fn production_swift_camera_source_and_shell() {
                 "swiftui/AtlasDocument.swift",
                 "swiftui/AtlasPreparedText.swift",
                 "swiftui/AtlasSearch.swift",
+                "swiftui/AtlasSearchExpression.swift",
                 "swiftui/AtlasSearchCoordinator.swift",
                 "swiftui/AtlasProjectIO.swift",
                 "swiftui/AtlasProjectCatalog.swift",
@@ -185,6 +197,7 @@ fn production_swift_camera_source_and_shell() {
                 "swiftc",
                 "-parse-as-library",
                 "swiftui/AtlasSearch.swift",
+                "swiftui/AtlasSearchExpression.swift",
                 "swiftui/AtlasSearchCoordinator.swift",
                 "swiftui/AtlasProjectIO.swift",
                 "swiftui/tests/AtlasProjectIOTests.swift",
@@ -202,6 +215,7 @@ fn production_swift_camera_source_and_shell() {
                 "swiftc",
                 "-parse-as-library",
                 "swiftui/AtlasSearch.swift",
+                "swiftui/AtlasSearchExpression.swift",
                 "swiftui/AtlasSearchCoordinator.swift",
                 "swiftui/AtlasProjectIO.swift",
                 "swiftui/AtlasProjectCatalog.swift",

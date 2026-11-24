@@ -701,7 +701,7 @@ import Observation
                     let selected = try await AtlasCapturedReader.activate(target, identity: opened.identity,
                         find: { try await coordinator.find($0) },
                         nextPage: { needle, cursor in
-                            try await coordinator.find(needle, startAfter: cursor)
+                            try await self.coordinator.find(needle, startAfter: cursor)
                         }, read: { try await coordinator.read(.hit($0)) },
                         isCurrent: {
                             operation == ticket && fileQuery.utf8.elementsEqual(target.needle.utf8)
@@ -713,14 +713,20 @@ import Observation
                     selectedHitIndex = selected.index
                     install(selected.page, request: .hit(selected.target))
                 } else if target.mode == .occurrences {
+                    let prepareWindow: (@MainActor (String, UInt64) async throws -> AtlasReferencePage)?
+                    if coordinator.supportsReferenceWindows {
+                        prepareWindow = { name, offset in
+                            try await self.coordinator.prepareReferences(name,
+                                window: AtlasReferenceWindowRequest(offset: offset, countAllMatches: true))
+                        }
+                    } else {
+                        prepareWindow = nil
+                    }
                     let selected = try await AtlasCapturedReader.activateOccurrence(target,
                         identity: opened.identity,
                         prepare: { try await coordinator.prepareReferences($0) },
                         nextPage: { try await coordinator.referencePage($0) },
-                        prepareWindow: coordinator.supportsReferenceWindows ? { name, offset in
-                            try await coordinator.prepareReferences(name,
-                                window: AtlasReferenceWindowRequest(offset: offset, countAllMatches: true))
-                        } : nil,
+                        prepareWindow: prepareWindow,
                         read: { try await coordinator.read(.reference($0)) },
                         isCurrent: {
                             operation == ticket && referenceName.utf8.elementsEqual(target.needle.utf8)

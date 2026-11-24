@@ -136,7 +136,9 @@ struct AtlasViewportLayout: Sendable {
     private(set) var residentCost = AtlasViewportCost()
     private(set) var residentCount = 0
     private(set) var pendingCount = 0
-    private var readerOnlyCount = 0, unavailableCount = 0, capacityLimitedCount = 0
+    private var readerOnlyCount = 0
+    private var unavailableCount = 0
+    private var capacityLimitedCount = 0
 
     @ObservationIgnored private let limits: AtlasViewportLimits
     @ObservationIgnored private let worker: AtlasViewportWorker
