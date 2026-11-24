@@ -949,8 +949,9 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         }
         .onChange(of: projectChangeDiscoveryKey) { _, _ in
             guard !projectBrowser.closed, projectBrowser.root.utf8.elementsEqual(root.utf8),
-                  projectOpening.projectID == browserProject, let info = projectBrowser.info else { return }
-            projectChanges.reportDiscovery(project: browserProject, complete: info.complete,
+                  projectOpening.projectID == browserProject, let info = projectBrowser.info,
+                  info.scope.directory.isProject else { return }
+            projectChanges.reportDiscovery(project: browserProject, complete: info.completesProjectDiscovery,
                 more: info.more, omissions: info.omissionCount)
         }
         .onChange(of: liveRefreshInput, initial: true) { _, input in
@@ -2090,6 +2091,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
 
     private var progressiveProjectView: some View {
         let browser = projectBrowser, project = loadGeneration, rangeAuthority = snapshotExportSource
+        let browserOwner = browser.info?.owner, browsedDirectory = browser.directory
         let visible = projectBrowser.page?.files.filter { file in
             String(bytes: file.rawPath, encoding: .utf8).map { fileScope.includes($0, custom: customExtensions) }
                 ?? (fileScope == .all)
@@ -2132,8 +2134,26 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                       let accepted = browser.currentFile(file, from: page) else { throw AtlasProjectBrowserError.stale }
                 let target = try AtlasFileFocus(rawPath: accepted.rawPath)
                 requestAtlasTarget(.file(target), project: project)
+            }, canBrowseDirectory: canChangeAtlasDirectory, browseDirectory: { directory, move in
+                // A queued folder action cannot borrow a newly accepted cursor.
+                guard projectBrowser === browser, loadGeneration == project,
+                      browser.info?.owner == browserOwner, browser.directory == browsedDirectory else { return false }
+                return requestProjectDirectory(directory, move: move)
             })
             .id(projectViewIdentity)
+    }
+
+    @discardableResult
+    private func requestProjectDirectory(_ directory: AtlasDirectoryFocus,
+        move: AtlasProjectBrowserDirectoryMove = .visit) -> Bool {
+        guard canChangeAtlasDirectory, !projectBrowser.busy,
+              projectBrowser.navigate(to: directory, move: move) else { return false }
+        // The new cursor starts on a later main-actor turn. Folder completion
+        // cannot acknowledge the whole-project watcher; returning to root
+        // requires a fresh scan epoch even when the former root page completed.
+        projectChanges.cancelDiscovery(project: browserProject)
+        if directory.isProject { projectChanges.beginDiscovery(project: browserProject) }
+        return true
     }
 
     private func openCatalogFile(_ id: UInt64, project: UUID, catalogRevision: UUID) {
@@ -2517,13 +2537,14 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         guard projectViewActive, !projectRefresh.isRefreshing, !loadingProject,
               !atlasFolderPersistence.isLoading, atlasDeferredSavedViews == nil,
               !projectOpening.isPreparing, !atlasLayoutPending,
-              projectOpening.canBrowse, !projectBrowser.closed,
+              projectOpening.canBrowse, !projectBrowser.closed, !projectBrowser.busy,
               browserProject == loadGeneration, projectBrowser.root.utf8.elementsEqual(root.utf8) else { return false }
         if let automatic {
             guard liveRefreshInput.admits(automatic), projectChanges.acceptsAutomaticRefresh(automatic) else { return false }
         }
         let previous = projectBrowser, previousProject = browserProject
         let requestedDiscoveryPolicy = discoveryPolicy ?? previous.discoveryPolicy
+        let requestedDirectory = previous.directory
         let retainingPreviousMembership = requestedDiscoveryPolicy == previous.discoveryPolicy
         let requestedRoot = root, requestedTarget = atlasCatalogTarget
         let previousRevision = atlasRevision, previousRequest = atlasLayoutRequest
@@ -2547,7 +2568,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         accessLease = nil
 #endif
         if let project = projectRefresh.stage(root: root, project: previousProject, accessLease: accessLease,
-            discoveryPolicy: requestedDiscoveryPolicy,
+            discoveryPolicy: requestedDiscoveryPolicy, directory: requestedDirectory,
             prepare: { cancellation in
                 guard refreshAtlas else { return }
                 stagedAtlas = try await projectRefreshIO.perform(cancellation: cancellation,
@@ -2568,7 +2589,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                       atlasCatalogTarget == requestedTarget,
                       fileScope == requestedScope, Array(customExtensions.utf8) == requestedExtensions,
                       hasMetadataAtlas == refreshAtlas, !atlasLayoutPending, !projectOpening.isPreparing,
-                      candidate.browser.discoveryPolicy == requestedDiscoveryPolicy else { return false }
+                      candidate.browser.discoveryPolicy == requestedDiscoveryPolicy,
+                      candidate.browser.directory == requestedDirectory else { return false }
                 return acceptProjectRefresh(candidate, replacing: previous, atlas: stagedAtlas, accessLease: accessLease)
             },
             failed: { project in projectChanges.cancelDiscovery(project: project) }) {
@@ -2578,7 +2600,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             // watcher epoch before any candidate result can be delivered.
             projectChanges.bind(root: root, accessLease: accessLease)
             liveRefresh.didStart(projectChanges.refreshTicket, input: liveRefreshInput)
-            projectChanges.beginDiscovery(project: project)
+            if requestedDirectory.isProject { projectChanges.beginDiscovery(project: project) }
             return true
         }
         return false
@@ -2593,6 +2615,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
               browserProject == candidate.previousProject, loadGeneration == candidate.previousProject,
               root.utf8.elementsEqual(candidate.root.utf8),
               candidate.browser.root.utf8.elementsEqual(candidate.root.utf8),
+              candidate.browser.directory == previous.directory,
               candidate.project != candidate.previousProject, candidate.opening.projectID == candidate.project,
               candidate.opening.canBrowse, candidate.browser.currentPage, !candidate.browser.closed,
               let info = candidate.browser.info else { return false }
@@ -2653,6 +2676,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         loadProgress = ""
         projectOpening = replacementOpening
         browserProject = candidate.project
+        candidate.browser.inheritDirectoryHistory(from: previous)
         projectBrowser = candidate.browser
         previous.close()
         refreshOriginProject = candidate.project
@@ -2685,8 +2709,10 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         }
         // A first page can still have unvisited members or omissions. Only a
         // real complete scan under the same uninterrupted watcher clears hints.
-        projectChanges.reportDiscovery(project: candidate.project, complete: info.complete,
-            more: info.more, omissions: info.omissionCount)
+        if info.scope.directory.isProject {
+            projectChanges.reportDiscovery(project: candidate.project, complete: info.completesProjectDiscovery,
+                more: info.more, omissions: info.omissionCount)
+        }
         status = atlas?.notice ?? candidate.browser.notice
         if !query.isEmpty { runSearch(debounce: true) }
         if preservesFolderSession { persistAtlasFolderNavigation() }

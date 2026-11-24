@@ -52,6 +52,15 @@ for the selected file's documentation links or import candidates. Follow a
 neighbor while keeping the exact evidence list and captured readers available;
 the map reports omitted and unresolved records explicitly.
 
+**Project Files** can start progressive discovery directly in a folder under the
+open project. Enter its project-relative path or choose **Browse containing
+folder**, then use **Back**, **Forward**, **Up**, or **Whole project**. Each change
+keeps the accepted page until the new folder's first page is verified, preserves
+captured readers and the current atlas, and retains at most four metadata pages.
+Refresh keeps the selected folder and discovery policy; folder completeness
+never establishes whole-project coverage. This source integration awaits
+independent executable and physical-Mac verification.
+
 In **Project Files**, **Focus this file** gives a selected file its own atlas,
 including files discovered beyond a folder's 20,000-file map limit. Refresh,
 Back/Forward, saved landmarks and visible-file search preserve that exact file
@@ -153,6 +162,14 @@ The browsing product does not execute project code to open a directory. Editing,
 debuggers and terminals are outside its initial release scope.
 
 **Large-file passages can be kept with notes and recovered offline.**
+Retained and pinned readers now allow **Keep selected text** on complete captures
+larger than 4 MiB. The Desk saves the exact selection, or the current page when
+there is no selection, up to 256 KiB plus bounded decoding context. The passage
+preserves the original capture identity, path, encoding and byte offsets and
+supports notes, checkpoint recovery and source-pack export. It stays available
+after the reader closes or the live file changes. The separate 4 MiB limit for
+importing a complete source into a Desk pane remains in effect.
+
 In the Observed Range Reader, select text and choose **Keep selected passage**.
 The Reading Desk's **Observed passages** section keeps the original byte offsets,
 exact observed bytes, decoding context and personal notes through checkpoint

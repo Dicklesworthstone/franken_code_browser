@@ -72,6 +72,7 @@ import Observation
     @discardableResult
     func stage(root: String, project: UUID, accessLease: AnyObject?,
                discoveryPolicy: AtlasDiscoveryPolicy = .repositoryRules,
+               directory: AtlasDirectoryFocus = .project,
                prepare: @escaping @MainActor (AtlasSearchCancellation) async throws -> Void = { _ in },
                accepted: @escaping @MainActor (Candidate) -> Bool,
                failed: @escaping @MainActor (UUID) -> Void) -> UUID? {
@@ -91,10 +92,10 @@ import Observation
             }
             do {
                 try Task.checkCancellation()
-                try await browser.open(root: root, accessLease: accessLease, discoveryPolicy: discoveryPolicy)
+                try await browser.open(root: root, accessLease: accessLease, discoveryPolicy: discoveryPolicy, directory: directory)
                 try Task.checkCancellation()
                 guard let self, self.attempt === request, !request.canceled,
-                      !browser.closed, browser.currentPage, browser.info != nil,
+                      !browser.closed, browser.currentPage, browser.info != nil, browser.directory == directory,
                       browser.root.utf8.elementsEqual(root.utf8),
                       request.opening.acceptProgressive(for: request.ticket) else {
                     request.failOnce()
@@ -103,7 +104,7 @@ import Observation
                 try await prepare(request.cancellation)
                 try Task.checkCancellation()
                 guard self.attempt === request, !request.canceled, !request.cancellation.isCanceled,
-                      !browser.closed, browser.currentPage, browser.info != nil,
+                      !browser.closed, browser.currentPage, browser.info != nil, browser.directory == directory,
                       browser.root.utf8.elementsEqual(root.utf8) else {
                     request.failOnce()
                     return
@@ -115,8 +116,10 @@ import Observation
                 // host's installation of this exact browser/opening identity.
                 if accepted(candidate) {
                     transferred = true
-                    if let info = browser.info, info.complete, !info.more, info.omissionCount == 0 {
+                    if browser.info?.completesProjectDiscovery == true {
                         self.notice = "Project discovery refreshed. Open readers keep their captured bytes and position."
+                    } else if !directory.isProject {
+                        self.notice = "Folder discovery refreshed. Whole-project coverage remains unchanged. Open readers keep their captured bytes and position."
                     } else {
                         self.notice = "New project page ready; discovery remains incomplete. Open readers keep their captured bytes and position."
                     }

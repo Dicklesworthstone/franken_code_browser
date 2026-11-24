@@ -90,13 +90,50 @@ private struct AtlasCatalogPath: Decodable {
     private enum CodingKeys: CodingKey { case encoding, hex, display }
 }
 
+/// Discovery scope is separate from the project grant. Paths in every page
+/// remain relative to that original root; linked readers can leave this folder.
+struct AtlasProjectBrowserScope: Decodable, Equatable, Sendable {
+    let directory: AtlasDirectoryFocus
+    let echoed: Bool
+    static let maximumDirectoryComponents = 31
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let keys: [CodingKeys] = [.discovery_scope, .discovery_directory, .path_basis]
+        if keys.allSatisfy({ !c.contains($0) }) {
+            // Old workspace transports had no scope fields. They cannot
+            // satisfy a scoped request or lose an already witnessed echo.
+            directory = .project; echoed = false; return
+        }
+        guard keys.allSatisfy({ c.contains($0) }),
+              try c.decode(String.self, forKey: .path_basis) == "project-root" else {
+            throw AtlasProjectBrowserError.invalidResponse
+        }
+        let scope = try c.decode(String.self, forKey: .discovery_scope)
+        if scope == "workspace" {
+            guard try c.decodeNil(forKey: .discovery_directory) else { throw AtlasProjectBrowserError.invalidResponse }
+            directory = .project
+        } else if scope == "directory" {
+            let path = try c.decode(AtlasCatalogPath.self, forKey: .discovery_directory)
+            guard path.raw.split(separator: 47).count <= Self.maximumDirectoryComponents else {
+                throw AtlasProjectBrowserError.invalidResponse
+            }
+            directory = try AtlasDirectoryFocus(rawPath: path.raw)
+        } else { throw AtlasProjectBrowserError.invalidResponse }
+        echoed = true
+    }
+    private enum CodingKeys: CodingKey { case discovery_scope, discovery_directory, path_basis }
+}
+
 struct AtlasProjectBrowserInfo: Sendable {
     let owner, latest, firstRetained, retainedPages, retainedFiles, retainedPathBytes, discovered: UInt64
     let state: String
     let more, paused, complete: Bool
     let directories, excluded, symlinks, special, unavailable, cycles, pathLimited, depthLimited, queueRefused: UInt64
     let policy: AtlasRepositoryPolicy
+    let scope: AtlasProjectBrowserScope
     func retains(_ page: UInt64) -> Bool { page >= firstRetained && page <= latest }
+    var completesProjectDiscovery: Bool { scope.directory.isProject && complete && !more && omissionCount == 0 }
     var omissionCount: UInt64 {
         // Presentation only: never wrap counters from a very long discovery.
         [unavailable, cycles, pathLimited, depthLimited, queueRefused].reduce(0) {
@@ -109,6 +146,7 @@ struct AtlasProjectBrowserInfo: Sendable {
     fileprivate static func decode(_ data: Data, owner: UInt64) throws -> Self {
         do {
             let w = try JSONDecoder().decode(Wire.self, from: data)
+            let scope = try JSONDecoder().decode(AtlasProjectBrowserScope.self, from: data)
             let latest = w.latest_page.value, first = w.first_retained_page.value
             let policy = try AtlasRepositoryPolicy.admit(name: w.policy, enabled: w.rule_files_enabled,
                 evidence: w.rule_policy, discoveryComplete: w.discovery_complete)
@@ -139,7 +177,7 @@ struct AtlasProjectBrowserInfo: Sendable {
                 special: w.discovery.special_objects.value, unavailable: w.discovery.unavailable.value,
                 cycles: w.discovery.cycles.value, pathLimited: w.discovery.path_limited.value,
                 depthLimited: w.discovery.depth_limited.value, queueRefused: w.discovery.queue_refused.value,
-                policy: policy)
+                policy: policy, scope: scope)
         } catch let error as AtlasProjectBrowserError { throw error }
         catch { throw AtlasProjectBrowserError.invalidResponse }
     }
@@ -176,6 +214,7 @@ struct AtlasProjectBrowserPage: Sendable {
             var ids = Set<UInt64>(), paths = Set<[UInt8]>(), bytes = 0, charged = 0, previousID: UInt64 = 0
             for file in w.files {
                 guard file.id > previousID, file.id <= info.discovered,
+                      info.scope.directory.containsFile(file.rawPath),
                       ids.insert(file.id).inserted, paths.insert(file.rawPath).inserted else {
                     throw AtlasProjectBrowserError.invalidResponse
                 }
@@ -253,6 +292,7 @@ enum AtlasProjectBrowserRequest: Sendable {
 struct AtlasProjectBrowserTransport: Sendable {
     typealias VerifiedDocumentLink = @Sendable (UInt64, UInt64, UInt64, UInt64, UInt64, UInt64) -> String?
     typealias OpenWithPolicy = @Sendable (UInt64, String, AtlasDiscoveryPolicy) -> String?
+    typealias OpenDirectoryWithPolicy = @Sendable (UInt64, String, AtlasDirectoryFocus, AtlasDiscoveryPolicy) -> String?
     let create: @Sendable () -> UInt64
     let run: @Sendable (UInt64, AtlasProjectBrowserRequest) -> String?
     let cancel: @Sendable (UInt64) -> Bool
@@ -261,16 +301,19 @@ struct AtlasProjectBrowserTransport: Sendable {
     let readerDomain: UUID?
     let verifiedDocumentLink: VerifiedDocumentLink?
     let openWithPolicy: OpenWithPolicy?
+    let openDirectoryWithPolicy: OpenDirectoryWithPolicy?
 
     init(create: @escaping @Sendable () -> UInt64,
         run: @escaping @Sendable (UInt64, AtlasProjectBrowserRequest) -> String?,
         cancel: @escaping @Sendable (UInt64) -> Bool, close: @escaping @Sendable (UInt64) -> Bool,
         retirementFailed: @escaping @Sendable () -> Void, readerDomain: UUID?,
-        verifiedDocumentLink: VerifiedDocumentLink? = nil, openWithPolicy: OpenWithPolicy? = nil) {
+        verifiedDocumentLink: VerifiedDocumentLink? = nil, openWithPolicy: OpenWithPolicy? = nil,
+        openDirectoryWithPolicy: OpenDirectoryWithPolicy? = nil) {
         self.create = create; self.run = run; self.cancel = cancel; self.close = close
         self.retirementFailed = retirementFailed; self.readerDomain = readerDomain
         self.verifiedDocumentLink = verifiedDocumentLink
         self.openWithPolicy = openWithPolicy
+        self.openDirectoryWithPolicy = openDirectoryWithPolicy
     }
 }
 
@@ -385,12 +428,13 @@ private struct AtlasProjectBrowserReceipt: Sendable {
     let window: AtlasReaderPage
     let initialOriginalOffset: UInt64
     static func decode(_ json: String?, owner: UInt64, page: UInt64, file: AtlasProjectBrowserFile,
-        destination: UInt64, discoveryPolicy: AtlasDiscoveryPolicy? = nil,
+        destination: UInt64, scope: AtlasProjectBrowserScope, discoveryPolicy: AtlasDiscoveryPolicy? = nil,
         legacyDefault: Bool = false) throws -> Self {
         let data = try AtlasProjectBrowserWire.admit(json, owner: owner, command: "open-reader")
         do {
             let current = try AtlasProjectBrowserInfo.decode(data, owner: owner)
-            guard discoveryPolicy?.admits(current.policy.name, legacyDefault: legacyDefault) != false else {
+            guard current.scope == scope,
+                  discoveryPolicy?.admits(current.policy.name, legacyDefault: legacyDefault) != false else {
                 throw AtlasProjectBrowserError.invalidResponse
             }
             struct Selection: Decodable {
@@ -470,11 +514,12 @@ private struct AtlasProjectBrowserLinkReceipt: Sendable {
     let fragment: AtlasProjectBrowserFragment
     static func decode(_ json: String?, source: AtlasProjectBrowserLinkOrigin,
         target: AtlasReaderDocumentLinkTarget, destination: UInt64,
-        discoveryPolicy: AtlasDiscoveryPolicy, legacyDefault: Bool) throws -> Self {
+        scope: AtlasProjectBrowserScope, discoveryPolicy: AtlasDiscoveryPolicy, legacyDefault: Bool) throws -> Self {
         let data = try AtlasProjectBrowserWire.admit(json, owner: source.catalog, command: "open-document-link")
         do {
             let current = try AtlasProjectBrowserInfo.decode(data, owner: source.catalog)
-            guard discoveryPolicy.admits(current.policy.name, legacyDefault: legacyDefault) else {
+            guard current.scope == scope,
+                  discoveryPolicy.admits(current.policy.name, legacyDefault: legacyDefault) else {
                 throw AtlasProjectBrowserError.invalidResponse
             }
             struct Wire: Decodable {
@@ -575,22 +620,31 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
     let owner: UInt64
     let transport: AtlasProjectBrowserTransport
     let discoveryPolicy: AtlasDiscoveryPolicy
+    let directory: AtlasDirectoryFocus
     private let access: AtlasProjectBrowserAccess
     /// Share only the native root-access lifetime with a captured reader. The
     /// catalog itself can retire while the independent reader keeps this grant.
     var retainedAccessLease: AnyObject { access }
+    var accessReference: AnyObject? { access.reference }
+    var legacyPolicy: Bool { directory.isProject && transport.openWithPolicy == nil }
     private static let retirement = DispatchQueue(label: "dev.frankencode.browser.discovery-retirement", qos: .utility)
-    init(transport: AtlasProjectBrowserTransport, access: AnyObject?, discoveryPolicy: AtlasDiscoveryPolicy) throws {
-        guard discoveryPolicy == .repositoryRules || transport.openWithPolicy != nil else {
+    init(transport: AtlasProjectBrowserTransport, access: AnyObject?, discoveryPolicy: AtlasDiscoveryPolicy,
+        directory: AtlasDirectoryFocus) throws {
+        guard directory.rawPath.split(separator: 47).count <= AtlasProjectBrowserScope.maximumDirectoryComponents,
+              directory.isProject ? (discoveryPolicy == .repositoryRules || transport.openWithPolicy != nil)
+                : transport.openDirectoryWithPolicy != nil else {
             throw AtlasProjectBrowserError.unavailable
         }
         let owner = transport.create()
         guard owner != 0 else { throw AtlasProjectBrowserError.unavailable }
         self.owner = owner; self.transport = transport; self.access = AtlasProjectBrowserAccess(access)
         self.discoveryPolicy = discoveryPolicy
+        self.directory = directory
     }
-    func validate(_ info: AtlasProjectBrowserInfo) throws {
-        guard discoveryPolicy.admits(info.policy.name, legacyDefault: transport.openWithPolicy == nil) else {
+    func validate(_ info: AtlasProjectBrowserInfo, expected: AtlasProjectBrowserScope? = nil) throws {
+        guard info.scope.directory == directory, directory.isProject || info.scope.echoed,
+              expected == nil || expected == info.scope,
+              discoveryPolicy.admits(info.policy.name, legacyDefault: legacyPolicy) else {
             throw AtlasProjectBrowserError.invalidResponse
         }
     }
@@ -609,6 +663,8 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
     }
 }
 
+enum AtlasProjectBrowserDirectoryMove { case visit, back, forward }
+
 /// One visible metadata page and one entered operation. The Rust session owns
 /// at most four pages; Swift never accumulates the traversed project tree.
 @Observable @MainActor final class AtlasProjectBrowserModel {
@@ -616,6 +672,11 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
     private(set) var page: AtlasProjectBrowserPage?
     private(set) var root = ""
     private(set) var discoveryPolicy: AtlasDiscoveryPolicy = .repositoryRules
+    private(set) var directory: AtlasDirectoryFocus = .project
+    private(set) var pendingDirectory: AtlasDirectoryFocus?
+    private(set) var previousDirectories: [AtlasDirectoryFocus] = []
+    private(set) var followingDirectories: [AtlasDirectoryFocus] = []
+    static let maximumDirectoryHistory = 32
     /// Lifetime identity of the native grant supplied by the project owner.
     /// Same-path grant replacement must revoke local-link history; a catalog
     /// refresh using this same grant may preserve already retained readers.
@@ -626,6 +687,7 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
     @ObservationIgnored private let transport: AtlasProjectBrowserTransport
     @ObservationIgnored private let io = AtlasProjectIO()
     @ObservationIgnored private var session: AtlasProjectBrowserSession?
+    @ObservationIgnored private var pendingSession: AtlasProjectBrowserSession?
     @ObservationIgnored private var flag: AtlasSearchCancellation?
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var stopRequested = false
@@ -648,13 +710,16 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
     }
 
     var supportsDiscoveryPolicy: Bool { transport.openWithPolicy != nil }
+    var supportsDirectoryBrowsing: Bool { transport.openDirectoryWithPolicy != nil }
 
-    func open(root: String, accessLease: AnyObject?, discoveryPolicy: AtlasDiscoveryPolicy = .repositoryRules) async throws {
+    func open(root: String, accessLease: AnyObject?, discoveryPolicy: AtlasDiscoveryPolicy = .repositoryRules,
+        directory: AtlasDirectoryFocus = .project) async throws {
         guard !closed, !busy, session == nil, root.hasPrefix("/"), root.utf8.count <= 16_384,
               !root.utf8.contains(0) else { throw AtlasProjectBrowserError.unavailable }
-        let lease = try AtlasProjectBrowserSession(transport: transport, access: accessLease, discoveryPolicy: discoveryPolicy)
+        let lease = try AtlasProjectBrowserSession(transport: transport, access: accessLease,
+            discoveryPolicy: discoveryPolicy, directory: directory)
         self.root = root; rootAccessIdentity = accessLease.map(ObjectIdentifier.init)
-        self.discoveryPolicy = discoveryPolicy
+        self.discoveryPolicy = discoveryPolicy; self.directory = directory
         session = lease; busy = true
         let flag = AtlasSearchCancellation(); self.flag = flag
         defer { finish() }
@@ -669,6 +734,61 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
             guard await recover(lease) else { notice = Self.message(error); throw error }
         }
     }
+    /// Stage one independent cursor under the same project grant. Only a
+    /// verified first page changes the accepted scope, row authority or history.
+    /// Returning synchronously lets the host bind a watcher epoch before work.
+    @discardableResult
+    func navigate(to destination: AtlasDirectoryFocus, move: AtlasProjectBrowserDirectoryMove = .visit) -> Bool {
+        guard canOperate, supportsDirectoryBrowsing, let previous = session,
+              destination != directory, pendingSession == nil else { return false }
+        switch move {
+        case .visit: break
+        case .back: guard previousDirectories.last == destination else { return false }
+        case .forward: guard followingDirectories.last == destination else { return false }
+        }
+        let candidate: AtlasProjectBrowserSession
+        do {
+            candidate = try AtlasProjectBrowserSession(transport: transport, access: previous.accessReference,
+                discoveryPolicy: discoveryPolicy, directory: destination)
+        } catch { notice = Self.message(error); return false }
+        let requestedRoot = root, sourceDirectory = directory
+        let flag = AtlasSearchCancellation(); self.flag = flag
+        busy = true; pendingSession = candidate; pendingDirectory = destination
+        notice = destination.isProject ? "Opening a new whole-project discovery…"
+            : "Opening folder \(destination.display)…"
+        task = Task {
+            defer { pendingSession = nil; pendingDirectory = nil; finish() }
+            do {
+                let first = try AtlasProjectBrowserPage.decode(await run(candidate, .open(requestedRoot), flag: flag),
+                    owner: candidate.owner, page: 1)
+                try candidate.validate(first.info)
+                guard !closed, !flag.isCanceled, !Task.isCancelled, session === previous,
+                      pendingSession === candidate, directory == sourceDirectory,
+                      root.utf8.elementsEqual(requestedRoot.utf8) else { throw AtlasProjectBrowserError.canceled }
+                switch move {
+                case .visit:
+                    previousDirectories.append(sourceDirectory); followingDirectories = []
+                case .back:
+                    _ = previousDirectories.popLast(); followingDirectories.append(sourceDirectory)
+                case .forward:
+                    _ = followingDirectories.popLast(); previousDirectories.append(sourceDirectory)
+                }
+                previousDirectories = Array(previousDirectories.suffix(Self.maximumDirectoryHistory))
+                followingDirectories = Array(followingDirectories.suffix(Self.maximumDirectoryHistory))
+                session = candidate; directory = destination; accept(first)
+            } catch {
+                if !closed { notice = "Folder navigation was not applied. " + Self.message(error) }
+            }
+        }
+        return true
+    }
+    /// Refresh keeps navigation destinations, never old catalog pages or leases.
+    func inheritDirectoryHistory(from previous: AtlasProjectBrowserModel) {
+        guard currentPage, !closed, root.utf8.elementsEqual(previous.root.utf8),
+              rootAccessIdentity == previous.rootAccessIdentity, directory == previous.directory else { return }
+        previousDirectories = Array(previous.previousDirectories.suffix(Self.maximumDirectoryHistory))
+        followingDirectories = Array(previous.followingDirectories.suffix(Self.maximumDirectoryHistory))
+    }
     func advance() {
         guard canContinue, let info, info.latest < UInt64.max else { return }
         let after = info.latest
@@ -676,7 +796,7 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
             do {
                 let next = try AtlasProjectBrowserPage.decode(await model.run(lease, .advance(after: after), flag: flag),
                     owner: lease.owner, page: after + 1)
-                try lease.validate(next.info)
+                try lease.validate(next.info, expected: model.info?.scope)
                 guard !model.closed, model.session === lease else { throw AtlasProjectBrowserError.canceled }
                 model.accept(next)
             } catch {
@@ -690,7 +810,7 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
         guard canOperate, info?.retains(id) == true else { return }
         perform { model, lease, flag in
             let page = try AtlasProjectBrowserPage.decode(await model.run(lease, .page(id), flag: flag), owner: lease.owner, page: id)
-            try lease.validate(page.info)
+            try lease.validate(page.info, expected: model.info?.scope)
             guard !model.closed, model.session === lease else { throw AtlasProjectBrowserError.canceled }
             model.accept(page)
         }
@@ -704,6 +824,11 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
     func stop() {
         guard !closed else { return }
         if busy {
+            if let pendingSession {
+                flag?.cancel(); pendingSession.cancel()
+                notice = "Stopping folder navigation; the previous file page remains available."
+                return
+            }
             stopRequested = true; flag?.cancel(); session?.cancel()
             notice = "Stopping after entered project work drains…"
             return
@@ -712,7 +837,7 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
         perform { model, lease, flag in
             do {
                 let info = try AtlasProjectBrowserInfo.decode(await model.run(lease, .stop, flag: flag), owner: lease.owner, command: "stop")
-                try lease.validate(info)
+                try lease.validate(info, expected: model.info?.scope)
                 guard !model.closed, model.session === lease else { throw AtlasProjectBrowserError.canceled }
                 model.info = info
                 model.notice = "Discovery paused. Retained pages remain readable; Continue resumes from this cursor."
@@ -741,8 +866,8 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
                     return try withExtendedLifetime(lease) {
                         let admitted = try AtlasProjectBrowserReceipt.decode(lease.transport.run(lease.owner,
                             .openReader(reader: destination, page: page.id, file: file.id, bytes: AtlasReaderLimits.captureBytes)),
-                            owner: lease.owner, page: page.id, file: file, destination: destination,
-                            discoveryPolicy: lease.discoveryPolicy, legacyDefault: lease.transport.openWithPolicy == nil)
+                            owner: lease.owner, page: page.id, file: file, destination: destination, scope: page.info.scope,
+                            discoveryPolicy: lease.discoveryPolicy, legacyDefault: lease.legacyPolicy)
                         try receipt.set(admitted)
                         return AtlasReaderRetainedInitialization(info: admitted.info, initialOriginalOffset: 0,
                             imageSource: imageSource)
@@ -823,7 +948,7 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
         outline: AtlasReaderOutlineTransport?, document: AtlasReaderDocumentTransport?,
         initialize: @escaping @Sendable (UInt64) -> String?) async throws -> AtlasProjectBrowserCapture {
         try Task.checkCancellation()
-        guard canOperate, session === lease, let domain = transport.readerDomain,
+        guard canOperate, session === lease, let scope = info?.scope, let domain = transport.readerDomain,
               origin.page?.identity.matches(source.identity) == true,
               origin.retainedCaptureSHA256 == source.digest,
               origin.documentPreview.allows(target) else { throw AtlasProjectBrowserError.stale }
@@ -839,7 +964,7 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
                     return try withExtendedLifetime(lease) {
                         let admitted = try AtlasProjectBrowserLinkReceipt.decode(initialize(destination),
                             source: source, target: target, destination: destination,
-                            discoveryPolicy: lease.discoveryPolicy, legacyDefault: lease.transport.openWithPolicy == nil)
+                            scope: scope, discoveryPolicy: lease.discoveryPolicy, legacyDefault: lease.legacyPolicy)
                         try receipt.set(admitted)
                         return AtlasReaderRetainedInitialization(info: admitted.capture.info,
                             initialOriginalOffset: admitted.capture.initialOriginalOffset,
@@ -875,14 +1000,15 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
     }
     func close() {
         guard !closed else { return }
-        closed = true; stopRequested = false; flag?.cancel(); session?.cancel(); task?.cancel()
+        closed = true; stopRequested = false; flag?.cancel(); session?.cancel(); pendingSession?.cancel(); task?.cancel()
         info = nil; page = nil
-        if !busy { session = nil }
+        if !busy { session = nil; pendingSession = nil; pendingDirectory = nil }
     }
     private func accept(_ page: AtlasProjectBrowserPage) {
         self.page = page; info = page.info
-        notice = page.info.more ? "Project page ready. Continue discovers the next bounded batch."
-            : (page.info.complete ? "Discovery finished for this project policy." : "Discovery finished with omissions; inspect the coverage counts.")
+        let subject = directory.isProject ? "Project" : "Folder"
+        notice = page.info.more ? "\(subject) page ready. Continue discovers the next bounded batch."
+            : (page.info.complete ? "\(subject) discovery finished for this policy." : "\(subject) discovery finished with omissions; inspect the coverage counts.")
         notice += " " + page.info.policy.summary
     }
     private func recover(_ lease: AtlasProjectBrowserSession) async -> Bool {
@@ -890,9 +1016,9 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
         let recovery = AtlasSearchCancellation()
         do {
             let info = try AtlasProjectBrowserInfo.decode(await run(lease, .info, flag: recovery), owner: lease.owner)
-            try lease.validate(info)
+            try lease.validate(info, expected: self.info?.scope)
             let page = try AtlasProjectBrowserPage.decode(await run(lease, .page(info.latest), flag: recovery), owner: lease.owner, page: info.latest)
-            try lease.validate(page.info)
+            try lease.validate(page.info, expected: info.scope)
             guard !closed, session === lease else { return false }
             accept(page); return true
         } catch {
@@ -903,8 +1029,12 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
     private func run(_ lease: AtlasProjectBrowserSession, _ request: AtlasProjectBrowserRequest,
         flag: AtlasSearchCancellation) async throws -> String? {
         try await io.perform(cancellation: flag, keepingAlive: [lease]) {
-            if case .open(let root) = request, let open = lease.transport.openWithPolicy {
-                return open(lease.owner, root, lease.discoveryPolicy)
+            if case .open(let root) = request {
+                if !lease.directory.isProject {
+                    guard let open = lease.transport.openDirectoryWithPolicy else { throw AtlasProjectBrowserError.unavailable }
+                    return open(lease.owner, root, lease.directory, lease.discoveryPolicy)
+                }
+                if let open = lease.transport.openWithPolicy { return open(lease.owner, root, lease.discoveryPolicy) }
             }
             return lease.transport.run(lease.owner, request)
         }

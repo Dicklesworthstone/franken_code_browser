@@ -312,6 +312,40 @@ policy, including the exact rule-observation fingerprint when present. The overr
 Root confinement, symlink and special-object refusal, resource limits and
 independent exclusions for FCB's own artifacts still apply.
 
+### Browsing a folder directly in Project Files
+
+**Project Files → Browse folder** starts progressive metadata discovery directly
+in a project-relative directory. Enter a folder path or choose **Browse containing
+folder** from a current file row. **Back**, **Forward**, **Up** and **Whole project**
+move between scopes without replacing the project, rebuilding the text atlas or
+closing retained readers. Navigation history keeps at most 32 destinations in
+each direction; returning to a destination starts a new bounded discovery cursor.
+The latest four metadata pages remain the catalog's residency limit.
+
+The original root grant and discovery policy remain authoritative. Directory
+requests preserve raw native bytes, including non-UTF-8 names reached through a
+file row or navigation history, with a 2,048-byte and 31-component limit. Paths
+in every page remain relative to the original project root. Rule-aware discovery
+retains ancestor ignore rules; Include ignored and generated files applies to
+the chosen folder. Explicit local-document links may open another file inside
+the granted project even when that target is outside the browsed folder.
+
+A new folder becomes visible only after its first page proves the requested
+raw directory, policy, owner and path basis. Invalid, failed or canceled work
+leaves the accepted page and navigation history intact. Old page rows cannot
+borrow the replacement cursor. **Refresh project**, policy changes and live
+refresh preserve the current browse folder and bounded history. A complete
+folder scan never acknowledges whole-project filesystem-change hints; returning
+to Whole project requires a new root discovery. An unchanged change ticket
+receives at most one automatic refresh attempt.
+
+Focused sources in
+[`swiftui/tests/test-project-catalog.sh`](swiftui/tests/test-project-catalog.sh)
+cover raw paths, scope-echo refusal, sibling-row rejection, transactional
+navigation/cancellation, retained readers, explicit links outside the folder,
+history bounds and scoped refresh. This is a **fcb-mhpb** code-first checkpoint;
+batch verification and physical-Mac interaction checks remain pending.
+
 ### Reading large files from Project Files
 
 Every **Project Files** row offers **Read ranges**, so a file can be read directly
@@ -2150,6 +2184,18 @@ it performs no additional source reads. Open **Reading desk…** and use the
 the text, text with location, or exact original bytes as hex. **Keep note in
 desk** accepts the personal edit. The passage remains readable after the source
 reader closes, the live file changes, or the Desk is recovered on a later launch.
+
+**Keep in reading desk** also accepts selected passages from immutable reader
+captures larger than 4 MiB, up to the reader's 32 MiB capture limit. It retains at
+most 256 KiB of selected original bytes plus eight decoder-context bytes per
+side, preserving original owner/file/revision, raw path, encoding and absolute
+offsets. These items appear under **Observed passages** and support existing
+personal notes, checkpoint/recovery and source-pack export. Their evidence is
+labeled `host-supplied-sequence`: an immutable excerpt from retained bytes, with
+no live reread or whole-file Desk claim. Complete-source Desk panes and comparison
+retain their independent 4 MiB limits. Changed source/selection intent is refused;
+an uncertain save is reconciled against accepted Desk state without automatically
+importing again.
 
 This handoff is available from a selected file, project-file reading, Quick Open,
 and streamed search context. They all use the same Reading Desk. Ordinary

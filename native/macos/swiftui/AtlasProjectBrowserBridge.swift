@@ -4,6 +4,9 @@ import Foundation
 @_silgen_name("fcb_catalog_open") private func catalogOpen(_ handle: UInt64, _ root: UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_catalog_open_with_policy") private func catalogOpenWithPolicy(_ handle: UInt64,
     _ root: UnsafePointer<CChar>?, _ policy: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_catalog_open_directory_with_policy") private func catalogOpenDirectoryWithPolicy(_ handle: UInt64,
+    _ root: UnsafePointer<CChar>?, _ directory: UnsafePointer<UInt8>?, _ length: UInt64,
+    _ policy: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_catalog_info") private func catalogInfo(_ handle: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_catalog_page") private func catalogPage(_ handle: UInt64, _ page: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_catalog_advance") private func catalogAdvance(_ handle: UInt64, _ page: UInt64) -> UnsafeMutablePointer<CChar>?
@@ -43,6 +46,15 @@ extension AtlasProjectBrowserTransport {
     }, openWithPolicy: { handle, root, policy in
         guard root.hasPrefix("/"), root.utf8.count <= 16_384, !root.utf8.contains(0) else { return nil }
         return root.withCString { take(catalogOpenWithPolicy(handle, $0, policy.rawValue)) }
+    }, openDirectoryWithPolicy: { handle, root, directory, policy in
+        guard root.hasPrefix("/"), root.utf8.count <= 16_384, !root.utf8.contains(0), !directory.isProject,
+              directory.rawPath.count <= AtlasDirectoryFocus.maximumPathBytes,
+              directory.rawPath.split(separator: 47).count <= AtlasProjectBrowserScope.maximumDirectoryComponents else { return nil }
+        return root.withCString { rootBytes in
+            directory.rawPath.withUnsafeBufferPointer { path in
+                take(catalogOpenDirectoryWithPolicy(handle, rootBytes, path.baseAddress, UInt64(path.count), policy.rawValue))
+            }
+        }
     })
 
     private static func take(_ pointer: UnsafeMutablePointer<CChar>?) -> String? {
