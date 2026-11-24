@@ -115,3 +115,116 @@ fn cancellation_conflicting_evidence_and_split_scalars_never_publish_a_passage()
     assert_eq!(desk.observed_passages().len(), 1);
     assert_eq!(desk.read_observed_passage(desk.revision(), accepted.passage, alloc(9002), || false).unwrap().text(), "saved");
 }
+
+
+fn sliced_extent(source: &[u8], captured: ByteRange, requested: ByteRange,
+    consistency: crate::search::ExtentConsistency) -> ObservedExtent {
+    let budget = ResourceBudget::new(owner(77), ByteLength::new(4 * 1024 * 1024)).unwrap();
+    let request = CaptureRequest::new(FileId::new(owner(77), 41).unwrap(),
+        SourceRevision::new(owner(77), 42).unwrap()).unwrap().with_range(requested).unwrap();
+    let bytes = &source[captured.start().get() as usize..captured.end().get() as usize];
+    let lease = budget.try_reserve_managed(owner(77), alloc(1), ByteLength::new(bytes.len() as u64 + 4096)).unwrap();
+    ObservedExtent::restore_recorded(request, captured, ByteLength::new(source.len() as u64),
+        Some(ByteLength::new(source.len() as u64)), consistency, bytes, lease).unwrap()
+}
+
+#[test]
+fn one_source_observation_keeps_distinct_compatible_extents_and_deduplicates_exact_repeats() {
+    let (mut desk, budget) = setup(DeskLimits::default());
+    let source: Vec<_> = (0..200).map(|i| b'a' + (i % 26) as u8).collect();
+    let a = sliced_extent(&source, range(0, 80), range(0, 80), crate::search::ExtentConsistency::HostSupplied);
+    let b = sliced_extent(&source, range(64, 144), range(64, 144), crate::search::ExtentConsistency::HostSupplied);
+    let c = sliced_extent(&source, range(144, 200), range(144, 200), crate::search::ExtentConsistency::HostSupplied);
+    let first = import(&mut desk, &a, range(10, 20));
+    let second = import(&mut desk, &b, range(80, 90));
+    let third = import(&mut desk, &c, range(160, 170));
+    let repeated = import(&mut desk, &b, range(100, 110));
+    assert_ne!(first.observation, second.observation);
+    assert_ne!(second.observation, third.observation);
+    assert_eq!(second.observation, repeated.observation);
+    assert_ne!(second.passage, repeated.passage);
+    assert_eq!(desk.retained_source_count(), 3);
+    assert_eq!(desk.retained_source_bytes(), 216);
+    for (id, selected) in [(first.passage, range(10, 20)), (second.passage, range(80, 90)),
+        (third.passage, range(160, 170)), (repeated.passage, range(100, 110))] {
+        let text = desk.read_observed_passage(desk.revision(), id, alloc(9000 + id), || false).unwrap();
+        assert_eq!(text.extent().range_bytes(selected).unwrap(),
+            &source[selected.start().get() as usize..selected.end().get() as usize]);
+        let observation = desk.observation(desk.revision(),
+            desk.observed_passage(desk.revision(), id).unwrap().observation()).unwrap();
+        assert_eq!(observation.origin_observation(), 42);
+        assert_eq!(observation.origin_file(), 41);
+    }
+    // Each local row owns its own bounded payload; removing one never drops a
+    // sibling or an independently retained view.
+    let held = desk.read_observed_passage(desk.revision(), second.passage, alloc(9900), || false).unwrap();
+    let before = budget.accounting().reserved().get();
+    for id in [second.passage, repeated.passage] {
+        desk.forget_observed_passage(desk.revision(), desk.last_attempt() + 1, id, 1, || false).unwrap();
+    }
+    assert_eq!(desk.retained_source_count(), 2);
+    assert_eq!(desk.retained_source_bytes(), 136);
+    assert_eq!(held.extent().range(), range(64, 144));
+    drop(held);
+    assert!(budget.accounting().reserved().get() < before);
+}
+
+#[test]
+fn conflicting_overlapping_extents_and_metadata_leave_old_passages_unchanged() {
+    let (mut desk, _) = setup(DeskLimits::default());
+    let source = vec![b'a'; 16 * 1024];
+    let first = sliced_extent(&source, range(0, 8192), range(0, 8192),
+        crate::search::ExtentConsistency::HostSupplied);
+    let kept = import(&mut desk, &first, range(16, 32));
+    desk.edit_observed_passage(1, 2, kept.passage, 1, "Keep", "original note", || false).unwrap();
+    let mut changed = source.clone(); changed[5000] = b'b';
+    let conflicts = [
+        (sliced_extent(&changed, range(4096, 12_288), range(4096, 12_288),
+            crate::search::ExtentConsistency::HostSupplied), b"src/\xff.rs".as_slice(), DetectedEncoding::Utf8 { has_bom: false }),
+        (sliced_extent(&source, range(4096, 12_288), range(4096, 12_288),
+            crate::search::ExtentConsistency::HostSupplied), b"different".as_slice(), DetectedEncoding::Utf8 { has_bom: false }),
+        (sliced_extent(&source, range(4096, 12_288), range(4096, 12_288),
+            crate::search::ExtentConsistency::HostSupplied), b"src/\xff.rs".as_slice(), DetectedEncoding::Utf16Le),
+        (sliced_extent(&source, range(4096, 12_288), range(4096, 12_288),
+            crate::search::ExtentConsistency::UnchangedMetadata), b"src/\xff.rs".as_slice(), DetectedEncoding::Utf8 { has_bom: false }),
+        (sliced_extent(&source[..15_000], range(4096, 12_288), range(4096, 12_288),
+            crate::search::ExtentConsistency::HostSupplied), b"src/\xff.rs".as_slice(), DetectedEncoding::Utf8 { has_bom: false }),
+    ];
+    for (extent, path, encoding) in conflicts {
+        let attempt = desk.last_attempt() + 1;
+        assert_eq!(desk.import_observation(2, attempt, &extent, path, encoding, range(6000, 6010),
+            501, alloc(10_000 + attempt), || false), Err(DeskError::IdentityConflict));
+        assert_eq!(desk.revision(), 2);
+        assert_eq!(desk.retained_source_count(), 1);
+        let note = desk.observed_passage(2, kept.passage).unwrap();
+        assert_eq!(note.body(), "original note"); assert_eq!(note.update_sequence(), 2);
+    }
+    let compatible = sliced_extent(&source, range(4096, 12_288), range(4096, 12_288),
+        crate::search::ExtentConsistency::HostSupplied);
+    let attempt = desk.last_attempt() + 1;
+    let mut polls = 0;
+    assert_eq!(desk.import_observation(2, attempt, &compatible, b"src/\xff.rs",
+        DetectedEncoding::Utf8 { has_bom: false }, range(6000, 6010), 501, alloc(20_000), || {
+            polls += 1; polls >= 4
+        }), Err(DeskError::Canceled));
+    assert_eq!(desk.revision(), 2); assert_eq!(desk.observed_passages().len(), 1);
+    let accepted = import(&mut desk, &compatible, range(6000, 6010));
+    assert_ne!(accepted.observation, kept.observation);
+}
+
+#[test]
+fn identical_captured_prefixes_with_different_requests_remain_separate_evidence() {
+    let (mut desk, _) = setup(DeskLimits::default());
+    let source = vec![b'a'; 200];
+    let a = sliced_extent(&source, range(0, 80), range(0, 100), crate::search::ExtentConsistency::ShortRead);
+    let b = sliced_extent(&source, range(0, 80), range(0, 120), crate::search::ExtentConsistency::ShortRead);
+    let first = import(&mut desk, &a, range(10, 20));
+    let second = import(&mut desk, &b, range(10, 20));
+    assert_ne!(first.observation, second.observation);
+    assert_eq!(desk.retained_source_count(), 2);
+    for (id, requested) in [(first.observation, range(0, 100)), (second.observation, range(0, 120))] {
+        let extent = desk.observation(desk.revision(), id).unwrap().extent();
+        assert_eq!(extent.request().range(), Some(requested));
+        assert_eq!(extent.range(), range(0, 80)); assert!(!extent.request_filled());
+    }
+}

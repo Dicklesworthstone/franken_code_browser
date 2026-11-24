@@ -391,3 +391,67 @@ fn source_hex(out: &mut Output, bytes: &[u8], canceled: &mut impl FnMut() -> boo
     }
     out.literal("\"")?; Ok(())
 }
+
+
+#[cfg(test)]
+mod observed_extent_tests {
+    use super::*;
+    use fcb::{ByteOffset, FileId, SourceRevision};
+    use fcb::search::{CaptureRequest, DetectedEncoding, ExtentConsistency, ObservedExtent,
+        ResourceAllocationId, ResourceBudget};
+    use crate::host::desk::DeskLimits;
+
+    fn range(start: u64, end: u64) -> ByteRange {
+        ByteRange::new(ByteOffset::new(start), ByteOffset::new(end)).unwrap()
+    }
+    fn allocation(value: u64) -> ResourceAllocationId { ResourceAllocationId::new(value).unwrap() }
+
+    #[test]
+    fn export_keeps_each_same_origin_extent_and_note_in_saved_order() {
+        let origin = ArenaOwnerId::new(77).unwrap();
+        let owner = ArenaOwnerId::new(900).unwrap();
+        let budget = ResourceBudget::new(origin, ByteLength::new(64 * 1024)).unwrap();
+        let mut source = vec![b'a'; 64];
+        source[10..24].copy_from_slice(b"first evidence");
+        source[40..55].copy_from_slice(b"second evidence");
+        let mut session = DeskSession::new(owner, DeskLimits::default()).unwrap();
+        for (index, captured, selected, label, body) in [
+            (0, range(0, 40), range(10, 24), "First note", "first rationale"),
+            (1, range(24, 64), range(40, 55), "Second note", "second\0rationale"),
+        ] {
+            let request = CaptureRequest::new(FileId::new(origin, 41).unwrap(),
+                SourceRevision::new(origin, 42).unwrap()).unwrap().with_range(captured).unwrap();
+            let extent = ObservedExtent::from_bytes(request, ByteLength::new(source.len() as u64),
+                &source[captured.start().get() as usize..captured.end().get() as usize],
+                &budget, allocation(1 + index)).unwrap();
+            assert_eq!(extent.consistency(), ExtentConsistency::HostSupplied);
+            let attempt = session.desk.last_attempt() + 1;
+            let kept = session.desk.import_observation(session.desk.revision(), attempt, &extent,
+                b"source-that-is-only-a-label.rs", DetectedEncoding::Utf8 { has_bom: false },
+                selected, 500, allocation(100 + index), || false).unwrap();
+            session.desk.edit_observed_passage(attempt, attempt + 1, kept.passage, 1, label, body, || false).unwrap();
+        }
+        let checkpoint = session.desk.checkpoint(4, allocation(200), || false).unwrap();
+        let mut restored = DeskSession::new(ArenaOwnerId::new(901).unwrap(), DeskLimits::default()).unwrap();
+        restored.desk.restore_checkpoint(0, 1, checkpoint.bytes(), allocation(201), || false).unwrap();
+        let (pack, coverage) = restored.source_pack(1, DeskSourcePackLimits::default(), &mut || false).unwrap();
+        assert!(coverage.complete()); assert_eq!(coverage.total_observed_passages, 2);
+        assert_eq!(coverage.exported_selections, 2); assert_eq!(coverage.selected_original_bytes, 29);
+        let text = std::str::from_utf8(pack.as_bytes()).unwrap();
+        assert!(text.contains("\"schema\":\"fcb.desk-source-pack/2\""));
+        assert!(text.contains("\"live_roots_accessed\":false"));
+        assert_eq!(text.matches("\"origin_owner\":\"77\"").count(), 2);
+        assert_eq!(text.matches("\"origin_file\":\"41\"").count(), 2);
+        assert_eq!(text.matches("\"origin_observation\":\"42\"").count(), 2);
+        let first = text.find("\"label\":\"First note\"").unwrap();
+        let second = text.find("\"label\":\"Second note\"").unwrap();
+        assert!(first < second);
+        let a = &text[first..second]; let b = &text[second..];
+        assert!(a.contains("\"body\":\"first rationale\""));
+        assert!(a.contains("\"selected_original_hex\":\"66697273742065766964656e6365\""));
+        assert!(b.contains("\"body\":\"second\\u0000rationale\""));
+        assert!(b.contains("\"selected_original_hex\":\"7365636f6e642065766964656e6365\""));
+        assert!(a.contains("\"whole_file_immutable\":false"));
+        assert!(b.contains("\"whole_file_immutable\":false"));
+    }
+}

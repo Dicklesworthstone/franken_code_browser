@@ -97,12 +97,21 @@ impl ReadingDesk {
         validate_selection_range(extent, selection)?;
         if personal_count(&next) == self.limits.bookmarks { return Err(DeskError::BookmarkLimit); }
         let origin = extent.request();
-        let existing = next.observations.iter().find(|o| o.live_import && o.origin_owner == origin.file().owner()
-            && o.origin_file == origin.file().get() && o.origin_observation == origin.revision().get());
-        let id = if let Some(old) = existing {
-            if old.path != path || old.encoding != encoding || !same_evidence(&old.extent, extent) {
+        let mut existing = None;
+        for old in next.observations.iter().filter(|o| o.live_import && o.origin_owner == origin.file().owner()
+            && o.origin_file == origin.file().get() && o.origin_observation == origin.revision().get()) {
+            check(&mut canceled)?;
+            // One search observation can retain several bounded excerpts. Keep
+            // separate local rows for different requested/captured extents,
+            // while rejecting conflicting meanings or bytes in any overlap.
+            if old.path != path || old.encoding != encoding || !compatible_evidence(&old.extent, extent, &mut canceled)? {
                 return Err(DeskError::IdentityConflict);
             }
+            if old.extent.request().range() == extent.request().range() && old.extent.range() == extent.range() {
+                existing = Some(old);
+            }
+        }
+        let id = if let Some(old) = existing {
             old.id
         } else {
             if self.retained_source_count() == self.limits.sources { return Err(DeskError::SourceLimit); }
@@ -187,10 +196,23 @@ impl ReadingDesk {
     }
 }
 
-fn same_evidence(a: &ObservedExtent, b: &ObservedExtent) -> bool {
-    a.request().range() == b.request().range() && a.range() == b.range()
-        && a.observed_length() == b.observed_length() && a.final_length() == b.final_length()
-        && a.consistency() == b.consistency() && a.bytes() == b.bytes()
+fn compatible_evidence(a: &ObservedExtent, b: &ObservedExtent, canceled: &mut impl FnMut() -> bool)
+    -> Result<bool, DeskError> {
+    if a.observed_length() != b.observed_length() || a.final_length() != b.final_length()
+        || a.consistency() != b.consistency() { return Ok(false); }
+    let start = a.range().start().max(b.range().start());
+    let end = a.range().end().min(b.range().end());
+    if start >= end { return Ok(true); }
+    let overlap = ByteRange::new(start, end).map_err(|_| DeskError::InvalidLocation)?;
+    let left = a.range_bytes(overlap).map_err(extent_error)?;
+    let right = b.range_bytes(overlap).map_err(extent_error)?;
+    // Existing rows and payload are already bounded by DeskLimits. Compare
+    // borrowed slices without allocation and poll through larger overlaps.
+    for (left, right) in left.chunks(4096).zip(right.chunks(4096)) {
+        check(canceled)?;
+        if left != right { return Ok(false); }
+    }
+    Ok(true)
 }
 pub(super) fn rebound_request(original: CaptureRequest, owner: ArenaOwnerId, identity: u64)
     -> Result<CaptureRequest, DeskError> {

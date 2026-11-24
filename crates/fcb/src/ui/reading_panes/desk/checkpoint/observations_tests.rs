@@ -240,3 +240,47 @@ fn canceled_restore_and_legacy_replacement_preserve_or_deliberately_replace_pass
     let saved = restored.checkpoint(restored.revision(), alloc(301), || false).unwrap();
     assert_eq!(saved.bytes(), legacy.bytes());
 }
+
+
+#[test]
+fn checkpoint_preserves_distinct_extents_from_one_origin_and_each_personal_note() {
+    let source: Vec<_> = (0..512).map(|i| b'a' + (i % 26) as u8).collect();
+    let first = observed(0, 240, 512, Some(512), ExtentConsistency::HostSupplied, &source[..240]);
+    let second = observed(160, 400, 512, Some(512), ExtentConsistency::HostSupplied, &source[160..400]);
+    let mut original = desk(900);
+    let a = import(&mut original, &first, DetectedEncoding::Utf8 { has_bom: false }, range(16, 32));
+    let b = import(&mut original, &second, DetectedEncoding::Utf8 { has_bom: false }, range(200, 232));
+    assert_ne!(a.observation, b.observation);
+    original.edit_observed_passage(2, 3, a.passage, 1, "First", "first\0note", || false).unwrap();
+    original.edit_observed_passage(3, 4, b.passage, 1, "Second", "second\r\nnote", || false).unwrap();
+    let saved = original.checkpoint(4, alloc(3000), || false).unwrap();
+    assert_eq!(saved.source_bytes(), 480);
+    let mut restored = desk(901);
+    restored.restore_checkpoint(0, 1, saved.bytes(), alloc(2), || false).unwrap();
+    assert_eq!(restored.retained_source_count(), 2);
+    assert_eq!(restored.observed_passages().len(), 2);
+    for (index, selected, captured, label, body) in [
+        (0, range(16, 32), range(0, 240), "First", "first\0note"),
+        (1, range(200, 232), range(160, 400), "Second", "second\r\nnote"),
+    ] {
+        let passage = &restored.observed_passages()[index];
+        assert_eq!(passage.selection(), selected);
+        assert_eq!(passage.label(), label); assert_eq!(passage.body(), body);
+        assert_eq!(passage.update_sequence(), 2);
+        let observation = restored.observation(1, passage.observation()).unwrap();
+        assert_eq!(observation.extent().range(), captured);
+        assert_eq!(observation.origin_owner().get(), u64::MAX - 10);
+        assert_eq!(observation.origin_file(), u64::MAX - 20);
+        assert_eq!(observation.origin_observation(), u64::MAX - 30);
+        let text = restored.read_observed_passage(1, passage.id(), alloc(4000 + index as u64), || false).unwrap();
+        assert_eq!(text.extent().range_bytes(selected).unwrap(),
+            &source[selected.start().get() as usize..selected.end().get() as usize]);
+    }
+    let first_note = restored.observed_passages()[0].id();
+    let second_note = restored.observed_passages()[1].id();
+    restored.forget_observed_passage(1, 2, first_note, 2, || false).unwrap();
+    assert_eq!(restored.retained_source_count(), 1);
+    assert_eq!(restored.observed_passage(2, second_note).unwrap().body(), "second\r\nnote");
+    let surviving = restored.checkpoint(2, alloc(5000), || false).unwrap();
+    assert_eq!(surviving.source_bytes(), 240);
+}
