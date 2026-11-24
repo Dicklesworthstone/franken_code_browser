@@ -36,11 +36,16 @@ fn search(handle: u64, generation: u64, mode: u64, name_mode: u64, needle: &str)
 fn saved_structure_c_signatures_match_the_public_header() {
     let _: unsafe extern "C" fn(u64, u64, u64, u64, *const c_char, u64, u64) -> *mut c_char =
         fcb_saved_structure_search;
+    let _: unsafe extern "C" fn(u64, u64, u64, u64, *const c_char, u64, u64, u64, u64) -> *mut c_char =
+        fcb_saved_structure_search_matching;
+    let _: unsafe extern "C" fn(u64, u64, u64, u64, *const c_char, u64, u64, u64, u64, u64) -> *mut c_char =
+        fcb_saved_structure_search_matching_page;
     let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_saved_structure_results;
     let _: extern "C" fn(u64, u64) -> *mut c_char = fcb_saved_clear_structure;
     let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_saved_open_structure_hit_reader;
     let header = include_str!("../include/fcb_saved_repository.h");
-    for name in ["fcb_saved_structure_search(", "fcb_saved_structure_results(",
+    for name in ["fcb_saved_structure_search(", "fcb_saved_structure_search_matching(",
+        "fcb_saved_structure_search_matching_page(", "fcb_saved_structure_results(",
         "fcb_saved_clear_structure(", "fcb_saved_open_structure_hit_reader("] {
         assert_eq!(header.matches(name).count(), 1, "missing or duplicate declaration for {name}");
     }
@@ -150,5 +155,78 @@ fn c_malformed_inputs_are_redacted_and_failed_replacement_can_be_reconciled() {
     assert!(search(handle, 3, 4, 1, "private_name").contains("\"status\":\"error\""));
     assert!(search(handle, 4, 4, 2, "private_name").contains("\"status\":\"error\""));
     assert!(search(handle, 5, 4, 0, "private_name").contains("\"retained_hits\":\"1\""));
+    assert_eq!(fcb_saved_close(handle), 1);
+}
+
+#[test]
+fn c_counted_name_search_keeps_counts_windows_and_reader_provenance_separate() {
+    let _guard = crate::reader_ffi::FFI_TEST_LOCK.lock().unwrap();
+    let path = archive(&[(b"docs/guide.md", b"# Target\n\n## target\n\n### TARGET\n")]);
+    let handle = fcb_saved_create(); assert_ne!(handle, 0);
+    assert!(take(unsafe { fcb_saved_open(handle, path.as_ptr()) }).contains("\"status\":\"ok\""));
+    let needle = CString::new("target").unwrap();
+    let first = take(unsafe { fcb_saved_structure_search_matching(handle, 1, 2, 0,
+        needle.as_ptr(), 0, 1, 1, 4096) });
+    for expected in ["\"case_sensitive\":false", "\"name_case\":\"unicode-lowercase\"",
+        "\"count_all_matches\":true", "\"matches_seen\":\"3\"", "\"retained_hits\":\"1\"",
+        "\"matches_seen_exact\":true", "\"complete\":true", "\"truncated\":true",
+        "\"has_more_matches\":true", "\"next_match_offset\":\"1\"", "\"name\":\"Target\""] {
+        assert!(first.contains(expected), "missing {expected}: {first}");
+    }
+    let reader = crate::reader_ffi::fcb_reader_create(); assert_ne!(reader, 0);
+    let opened = take(fcb_saved_open_structure_hit_reader(handle, reader, 1, 1));
+    assert!(opened.contains("\"command\":\"structure-open-reader\""), "{opened}");
+    assert!(opened.contains("\"case_sensitive\":false"), "{opened}");
+    assert!(opened.contains("\"count_all_matches\":true"), "{opened}");
+    assert!(opened.contains("\"name\":\"Target\""), "{opened}");
+    let later = take(unsafe { fcb_saved_structure_search_matching_page(handle, 2, 2, 0,
+        needle.as_ptr(), 0, 1, 1, 4096, 1) });
+    for expected in ["\"matches_seen\":\"3\"", "\"retained_hits\":\"1\"",
+        "\"skipped_matches\":\"1\"", "\"next_match_offset\":\"2\"", "\"name\":\"target\""] {
+        assert!(later.contains(expected), "missing {expected}: {later}");
+    }
+    let last = take(unsafe { fcb_saved_structure_search_matching_page(handle, 3, 2, 0,
+        needle.as_ptr(), 0, 1, 1, 4096, 2) });
+    for expected in ["\"matches_seen\":\"3\"", "\"matches_seen_exact\":true",
+        "\"truncated\":false", "\"has_more_matches\":false", "\"next_match_offset\":null",
+        "\"name\":\"TARGET\""] {
+        assert!(last.contains(expected), "missing {expected}: {last}");
+    }
+    let count = take(unsafe { fcb_saved_structure_search_matching(handle, 4, 2, 0,
+        needle.as_ptr(), 0, 1, 0, 4096) });
+    for expected in ["\"matches_seen\":\"3\"", "\"retained_hits\":\"0\"",
+        "\"matches_seen_exact\":true", "\"truncated\":true",
+        "\"has_more_matches\":false", "\"next_match_offset\":null"] {
+        assert!(count.contains(expected), "missing {expected}: {count}");
+    }
+    let page = take(fcb_saved_structure_results(handle, 4, 0, 64));
+    assert!(page.contains("\"matches_seen\":\"3\""), "{page}");
+    assert_eq!(fcb_saved_close(handle), 1);
+    let retained = take(crate::reader_ffi::fcb_reader_info(reader));
+    assert!(retained.contains("\"status\":\"ok\""), "{retained}");
+    assert_eq!(crate::reader_ffi::fcb_reader_close(reader), 1);
+}
+
+#[test]
+fn c_structure_matching_rejects_invalid_flags_and_preserves_exact_occurrences() {
+    let _guard = crate::reader_ffi::FFI_TEST_LOCK.lock().unwrap();
+    let path = archive(&[(b"src/source.rs", b"needle Needle needle\n")]);
+    let handle = fcb_saved_create(); assert_ne!(handle, 0);
+    assert!(take(unsafe { fcb_saved_open(handle, path.as_ptr()) }).contains("\"status\":\"ok\""));
+    let needle = CString::new("needle").unwrap();
+    let accepted = take(unsafe { fcb_saved_structure_search_matching(handle, 1, 4, 0,
+        needle.as_ptr(), 1, 1, 1, 4096) });
+    assert!(accepted.contains("\"matches_seen\":\"2\""), "{accepted}");
+    assert!(accepted.contains("\"retained_hits\":\"1\""), "{accepted}");
+    for (case_sensitive, count_all) in [(2, 1), (1, 2), (0, 1)] {
+        let error = take(unsafe { fcb_saved_structure_search_matching(handle, 2, 4, 0,
+            needle.as_ptr(), case_sensitive, count_all, 1, 4096) });
+        assert!(error.contains("SAVED_HANDLE_INVALID_ARGUMENT"), "{error}");
+        assert!(!error.contains("needle"), "{error}");
+    }
+    let retained = take(fcb_saved_structure_results(handle, 1, 0, 64));
+    assert!(retained.contains("\"matches_seen\":\"2\""), "{retained}");
+    assert!(retained.contains("\"case_sensitive\":true"), "{retained}");
+    assert!(retained.contains("\"name_case\":\"sensitive\""), "{retained}");
     assert_eq!(fcb_saved_close(handle), 1);
 }

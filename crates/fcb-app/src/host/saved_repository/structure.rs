@@ -35,7 +35,7 @@ impl AcceptedStructure {
     #[allow(clippy::too_many_arguments)]
     fn prepare(saved: &mut SavedRepositorySession, generation: u64, mode: StructureMode,
         name_mode: SymbolNameMode, needle: &str, max_hits: usize, max_source_bytes: u64, skip_matches: u64,
-        canceled: &mut impl FnMut() -> bool) -> Result<Self, SavedRepositoryError> {
+        case_sensitive: bool, count_all_matches: bool, canceled: &mut impl FnMut() -> bool) -> Result<Self, SavedRepositoryError> {
         check(canceled)?;
         let owner = saved.owner();
         let qgen = QueryGeneration::new(owner, generation).map_err(|_| SavedRepositoryError::StaleQuery)?;
@@ -46,10 +46,10 @@ impl AcceptedStructure {
         let first_file = FileId::new(owner, 1).map_err(|_| SavedRepositoryError::IdentityExhausted)?;
         let first_revision = SourceRevision::new(owner, 1).map_err(|_| SavedRepositoryError::IdentityExhausted)?;
         let before = saved.archive.load_stats();
-        let mut work = StructureQuery::new_page(&mut saved.archive, needle, StructureOptions {
+        let mut work = StructureQuery::new_matching_page(&mut saved.archive, needle, StructureOptions {
             generation: qgen, first_file, first_revision, mode, name_mode,
             max_matches: max_hits, max_source_bytes,
-        }, skip_matches, &saved.budget, allocations)?;
+        }, skip_matches, case_sensitive, count_all_matches, &saved.budget, allocations)?;
         while work.state() == StructureState::Pending {
             work.step(qgen, &saved.budget, &mut *canceled)?;
         }
@@ -91,6 +91,10 @@ impl AcceptedStructure {
         out.literal(",\"name_mode\":")?; out.quoted(match self.report.name_mode() {
             SymbolNameMode::Exact => "exact", SymbolNameMode::Prefix => "prefix", SymbolNameMode::Contains => "contains",
         })?;
+        out.literal(",\"case_sensitive\":")?; out.boolean(self.report.case_sensitive())?;
+        out.literal(",\"count_all_matches\":")?; out.boolean(self.report.count_all_matches())?;
+        out.literal(",\"name_case\":")?;
+        out.quoted(if self.report.case_sensitive() { "sensitive" } else { "unicode-lowercase" })?;
         Ok(())
     }
 
@@ -104,7 +108,7 @@ impl AcceptedStructure {
         })?;
         out.literal(",\"realized_mode\":")?; out.quoted(mode.realized())?;
         out.literal(",\"evidence_level\":")?; out.quoted(mode.realized())?;
-        out.literal(",\"semantic_complete\":false,\"name_case\":\"sensitive\",\"scope\":\"whole-saved-archive\",\"completeness_basis\":\"admitted-extraction-processing\",\"index_used\":false,\"index_policy\":\"direct-verified-member-extraction\"")?;
+        out.literal(",\"semantic_complete\":false,\"scope\":\"whole-saved-archive\",\"completeness_basis\":\"admitted-extraction-processing\",\"index_used\":false,\"index_policy\":\"direct-verified-member-extraction\"")?;
         if mode == StructureMode::Occurrences {
             out.literal(",\"includes_comments_and_literals\":true,\"compiler_resolved\":false,\"token_policy\":\"ascii-alphanumeric-underscore-dollar-plus-nonascii-nonwhitespace-noncontrol-v1\",\"name_syntax\":\"single-token-no-leading-ascii-digit\",\"unicode_normalization\":\"none\"")?;
         }
@@ -113,8 +117,8 @@ impl AcceptedStructure {
             StructureState::WorkLimit => "work-limit", _ => return Err(StructureError::Pending.into()),
         })?;
         out.literal(",\"complete\":")?; out.boolean(self.report.is_complete())?;
-        out.literal(",\"matches_seen_exact\":")?; out.boolean(self.report.is_complete())?;
-        out.literal(",\"truncated\":")?; out.boolean(self.report.state() == StructureState::Truncated)?;
+        out.literal(",\"matches_seen_exact\":")?; out.boolean(self.report.matches_seen_exact())?;
+        out.literal(",\"truncated\":")?; out.boolean(self.report.truncated())?;
         super::window_fields(out, self.report.skip_matches(), self.report.skipped_matches(),
             self.report.has_more_matches(), self.report.next_match_offset())?;
         let s = self.report.stats();
@@ -231,12 +235,32 @@ impl SavedRepositorySession {
 
     #[allow(clippy::too_many_arguments)]
     pub fn structure_search_page(&mut self, generation: u64, mode: StructureMode, name_mode: SymbolNameMode,
-        needle: &str, max_hits: usize, max_source_bytes: u64, skip_matches: u64, mut canceled: impl FnMut() -> bool)
+        needle: &str, max_hits: usize, max_source_bytes: u64, skip_matches: u64, canceled: impl FnMut() -> bool)
         -> Result<HostResponse, SavedRepositoryError> {
+        self.structure_search_matching_page(generation, mode, name_mode, needle, max_hits,
+            max_source_bytes, true, false, skip_matches, canceled)
+    }
+
+    /// Name matching and exhaustive counts are independent of the bounded
+    /// retained witness table. Occurrences retain their exact token policy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn structure_search_matching(&mut self, generation: u64, mode: StructureMode,
+        name_mode: SymbolNameMode, needle: &str, max_hits: usize, max_source_bytes: u64,
+        case_sensitive: bool, count_all_matches: bool, canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, SavedRepositoryError> {
+        self.structure_search_matching_page(generation, mode, name_mode, needle, max_hits,
+            max_source_bytes, case_sensitive, count_all_matches, 0, canceled)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn structure_search_matching_page(&mut self, generation: u64, mode: StructureMode,
+        name_mode: SymbolNameMode, needle: &str, max_hits: usize, max_source_bytes: u64,
+        case_sensitive: bool, count_all_matches: bool, skip_matches: u64,
+        mut canceled: impl FnMut() -> bool) -> Result<HostResponse, SavedRepositoryError> {
         query_attempt(&mut self.last_structure_attempt, generation)?;
         check(&mut canceled)?;
         let candidate = AcceptedStructure::prepare(self, generation, mode, name_mode, needle,
-            max_hits, max_source_bytes, skip_matches, &mut canceled)?;
+            max_hits, max_source_bytes, skip_matches, case_sensitive, count_all_matches, &mut canceled)?;
         let response = candidate.page(self, generation, 0, 64, &mut canceled)?;
         self.structure = Some(candidate);
         Ok(response)

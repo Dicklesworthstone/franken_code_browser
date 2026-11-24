@@ -489,6 +489,33 @@ char *fcb_saved_structure_search(uint64_t handle, uint64_t generation,
 char *fcb_saved_structure_search_page(uint64_t handle, uint64_t generation,
     uint64_t mode, uint64_t name_mode, const char *needle,
     uint64_t max_hits, uint64_t max_source_bytes, uint64_t skip_matches);
+/* Matching/count variants preserve the legacy functions and generation space.
+ * Both flags are exactly 0 or 1. case_sensitive=0 compares symbol and heading
+ * names with Unicode scalar lowercase, not full folding or normalization.
+ * Occurrences require case_sensitive=1 and exact token-name matching.
+ *
+ * count_all_matches=1 continues admitted extraction after max_hits is reached;
+ * the limit bounds retained witnesses only. max_hits=0 counts without rows or a
+ * continuation. All existing source, metadata, cancellation and work bounds
+ * remain in force. Counts include the skipped prefix and metadata omissions.
+ * matches_seen_exact certifies completed admitted extraction and source coverage
+ * independently of metadata omissions; complete also requires no metadata
+ * omissions. Neither field claims compiler-resolved semantic completeness.
+ * truncated reports later rows omitted by the retained cap, independently of
+ * state and complete. has_more_matches additionally requires a nonzero row
+ * limit; next_match_offset is the FIRST later candidate, never the final count.
+ * Use next_match_offset, not matches_seen, to request the next bounded window.
+ * Receipts and reader provenance freeze case_sensitive, count_all_matches and
+ * name_case (sensitive or unicode-lowercase); original-source ranges remain exact.
+ */
+char *fcb_saved_structure_search_matching(uint64_t handle, uint64_t generation,
+    uint64_t mode, uint64_t name_mode, const char *needle,
+    uint64_t case_sensitive, uint64_t count_all_matches,
+    uint64_t max_hits, uint64_t max_source_bytes);
+char *fcb_saved_structure_search_matching_page(uint64_t handle, uint64_t generation,
+    uint64_t mode, uint64_t name_mode, const char *needle,
+    uint64_t case_sensitive, uint64_t count_all_matches,
+    uint64_t max_hits, uint64_t max_source_bytes, uint64_t skip_matches);
 char *fcb_saved_structure_results(uint64_t handle, uint64_t generation,
     uint64_t start, uint64_t limit);
 char *fcb_saved_clear_structure(uint64_t handle, uint64_t generation);
