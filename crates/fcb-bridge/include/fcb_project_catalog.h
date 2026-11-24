@@ -118,6 +118,34 @@ char *fcb_catalog_open(uint64_t handle, const char *root);
  */
 char *fcb_catalog_open_with_policy(uint64_t handle, const char *root,
     uint64_t discovery_policy);
+
+/* Progressively browse one existing directory under the ORIGINAL project root.
+ * directory is 1..2048 raw Unix bytes with at most 31 nonempty slash-separated
+ * components; '.', '..', NUL and leading/trailing slashes are rejected. Raw
+ * non-UTF-8 names and literal backslashes are preserved. The original project
+ * root, root-relative paths and depth-32 bound remain unchanged; sibling
+ * directories are not enumerated. Policy 0 loads inherited root/ancestor rules
+ * before descending; excluded ancestors cannot be bypassed by child negations.
+ * Policy 1 reads no rule configuration. Own-artifact, symlink and special-object
+ * exclusions still apply. Missing/non-directory/symlink targets refuse; an empty
+ * allowed folder can complete, while withheld ancestors remain partial.
+ *
+ * The empty handle, first-page publication, cancel/close and four-page retention
+ * contracts above apply. This does not reset an already opened handle. A new
+ * target or policy needs a fresh handle. No source payload is read at open.
+ * Invalid policy, zero/oversized directory_len or null directory is refused
+ * before dereferencing either input. Otherwise both inputs stay readable and
+ * unchanged through return. Free each non-null reply once with fcb_free_string.
+ *
+ * All successful catalog-session replies now include discovery_scope
+ * ("workspace" or "directory"), discovery_directory (null or reversible native
+ * path), and path_basis:"project-root". These fields survive stop, replay and
+ * completion. Counts and discovery_complete refer ONLY to that fixed scope,
+ * never absence elsewhere in the project. Explicit reader/document-link opens
+ * still use the original project grant; discovery scope is not a new grant.
+ */
+char *fcb_catalog_open_directory_with_policy(uint64_t handle, const char *root,
+    const uint8_t *directory, uint64_t directory_len, uint64_t discovery_policy);
 char *fcb_catalog_info(uint64_t handle);
 
 /* Page IDs begin at 1; old pages can be replayed while retained. Metadata-only.

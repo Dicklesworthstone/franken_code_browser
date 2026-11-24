@@ -110,6 +110,16 @@ impl CatalogSessions {
         self.open_with_policy(handle, root, CatalogDiscoveryPolicy::RepositoryRules, canceled)
     }
     pub(super) fn open_with_policy(&self, handle: u64, root: &Path, policy: CatalogDiscoveryPolicy,
+        canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, AccessError> {
+        self.open_scoped(handle, root, None, policy, canceled)
+    }
+    pub(super) fn open_directory_with_policy(&self, handle: u64, root: &Path,
+        directory: &[u8], policy: CatalogDiscoveryPolicy, canceled: impl FnMut() -> bool)
+        -> Result<HostResponse, AccessError> {
+        self.open_scoped(handle, root, Some(directory), policy, canceled)
+    }
+    fn open_scoped(&self, handle: u64, root: &Path, directory: Option<&[u8]>, policy: CatalogDiscoveryPolicy,
         mut canceled: impl FnMut() -> bool)
         -> Result<HostResponse, AccessError> {
         let cell = self.get(handle)?;
@@ -120,7 +130,10 @@ impl CatalogSessions {
         let mut stop = || cell.validate(epoch).is_err() || canceled();
         let result = (|| {
             let owner = ArenaOwnerId::new(handle).map_err(|_| AccessError::InvalidArgument)?;
-            let mut candidate = CatalogSession::open_with_policy(owner, root, policy, &mut stop)?;
+            let mut candidate = match directory {
+                Some(directory) => CatalogSession::open_directory_with_policy(owner, root, directory, policy, &mut stop)?,
+                None => CatalogSession::open_with_policy(owner, root, policy, &mut stop)?,
+            };
             let response = candidate.page(1, &mut stop)?;
             if stop() { return Err(AccessError::Canceled); }
             *state = Some(candidate);
@@ -253,3 +266,7 @@ fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, AccessError> {
 #[cfg(all(test, unix))]
 #[path = "catalog_sessions_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "catalog_directory_sessions_tests.rs"]
+mod directory_tests;

@@ -4,7 +4,7 @@
 //! No walker, path resolver, source capture or metadata cache lives here.
 use std::{ffi::c_char, path::Path, sync::OnceLock};
 use fcb_app::host::HostResponse;
-use fcb_app::host::catalog_session::CatalogDiscoveryPolicy;
+use fcb_app::host::catalog_session::{CatalogDiscoveryPolicy, MAX_CATALOG_DIRECTORY_BYTES};
 use super::{cstr, reply, string_out};
 use super::catalog_sessions::{AccessError, CatalogSessions, Command};
 
@@ -47,6 +47,33 @@ pub unsafe extern "C" fn fcb_catalog_open_with_policy(handle: u64, root: *const 
         };
         let root = unsafe { cstr(root) }.ok_or(AccessError::InvalidArgument)?;
         catalogs.open_with_policy(handle, Path::new(root), policy, || false)
+    }))
+}
+/// Browse one raw project-relative directory under the original root grant.
+/// The fixed target is echoed on every subsequent session receipt. Work,
+/// cancellation, retained-page limits and reader ownership match root browsing.
+/// # Safety
+/// For valid policy/length, root is a readable UTF-8 C string and directory
+/// points to directory_len initialized bytes in one allocation through return.
+/// Invalid policy, empty/oversized length or null directory refuses before
+/// dereferencing either input. Free each non-null reply with fcb_free_string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_catalog_open_directory_with_policy(handle: u64,
+    root: *const c_char, directory: *const u8, directory_len: u64,
+    discovery_policy: u64) -> *mut c_char {
+    reply(|| answer(handle, |catalogs| {
+        let policy = match discovery_policy {
+            0 => CatalogDiscoveryPolicy::RepositoryRules,
+            1 => CatalogDiscoveryPolicy::IncludeExcluded,
+            _ => return Err(AccessError::InvalidArgument),
+        };
+        let length = number(directory_len)?;
+        if !(1..=MAX_CATALOG_DIRECTORY_BYTES).contains(&length) || directory.is_null() {
+            return Err(AccessError::InvalidArgument);
+        }
+        let root = unsafe { cstr(root) }.ok_or(AccessError::InvalidArgument)?;
+        let directory = unsafe { std::slice::from_raw_parts(directory, length) };
+        catalogs.open_directory_with_policy(handle, Path::new(root), directory, policy, || false)
     }))
 }
 #[unsafe(no_mangle)]
@@ -118,3 +145,7 @@ pub extern "C" fn fcb_catalog_close(handle: u64) -> u8 {
 #[cfg(all(test, unix))]
 #[path = "catalog_ffi_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "catalog_directory_ffi_tests.rs"]
+mod directory_tests;
