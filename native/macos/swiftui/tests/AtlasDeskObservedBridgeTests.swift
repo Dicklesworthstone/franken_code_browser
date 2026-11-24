@@ -68,6 +68,23 @@ enum AtlasWorkspaceStreamTransport { static let nativeDomain = UUID() }
         precondition(stream.keep(h, r, a, reader, 0, 0, 0, 0) == nil)
         precondition(stream.keep(h, r, a, reader, 0, o, 0, 256) == nil && calls() == 2)
 
+        let retained = AtlasReadingDeskTransport.native.retainedPassage!
+        precondition(retained.domain == AtlasReaderTransport.native.comparison!.domain)
+        let retainedStart: UInt64 = 5 * 1024 * 1024, retainedEnd = retainedStart + 262_144
+        reset()
+        precondition(retained.keep(h, r, a, reader, retainedStart, retainedEnd) == "{}")
+        for (index, value) in [h, r, a, reader, retainedStart, retainedEnd].enumerated() {
+            precondition(argument(UInt64(index)) == value)
+        }
+        precondition(calls() == 1 && frees() == 1)
+        precondition(retained.keep(h, r, a, 0, retainedStart, retainedEnd) == nil)
+        for (first, last) in [(retainedStart, retainedStart), (retainedEnd, retainedStart),
+            (retainedStart, retainedEnd + 1), (UInt64(0), UInt64.max),
+            (AtlasDeskRetainedPassageImport.maximumCaptureBytes, AtlasDeskRetainedPassageImport.maximumCaptureBytes + 1)] {
+            precondition(retained.keep(h, r, a, reader, first, last) == nil)
+        }
+        precondition(calls() == 1 && frees() == 1, "Rejected retained selections never cross the ABI")
+
         reset(); mode(1)
         precondition(observed.read(h, r, o) == nil && calls() == 1 && frees() == 0)
         mode(2)

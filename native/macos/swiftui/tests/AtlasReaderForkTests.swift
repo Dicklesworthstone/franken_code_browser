@@ -236,21 +236,22 @@ private final class Driver: @unchecked Sendable {
             unsupported.close()
         }
 
-        // Large retained sources still pin and navigate without gaining a
-        // larger reading-desk transfer allowance. Only page payloads cross UI.
+        // Large retained sources pin and navigate; Keep is limited to a
+        // bounded passage, while whole-capture transfer keeps its own cap.
         do {
             let tail = Int(AtlasReaderLimits.transferBytes) + 16
             let driver = Driver(bytes: Array(repeating: 120, count: tail) + Array("needle\n".utf8))
             let parent = opened(driver)
-            check(parent.canPin && parent.canFind && !parent.canKeep,
-                  "large capture lost reading/pinning or acquired desk transfer")
-            check(parent.coverage.contains("4 MiB"), "smaller optional-operation cap was hidden")
+            check(parent.canPin && parent.canFind && parent.canKeep,
+                  "large capture lost reading/pinning or bounded passage eligibility")
+            check(parent.coverage.contains("4 MiB") && parent.coverage.contains("256 KiB"),
+                  "independent passage and whole-capture limits were hidden")
             parent.offsetInput = String(tail); parent.goToByte()
             wait("far large-source page did not open") { !parent.busy }
             check(parent.page?.text == "needle\n", "far source navigation was truncated at legacy cap")
             let child = pin(parent)
-            check(child.page?.text == "needle\n" && child.canPin && !child.canKeep,
-                  "large pin lost capture eligibility or widened desk transfer")
+            check(child.page?.text == "needle\n" && child.canPin && child.canKeep,
+                  "large pin lost capture or passage eligibility")
             driver.setLive("replacement"); parent.close()
             wait("large source parent did not retire") { driver.log.contains("close:1") }
             child.offsetInput = String(tail + 1); child.goToByte()

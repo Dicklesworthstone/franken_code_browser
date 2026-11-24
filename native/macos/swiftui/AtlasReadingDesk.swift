@@ -401,6 +401,40 @@ struct AtlasDeskObservedImport: Sendable {
     }
 }
 
+/// Expected evidence for a bounded excerpt of an immutable retained reader.
+/// The registry capability supplies the bytes; original capture identity and
+/// selection are checked again after publication, including a lost reply.
+/// No copied display text or pathname can authorize the import.
+struct AtlasDeskRetainedPassageImport: Sendable {
+    let originOwner, originFile, originRevision, capturedBytes: UInt64
+    let pathHex, encoding: String
+    let selection: AtlasDeskObservedRange
+    static let maximumCaptureBytes: UInt64 = 32 * 1024 * 1024
+
+    var isValid: Bool {
+        originOwner > 0 && originFile > 0 && originRevision > 0
+            && capturedBytes <= Self.maximumCaptureBytes
+            && AtlasDeskObservation.validPath(pathHex)
+            && AtlasDeskObservation.encodings.contains(encoding)
+            && selection.count > 0 && selection.count <= AtlasDeskObservation.maximumSelectionBytes
+            && selection.end <= capturedBytes
+    }
+    var capturedRange: AtlasDeskObservedRange? {
+        guard isValid else { return nil }
+        return try? AtlasDeskObservedRange(start: selection.start > 8 ? selection.start - 8 : 0,
+            end: min(selection.end + 8, capturedBytes))
+    }
+    func matches(_ observation: AtlasDeskObservation, passage: AtlasDeskObservedPassage) -> Bool {
+        guard let capturedRange else { return false }
+        return passage.observation == observation.id && passage.selection == selection
+            && observation.originOwner == originOwner && observation.originFile == originFile
+            && observation.originObservation == originRevision && observation.pathHex == pathHex
+            && observation.encoding == encoding && observation.consistency == "host-supplied-sequence"
+            && observation.capturedRange == capturedRange && observation.observedLength == capturedBytes
+            && observation.finalObservedLength == capturedBytes
+    }
+}
+
 struct AtlasDeskObservedTarget: Sendable, Identifiable {
     let owner: UInt64
     let observation: AtlasDeskObservation
@@ -535,6 +569,11 @@ struct AtlasDeskStreamImport: Sendable {
 struct AtlasDeskStreamTransport: Sendable {
     let domain: UUID
     let keep: @Sendable (UInt64, UInt64, UInt64, UInt64, UInt64, UInt64, UInt64, UInt64) -> String?
+}
+
+struct AtlasDeskRetainedPassageTransport: Sendable {
+    let domain: UUID
+    let keep: @Sendable (UInt64, UInt64, UInt64, UInt64, UInt64, UInt64) -> String?
 }
 
 struct AtlasDeskState: Sendable {
@@ -968,6 +1007,7 @@ struct AtlasReadingDeskTransport: Sendable {
     let readerDomain: UUID?
     let observed: AtlasDeskObservedTransport?
     let stream: AtlasDeskStreamTransport?
+    let retainedPassage: AtlasDeskRetainedPassageTransport?
 
     init(create: @escaping @Sendable () -> UInt64,
         run: @escaping @Sendable (UInt64, AtlasDeskRequest) -> String?,
@@ -975,10 +1015,10 @@ struct AtlasReadingDeskTransport: Sendable {
         close: @escaping @Sendable (UInt64) -> Bool,
         retirementFailed: @escaping @Sendable () -> Void,
         readerDomain: UUID? = nil, observed: AtlasDeskObservedTransport? = nil,
-        stream: AtlasDeskStreamTransport? = nil) {
+        stream: AtlasDeskStreamTransport? = nil, retainedPassage: AtlasDeskRetainedPassageTransport? = nil) {
         self.create = create; self.run = run; self.cancel = cancel; self.close = close
         self.retirementFailed = retirementFailed; self.readerDomain = readerDomain
-        self.observed = observed; self.stream = stream
+        self.observed = observed; self.stream = stream; self.retainedPassage = retainedPassage
     }
 }
 

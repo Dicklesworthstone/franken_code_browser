@@ -705,12 +705,35 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
         }
     }
 
-    /// Both source registries share attempt reconciliation. Lost delivery never
+    func keepRetainedPassage(_ target: AtlasDeskRetainedPassageImport, sourceDomain: UUID,
+        using source: @escaping @MainActor (@escaping @Sendable (UInt64) throws -> String?) async throws -> String?) {
+        guard canOperate, !hasUnverifiedChanges, target.isValid else { return }
+        guard transport.observed != nil, let retained = transport.retainedPassage,
+              retained.domain == sourceDomain, readerDomain == sourceDomain else {
+            notice = "This reader connection cannot save a bounded passage. Its retained source remains open."
+            return
+        }
+        keepPassage(originOwner: target.originOwner, using: source,
+            matching: { observation, passage in target.matches(observation, passage: passage) }) {
+                desk, revision, attempt, reader in
+                retained.keep(desk, revision, attempt, reader, target.selection.start, target.selection.end)
+            }
+    }
+
+    /// All source registries share attempt reconciliation. Lost delivery never
     /// repeats an import that may already have added a durable passage.
     private func keepObservation(_ target: AtlasDeskObservedImport,
         using source: @escaping @MainActor (@escaping @Sendable (UInt64) throws -> String?) async throws -> String?,
         importing: @escaping @Sendable (UInt64, UInt64, UInt64, UInt64) -> String?) {
         guard canOperate, !hasUnverifiedChanges, target.isValid else { return }
+        keepPassage(originOwner: target.originOwner, using: source,
+            matching: { observation, passage in target.matches(observation, passage: passage) }, importing: importing)
+    }
+
+    private func keepPassage(originOwner: UInt64,
+        using source: @escaping @MainActor (@escaping @Sendable (UInt64) throws -> String?) async throws -> String?,
+        matching: @escaping @Sendable (AtlasDeskObservation, AtlasDeskObservedPassage) -> Bool,
+        importing: @escaping @Sendable (UInt64, UInt64, UInt64, UInt64) -> String?) {
         perform { model, _, cancellation in
             let lease = try await model.ensureStarted(cancellation)
             guard let original = model.state else { throw AtlasReadingDeskError.unavailable }
@@ -726,7 +749,7 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
             do {
                 let json = try await source { reader in
                     try cancellation.check()
-                    guard reader == target.originOwner else { throw AtlasReadingDeskError.invalidInput }
+                    guard reader == originOwner else { throw AtlasReadingDeskError.invalidInput }
                     return withExtendedLifetime(lease) {
                         importing(lease.handle, original.revision, attempt, reader)
                     }
@@ -753,13 +776,13 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
                added.count == 1, accepted.observedPassages.count == previous.count + 1,
                let passage = added.first, passage.updateSequence == 1, passage.body.isEmpty,
                let observation = accepted.observations.first(where: { $0.id == passage.observation }),
-               target.matches(observation, passage: passage) {
+               matching(observation, passage) {
                 model.lastKeptObservedPassage = passage.id
                 model.notice = model.recoveryEnabled
-                    ? "Kept the selected observed passage with its original byte offsets. Add a personal note in Observed passages; automatic recovery will save it."
-                    : "Kept the selected observed passage with its original byte offsets. Add a personal note in Observed passages and save a checkpoint to retain it after closing."
+                    ? "Kept the selected passage with its original byte offsets. Add a personal note in Observed passages; automatic recovery will save it."
+                    : "Kept the selected passage with its original byte offsets. Add a personal note in Observed passages and save a checkpoint to retain it after closing."
             } else if accepted.revision < attempt {
-                model.notice = "The passage was not kept. The accepted desk is unchanged; check its capacity and select the original observation again."
+                model.notice = "The passage was not kept. The accepted desk is unchanged; check its capacity and select the original source range again."
             } else {
                 model.hasUnverifiedChanges = true
                 model.notice = "The passage's saved state remains unconfirmed. Inspect Observed passages before keeping another copy."

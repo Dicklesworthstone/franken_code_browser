@@ -100,7 +100,7 @@ extension AtlasReadingDeskModel {
         let navigation = reader.navigation
         let selectionID = reader.textSelection?.id
         let hadNativeIntent = reader.hasTextSelectionIntent
-        keepCapture(start: selected.start, end: selected.end, sourceDomain: expectedDomain) { work in
+        let retain: @MainActor (@escaping @Sendable (UInt64) throws -> String?) async throws -> String? = { work in
             guard let current = reader.page, current.identity.matches(original.identity), reader.canKeep,
                   current.start == original.start, current.end == original.end,
                   reader.source === source, reader.navigation == navigation,
@@ -113,35 +113,16 @@ extension AtlasReadingDeskModel {
             }
             return try await reader.withRetainedReader(work)
         }
-    }
-}
-
-
-extension AtlasPagedReaderModel {
-    /// The same exact range feeds first-time Keep and a Desk reader's location
-    /// update. Native text intent has priority over older search highlights.
-    var rangeForReadingDesk: (start: UInt64, end: UInt64)? {
-        guard let page else { return nil }
-        if hasTextSelectionIntent {
-            guard !resolvingTextSelection, let selected = textSelection,
-                  selected.identity.matches(page.identity),
-                  selected.pageStart == page.start, selected.pageEnd == page.end else { return nil }
-            return (selected.originalStart, selected.originalEnd)
+        if original.identity.capturedBytes > AtlasReaderLimits.transferBytes {
+            guard let range = try? AtlasDeskObservedRange(start: selected.start, end: selected.end) else { return }
+            let identity = original.identity
+            let target = AtlasDeskRetainedPassageImport(originOwner: identity.owner, originFile: identity.file,
+                originRevision: identity.revision, capturedBytes: identity.capturedBytes,
+                pathHex: identity.pathBytes.map { String(format: "%02x", $0) }.joined(),
+                encoding: identity.encoding, selection: range)
+            keepRetainedPassage(target, sourceDomain: expectedDomain, using: retain)
+        } else {
+            keepCapture(start: selected.start, end: selected.end, sourceDomain: expectedDomain, using: retain)
         }
-        if let selected = currentComparisonSelection {
-            return (selected.range.start, selected.range.end)
-        }
-        if findIsCurrent, let hit = page.selection, matchHex != nil {
-            return (hit.target.start, hit.target.end)
-        }
-        if outlineIsCurrent, let symbol = page.symbolSelection, symbolHex != nil {
-            let selected = symbol.target.symbol.selectedRange
-            return (selected.start, selected.end)
-        }
-        if referencesAreCurrent, let occurrence = page.referenceSelection, referenceHex != nil {
-            let selected = occurrence.target.occurrence.range
-            return (selected.start, selected.end)
-        }
-        return (page.start, page.end)
     }
 }

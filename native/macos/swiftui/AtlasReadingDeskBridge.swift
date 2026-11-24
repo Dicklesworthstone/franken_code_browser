@@ -42,6 +42,8 @@ extension AtlasDeskRecoveryService {
 @_silgen_name("fcb_desk_window") private func fcb_desk_window(_ h: UInt64, _ revision: UInt64, _ pane: UInt64, _ offset: UInt64, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_desk_import_reader") private func fcb_desk_import_reader(_ h: UInt64, _ revision: UInt64, _ attempt: UInt64,
     _ reader: UInt64, _ start: UInt64, _ end: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_desk_import_reader_passage") private func fcb_desk_import_reader_passage(_ h: UInt64,
+    _ revision: UInt64, _ attempt: UInt64, _ reader: UInt64, _ start: UInt64, _ end: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_desk_import_observation") private func fcb_desk_import_observation(_ h: UInt64, _ revision: UInt64,
     _ attempt: UInt64, _ reader: UInt64, _ observation: UInt64, _ start: UInt64, _ end: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_desk_import_stream_excerpt") private func fcb_desk_import_stream_excerpt(_ h: UInt64,
@@ -146,7 +148,14 @@ extension AtlasReadingDeskTransport {
                   (family == 0 && queryRevision == 0) || (family == 1 && queryRevision > 0) else { return nil }
             return take(fcb_desk_import_stream_excerpt(handle, revision, attempt, owner,
                 family, generation, queryRevision, index))
-        }))
+        }), retainedPassage: AtlasReaderTransport.native.comparison.map { comparison in
+            AtlasDeskRetainedPassageTransport(domain: comparison.domain,
+                keep: { handle, revision, attempt, reader, start, end in
+                    guard reader > 0, start < end, end <= AtlasDeskRetainedPassageImport.maximumCaptureBytes,
+                          end - start <= AtlasDeskObservation.maximumSelectionBytes else { return nil }
+                    return take(fcb_desk_import_reader_passage(handle, revision, attempt, reader, start, end))
+                })
+        })
 
     private static func take(_ pointer: UnsafeMutablePointer<CChar>?) -> String? {
         guard let pointer else { return nil }

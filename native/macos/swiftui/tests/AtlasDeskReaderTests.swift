@@ -148,6 +148,10 @@ private final class DeskReaderFixture: @unchecked Sendable {
             locked { log.append("desk-close") }; return true
         }, retirementFailed: { fatalError("desk retirement failed") }, readerDomain: domain)
     }
+    func initializeRetained(_ reader: UInt64) -> String? {
+        precondition(!Thread.isMainThread)
+        return locked { readers.insert(reader); return encode(readerInfo(reader)) }
+    }
     func readerTransport(domain: UUID? = nil) -> AtlasReaderTransport {
         AtlasReaderTransport(create: { [self] in locked {
             let id = next; next += 1; log.append("create:\(id)"); return id
@@ -186,6 +190,118 @@ private final class DeskReaderFixture: @unchecked Sendable {
             }
         }))
 
+    }
+}
+
+/// Only the bounded transfer ABI is injected. The actual reader/desk models,
+/// original-range selection and committed-but-undelivered reconciliation run.
+private final class RetainedPassageDeskFixture: @unchecked Sendable {
+    let owner: UInt64 = 59
+    let domain: UUID
+    let target: AtlasDeskRetainedPassageImport
+    private let identity: AtlasReaderIdentity
+    private let lock = NSLock()
+    private var revision: UInt64 = 0
+    private var accepted = false, lostReply = false, failingReads = 0
+    private var keeps = 0, wholeTransfers = 0
+    private let corruption: String?
+
+    init(identity: AtlasReaderIdentity, domain: UUID, start: UInt64, corruption: String? = nil) {
+        self.identity = identity; self.domain = domain; self.corruption = corruption
+        target = AtlasDeskRetainedPassageImport(originOwner: identity.owner, originFile: identity.file,
+            originRevision: identity.revision, capturedBytes: identity.capturedBytes,
+            pathHex: identity.pathBytes.map { String(format: "%02x", $0) }.joined(), encoding: identity.encoding,
+            selection: try! AtlasDeskObservedRange(start: start, end: start + 5))
+    }
+    private func locked<T>(_ body: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return body() }
+    var counts: (keeps: Int, wholeTransfers: Int) { locked { (keeps, wholeTransfers) } }
+    func loseReply(stateFailures: Int = 0) { locked { lostReply = true; failingReads = stateFailures } }
+    private func encode(_ value: [String: Any]) -> String {
+        String(decoding: try! JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]), as: UTF8.self)
+    }
+    private func range(_ start: UInt64, _ end: UInt64) -> [String: String] {
+        ["start": String(start), "end": String(end)]
+    }
+    private func header(_ command: String) -> [String: Any] {
+        ["schema": "fcb.reading-desk/1", "status": "ok", "command": command, "owner": String(owner),
+         "model_revision": String(revision), "last_attempt": String(revision),
+         "additional_source_bytes_read": "0", "native_presented": false]
+    }
+    private func observation() -> [String: Any] {
+        let context = target.capturedRange!
+        var out: [String: Any] = ["observation": "1", "origin_owner": String(target.originOwner),
+            "origin_file": String(target.originFile), "origin_observation": String(target.originRevision),
+            "path": identity.displayPath, "path_hex": target.pathHex, "encoding": target.encoding,
+            "consistency": "host-supplied-sequence", "extent_sha256": String(repeating: "a", count: 64),
+            "captured_range": range(context.start, context.end), "observed_length": String(target.capturedBytes),
+            "final_observed_length": String(target.capturedBytes), "capture_kind": "observed-extent",
+            "whole_file_immutable": false, "source_reopened": false]
+        switch corruption {
+        case "owner": out["origin_owner"] = String(target.originOwner + 1)
+        case "file": out["origin_file"] = String(target.originFile + 1)
+        case "revision": out["origin_observation"] = String(target.originRevision + 1)
+        case "path": out["path_hex"] = "6f74686572"
+        case "encoding": out["encoding"] = "utf16le"
+        case "length": out["observed_length"] = String(target.capturedBytes + 1)
+        case "final-length": out["final_observed_length"] = String(target.capturedBytes + 1)
+        case "context": out["captured_range"] = range(context.start + 1, context.end)
+        case "consistency": out["consistency"] = "unchanged-metadata-not-atomic"
+        default: break
+        }
+        return out
+    }
+    private func passage() -> [String: Any] {
+        ["passage": "1", "observation": "1", "update_sequence": "1", "label": "Retained passage", "body": "",
+         "selection": range(target.selection.start + (corruption == "selection" ? 1 : 0), target.selection.end)]
+    }
+    private func state() -> String {
+        var out = header("state")
+        out["panes"] = [String](); out["bookmarks"] = [String](); out["active_pane"] = NSNull()
+        out["retained_sources"] = accepted ? "1" : "0"
+        out["retained_source_bytes"] = accepted ? String(target.capturedRange!.count) : "0"
+        out["can_go_back"] = false; out["can_go_forward"] = false
+        out["persistence"] = "explicit-checkpoint"; out["autosave"] = false
+        out["observations"] = accepted ? [observation()] : []
+        out["observed_passages"] = accepted ? [passage()] : []
+        return encode(out)
+    }
+    func transport(retainedEnabled: Bool = true, registryDomain: UUID? = nil) -> AtlasReadingDeskTransport {
+        let admittedDomain = registryDomain ?? domain
+        return AtlasReadingDeskTransport(create: { [self] in owner }, run: { [self] h, request in
+            precondition(!Thread.isMainThread)
+            return locked {
+                guard h == owner else { return nil }
+                switch request {
+                case .start: return state()
+                case .state:
+                    if failingReads > 0 { failingReads -= 1; return nil }
+                    return state()
+                case .keep: wholeTransfers += 1; return nil
+                default: return nil
+                }
+            }
+        }, cancel: { _ in true }, close: { _ in true }, retirementFailed: { }, readerDomain: admittedDomain,
+        observed: AtlasDeskObservedTransport(domain: UUID(), keep: { _, _, _, _, _, _, _ in nil },
+            read: { [self] h, expected, id in locked {
+                guard h == owner, expected == revision, id == 1, accepted else { return nil }
+                var out = header("observed-passage")
+                out["observation"] = observation(); out["passage"] = passage()
+                out["text"] = "exact"; out["original_hex"] = "6578616374"; out["contains_replacements"] = false
+                out["capture_kind"] = "observed-extent"; out["whole_file_immutable"] = false; out["source_reopened"] = false
+                return encode(out)
+            } }, edit: { _, _, _, _, _, _, _ in nil }, forget: { _, _, _, _, _ in nil }),
+        retainedPassage: retainedEnabled ? AtlasDeskRetainedPassageTransport(domain: admittedDomain,
+            keep: { [self] h, expected, attempt, reader, start, end in
+                precondition(!Thread.isMainThread)
+                return locked {
+                    guard h == owner, expected == revision, attempt > revision,
+                          reader == target.originOwner, start == target.selection.start,
+                          end == target.selection.end else { return nil }
+                    keeps += 1; accepted = true; revision = attempt
+                    if lostReply { lostReply = false; return nil }
+                    return state()
+                }
+            }) : nil)
     }
 }
 
@@ -290,6 +406,7 @@ private final class DeskReaderFixture: @unchecked Sendable {
         try await nativeSelectionUpdatesExactDeskRange()
         try await comparedRangeKeepsFullTargetAndPoint()
         try await firstKeepUsesSelectedRangeAndRejectsChangedIntent()
+        try await largeRetainedCapturePassages()
         print("Desk reader transfer, exact native selections, source authority, navigation, stale update and cancellation regressions passed.")
     }
 
@@ -375,6 +492,94 @@ private final class DeskReaderFixture: @unchecked Sendable {
         precondition(desk.state!.active!.location == previous,
             "selection revocation changed already accepted personal state")
         precondition(!fixture.calls.contains("LIVE-OPEN"))
+    }
+
+    @MainActor private static func largeRetainedCapturePassages() async throws {
+        let start: UInt64 = 5 * 1024 * 1024
+        let source = DeskReaderFixture(bytes: Array(repeating: 120, count: Int(start))
+            + Array("exact retained evidence".utf8))
+        let reader = AtlasPagedReaderModel(transport: source.readerTransport())
+        try await reader.openRetained(label: source.label, offset: start, registryDomain: source.domain) { handle in
+            source.initializeRetained(handle)
+        }
+        defer { reader.close() }
+        precondition(reader.canKeep && !reader.canRefresh)
+        reader.updateTextSelection(source: reader.source!, navigation: reader.navigation,
+            range: NSRange(location: 0, length: 5))
+        precondition(!reader.canKeep, "pending large-source selection fell back to its page")
+        await wait("large retained selection did not resolve") { reader.textSelection != nil }
+        let identity = reader.page!.identity
+        let fixture = RetainedPassageDeskFixture(identity: identity, domain: source.domain, start: start)
+        let desk = AtlasReadingDeskModel(transport: fixture.transport())
+        defer { desk.close() }
+        fixture.loseReply()
+        desk.keep(reader: reader)
+        await wait("lost retained passage reply did not reconcile") { !desk.busy && desk.state != nil }
+        precondition(fixture.counts.keeps == 1 && fixture.counts.wholeTransfers == 0)
+        precondition(desk.lastKeptObservedPassage == 1 && !desk.hasUnverifiedChanges)
+        precondition(desk.state!.panes.isEmpty && desk.state!.retainedBytes == 21)
+        precondition(desk.state!.observedPassages[0].selection.start == start)
+        precondition(desk.state!.observations[0].consistency == "host-supplied-sequence")
+        precondition(desk.canSaveCheckpoint && desk.hasUnsavedContents)
+
+        for missing in [false, true] {
+            let rejected = RetainedPassageDeskFixture(identity: identity, domain: source.domain, start: start)
+            let model = AtlasReadingDeskModel(transport: rejected.transport(retainedEnabled: !missing,
+                registryDomain: missing ? source.domain : UUID()))
+            model.keep(reader: reader)
+            precondition(!model.busy && rejected.counts.keeps == 0 && rejected.counts.wholeTransfers == 0)
+            if missing { precondition(model.notice.contains("cannot save a bounded passage")) }
+            model.close()
+        }
+
+        for corruption in ["owner", "file", "revision", "path", "encoding", "length", "final-length",
+                           "context", "consistency", "selection"] {
+            let rejected = RetainedPassageDeskFixture(identity: identity, domain: source.domain,
+                start: start, corruption: corruption)
+            let model = AtlasReadingDeskModel(transport: rejected.transport())
+            model.keep(reader: reader)
+            await wait("corrupt retained passage reply did not finish") { !model.busy }
+            precondition(rejected.counts.keeps == 1 && model.lastKeptObservedPassage == nil
+                && model.hasUnverifiedChanges, "unrelated retained passage was confirmed: \(corruption)")
+            model.close()
+        }
+
+        let unknown = RetainedPassageDeskFixture(identity: identity, domain: source.domain, start: start)
+        let unknownDesk = AtlasReadingDeskModel(transport: unknown.transport())
+        unknown.loseReply(stateFailures: 1)
+        unknownDesk.keep(reader: reader)
+        await wait("unverifiable saved passage did not finish") { !unknownDesk.busy }
+        precondition(unknown.counts.keeps == 1 && unknownDesk.hasUnverifiedChanges)
+        unknownDesk.keep(reader: reader)
+        precondition(unknown.counts.keeps == 1 && !unknownDesk.busy,
+            "uncertain saved passage was imported a second time")
+        unknownDesk.close()
+
+        let stale = RetainedPassageDeskFixture(identity: identity, domain: source.domain, start: start)
+        let staleDesk = AtlasReadingDeskModel(transport: stale.transport())
+        staleDesk.keep(reader: reader)
+        reader.updateTextSelection(source: reader.source!, navigation: reader.navigation, range: nil)
+        await wait("revoked large-source selection did not finish") { !staleDesk.busy }
+        precondition(stale.counts.keeps == 0 && stale.counts.wholeTransfers == 0
+            && staleDesk.state?.revision == 0, "changed intent transferred a wider source passage")
+        staleDesk.close()
+
+        // A larger logical comparison range cannot quietly become its clipped
+        // page. Point selections remain points, not invented evidence bytes.
+        let wide = AtlasReaderComparisonReport.Range(start: 0, end: AtlasReaderLimits.maximumPageBytes + 1)
+        precondition(reader.goToComparedRange(wide, identity: identity))
+        await wait("large compared selection did not open") { !reader.busy }
+        precondition(!reader.canKeep && reader.rangeForReadingDesk?.end == wide.end)
+        let point = AtlasReaderComparisonReport.Range(start: start, end: start)
+        precondition(reader.goToComparedRange(point, identity: identity))
+        await wait("large compared point did not open") { !reader.busy }
+        precondition(!reader.canKeep)
+
+        reader.close()
+        let state = desk.state!, target = AtlasDeskObservedTarget(state: state, passage: state.observedPassages[0])!
+        let saved = try await desk.readObservedPassage(target)
+        precondition(saved.text == "exact" && saved.originalHex == "6578616374")
+        precondition(saved.target.passage.selection.start == start && !source.calls.contains("LIVE-OPEN"))
     }
 
 }

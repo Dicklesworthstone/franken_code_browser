@@ -156,9 +156,37 @@ import Observation
     }
     var canPin: Bool { page != nil && !busy && !pinning && !documentPreview.busy && !resolvingTextSelection && coordinator.canFork }
     var canKeep: Bool {
-        guard canPin, let page else { return false }
-        return page.identity.capturedBytes <= AtlasReaderLimits.transferBytes
-            && (!hasTextSelectionIntent || textSelection != nil)
+        guard canPin, let page, !hasTextSelectionIntent || textSelection != nil else { return false }
+        if page.identity.capturedBytes <= AtlasReaderLimits.transferBytes { return true }
+        guard let selected = rangeForReadingDesk else { return false }
+        return selected.start < selected.end && selected.end <= page.identity.capturedBytes
+            && selected.end - selected.start <= AtlasReaderLimits.maximumPageBytes
+    }
+    /// First-time Keep and Desk location updates share one exact range. Pending
+    /// native intent never falls back to a page or an older search highlight.
+    var rangeForReadingDesk: (start: UInt64, end: UInt64)? {
+        guard let page else { return nil }
+        if hasTextSelectionIntent {
+            guard !resolvingTextSelection, let selected = textSelection,
+                  selected.identity.matches(page.identity),
+                  selected.pageStart == page.start, selected.pageEnd == page.end else { return nil }
+            return (selected.originalStart, selected.originalEnd)
+        }
+        if let selected = currentComparisonSelection {
+            return (selected.range.start, selected.range.end)
+        }
+        if findIsCurrent, let hit = page.selection, matchHex != nil {
+            return (hit.target.start, hit.target.end)
+        }
+        if outlineIsCurrent, let symbol = page.symbolSelection, symbolHex != nil {
+            let selected = symbol.target.symbol.selectedRange
+            return (selected.start, selected.end)
+        }
+        if referencesAreCurrent, let occurrence = page.referenceSelection, referenceHex != nil {
+            let selected = occurrence.target.occurrence.range
+            return (selected.start, selected.end)
+        }
+        return (page.start, page.end)
     }
     var canCompare: Bool { page != nil && !busy && !pinning && !documentPreview.busy && !resolvingTextSelection && coordinator.supportsComparison }
     var retainedRegistryDomain: UUID? { coordinator.retainedRegistryDomain }
@@ -516,7 +544,7 @@ import Observation
         guard let page else { return "Retained capture limit: \(AtlasReaderLimits.captureBytes / 1024 / 1024) MiB. Oversized sources are refused, not truncated." }
         var messages = ["Logical page; layout is local to this window."]
         if page.identity.capturedBytes > AtlasReaderLimits.transferBytes {
-            messages.append("Comparison and reading-desk transfer are limited to 4 MiB per source. Paging, Find and pinning use this retained capture.")
+            messages.append("Keep saves a selected passage or page up to 256 KiB with its original offsets. Comparison and complete-source desk transfer are limited to 4 MiB per source. Paging, Find and pinning use this retained capture.")
         }
         if let highlight = page.highlight { messages.append(highlight.summary) }
         if refreshedFromDisk {

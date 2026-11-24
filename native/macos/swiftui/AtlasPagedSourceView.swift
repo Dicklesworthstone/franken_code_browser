@@ -480,7 +480,7 @@ import AppKit
                             : (model.currentComparisonSelection != nil ? "Keep compared range" : "Keep in reading desk"), systemImage: "books.vertical")
                     }
                         .disabled(!canKeep || !model.canKeep)
-                        .help("Keep this exact selected range or page, retaining its complete source up to 4 MiB. A compared range preserves the full byte target even when only part is displayed. Add bookmarks or personal notes in the Reading Desk.")
+                        .help("Keep this exact selection or page. Sources up to 4 MiB become complete Desk panes; larger captures keep passages up to 256 KiB with original offsets and personal notes. A compared range preserves its full byte target within that limit, even when only part is displayed.")
                 }
                 Menu("Export bytes…") {
                     Button("Entire retained file…") { beginExport(.wholeCapture) }
