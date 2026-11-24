@@ -86,7 +86,7 @@ and closed saved-manifest resolver. Evidence selects the complete exact original
 statement in UTF8/UTF16 source. Captured targets open at byte zero. External,\n\
 missing, ambiguous, unresolved and unavailable targets cannot open. This does\n\
 not establish compiler resolution or execute code. Build reads at most\n\
-MAX_SOURCE_BYTES (0..32 MiB), with 128 KiB per eligible source and 1..4096\n\
+MAX_SOURCE_BYTES (0..32 MiB), with 1 MiB per eligible source and 1..4096\n\
 retained statements; omission/diagnostic counters keep coverage explicit.\n\
 IMPORT_GEN is independent of Markdown/text/index/expression generations. Build\n\
 and clear attempts increase; failures preserve the last accepted projection.\n\

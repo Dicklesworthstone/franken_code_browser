@@ -1322,7 +1322,7 @@ project code, install dependencies, or fetch external packages.
 
 Preparation verifies at most one eligible source at a time. `MAX_LINKS` is
 1..4096, aggregate source allowance is 0..33554432 bytes, and a source larger
-than 131072 bytes is explicitly omitted. No source payload remains in the
+than 1048576 bytes (1 MiB) is explicitly omitted. No source payload remains in the
 projection. Pages read metadata only, retain stable one-based occurrence IDs,
 and accept `COUNT` 1..128; member ordinals and page offsets are zero-based.
 Always follow `next_offset`, which reflects the rows actually delivered.
@@ -1719,6 +1719,35 @@ end)` in `fcb_reader_sessions.h`. It uses the existing worker, handle epoch,
 cancel and owned-string rules. Regression sources cover core matching, public
 reader receipts, C transport ownership and native navigation. Executable
 verification remains pending the independent strict-RCH lane.
+
+## Larger source imports and relationship evidence
+
+Captured-project and saved-repository import inventories accept source members
+up to **1 MiB of original bytes**. This applies to the existing Rust, JavaScript,
+TypeScript, JSX, TSX, Python, C/C++, Go and Java import recognizers. UTF-8 BOMs
+and both UTF-16 byte orders preserve exact statement and specifier byte ranges,
+including statements beyond the former 128 KiB boundary. Existing decoded
+expansion policy remains in place for UTF-16; imports have no physical-line cap.
+
+The shared analysis mapping cache decodes complete source through bounded
+windows. Temporary decoded text, token storage and range maps are released
+after extraction, and the retained reservation reflects the actual fact and
+destination storage. Incoming/outgoing pages use that retained evidence.
+Workspace activation copies the captured source without reopening its live
+path; saved activation re-verifies the opened archive member and never opens
+the corresponding live path.
+
+The 4,096-fact cap, 1,024-byte destination cap, 32 MiB aggregate parse allowance
+and caller resource budgets still apply. Go module metadata remains limited
+to 64 KiB; a saved source plus its simultaneously loaded module must fit the
+1 MiB combined payload allowance. Limits, unavailable captures, diagnostics
+and unresolved targets remain explicit in coverage receipts. These lexical
+relationships do not establish compiler resolution.
+
+Regression sources cover late UTF-8/UTF-16 evidence, maximum original and
+expanded decoded sources, reverse navigation, canceled replacements and
+reader ownership after project/archive detachment. Execution and physical
+macOS qualification remain pending in the independent verification lane.
 
 ## Larger source outlines and symbol search
 

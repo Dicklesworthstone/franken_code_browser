@@ -6,7 +6,7 @@ import Foundation
 enum AtlasSavedImportWire {
     static let maximumLinks: UInt64 = 4096
     static let maximumSourceBytes: UInt64 = 32 * 1024 * 1024
-    static let maximumMemberBytes: UInt64 = 128 * 1024
+    static let maximumMemberBytes: UInt64 = 1024 * 1024
     // Verified snapshot reads count interrupted attempts as well as bytes.
     static let maximumMemberReadCalls: UInt64 = 1_048_576
 

@@ -183,3 +183,50 @@ fn saved_literal_loads_are_navigable_and_copy_exact_call_evidence_through_stdio(
     assert_eq!(result(&rows[10]).get("original_hex").text(), hex(b"require('./child')"));
     assert!(!f.root.join("src/main.cjs").exists() && !f.root.join("src/child.cjs").exists());
 }
+
+
+#[test]
+fn large_saved_imports_enter_desk_and_copy_exact_evidence_after_archive_close() {
+    let prefix = "# retained import source \u{1f980}\r\n".repeat(6000);
+    let statement = "from .helper import run as main";
+    for encoding in 0..3 {
+        let encode = |text: &str, bom: bool| -> Vec<u8> {
+            if encoding == 0 {
+                let mut bytes = if bom { vec![0xef, 0xbb, 0xbf] } else { Vec::new() };
+                bytes.extend_from_slice(text.as_bytes()); return bytes;
+            }
+            let mut bytes = if !bom { Vec::new() } else if encoding == 1 { vec![0xff, 0xfe] } else { vec![0xfe, 0xff] };
+            for unit in text.encode_utf16() {
+                bytes.extend_from_slice(&if encoding == 1 { unit.to_le_bytes() } else { unit.to_be_bytes() });
+            }
+            bytes
+        };
+        let source = encode(&format!("{prefix}{statement}\r\n"), true);
+        assert!(source.len() > 128 * 1024);
+        let f = Fixture::new(&[entry(b"pkg/helper.py", TARGET), entry(b"pkg/main.py", &source)], true);
+        let script = format!(
+            "0\tsaved-open\t{}\n\
+             0\tsaved-imports-build\t1\t1\t64\t1048576\n\
+             0\tsaved-importers\t1\t1\t0\t0\t64\n\
+             0\tsaved-import-source\t1\t1\t1\n\
+             4\tcopy\t1\n\
+             4\tsaved-import-target\t1\t1\t1\n\
+             6\tread\t2\t0\t64\t4\n\
+             6\tsaved-close\t1\n\
+             6\tcopy\t1\n\
+             6\tquit\n", f.path.display());
+        let (exit, rows) = invoke(&script);
+        assert_eq!(exit, EXIT_OK); assert_eq!(rows.len(), 10);
+        assert!(result(&rows[1]).get("imports_complete").flag());
+        assert_eq!(result(&rows[1]).get("max_member_source_bytes").number(), 1024 * 1024);
+        assert_eq!(result(&rows[2]).get("matching_links").number(), 1);
+        assert_eq!(result(&rows[3]).get("selection").get("start").number(),
+            encode(&prefix, true).len() as u64);
+        let expected = hex(&encode(statement, false));
+        assert_eq!(result(&rows[4]).get("original_hex").text(), expected);
+        assert_eq!(result(&rows[6]).get("text").text(), std::str::from_utf8(TARGET).unwrap());
+        assert_eq!(result(&rows[8]).get("original_hex").text(), expected);
+        assert_eq!(rows[8].get("saved_import_generation"), &Json::Null);
+        assert!(!f.root.join("pkg/main.py").exists() && !f.root.join("pkg/helper.py").exists());
+    }
+}

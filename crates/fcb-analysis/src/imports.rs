@@ -33,7 +33,7 @@ use fcb_source::{CaptureRequest, DetectedEncoding, detect_encoding};
 use crate::source_map::{SourceMap, SourceMapError};
 use franken_markdown::highlight::{self, Span, Tok};
 
-pub const MAX_IMPORT_SOURCE_BYTES: usize = 128 * 1024;
+pub const MAX_IMPORT_SOURCE_BYTES: usize = 1024 * 1024;
 pub const MAX_IMPORT_ITEMS: usize = 4096;
 pub const MAX_IMPORT_SPECIFIER_BYTES: usize = 1024;
 const MAX_STATEMENT_TERMINALS: usize = 1024;
@@ -136,7 +136,7 @@ pub struct CapturedImports<'source> {
 }
 impl<'source> CapturedImports<'source> {
     /// Worker operation; source, decoder, lexical terminals, output and cancellation
-    /// are bounded. The upstream whole-block lexer receives at most 128KiB original
+    /// are bounded. The upstream whole-block lexer receives at most 1 MiB original
     /// source and its admitted decoded expansion; no lexer runs on a UI callback.
     #[allow(clippy::too_many_arguments)]
     pub fn build(source: &'source [u8], request: CaptureRequest, generation: QueryGeneration,

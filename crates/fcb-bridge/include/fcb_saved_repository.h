@@ -567,7 +567,9 @@ char *fcb_saved_clear_relationships(uint64_t handle, uint64_t generation);
  * catalog candidate policies. Import statements preserve original byte evidence;
  * candidates do not establish compiler or runtime bindings. No live source path,
  * package execution, sys.path or network access is used. Prepare admits 1..4096
- * rows, up to 32 MiB aggregate source reads and at most 128 KiB per source member.
+ * rows, up to 32 MiB aggregate source reads and at most 1 MiB of original bytes
+ * per source member. Combined source and Go module metadata payloads also stay
+ * within 1 MiB; the separate module metadata limit remains 64 KiB.
  * Inspect imports_complete, truncation, diagnostics and omission counters before
  * interpreting an empty incoming/outgoing page. Accepted rows retain metadata;
  * source payloads are loaded one member at a time during extraction.

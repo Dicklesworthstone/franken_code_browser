@@ -9,7 +9,7 @@ mod support;
 use fixture::{Fixture, owner, entry};
 use support::{Json, parse};
 use std::{fs::{self, OpenOptions}, io::{Seek, SeekFrom, Write}};
-use fcb::search::{imports::MAX_IMPORT_SOURCE_BYTES, snapshot::{SnapshotData, SnapshotEntry}};
+use fcb::search::{imports::MAX_IMPORT_SOURCE_BYTES, snapshot::{SnapshotData, SnapshotEntry, SnapshotLimits}};
 use fcb::store::Sha256;
 use fcb_app::{EXIT_OK, EXIT_PARTIAL};
 use fcb_app::host::{HostResponse, reader::ReaderSession, saved_repository::{SavedRepositorySession,
@@ -754,10 +754,11 @@ fn explicit_javascript_targets_preserve_binary_bytes_and_opened_archive_identity
 fn unavailable_unsupported_and_source_limited_members_partition_coverage_without_payload_retention() {
     let source = b"from .b import Value\n";
     let oversized = vec![b' '; MAX_IMPORT_SOURCE_BYTES + 1];
-    let f = Fixture::new(&[entry(b"a.py", source), entry(b"b.py", b""), entry(b"c.py", &[0xff, 0, 1]),
+    let f = Fixture::with_limits(&[entry(b"a.py", source), entry(b"b.py", b""), entry(b"c.py", &[0xff, 0, 1]),
         entry(b"d.py", &oversized),
         SnapshotEntry { path: b"e.py", observed_bytes: 50, data: SnapshotData::Unavailable("READ_DENIED") },
-        entry(b"f.PYI", b""), entry(b"g.txt", b"import not_python")], true);
+        entry(b"f.PYI", b""), entry(b"g.txt", b"import not_python")], true,
+        SnapshotLimits { max_file_bytes: 2 * 1024 * 1024, ..SnapshotLimits::default() });
     let mut saved = f.open(57451);
     let response = saved.prepare_imports(1, 20, 1024 * 1024, || false).unwrap();
     assert_eq!(response.exit_code(), EXIT_PARTIAL);
@@ -990,4 +991,75 @@ fn rust_include_bytes_opens_exact_binary_from_the_retained_archive() {
     assert!(!json(&receipt).get("live_source_reopened").flag());
     drop(saved);
     assert_eq!(copy_all(&mut reader).get("original_hex").text(), hex(target));
+}
+
+
+#[test]
+fn large_saved_imports_keep_exact_utf16_evidence_after_cancel_and_archive_detachment() {
+    let prefix = "# retained import source \u{1f980}\r\n".repeat(6000);
+    let statement = "from .helper import run as chosen";
+    for big in [false, true] {
+        let source = utf16(&format!("{prefix}{statement}\r\n"), big);
+        assert!(source.len() > 128 * 1024 && source.len() <= MAX_IMPORT_SOURCE_BYTES);
+        let target = b"def run():\n    return 7\n";
+        let f = Fixture::new(&[entry(b"pkg/helper.py", target), entry(b"pkg/main.py", &source)], true);
+        let mut saved = f.open(58400 + u64::from(big) * 10);
+        let page = prepare(&mut saved, 1);
+        assert!(page.get("imports_complete").flag());
+        assert_eq!(page.get("source_limited_members").number(), 0);
+        assert_eq!(page.get("max_member_source_bytes").number(), MAX_IMPORT_SOURCE_BYTES as u64);
+        assert_eq!(page.get("peak_source_bytes").number(), source.len() as u64);
+        assert_eq!(page.get("retained_source_payload_bytes").number(), 0);
+        let row = link(&page, b"pkg/main.py", ".helper");
+        let id = row.get("link_id").number();
+        let expected_start = utf16(&prefix, big).len();
+        let expected = utf16(statement, big);
+        assert_eq!(row.get("evidence_range").get("start").number(), expected_start as u64);
+        assert_eq!(range(&source, row.get("evidence_range")), &expected[2..]);
+        let before = reads(&mut saved);
+        let incoming = json(&saved.import_page(1, Some(row.get("target_member").number()),
+            Direction::Incoming, 0, 64, || false).unwrap());
+        assert_eq!(incoming.get("links"), page.get("links"));
+        assert_eq!(reads(&mut saved), before);
+        let mut polls = 0;
+        assert!(saved.prepare_imports(2, 64, 1024 * 1024, || {
+            polls += 1; polls == 16
+        }).err().unwrap().is_canceled());
+        assert_eq!(saved.import_generation(), Some(1));
+        assert_eq!(json(&saved.import_page(1, None, Direction::All, 0, 64, || false).unwrap())
+            .get("links"), page.get("links"));
+        fs::rename(&f.path, f.root.join("detached-large-imports.fcbs")).unwrap();
+        let (mut evidence, receipt) = saved.open_import_reader(owner(58401 + u64::from(big) * 10),
+            1, id, Side::Evidence, || false).unwrap();
+        assert!(!json(&receipt).get("live_source_reopened").flag());
+        let (mut reader, _) = saved.open_import_reader(owner(58402 + u64::from(big) * 10),
+            1, id, Side::Target, || false).unwrap();
+        saved.clear_imports(3, || false).unwrap(); drop(saved);
+        assert_eq!(json(&evidence.copy_range(expected_start as u64,
+            (expected_start + expected.len() - 2) as u64, || false).unwrap())
+            .get("original_hex").text(), hex(&expected[2..]));
+        assert_eq!(copy_all(&mut reader).get("original_hex").text(), hex(target));
+    }
+}
+
+#[test]
+fn maximum_utf16_import_source_keeps_decoded_expansion_in_saved_repository_budget() {
+    let limit = MAX_IMPORT_SOURCE_BYTES;
+    let tail = "*/\nimport './target';\n";
+    let mut text = String::from("/*");
+    let padding_units = (limit - 2) / 2 - text.encode_utf16().count() - tail.encode_utf16().count();
+    text.push_str(&"\u{4e2d}".repeat(padding_units));
+    text.push_str(tail);
+    // Each BMP comment scalar takes two original bytes and three decoded bytes.
+    assert!(text.len() > limit);
+    let source = utf16(&text, false);
+    assert_eq!(source.len(), limit);
+    let f = Fixture::new(&[entry(b"main.ts", &source), entry(b"target.ts", b"")], true);
+    let mut saved = f.open(58430);
+    let page = prepare(&mut saved, 1);
+    assert!(page.get("imports_complete").flag());
+    assert_eq!(page.get("peak_source_bytes").number(), limit as u64);
+    let row = link(&page, b"main.ts", "./target");
+    assert_eq!(range(&source, row.get("evidence_range")), &utf16("import './target';", false)[2..]);
+    assert_eq!(row.get("resolution").text(), "captured");
 }

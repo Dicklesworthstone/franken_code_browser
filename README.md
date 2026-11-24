@@ -58,6 +58,14 @@ Results include comments and strings and open their retained source with exact
 occurrence highlighting. See [workspace identifier occurrences](native/macos/README.md#workspace-identifier-occurrences)
 for encoding, coverage and capture limits.
 
+**Imports now cover larger captured sources.** Project and saved-repository
+relationship inventories admit source files up to 1 MiB, with exact UTF-8/UTF-16
+statement evidence, incoming/outgoing navigation and independently retained
+readers. Extraction shares the bounded mapping cache used by Symbols and
+releases parsing scratch before retaining facts. Existing fact, destination,
+aggregate-work and Go metadata limits remain explicit; executable verification
+of this expansion is pending in the independent batch lane.
+
 **Outline and Symbols now admit larger source files.** Retained readers, workspace
 search, saved repositories and CLI declaration lookup share a 1 MiB limit for
 both original and decoded source, with up to 65,536 physical lines. The existing

@@ -229,7 +229,7 @@ import SwiftUI
                         : "Build import candidates, then choose Outgoing for declarations in a file or Imported by for catalog candidates targeting it. Read each exact statement before following its target.")
                     Text(model.projection == .documentation
                         ? "Capture admits up to 4,096 files, 1 MiB per file and 32 MiB total. Link extraction reads retained Markdown up to 256 KiB per document and keeps at most 4,096 links. Omitted documents remain visible in coverage."
-                        : "Follow captured Rust, JavaScript/TypeScript, Python, C/C++, Go and Java import evidence. Go uses captured go.mod metadata; Java uses conventional source paths. Build constraints, classpaths and compiler bindings are not established. Up to 128 KiB per source and 4,096 occurrences are retained. Targets remain catalog candidates, without package loading or compiler resolution.")
+                        : "Follow captured Rust, JavaScript/TypeScript, Python, C/C++, Go and Java import evidence. Go uses captured go.mod metadata; Java uses conventional source paths. Build constraints, classpaths and compiler bindings are not established. Up to 1 MiB of original bytes per source and 4,096 occurrences are admitted. Targets remain catalog candidates, without package loading or compiler resolution.")
                         .font(.caption).foregroundStyle(.secondary)
                     Text("File filters and visible-map selection do not narrow this project capture.")
                         .font(.caption).foregroundStyle(.secondary)

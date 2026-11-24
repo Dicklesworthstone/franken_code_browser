@@ -159,3 +159,95 @@ fn denied_or_canceled_imports_release_admission_before_an_exact_retry() {
         &budget, ResourceAllocationId::new(1).unwrap(), || false), Err(ImportError::InvalidEvidence)));
     assert_eq!(budget.accounting().reserved().get(), 0);
 }
+
+
+#[test]
+fn all_import_languages_keep_late_relationships_in_larger_utf8_and_utf16_sources() {
+    let cases = [
+        (ImportLanguage::Rust, "//", "mod child;", "child", ImportKind::RustModule),
+        (ImportLanguage::JavaScript, "//", "import \"./child.js\";", "./child.js", ImportKind::JavaScriptImport),
+        (ImportLanguage::TypeScript, "//", "import \"./child.js\";", "./child.js", ImportKind::JavaScriptImport),
+        (ImportLanguage::Jsx, "//", "import \"./child.js\";", "./child.js", ImportKind::JavaScriptImport),
+        (ImportLanguage::Tsx, "//", "import \"./child.js\";", "./child.js", ImportKind::JavaScriptImport),
+        (ImportLanguage::Python, "#", "import package.helper", "package.helper", ImportKind::PythonImport),
+        (ImportLanguage::Cpp, "//", "#include \"child.hpp\"", "child.hpp", ImportKind::CppQuotedInclude),
+        (ImportLanguage::Go, "//", "import \"example/pkg\"", "example/pkg", ImportKind::GoImport),
+        (ImportLanguage::Java, "//", "import example.library.Helper;", "example.library.Helper", ImportKind::JavaImport),
+    ];
+    for (language, comment, statement, destination, kind) in cases {
+        let prefix = format!("{}{}", if language == ImportLanguage::Go { "package example\n" } else { "" },
+            format!("{comment} held source\n").repeat(10_000));
+        let text = format!("{prefix}{statement}\n");
+        assert!(text.len() > 128 * 1024);
+        for little in [None, Some(false), Some(true)] {
+            let source = encode(&text, little, little.is_some());
+            let budget = resources(128 * 1024 * 1024);
+            let imports = build(&source, language, 8, &budget, || false).unwrap();
+            assert!(imports.is_complete(), "incomplete {}", language.name());
+            assert_eq!(imports.links_seen(), 1);
+            let fact = &imports.facts()[0];
+            assert_eq!(fact.kind(), kind);
+            assert_eq!(fact.destination(), destination);
+            assert_eq!(fact.original_range().start().get(),
+                encode(&prefix, little, little.is_some()).len() as u64);
+            let (start, end) = fact.specifier_range().as_usize_bounds().unwrap();
+            assert_eq!(&source[start..end], encode(destination, little, false));
+            assert_eq!(imports.validate_delivery(request().file(), request().revision(), generation()), Ok(()));
+            drop(imports);
+            assert_eq!(budget.accounting().reserved().get(), 0);
+        }
+    }
+}
+
+#[test]
+fn maximum_original_capture_keeps_utf16_decoded_expansion_and_exact_final_evidence() {
+    for (language, tail, destination, admitted) in [
+        (ImportLanguage::Rust, "*/\nmod edge;", "edge", 128 * 1024 * 1024),
+        (ImportLanguage::Jsx, "*/\nimport \"./edge\";", "./edge", 224 * 1024 * 1024),
+        (ImportLanguage::Tsx, "*/\nimport \"./edge\";", "./edge", 224 * 1024 * 1024),
+    ] {
+        for little in [None, Some(false), Some(true)] {
+            let original_units = if little.is_some() { (MAX_IMPORT_SOURCE_BYTES - 2) / 2 }
+                else { MAX_IMPORT_SOURCE_BYTES };
+            let fill = if little.is_some() { "中" } else { "x" };
+            let text = format!("/*{}{}", fill.repeat(original_units - 2 - tail.len()), tail);
+            if little.is_some() {
+                assert!(text.len() > MAX_IMPORT_SOURCE_BYTES);
+                assert!(text.len() <= MAX_IMPORT_SOURCE_BYTES * 3 / 2);
+            }
+            let source = encode(&text, little, little.is_some());
+            assert_eq!(source.len(), MAX_IMPORT_SOURCE_BYTES);
+            let budget = resources(admitted);
+            let imports = build(&source, language, 4, &budget, || false).unwrap();
+            assert!(imports.is_complete());
+            assert_eq!(imports.links_seen(), 1);
+            let fact = &imports.facts()[0];
+            assert_eq!(fact.destination(), destination);
+            let (start, end) = fact.specifier_range().as_usize_bounds().unwrap();
+            assert!(start > 128 * 1024);
+            assert_eq!(&source[start..end], encode(destination, little, false));
+            assert!(budget.accounting().peak_reserved().get() <= admitted);
+            drop(imports);
+            assert_eq!(budget.accounting().reserved().get(), 0);
+            let oversized = b" ".repeat(MAX_IMPORT_SOURCE_BYTES + 1);
+            assert!(matches!(build(&oversized, language, 4, &budget, || false), Err(ImportError::SourceLimit)));
+            assert_eq!(budget.accounting().reserved().get(), 0);
+        }
+    }
+}
+
+#[test]
+fn shared_mapping_does_not_impose_symbol_line_limits_on_imports() {
+    let text = format!("{}/*{}*/\nmod later;", "\n".repeat(70_000), "中".repeat(24_000));
+    assert!(text.len() > 128 * 1024);
+    for little in [None, Some(false), Some(true)] {
+        let source = encode(&text, little, little.is_some());
+        let budget = resources(64 * 1024 * 1024);
+        let imports = build(&source, ImportLanguage::Rust, 4, &budget, || false).unwrap();
+        assert!(imports.is_complete());
+        assert_eq!(imports.links_seen(), 1);
+        assert_eq!(imports.facts()[0].destination(), "later");
+        let (start, end) = imports.facts()[0].specifier_range().as_usize_bounds().unwrap();
+        assert_eq!(&source[start..end], encode("later", little, false));
+    }
+}

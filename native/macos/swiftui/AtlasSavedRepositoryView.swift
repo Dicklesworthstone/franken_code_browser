@@ -1092,7 +1092,7 @@ private final class AtlasSavedTrailArchiveAccess {
                 VStack(alignment: .leading, spacing: 10) {
                     Text(model.busy ? "Preparing saved import metadata…" : "Build imports to inspect source dependencies.").font(.headline)
                     Text("Select a saved member to inspect its outgoing statements or incoming catalog candidates. Read the exact statement or open a captured target without a working-tree checkout.")
-                    Text("Each build admits up to 4,096 statements and 32 MiB of source, with a 128 KiB limit per source member. Unavailable, unsupported and limited sources remain visible in coverage.")
+                    Text("Each build admits up to 4,096 statements and 32 MiB of source, with a 1 MiB original-byte limit per source member. Unavailable, unsupported and limited sources remain visible in coverage.")
                         .font(.caption).foregroundStyle(.secondary)
                 }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).padding(.top, 12)
             }

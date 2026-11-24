@@ -900,8 +900,11 @@ Both actions reverify the member digest from the already opened archive before
 installing an independent reader; in-place corruption never substitutes live
 source. Opened readers remain usable after the import inventory or archive closes.
 
-The build processes one source member at a time, admits at most 128 KiB per
-source and 32 MiB in aggregate, and retains up to 4,096 import occurrences.
+The build processes one source member at a time, admits at most **1 MiB of
+original source bytes** and **32 MiB** in aggregate, and retains up to **4,096
+import occurrences**. UTF-8 and BOM-marked UTF-16 retain their original
+statement and specifier coordinates. These limits apply independently of the
+symbol, heading and occurrence search limits.
 Accepted inventory data contains metadata, with no retained source payloads.
 Pagination and direction changes use that inventory without repeating source
 reads. Missing captures, unsupported sources, parser diagnostics, source limits,
@@ -1813,7 +1816,8 @@ Module metadata is capped at 64 KiB per lookup and shares the 32 MiB aggregate
 work allowance. Project receipts report `parsed_module_bytes` separately from
 `parsed_source_bytes`; both count against the parse limit. Saved-archive reads
 verify the metadata digest, count it in `member_bytes_read`, and keep combined
-source and metadata payloads within 128 KiB. Paging accepted imports performs
+source and metadata payloads within **1 MiB**. A source already using that
+allowance keeps unresolved import evidence if its module metadata cannot fit. Paging accepted imports performs
 no new source or metadata reads. Evidence and target readers keep their exact
 captured bytes after metadata edits, projection replacement or archive detachment.
 
@@ -1844,8 +1848,8 @@ target chosen. Missing, uncaptured and unavailable candidates likewise retain
 their evidence and explicit status. Saved navigation uses archive catalog
 membership and verified captured bytes without reopening a working tree.
 
-The inventory admits 128 KiB per source, 32 MiB of aggregate parsing and 4,096
-retained import occurrences. Unsupported syntax, malformed decoding, parse limits and
+The inventory admits **1 MiB of original bytes per source**, **32 MiB** of
+aggregate parsing and **4,096 retained import occurrences**. Unsupported syntax, malformed decoding, parse limits and
 omitted rows remain visible coverage conditions. These limits apply to the
 captured project import browser. The **Saved Repository → Imports** workflow
 applies the same lexical policies to archived members. Rust/Swift regression fixtures cover Rust

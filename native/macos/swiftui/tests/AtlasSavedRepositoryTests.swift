@@ -56,15 +56,17 @@ final class SavedRepositoryFixture: @unchecked Sendable {
     let longHeading: Bool
     let lineEncoding: String?
     let lineRange: (UInt64, UInt64)?
+    let sourceMemberOverride: Member?
     init(searchVectors: Bool = false, headingVectors: Bool = false, longHeading: Bool = false,
         lineEncoding: String? = nil, lineRange: (UInt64, UInt64)? = nil, expansionVectors: Bool = false,
-        imageVectors: Bool = false) {
+        imageVectors: Bool = false, sourceMemberOverride: Member? = nil) {
         precondition(lineEncoding == nil || (["utf8", "utf16le", "utf16be"].contains(lineEncoding!) && !searchVectors && !headingVectors))
         precondition(!expansionVectors || (searchVectors && !headingVectors && lineEncoding == nil))
         precondition(!imageVectors || (!searchVectors && !headingVectors && lineEncoding == nil))
         self.searchVectors = searchVectors; self.expansionVectors = expansionVectors; self.imageVectors = imageVectors
         self.headingVectors = headingVectors; self.longHeading = longHeading
         self.lineEncoding = lineEncoding; self.lineRange = lineRange
+        self.sourceMemberOverride = sourceMemberOverride
     }
     let archiveDigest = String(repeating: "d", count: 64)
     var source: [UInt8] {
@@ -141,7 +143,7 @@ final class SavedRepositoryFixture: @unchecked Sendable {
     var members: [Member] {
         [
             Member(path: Array("README.md".utf8), display: "README.md", bytes: source, digest: sourceDigest),
-            Member(path: rawPath, display: "raw-\\xff.rs",
+            sourceMemberOverride ?? Member(path: rawPath, display: "raw-\\xff.rs",
                 bytes: searchVectors ? searchUTF8 : Array("changed bytes\n".utf8),
                 digest: expansionVectors ? "a65018cffe8e0ed3f3112a79326e4c9718dc498a1f18a3a72f2f77c792c48b70" : searchVectors ? "ec34a752af5a6ce18bfd388bda04c6c9f60b22301b44d413c085507ca994f6cc"
                     : "7c60358cb724c1b671469c5f167cea45a4f70df4e3ac87b79340692e6f17f574"),

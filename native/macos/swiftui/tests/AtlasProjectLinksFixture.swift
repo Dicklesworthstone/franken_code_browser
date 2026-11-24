@@ -7,14 +7,20 @@ final class ProjectLinksFixture: @unchecked Sendable {
     let index = IndexedFixture()
     let domain = UUID()
     let includesImports: Bool
-    init(includesImports: Bool = false) {
+    let largeImportEncoding: String?
+    private let largeImportBytes: [UInt8]?
+    init(includesImports: Bool = false, largeImportEncoding: String? = nil) {
+        precondition(includesImports || largeImportEncoding == nil)
         self.includesImports = includesImports
+        self.largeImportEncoding = largeImportEncoding
+        self.largeImportBytes = largeImportEncoding.map(Self.largeImportSource)
         if includesImports {
             index.configure { $0.files = 4 }
+            let importBytes = largeImportBytes?.count ?? 4096
             index.patch { _, value in
                 var value = value
                 if let captured = value["captured_files"] as? String, let count = Int(captured), count >= 3 {
-                    let bytes = count == 3 ? "8292" : "8392"
+                    let bytes = String(4096 + 100 + importBytes + (count == 3 ? 0 : 100))
                     value["indexed_source_bytes"] = bytes; value["initial_source_bytes_read"] = bytes
                 }
                 return value
@@ -59,6 +65,36 @@ final class ProjectLinksFixture: @unchecked Sendable {
         }
         return text + String(repeating: " ", count: (file == 1 ? 4096 : 100) - text.utf8.count)
     }
+
+    /// Fixed original bytes for native protocol/model tests. Extraction and
+    /// capture hashing remain the separately tested Rust engine's responsibility.
+    static func largeImportSource(_ encoding: String) -> [UInt8] {
+        precondition(["utf8", "utf16le", "utf16be"].contains(encoding))
+        let unit = encoding == "utf8" ? 1 : 2
+        func bytes(_ text: String) -> [UInt8] {
+            if unit == 1 { return Array(text.utf8) }
+            return text.utf16.flatMap { value in
+                encoding == "utf16le" ? [UInt8(value & 255), UInt8(value >> 8)]
+                    : [UInt8(value >> 8), UInt8(value & 255)]
+            }
+        }
+        let bom: [UInt8] = encoding == "utf16le" ? [255, 254] : encoding == "utf16be" ? [254, 255] : []
+        let suffix = bytes("// 😀\r\n" + String(repeating: "mod child;\n", count: 70))
+        let padding = (1_048_576 - bom.count - suffix.count) / unit
+        let raw = bom + bytes(String(repeating: " ", count: padding)) + suffix
+        precondition(raw.count == 1_048_576)
+        return raw
+    }
+    static func importEvidenceRange(_ id: UInt64, encoding: String? = nil) -> [String: String] {
+        let unit: UInt64 = encoding == nil || encoding == "utf8" ? 1 : 2
+        let first: UInt64 = encoding == nil ? 11 : 1_048_576 - 70 * 11 * unit
+        let start = first + (id - 1) * 11 * unit
+        return ["start": String(start), "end": String(start + 10 * unit)]
+    }
+    private static func importSourceBytes(_ file: UInt64, encoding: String?) -> Int {
+        file == 1 && encoding != nil ? 1_048_576 : source(file, projection: .imports).utf8.count
+    }
+
     static func digest(_ file: UInt64) -> String { String(repeating: file == 1 ? "a" : "b", count: 64) }
     static func name(_ file: UInt64, projection: AtlasProjectRelationshipProjection = .documentation) -> String {
         projection == .imports ? (file == 1 ? "src/lib.rs" : "src/child.rs") : (file == 1 ? "docs.md" : "guide.md")
@@ -107,9 +143,13 @@ final class ProjectLinksFixture: @unchecked Sendable {
         ], uniquingKeysWith: { _, value in value })
         return result
     }
-    static func readerInfo(_ owner: UInt64, file: UInt64, projection: AtlasProjectRelationshipProjection = .documentation) -> [String: Any] {
-        ["schema": "fcb.reader-session/1", "status": "ok", "command": "info", "owner": String(owner),
-         "file_id": "1", "source_revision": "1", "captured_bytes": String(source(file, projection: projection).utf8.count), "encoding": "utf8",
+    static func readerInfo(_ owner: UInt64, file: UInt64, projection: AtlasProjectRelationshipProjection = .documentation,
+        importEncoding: String? = nil) -> [String: Any] {
+        let large = projection == .imports && file == 1 && importEncoding != nil
+        return ["schema": "fcb.reader-session/1", "status": "ok", "command": "info", "owner": String(owner),
+         "file_id": "1", "source_revision": "1",
+         "captured_bytes": String(large ? 1_048_576 : source(file, projection: projection).utf8.count),
+         "encoding": large ? importEncoding! : "utf8",
          "path": path(name(file, projection: projection)), "capture_origin": "host-supplied", "capture_sha256": digest(file),
          "initial_source_bytes_read": "0", "initial_read_calls": "0", "additional_source_bytes_read": "0",
          "native_presented": false, "accepted_query_generation": NSNull(), "accepted_outline_generation": NSNull(),
@@ -188,16 +228,23 @@ final class ProjectLinksFixture: @unchecked Sendable {
             self.lock.lock(); let file = self.readerFiles[owner]
             let projection = self.readerProjections[owner] ?? .documentation; self.lock.unlock()
             guard let file else { return nil }
-            let bytes = Array(Self.source(file, projection: projection).utf8), end = min(UInt64(bytes.count), offset + count)
-            precondition(offset <= end)
-            let raw = bytes[Int(offset)..<Int(end)]
-            var value = Self.readerInfo(owner, file: file, projection: projection)
+            let large = projection == .imports && file == 1 && self.largeImportBytes != nil
+            let bytes = large ? self.largeImportBytes! : Array(Self.source(file, projection: projection).utf8)
+            let encoding = large ? self.largeImportEncoding! : "utf8"
+            let end = min(UInt64(bytes.count), offset + count)
+            let visibleStart = encoding != "utf8" ? max(2, offset) : offset
+            precondition(visibleStart <= end)
+            let raw = bytes[Int(visibleStart)..<Int(end)]
+            var value = Self.readerInfo(owner, file: file, projection: projection, importEncoding: self.largeImportEncoding)
             value["command"] = "window"; value["text_kind"] = "logical-captured-text-not-shaped"
             value["requested_original_range"] = ["start": String(offset), "end": String(end)]
-            value["visible_range"] = ["start": String(offset), "end": String(end)]
-            value["range_limited"] = false; value["boundaries_adjusted"] = false; value["has_replacements"] = false
+            value["visible_range"] = ["start": String(visibleStart), "end": String(end)]
+            value["range_limited"] = false; value["boundaries_adjusted"] = visibleStart != offset; value["has_replacements"] = false
             value["first_physical_line"] = NSNull(); value["next_offset"] = end < UInt64(bytes.count) ? String(end) as Any : NSNull()
-            value["text"] = String(decoding: raw, as: UTF8.self); value["original_hex"] = Self.hex(raw); value["selection"] = NSNull()
+            let textEncoding: String.Encoding = encoding == "utf16le" ? .utf16LittleEndian
+                : encoding == "utf16be" ? .utf16BigEndian : .utf8
+            value["text"] = String(bytes: raw, encoding: textEncoding)!
+            value["original_hex"] = Self.hex(raw); value["selection"] = NSNull()
             return self.call("window", value)
         }, lines: { _, _, _, _ in nil }, cancel: { _ in true }, close: { owner in
             self.lock.lock(); defer { self.lock.unlock() }
@@ -287,20 +334,22 @@ extension ProjectLinksFixture {
          "resolver": "fcb-closed-catalog-imports-v11", "extraction_policy": "rust-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v9",
          "compiler_resolved": false, "semantic_complete": false]
     }
-    static func importRow(_ id: UInt64) -> [String: Any] {
+    static func importRow(_ id: UInt64, encoding: String? = nil) -> [String: Any] {
         var value = row(id)
         value["source_file_id"] = "3"; value["target_file_id"] = "4"
         value["source_path"] = path(name(1, projection: .imports))
         value["target_path"] = path(name(2, projection: .imports))
         value["destination"] = "child"
-        value["evidence_range"] = ["start": String(11 + (id - 1) * 11), "end": String(21 + (id - 1) * 11)]
+        value["source_bytes"] = String(importSourceBytes(1, encoding: encoding))
+        value["evidence_range"] = importEvidenceRange(id, encoding: encoding)
         value["language"] = "rust"; value["lexical_import_kind"] = "rust-module"
         value["resolution_basis"] = "rust-module-file-candidate"
         for key in ["block_index", "destination_suffix", "fragment_resolution"] { value.removeValue(forKey: key) }
         return value
     }
     static func importPage(owner: UInt64, generation: UInt64, command: String, examined: Int = 2,
-        direction: AtlasProjectLinkDirection = .all, path: String? = nil, start: UInt64 = 0, limit: UInt64 = 64) -> [String: Any] {
+        direction: AtlasProjectLinkDirection = .all, path: String? = nil, start: UInt64 = 0, limit: UInt64 = 64,
+        encoding: String? = nil) -> [String: Any] {
         var value = identity(owner: owner, generation: generation, command: command)
         value["schema"] = "fcb.atlas-imports/1"
         value.merge(importProof, uniquingKeysWith: { _, value in value })
@@ -312,11 +361,11 @@ extension ProjectLinksFixture {
         let total = UInt64(selected.count), end = min(total, start + limit)
         value.merge([
             "source_observation": "retained-index-captures", "max_links": "4096", "max_parse_bytes": "33554432",
-            "max_source_bytes": "131072", "max_metadata_bytes": "8388608",
+            "max_source_bytes": String(AtlasProjectImportEvidence.sourceLimit), "max_metadata_bytes": "8388608",
             "metadata_bytes": examined == 0 ? "0" : "35000", "source_bytes_read": "0", "read_calls": "0",
-            "parsed_source_bytes": examined == 0 ? "0" : (examined == 1 ? "4096" : "4196"),
+            "parsed_source_bytes": examined == 0 ? "0" : String(importSourceBytes(1, encoding: encoding) + (examined == 1 ? 0 : 100)),
             "parsed_module_bytes": "0",
-            "hashed_source_bytes": examined == 0 ? "0" : "4196", "capture_region_complete": true,
+            "hashed_source_bytes": examined == 0 ? "0" : String(importSourceBytes(1, encoding: encoding) + 100), "capture_region_complete": true,
             "source_files": "2", "captured_source_files": "2", "capture_unavailable_source_files": "0",
             "outside_capture_scope_source_files": "0", "uncaptured_source_files": "0",
             "examined_source_files": String(examined), "pending_source_files": String(2 - examined),
@@ -328,26 +377,26 @@ extension ProjectLinksFixture {
             "direction": direction.rawValue, "filter_path": path == nil ? NSNull() : Self.path(path!),
             "filter_file_id": path == nil ? NSNull() : (path == "src/lib.rs" ? "3" : "4"),
             "offset": String(start), "limit": String(limit), "matching_links": String(total),
-            "links": start < end ? selected[Int(start)..<Int(end)].map(Self.importRow) : [],
+            "links": start < end ? selected[Int(start)..<Int(end)].map { Self.importRow($0, encoding: encoding) } : [],
             "next_offset": end < total ? String(end) as Any : NSNull()
         ], uniquingKeysWith: { _, value in value })
         return value
     }
     static func importReceipt(owner: UInt64, reader: UInt64, generation: UInt64, link: UInt64,
-        side: AtlasProjectLinkSide) -> [String: Any] {
+        side: AtlasProjectLinkSide, encoding: String? = nil) -> [String: Any] {
         let file: UInt64 = side == .evidence ? 1 : 2
-        let row = importRow(link)
+        let row = importRow(link, encoding: encoding)
         var value = identity(owner: owner, generation: generation, command: "imports-open-reader")
         value["schema"] = "fcb.atlas-imports/1"
         value.merge(importProof, uniquingKeysWith: { _, value in value })
         value.merge([
             "link_id": String(link), "side": side.rawValue, "file_id": String(file + 2), "source_revision": "1",
             "path": path(name(file, projection: .imports)), "source_sha256": digest(file),
-            "source_bytes": String(source(file, projection: .imports).utf8.count),
+            "source_bytes": String(importSourceBytes(file, encoding: encoding)),
             "source_observation": "retained-index-capture", "source_reopened": false, "additional_source_bytes_read": "0",
-            "reader_owner": String(reader), "reader": readerInfo(reader, file: file, projection: .imports),
+            "reader_owner": String(reader), "reader": readerInfo(reader, file: file, projection: .imports, importEncoding: encoding),
             "relationship": row, "evidence_range": row["evidence_range"]!,
-            "initial_original_offset": side == .evidence ? String(11 + (link - 1) * 11) : "0"
+            "initial_original_offset": side == .evidence ? importEvidenceRange(link, encoding: encoding)["start"]! : "0"
         ], uniquingKeysWith: { _, value in value })
         return value
     }
@@ -360,7 +409,7 @@ extension ProjectLinksFixture {
             self.importGenerations[owner] = generation; self.importSteps[owner] = 0
             self.lock.unlock()
             return self.call("imports-begin", Self.importPage(owner: owner, generation: generation,
-                command: "imports-begin", examined: 0))
+                command: "imports-begin", examined: 0, encoding: self.largeImportEncoding))
         }, step: { owner, generation, _ in
             self.lock.lock()
             precondition(self.importGenerations[owner] == generation)
@@ -369,7 +418,7 @@ extension ProjectLinksFixture {
             if next == 2 { self.acceptedImportGenerations[owner] = generation }
             self.lock.unlock()
             return self.call("imports-step", Self.importPage(owner: owner, generation: generation,
-                command: "imports-step", examined: next))
+                command: "imports-step", examined: next, encoding: self.largeImportEncoding))
         }, page: { owner, generation, direction, hex, start, limit in
             guard self.accepts(generation, owner: owner, imports: true) else {
                 return self.call("imports-page", ["schema": "fcb.atlas-imports/1", "status": "error",
@@ -382,7 +431,7 @@ extension ProjectLinksFixture {
                     "error": ["code": "ATLAS_IMPORTS_PATH_NOT_FOUND"]])
             }
             var page = Self.importPage(owner: owner, generation: generation, command: "imports-page",
-                direction: direction, path: selected, start: start, limit: limit)
+                direction: direction, path: selected, start: start, limit: limit, encoding: self.largeImportEncoding)
             if let selected, let at = names.firstIndex(of: selected) { page["filter_file_id"] = String(at + 1) }
             return self.call("imports-page", page)
         }, openReader: { owner, reader, generation, link, side in
@@ -395,7 +444,7 @@ extension ProjectLinksFixture {
             self.readerProjections[reader] = .imports
             self.lock.unlock()
             return self.call("imports-reader", Self.importReceipt(owner: owner, reader: reader,
-                generation: generation, link: link, side: side))
+                generation: generation, link: link, side: side, encoding: self.largeImportEncoding))
         })
     }
 }

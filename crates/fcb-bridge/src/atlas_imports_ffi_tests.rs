@@ -27,7 +27,9 @@ fn workspace_source(source: &[u8]) -> (PathBuf, u64) {
     let handle = fcb_atlas_create(); assert_ne!(handle, 0);
     let text = CString::new(root.to_str().unwrap()).unwrap();
     assert!(take(unsafe { fcb_atlas_open(handle, text.as_ptr(), 100) }).contains("\"status\":\"ok\""));
-    assert!(take(fcb_atlas_index_prepare(handle, 1, 100, 8192, 65536, 65536)).contains("\"capture_complete\":true"));
+    let max_file_bytes = source.len().max(8192) as u64;
+    assert!(take(fcb_atlas_index_prepare(handle, 1, 100, max_file_bytes,
+        (max_file_bytes * 2).max(65536), 65536)).contains("\"capture_complete\":true"));
     (root, handle)
 }
 fn begin(handle: u64, generation: u64) -> String {
@@ -262,4 +264,44 @@ fn c_literal_require_and_import_calls_reach_exact_frozen_source_and_targets() {
         }
     }
     assert_eq!(fcb_atlas_close(atlas), 1);
+}
+
+
+#[test]
+fn c_large_imports_keep_late_utf16_evidence_after_project_and_index_close() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let prefix = "// retained import source \u{1f980}\r\n".repeat(6000);
+    let statement = "mod child;";
+    for big in [false, true] {
+        let encode = |text: &str, bom: bool| -> Vec<u8> {
+            let mut bytes = if !bom { Vec::new() } else if big { vec![0xfe, 0xff] } else { vec![0xff, 0xfe] };
+            for unit in text.encode_utf16() {
+                bytes.extend_from_slice(&if big { unit.to_be_bytes() } else { unit.to_le_bytes() });
+            }
+            bytes
+        };
+        let source = encode(&format!("{prefix}{statement}\r\n"), true);
+        assert!(source.len() > 128 * 1024);
+        let (root, handle) = workspace_source(&source);
+        assert!(take(fcb_atlas_imports_begin(handle, 1, 1, 100, 1024 * 1024)).contains("\"status\":\"ok\""));
+        let page = finish(handle, 1);
+        assert!(page.contains("\"relationships_complete\":true"), "{page}");
+        assert_eq!(number(&page, "max_source_bytes"), 1024 * 1024);
+        assert_eq!(number(&page, "retained_links"), 1);
+        let id = number(&page, "link_id");
+        let start = encode(&prefix, true).len() as u64;
+        let expected = encode(statement, false);
+        fs::write(root.join("src/lib.rs"), b"mod changed;").unwrap();
+        let reader = fcb_reader_create(); assert_ne!(reader, 0);
+        let receipt = take(fcb_atlas_imports_open_reader(handle, reader, 1, id, 0));
+        assert_eq!(number(&receipt, "initial_original_offset"), start);
+        assert_eq!(number(&receipt, "additional_source_bytes_read"), 0);
+        assert!(receipt.contains("\"source_reopened\":false"));
+        let retained_page = unsafe { fcb_atlas_imports_page(handle, 1, 0, std::ptr::null(), 0, 64) };
+        assert!(take(fcb_atlas_index_clear(handle, 2)).contains("\"status\":\"ok\""));
+        assert_eq!(fcb_atlas_close(handle), 1);
+        assert!(take(retained_page).contains("\"destination\":\"child\""));
+        assert!(take(fcb_reader_copy_range(reader, start, start + expected.len() as u64)).contains(&hex(&expected)));
+        assert_eq!(fcb_reader_close(reader), 1);
+    }
 }

@@ -135,6 +135,7 @@ struct AtlasProjectLinkRange: Equatable, Sendable {
 
 /// Native validation of engine evidence, never native source parsing or resolution.
 struct AtlasProjectImportEvidence: Equatable, Sendable {
+    static let sourceLimit: UInt64 = 1024 * 1024
     let language, kind, resolutionBasis: String
 
     static func validateRoot(_ w: AtlasIndexWire) throws {
@@ -337,7 +338,7 @@ struct AtlasProjectLink: Identifiable, Sendable, Equatable, Decodable {
         } else {
             block = nil; destinationSuffix = ""; fragmentResolution = "none"
             importEvidence = try AtlasProjectImportEvidence(w)
-            guard bytes <= 131_072, evidenceRange.start < evidenceRange.end, evidenceRange.end <= bytes,
+            guard bytes <= AtlasProjectImportEvidence.sourceLimit, evidenceRange.start < evidenceRange.end, evidenceRange.end <= bytes,
                   !destination.isEmpty,
                   importEvidence?.resolutionBasis != "python-absolute-module-candidate" || !destination.hasPrefix("."),
                   try w.absent(["block_index", "destination_suffix", "fragment_resolution"]) else {
@@ -450,7 +451,7 @@ struct AtlasProjectLinksCoverage: Equatable, Sendable {
                   try w.number("max_markdown_source_bytes") == 262_144 else { throw AtlasProjectLinksError.invalidResponse }
         } else {
             try AtlasProjectImportEvidence.validateRoot(w)
-            guard try w.number("max_source_bytes") == 131_072 else { throw AtlasProjectLinksError.invalidResponse }
+            guard try w.number("max_source_bytes") == AtlasProjectImportEvidence.sourceLimit else { throw AtlasProjectLinksError.invalidResponse }
         }
         guard try w.text("source_observation") == "retained-index-captures",
               try w.number("max_links") == 4096, try w.number("max_parse_bytes") == 32 * 1024 * 1024,

@@ -41,7 +41,8 @@ import Foundation
             ("projection", "compiler-imports"), ("relationship_kind", "parsed-markdown-link"),
             ("evidence_precision", "whole-captured-markdown-document"), ("extractor", "unknown"),
             ("resolver", "compiler"), ("extraction_policy", "all-languages"),
-            ("source_bytes_read", "1"), ("read_calls", "1"), ("max_source_bytes", "262144"),
+            ("source_bytes_read", "1"), ("read_calls", "1"), ("max_source_bytes", "131072"),
+            ("max_source_bytes", "262144"),
             ("pending_source_files", "1"), ("retained_links", "71")
         ] {
             var bad = valid; bad[key] = value; refuse(bad, index: index)
@@ -52,7 +53,7 @@ import Foundation
         }
         for (key, value) in [
             ("language", "python"), ("lexical_import_kind", "javascript-import"), ("resolution_basis", "external-specifier"),
-            ("source_bytes", "131073"), ("source_file_id", "5"), ("source_link_id", "0"), ("destination", "")
+            ("source_bytes", "1048577"), ("source_file_id", "5"), ("source_link_id", "0"), ("destination", "")
         ] {
             var bad = valid, rows = valid["links"] as! [[String: Any]]
             rows[0][key] = value; bad["links"] = rows; refuse(bad, index: index)
@@ -685,7 +686,49 @@ import Foundation
         }
     }
 
+    @MainActor private static func largeSourceReaders() async throws {
+        precondition(AtlasProjectImportEvidence.sourceLimit == 1_048_576)
+        for encoding in ["utf8", "utf16le", "utf16be"] {
+            let fixture = ProjectLinksFixture(includesImports: true, largeImportEncoding: encoding)
+            let model = AtlasProjectLinksModel(root: "/project", projection: .imports, transport: fixture.transport)
+            model.prepare(); await settled(model)
+            let page = model.page!, link = page.links[0]
+            let unit: UInt64 = encoding == "utf8" ? 1 : 2
+            let first: UInt64 = 1_048_576 - 70 * 11 * unit
+            precondition(link.source.capturedBytes == 1_048_576 && link.evidenceRange.start == first
+                && link.evidenceRange.end == first + 10 * unit && link.canOpenTarget)
+            let source = try await model.open(link, from: page, side: .evidence, readerTransport: fixture.readerTransport)
+            let target = try await model.open(link, from: page, side: .target, readerTransport: fixture.readerTransport)
+            let raw = ProjectLinksFixture.largeImportSource(encoding)
+            let statementHex = ProjectLinksFixture.hex(raw[Int(first)..<Int(first + 10 * unit)])
+            precondition(source.reader.page?.start == first
+                && source.reader.page?.identity.capturedBytes == 1_048_576
+                && source.reader.page?.identity.encoding == encoding
+                && source.reader.page?.text.hasPrefix("mod child;\n") == true
+                && source.reader.page?.originalHex.hasPrefix(statementHex) == true
+                && !source.reader.canRefresh,
+                "Large import evidence must use the retained original-byte reader")
+            precondition(target.reader.page?.start == 0 && target.reader.page?.identity.encoding == "utf8"
+                && target.reader.page?.text.hasPrefix("pub struct Child;") == true)
+            model.close()
+            precondition(source.reader.canPin && target.reader.canPin)
+            let last = first + 69 * 11 * unit
+            source.reader.offsetInput = String(last); source.reader.goToByte()
+            let deadline = ProcessInfo.processInfo.systemUptime + 10
+            while source.reader.busy && ProcessInfo.processInfo.systemUptime < deadline { await Task.yield() }
+            precondition(!source.reader.busy && source.reader.page?.start == last
+                && source.reader.page?.text == "mod child;\n"
+                && source.reader.page?.originalHex == ProjectLinksFixture.hex(raw[Int(last)...]),
+                "Closing the inventory must preserve independent reading and lossless copy bytes near EOF")
+            precondition(fixture.index.count("create:") == 1
+                && fixture.log.filter { $0 == "imports-begin" }.count == 1
+                && fixture.log.filter { $0 == "imports-step" }.count == 2)
+            source.reader.close(); target.reader.close()
+        }
+    }
+
     @MainActor static func main() async throws {
+        try await largeSourceReaders()
         let fixture = ProjectLinksFixture(includesImports: true), index = try await prepared(fixture)
         try ProjectLinksGeometryTests.run(index, projection: .imports)
         try wire(index)

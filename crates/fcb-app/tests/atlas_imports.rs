@@ -759,7 +759,9 @@ fn source_and_parse_limits_never_turn_unexamined_members_into_proven_absence() {
     let oversized = vec![b' '; MAX_ATLAS_IMPORT_SOURCE_BYTES + 1];
     let source = b"import './a';";
     let mut f = Fixture::new(&[("a.ts", b""), ("b.ts", source), ("bad.ts", b"\xff"), ("huge.ts", &oversized)]);
-    f.build(1); let page = f.prepare(1, 1);
+    f.search.prepare_index(&f.atlas, 1, AtlasIndexOptions { max_file_bytes: 2 * 1024 * 1024,
+        ..index_options() }, || false).unwrap();
+    let page = f.prepare(1, 1);
     assert!(!page.get("relationships_complete").flag());
     assert_eq!(page.get("scanned_source_files").number(), 2);
     assert_eq!(page.get("unsupported_source_files").number(), 1);
@@ -1129,4 +1131,77 @@ fn rust_literal_includes_connect_project_backlinks_to_retained_docs() {
         row.get("link_id").number(), Side::Target, || false).unwrap();
     assert!(!json(&receipt).get("source_reopened").flag());
     assert_eq!(reader.capture().bytes(), text);
+}
+
+
+#[test]
+fn large_import_sources_keep_late_ranges_reverse_links_and_independent_readers() {
+    let prefix = "// retained import source \u{1f980}\r\n".repeat(6000);
+    let statement = "import './target';";
+    for encoding in 0..3 {
+        let encode = |text: &str, bom: bool| -> Vec<u8> {
+            if encoding == 0 {
+                let mut bytes = if bom { vec![0xef, 0xbb, 0xbf] } else { Vec::new() };
+                bytes.extend_from_slice(text.as_bytes()); return bytes;
+            }
+            let mut bytes = if !bom { Vec::new() } else if encoding == 1 { vec![0xff, 0xfe] } else { vec![0xfe, 0xff] };
+            for unit in text.encode_utf16() {
+                bytes.extend_from_slice(&if encoding == 1 { unit.to_le_bytes() } else { unit.to_be_bytes() });
+            }
+            bytes
+        };
+        let source = encode(&format!("{prefix}{statement}\r\n"), true);
+        assert!(source.len() > 128 * 1024 && source.len() <= MAX_ATLAS_IMPORT_SOURCE_BYTES);
+        let target = b"export const original = 1;\n";
+        let start = encode(&prefix, true).len();
+        let expected = encode(statement, false);
+        let mut f = Fixture::new(&[("main.ts", &source), ("target.ts", target)]);
+        f.build(1); let page = f.prepare(1, 1);
+        assert!(page.get("relationships_complete").flag());
+        assert_eq!(page.get("source_limited_source_files").number(), 0);
+        let row = link(&page, b"main.ts", "./target");
+        let id = row.get("link_id").number();
+        assert_eq!(row.get("source_bytes").number(), source.len() as u64);
+        assert_eq!(row.get("evidence_range").get("start").number(), start as u64);
+        assert_eq!(range(row.get("evidence_range"), &source), expected);
+        assert_eq!(range(row.get("specifier_range"), &source), encode("./target", false));
+        let incoming = f.page(1, Direction::Incoming, Some(b"target.ts"), 0, 64);
+        assert_eq!(incoming.get("links").array(), page.get("links").array());
+        f.begin(2, 1, 64, MAX_ATLAS_IMPORT_PARSE_BYTES);
+        let mut polls = 0;
+        assert!(matches!(f.search.step_imports(&f.atlas, 2, || {
+            polls += 1; polls == 8
+        }), Err(Error::Canceled)));
+        assert_eq!(f.search.import_generation(), Some(1));
+        assert_eq!(f.page(1, Direction::All, None, 0, 64).get("links"), page.get("links"));
+        fs::write(f.root.join("main.ts"), b"import 'replacement';").unwrap();
+        fs::write(f.root.join("target.ts"), b"replacement target").unwrap();
+        let (mut evidence, receipt) = f.search.open_import_reader(&f.atlas, owner(73910 + encoding * 2),
+            1, id, Side::Evidence, || false).unwrap();
+        assert_eq!(json(&receipt).get("initial_original_offset").number(), start as u64);
+        assert_eq!(json(&receipt).get("additional_source_bytes_read").number(), 0);
+        let (mut reader, _) = f.search.open_import_reader(&f.atlas, owner(73911 + encoding * 2),
+            1, id, Side::Target, || false).unwrap();
+        f.search.clear_index(&f.atlas, 2, || false).unwrap(); drop(f.search);
+        assert_eq!(json(&evidence.copy_range(start as u64, (start + expected.len()) as u64,
+            || false).unwrap()).get("original_hex").text(), hex(&expected));
+        assert_eq!(json(&reader.copy_range(0, target.len() as u64, || false).unwrap())
+            .get("original_hex").text(), hex(target));
+    }
+}
+
+#[test]
+fn maximum_import_source_reaches_the_final_statement_in_a_captured_project() {
+    let tail = b"*/\nimport './target';\n";
+    let mut source = b"/*".to_vec();
+    source.resize(MAX_ATLAS_IMPORT_SOURCE_BYTES - tail.len(), b'x');
+    source.extend_from_slice(tail);
+    let mut f = Fixture::new(&[("main.ts", &source), ("target.ts", b"")]);
+    f.build(1); let page = f.prepare(1, 1);
+    assert!(page.get("relationships_complete").flag());
+    assert_eq!(page.get("parsed_source_bytes").number(), MAX_ATLAS_IMPORT_SOURCE_BYTES as u64);
+    let row = link(&page, b"main.ts", "./target");
+    assert_eq!(range(row.get("evidence_range"), &source), b"import './target';");
+    assert_eq!(row.get("resolution").text(), "captured");
+    assert!(row.get("evidence_range").get("start").number() > 128 * 1024);
 }

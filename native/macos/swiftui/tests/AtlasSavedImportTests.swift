@@ -4,11 +4,46 @@ import Dispatch
 /// The foreign replies are fixed protocol vectors, not a second extractor.
 /// The shared fixture supplies independently retained original-byte readers.
 private final class SavedImportFixture: @unchecked Sendable {
-    let base = SavedRepositoryFixture(searchVectors: true)
+    let base: SavedRepositoryFixture
     let sourceOrdinal: UInt64
-    init(sourceOrdinal: UInt64 = 1) { self.sourceOrdinal = sourceOrdinal }
-    var evidenceStart: UInt64 { sourceOrdinal == 1 ? 202 : (sourceOrdinal == 2 ? 404 : 2) }
-    var evidenceEnd: UInt64 { sourceOrdinal == 1 ? 208 : (sourceOrdinal == 2 ? 416 : 8) }
+    let largeEncoding: String?
+    init(sourceOrdinal: UInt64 = 1, largeEncoding: String? = nil) {
+        precondition(largeEncoding == nil || sourceOrdinal == 1)
+        self.sourceOrdinal = sourceOrdinal; self.largeEncoding = largeEncoding
+        let replacement = largeEncoding.map { encoding in
+            SavedRepositoryFixture.Member(path: Array("src/large.rs".utf8), display: "src/large.rs",
+                bytes: Self.largeSource(encoding), digest: String(repeating: "c", count: 64), encoding: encoding)
+        }
+        base = SavedRepositoryFixture(searchVectors: true, sourceMemberOverride: replacement)
+    }
+    /// Exact original source vectors; the native fixture does not extract or
+    /// hash declarations. Real extraction is covered by host and C regressions.
+    private static func largeSource(_ encoding: String) -> [UInt8] {
+        precondition(["utf8", "utf16le", "utf16be"].contains(encoding))
+        let unit = encoding == "utf8" ? 1 : 2
+        func bytes(_ text: String) -> [UInt8] {
+            if unit == 1 { return Array(text.utf8) }
+            return text.utf16.flatMap { value in
+                encoding == "utf16le" ? [UInt8(value & 255), UInt8(value >> 8)]
+                    : [UInt8(value >> 8), UInt8(value & 255)]
+            }
+        }
+        let bom: [UInt8] = encoding == "utf8" ? [239, 187, 191]
+            : encoding == "utf16le" ? [255, 254] : [254, 255]
+        let suffix = bytes("// 😀\r\n" + String(repeating: "mod saved;\n", count: 70))
+        let padding = (1_048_576 - bom.count - suffix.count) / unit
+        let raw = bom + bytes(String(repeating: " ", count: padding)) + suffix
+        precondition(raw.count == 1_048_576)
+        return raw
+    }
+    var evidenceStart: UInt64 {
+        if let largeEncoding { return 1_048_576 - 70 * 11 * (largeEncoding == "utf8" ? 1 : 2) }
+        return sourceOrdinal == 1 ? 202 : (sourceOrdinal == 2 ? 404 : 2)
+    }
+    var evidenceEnd: UInt64 {
+        if let largeEncoding { return evidenceStart + 10 * (largeEncoding == "utf8" ? 1 : 2) }
+        return sourceOrdinal == 1 ? 208 : (sourceOrdinal == 2 ? 416 : 8)
+    }
     var source: SavedRepositoryFixture.Member { base.members[Int(sourceOrdinal)] }
     let entered = DispatchSemaphore(value: 0), resume = DispatchSemaphore(value: 0)
     private let lock = NSLock()
@@ -33,11 +68,14 @@ private final class SavedImportFixture: @unchecked Sendable {
     }
     func link(_ id: UInt64) -> [String: Any] {
         let target = base.members[id == 1 ? 3 : 4]
+        let unit: UInt64 = largeEncoding == nil || largeEncoding == "utf8" ? 1 : 2
+        let specifierStart = largeEncoding == nil ? evidenceStart + 2 : evidenceStart + 4 * unit
+        let specifierEnd = largeEncoding == nil ? evidenceEnd - 2 : evidenceEnd - unit
         var row: [String: Any] = ["link_id": String(id), "source_member": String(sourceOrdinal), "source_file_id": String(sourceOrdinal + 1),
             "source_revision": String(sourceOrdinal + 1), "source_digest": source.digest!, "source_path": base.path(source.path, source.display),
             "source_bytes": String(source.bytes!.count), "source_link_id": String(id),
             "evidence_range": ["start": String(evidenceStart), "end": String(evidenceEnd)],
-            "specifier_range": ["start": String(evidenceStart + 2), "end": String(evidenceEnd - 2)],
+            "specifier_range": ["start": String(specifierStart), "end": String(specifierEnd)],
             "language": "rust", "lexical_import_kind": "rust-module", "destination": "saved",
             "resolution": id == 1 ? "captured" : "unavailable", "resolution_basis": "rust-module-file-candidate",
             "target_member": id == 1 ? "3" : "4", "target_file_id": id == 1 ? "4" : "5",
@@ -62,7 +100,7 @@ private final class SavedImportFixture: @unchecked Sendable {
             "parser_diagnostics": "0", "retained_links": "2", "links_seen": "2",
             "member_bytes_read": String(source.bytes!.count), "member_read_calls": "1",
             "peak_source_bytes": String(source.bytes!.count), "retained_source_payload_bytes": "0",
-            "max_links": "4096", "max_source_bytes": "33554432", "max_member_source_bytes": "131072",
+            "max_links": "4096", "max_source_bytes": "33554432", "max_member_source_bytes": String(AtlasSavedImportWire.maximumMemberBytes),
             "direction": direction.rawValue, "filter_member": member.map { String($0) as Any } ?? NSNull(),
             "offset": String(start), "limit": String(limit), "matching_links": String(matches.count), "links": rows,
             "next_offset": start + UInt64(rows.count) < UInt64(matches.count) ? String(start + UInt64(rows.count)) as Any : NSNull()
@@ -591,7 +629,70 @@ private final class SavedImportFixture: @unchecked Sendable {
         }
     }
 
+    @MainActor private static func largeSourceReaders() async throws {
+        precondition(AtlasSavedImportWire.maximumMemberBytes == 1_048_576)
+        for encoding in ["utf8", "utf16le", "utf16be"] {
+            let fixture = SavedImportFixture(largeEncoding: encoding)
+            let browser = AtlasSavedRepositoryModel(transport: fixture.transport)
+            browser.open(path: "/saved/repository.fcbs", accessLease: nil)
+            await wait("large import archive") { !browser.busy }
+            let identity = browser.info!.identity
+            func decode(_ value: [String: Any]) throws -> AtlasSavedImports {
+                try AtlasSavedImports.decode(fixture.base.encode(value), identity: identity, generation: 1,
+                    direction: .all, member: nil, start: 0, limit: 64)
+            }
+            let wire = fixture.page(identity.owner, generation: 1)
+            let admitted = try decode(wire)
+            precondition(admitted.links[0].sourceBytes == 1_048_576
+                && admitted.links[0].evidence.end == fixture.evidenceEnd)
+            var oldLimit = wire; oldLimit["max_member_source_bytes"] = "131072"
+            reject { _ = try decode(oldLimit) }
+            // The same ceiling bounds the simultaneously held source and Go
+            // module payload, even when the aggregate read budget has room.
+            var excessPeak = wire
+            excessPeak["member_bytes_read"] = "1114112"; excessPeak["peak_source_bytes"] = "1048577"
+            reject { _ = try decode(excessPeak) }
+            for (field, wrong) in [
+                ("source_bytes", "1048577" as Any),
+                ("evidence_range", ["start": String(fixture.evidenceStart), "end": "1048577"])
+            ] {
+                var invalid = wire, rows = wire["links"] as! [[String: Any]]
+                rows[0][field] = wrong; invalid["links"] = rows
+                reject { _ = try decode(invalid) }
+            }
+            browser.prepareImports(); await wait("large import build") { !browser.busy }
+            let page = browser.imports!, link = page.links[0]
+            let source = try await browser.openImport(link, from: page, side: .evidence,
+                readerTransport: fixture.base.readerTransport())
+            let target = try await browser.openImport(link, from: page, side: .target,
+                readerTransport: fixture.base.readerTransport())
+            let shown = source.reader.page!, bytes = fixture.source.bytes!
+            let unit: UInt64 = encoding == "utf8" ? 1 : 2
+            precondition(source.member.observedBytes == 1_048_576
+                && shown.identity.encoding == encoding && shown.start == fixture.evidenceStart - 128
+                && shown.text.contains("// 😀\r\nmod saved;\n") && !shown.hasReplacements
+                && !source.reader.canRefresh)
+            let selectedHex = String(shown.originalHex.dropFirst(Int((fixture.evidenceStart - shown.start) * 2))
+                .prefix(Int((fixture.evidenceEnd - fixture.evidenceStart) * 2)))
+            precondition(selectedHex == fixture.base.hex(bytes[Int(fixture.evidenceStart)..<Int(fixture.evidenceEnd)]),
+                "Late import statement copy bytes must come from the retained original encoding")
+            precondition(target.member.id == 3 && target.reader.page?.identity.encoding == "utf16be")
+            browser.closeArchive()
+            precondition(source.reader.canPin && target.reader.canPin)
+            let last = fixture.evidenceStart + 69 * 11 * unit
+            source.reader.offsetInput = String(last); source.reader.goToByte()
+            await wait("large retained import navigation") { !source.reader.busy }
+            precondition(source.reader.page?.start == last && source.reader.page?.text == "mod saved;\n"
+                && source.reader.page?.originalHex == fixture.base.hex(bytes[Int(last)...])
+                && !fixture.base.calls.contains("LIVE-OPEN")
+                && fixture.calls.filter { $0.hasPrefix("prepare:") }.count == 1,
+                "Archive closure must not recapture or discard the independently retained large source")
+            source.reader.close(); target.reader.close(); browser.close()
+        }
+    }
+
     @MainActor static func main() async throws {
+        try await largeSourceReaders()
         let f = SavedImportFixture()
         let browser = AtlasSavedRepositoryModel(transport: f.transport)
         browser.open(path: "/saved/repository.fcbs", accessLease: nil)
@@ -616,7 +717,8 @@ private final class SavedImportFixture: @unchecked Sendable {
         precondition(interruptedPage.readCalls > interruptedPage.sourceBytes, "interrupted snapshot attempts can exceed byte count")
         for (field, value) in [("owner", "99" as Any), ("compiler_resolved", true), ("source_members", "0"),
             ("member_bytes_read", "33554433"), ("retained_source_payload_bytes", "1"), ("next_offset", "1"),
-            ("limit", "63"), ("import_generation", "2"), ("peak_source_bytes", "131073")] {
+            ("limit", "63"), ("import_generation", "2"), ("peak_source_bytes", "1048577"),
+            ("max_member_source_bytes", "131072")] {
             var invalid = f.page(identity.owner, generation: 1); invalid[field] = value
             reject { _ = try decode(invalid) }
         }

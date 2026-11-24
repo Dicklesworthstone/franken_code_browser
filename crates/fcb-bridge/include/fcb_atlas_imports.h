@@ -25,6 +25,9 @@ extern "C" {
  * independent from text queries, index builds and Markdown-link generations.
  * index_generation must name the currently accepted retained index.
  * max_imports is 1..4096; max_parse_bytes is 0..32 MiB of aggregate source input.
+ * Each source admits at most 1 MiB of original bytes. UTF-8 and BOM-marked
+ * UTF-16 preserve exact original evidence ranges; extraction remains bounded.
+ * Go module metadata retains its separate 64 KiB per-source allowance.
  * Zero input allowance cannot establish absence in unexamined source.
  * A failed/canceled replacement preserves the previous accepted inventory.
  */
