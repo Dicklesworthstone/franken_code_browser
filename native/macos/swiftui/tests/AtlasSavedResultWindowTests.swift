@@ -23,10 +23,14 @@ private final class SavedResultWindowFixture: @unchecked Sendable {
     private var scans: [Scan] = []
     private var metadata: [String] = []
     private var fault: Fault?
+    private var metadataChange: String?
+    private var changedMetadata: String?
     private func locked<T>(_ body: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return body() }
     var calls: [Scan] { locked { scans } }
     var metadataCalls: [String] { locked { metadata } }
+    var changedMetadataReply: String? { locked { changedMetadata } }
     func failNext(_ value: Fault) { locked { fault = value } }
+    func changeNextMetadata(_ field: String) { locked { metadataChange = field } }
 
     private func render(_ reply: String, scan: Scan, start: UInt64 = 0, limit: UInt64 = 64) -> String {
         var out = try! JSONSerialization.jsonObject(with: Data(reply.utf8)) as! [String: Any]
@@ -70,6 +74,9 @@ private final class SavedResultWindowFixture: @unchecked Sendable {
             out["state"] = first && !scan.counting ? "truncated" : "complete"
             out["truncated"] = first; out["complete"] = false
             out["metadata_omitted"] = String(omitted)
+            // These synthetic envelopes account for the full counted source
+            // work, not only the two original witnesses used for activation.
+            out["loaded_bytes"] = "65536"; out["member_bytes_read"] = "65536"
             if first { out["metadata_bytes"] = "1048576" }
         } else {
             out["truncated"] = seen > retained
@@ -110,7 +117,19 @@ private final class SavedResultWindowFixture: @unchecked Sendable {
         guard let scan = locked({ accepted[namespace] }), scan.generation == generation else { return nil }
         guard let reply = upstream.run(owner, request) else { return nil }
         locked { metadata.append("\(namespace.rawValue):\(generation):\(start)") }
-        return render(reply, scan: scan, start: start, limit: limit)
+        let result = render(reply, scan: scan, start: start, limit: limit)
+        let field = locked { () -> String? in
+            let value = metadataChange; metadataChange = nil; return value
+        }
+        guard let field else { return result }
+        precondition(namespace == .structure)
+        var out = try! JSONSerialization.jsonObject(with: Data(result.utf8)) as! [String: Any]
+        let value = UInt64(out[field] as! String)!
+        out[field] = String(["max_hits", "max_source_bytes", "files_searched"].contains(field) ? value - 1 : value + 1)
+        if field == "loaded_bytes" { out["member_bytes_read"] = out[field] }
+        let changed = base.encode(out)
+        locked { changedMetadata = changed }
+        return changed
     }
 
     var transport: AtlasSavedTransport {
@@ -198,6 +217,7 @@ enum AtlasSavedResultWindowTests {
         try await literalWindowsKeepPoliciesAndExactReaders()
         await refusedLostAndCanceledWindowsReconcileOnce()
         try await expressionAndStructureWindowsKeepIndependentAuthority()
+        try await structuralMetadataCannotRewriteAcceptedCoverage()
     }
 
     @MainActor private static func literalWindowsKeepPoliciesAndExactReaders() async throws {
@@ -350,5 +370,50 @@ enum AtlasSavedResultWindowTests {
         _ = try await structuralReader.withMatchReader { $0 }
         precondition(!f.base.calls.contains("LIVE-OPEN"))
         expressionReader.reader.close(); structuralReader.reader.close(); model.close()
+    }
+
+    @MainActor private static func structuralMetadataCannotRewriteAcceptedCoverage() async throws {
+        let f = SavedResultWindowFixture(), model = await opened(f)
+        model.searchMode = .occurrences; model.searchInput = f.base.occurrenceNeedle; model.search()
+        await wait("structural summary query did not finish") { !model.busy }
+        model.loadStructureWindow(offset: 4098, from: model.structurePage!)
+        await wait("structural summary tail did not finish") { !model.busy }
+        let accepted = model.structurePage!
+        precondition(accepted.maximum == 4096 && accepted.hits.count == 2)
+        let reader = try await model.openStructureHit(accepted.hits[1], from: accepted,
+            readerTransport: f.base.readerTransport())
+        let scans = f.calls.count
+        for field in ["max_hits", "max_source_bytes", "loaded_bytes", "peak_source_bytes",
+            "member_read_calls", "metadata_bytes", "files_searched"] {
+            f.changeNextMetadata(field)
+            model.loadStructureResults(start: 0, from: accepted)
+            await wait("changed structural \(field) did not drain") { !model.busy }
+            // Each changed page is individually valid. Its failure is the
+            // attempt to rewrite this already accepted query's frozen facts.
+            let changed = try AtlasSavedStructurePage.decode(f.changedMetadataReply,
+                identity: accepted.identity, generation: accepted.generation, mode: accepted.mode,
+                nameMode: accepted.nameMode, needle: accepted.needle, start: 0, limit: 64,
+                resultOffset: accepted.window.offset, policy: accepted.policy)
+            precondition(!changed.hasSameSummary(as: accepted))
+            precondition(model.structurePage!.hasSameSummary(as: accepted) && model.structurePage?.start == 0
+                && model.structureIsCurrent && reader.canUseMatch && f.calls.count == scans,
+                "Metadata pagination rewrote accepted \(field)")
+            let pages = f.metadataCalls.count, handoffs = f.base.calls.filter { $0.hasPrefix("handoff:") }.count
+            model.loadStructureResults(start: 1, from: changed)
+            model.loadStructureWindow(offset: 0, from: changed)
+            await refused("Changed structural summary authorized source activation") {
+                _ = try await model.openStructureHit(changed.hits[0], from: changed,
+                    readerTransport: f.base.readerTransport())
+            }
+            precondition(!model.busy && f.calls.count == scans && f.metadataCalls.count == pages
+                && f.base.calls.filter { $0.hasPrefix("handoff:") }.count == handoffs)
+        }
+        model.loadStructureResults(start: 1, from: accepted)
+        await wait("unchanged structural metadata did not finish") { !model.busy }
+        precondition(model.structurePage?.start == 1 && model.structurePage!.hasSameSummary(as: accepted)
+            && f.calls.count == scans, "A valid metadata page was refused")
+        model.closeArchive()
+        precondition(reader.canUseMatch && reader.match?.originalHex == f.base.hex(f.base.searchUTF16[2..<416]))
+        reader.reader.close(); model.close()
     }
 }

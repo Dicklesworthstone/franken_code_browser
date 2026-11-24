@@ -256,6 +256,20 @@ import Dispatch
         zero["retained_matching_files"] = "0"; zero["hits"] = [[String: Any]]()
         let countOnly = try decodeLiteral(zero)
         precondition(countOnly.complete && countOnly.hits.isEmpty && countOnly.seen == 12000 && countOnly.truncated)
+        precondition(countOnly.window.hasMore && countOnly.window.next == nil,
+            "Legacy count-only metadata invented a nonprogressing result window")
+        for offset in [UInt64(0), 7000] {
+            var countedWindow = zero
+            countedWindow["result_offset"] = String(offset); countedWindow["skipped_matches"] = String(offset)
+            countedWindow["has_more_matches"] = true; countedWindow["next_match_offset"] = NSNull()
+            let accepted = try decodeLiteral(countedWindow)
+            precondition(accepted.counting.exact && accepted.seen == 12000 && accepted.window.offset == offset
+                && accepted.window.hasMore && accepted.window.next == nil)
+            countedWindow["next_match_offset"] = String(offset)
+            rejected("literal count-only evidence authorized an unchanged cursor") { _ = try decodeLiteral(countedWindow) }
+            countedWindow["next_match_offset"] = String(offset + 1)
+            rejected("literal count-only evidence invented a row to advance") { _ = try decodeLiteral(countedWindow) }
+        }
         for field in ["count_all_matches", "matches_seen_exact", "max_matches", "matching_files", "retained_matching_files"] {
             var bad = literal; bad.removeValue(forKey: field)
             rejected("counted literal accepted missing \(field)") { _ = try decodeLiteral(bad) }
@@ -289,6 +303,17 @@ import Dispatch
         expressionZero["retained_matching_files"] = "0"; expressionZero["hits"] = [[String: Any]]()
         let noRows = try decodeExpression(expressionZero)
         precondition(noRows.complete && noRows.seen == 12000 && noRows.hits.isEmpty)
+        precondition(noRows.window.hasMore && noRows.window.next == nil)
+        expressionZero["result_offset"] = "7000"; expressionZero["skipped_matches"] = "7000"
+        expressionZero["has_more_matches"] = true; expressionZero["next_match_offset"] = NSNull()
+        let countedTail = try decodeExpression(expressionZero)
+        precondition(countedTail.complete && countedTail.window.hasMore && countedTail.window.next == nil)
+        expressionZero["state"] = "work-limit"; expressionZero["complete"] = false
+        expressionZero["matches_seen_exact"] = false
+        let partialTail = try decodeExpression(expressionZero)
+        precondition(!partialTail.counting.exact && partialTail.seen == 12000 && partialTail.window.next == nil)
+        expressionZero["next_match_offset"] = "7000"
+        rejected("expression count-only evidence authorized an unchanged cursor") { _ = try decodeExpression(expressionZero) }
         for field in ["count_all_matches", "matching_files", "retained_matching_files"] {
             var bad = expression; bad.removeValue(forKey: field)
             rejected("counted expression accepted missing \(field)") { _ = try decodeExpression(bad) }
@@ -1257,6 +1282,10 @@ import Dispatch
         counted["metadata_omitted"] = "0"; counted["complete"] = true
         let navigable = try countedPage()
         precondition(navigable.complete && navigable.truncated && navigable.window.next == 1)
+        let countBeforeCorruption = counted["matches_seen"]!
+        counted["matches_seen"] = String(UInt64(counted["loaded_bytes"] as! String)! + 1)
+        rejected("structural count exceeded all admitted source bytes") { _ = try countedPage() }
+        counted["matches_seen"] = countBeforeCorruption
         counted["max_hits"] = "0"; counted["retained_hits"] = "0"; counted["hits"] = [[String: Any]]()
         counted["result_offset"] = "0"; counted["skipped_matches"] = "0"; counted["has_more_matches"] = false
         counted["next_match_offset"] = NSNull()

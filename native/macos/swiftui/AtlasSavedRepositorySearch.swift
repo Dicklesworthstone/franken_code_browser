@@ -137,8 +137,12 @@ struct AtlasSavedResultWindow: Equatable, Sendable {
         }
         let end = skipped + retained + omitted
         let more = raw.more ?? legacyMore
-        let next = raw.offset == nil ? (more ? end : nil) : raw.next
-        guard more == (permitsContinuation && seen > end), next == (more ? end : nil) else {
+        // Literal/expression count-only queries retain omitted-match evidence
+        // without an advancing cursor. Structural zero-row queries suppress
+        // that evidence as well through permitsContinuation.
+        let continuation: UInt64? = more && retained > 0 && end > offset ? end : nil
+        let next = raw.offset == nil ? continuation : raw.next
+        guard more == (permitsContinuation && seen > end), next == continuation else {
             throw AtlasSavedError.invalidResponse
         }
         return Self(offset: offset, skipped: skipped, hasMore: more, next: next)
@@ -298,9 +302,28 @@ struct AtlasSavedStructurePage: Sendable {
     let state: String
     let complete, truncated, matchesSeenExact: Bool
     let policy: AtlasSavedStructurePolicy
+    let maximum: UInt64
     let retained, seen, visited, loaded, searched, unavailable, unsupported: UInt64
     let sourceLimited, extractionLimited, metadataOmitted, sourceBytes, sourceLimit, metadataBytes: UInt64
+    let peakSourceBytes, memberReadCalls: UInt64
     let window: AtlasSavedResultWindow
+
+    /// Metadata pagination belongs to one immutable accepted extraction. A new
+    /// page may replace its rows, never its limits, coverage or source-I/O facts.
+    func hasSameSummary(as other: Self) -> Bool {
+        identity == other.identity && generation == other.generation
+            && needle.utf8.elementsEqual(other.needle.utf8) && mode == other.mode && nameMode == other.nameMode
+            && policy == other.policy && maximum == other.maximum
+            && window == other.window && state == other.state && complete == other.complete
+            && truncated == other.truncated && matchesSeenExact == other.matchesSeenExact
+            && retained == other.retained && seen == other.seen
+            && visited == other.visited && loaded == other.loaded && searched == other.searched
+            && unavailable == other.unavailable && unsupported == other.unsupported
+            && sourceLimited == other.sourceLimited && extractionLimited == other.extractionLimited
+            && metadataOmitted == other.metadataOmitted && sourceBytes == other.sourceBytes
+            && sourceLimit == other.sourceLimit && metadataBytes == other.metadataBytes
+            && peakSourceBytes == other.peakSourceBytes && memberReadCalls == other.memberReadCalls
+    }
 
     static func decode(_ json: String?, identity: AtlasSavedIdentity, generation: UInt64,
         mode expectedMode: AtlasSavedSearchMode?, nameMode expectedName: AtlasSearchNameMode?,
@@ -354,6 +377,7 @@ struct AtlasSavedStructurePage: Sendable {
                   !w.truncated || retained == w.max_hits.value,
                   (w.state == "truncated") == (w.truncated && !policy.countAllMatches),
                   policy.countAllMatches || w.matches_seen.value - window.skipped == retained + omitted + (w.truncated ? 1 : 0),
+                  !policy.countAllMatches || w.matches_seen.value <= bytes,
                   visited <= identity.members, loaded <= visited, loaded <= identity.captured,
                   searched <= loaded, unavailable <= visited, unavailable <= identity.members - identity.captured,
                   unsupported <= visited - unavailable, limited <= visited - unavailable - unsupported,
@@ -393,10 +417,11 @@ struct AtlasSavedStructurePage: Sendable {
             }
             return Self(identity: identity, generation: generation, needle: w.needle, mode: mode, nameMode: nameMode,
                 hits: w.hits.values, start: start, next: next, state: w.state, complete: w.complete, truncated: w.truncated,
-                matchesSeenExact: w.matches_seen_exact, policy: policy, retained: retained, seen: w.matches_seen.value, visited: visited, loaded: loaded, searched: searched,
+                matchesSeenExact: w.matches_seen_exact, policy: policy, maximum: w.max_hits.value,
+                retained: retained, seen: w.matches_seen.value, visited: visited, loaded: loaded, searched: searched,
                 unavailable: unavailable, unsupported: unsupported, sourceLimited: limited, extractionLimited: extractionLimited,
                 metadataOmitted: omitted, sourceBytes: bytes, sourceLimit: w.max_source_bytes.value, metadataBytes: w.metadata_bytes.value,
-                window: window)
+                peakSourceBytes: w.peak_source_bytes.value, memberReadCalls: calls, window: window)
         } catch let error as AtlasSavedError { throw error }
         catch { throw AtlasSavedError.invalidResponse }
     }

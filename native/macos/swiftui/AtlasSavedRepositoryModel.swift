@@ -1537,7 +1537,8 @@ private final class AtlasSavedSession: @unchecked Sendable {
                         policy: policy), flag: flag),
                     identity: info.identity, generation: generation, mode: mode, nameMode: nameMode,
                     needle: needle, start: 0, limit: 64, policy: policy)
-                guard page.window.offset == 0 else { throw AtlasSavedError.invalidResponse }
+                guard page.window.offset == 0, page.maximum == AtlasSavedSearchWire.maximumHits,
+                      page.sourceLimit == AtlasSavedSearchWire.maximumSourceBytes else { throw AtlasSavedError.invalidResponse }
                 guard model.session === lease, !model.closed else { throw AtlasSavedError.canceled }
                 model.structureGeneration = generation; model.structurePage = page
                 model.notice = page.complete ? "Finished extraction across the captured manifest. Results retain their stated evidence level."
@@ -1571,10 +1572,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
     }
     func loadStructureWindow(offset: UInt64, from page: AtlasSavedStructurePage) {
         guard canOperate, structureIsCurrent, let accepted = structurePage,
-              page.identity == accepted.identity, page.generation == accepted.generation,
-              page.start == accepted.start, page.window == accepted.window,
-              page.mode == accepted.mode, page.nameMode == accepted.nameMode, page.policy == accepted.policy,
-              page.needle.utf8.elementsEqual(accepted.needle.utf8),
+              page.hasSameSummary(as: accepted), page.start == accepted.start,
               offset != page.window.offset, offset == page.window.next || offset < page.window.offset else { return }
         perform { model, flag in
             guard let lease = model.session else { throw AtlasSavedError.unavailable }
@@ -1583,11 +1581,13 @@ private final class AtlasSavedSession: @unchecked Sendable {
             do {
                 let next = try AtlasSavedStructurePage.decode(await model.run(lease,
                     .structureWindow(generation: generation, mode: page.mode, nameMode: page.nameMode,
-                        query: page.needle, matches: AtlasSavedSearchWire.maximumHits,
+                        query: page.needle, matches: page.maximum,
                         sourceBytes: page.sourceLimit, skipMatches: offset, policy: page.policy), flag: flag),
                     identity: page.identity, generation: generation, mode: page.mode, nameMode: page.nameMode,
                     needle: page.needle, start: 0, limit: 64, resultOffset: offset, policy: page.policy)
-                guard next.sourceLimit == page.sourceLimit else { throw AtlasSavedError.invalidResponse }
+                guard next.sourceLimit == page.sourceLimit, next.maximum == page.maximum else {
+                    throw AtlasSavedError.invalidResponse
+                }
                 guard model.session === lease, !model.closed else { throw AtlasSavedError.canceled }
                 model.structureGeneration = generation; model.structurePage = next
                 model.notice = next.complete ? "Loaded the structural window at its stated evidence level."
@@ -1602,19 +1602,15 @@ private final class AtlasSavedSession: @unchecked Sendable {
     }
 
     func loadStructureResults(start: UInt64, from page: AtlasSavedStructurePage) {
-        guard structureIsCurrent, let accepted = structurePage, page.identity == accepted.identity,
-              page.generation == accepted.generation, page.start == accepted.start, page.window == accepted.window,
-              page.mode == accepted.mode, page.nameMode == accepted.nameMode, page.policy == accepted.policy,
-              page.needle.utf8.elementsEqual(accepted.needle.utf8), start <= accepted.retained else { return }
+        guard structureIsCurrent, let accepted = structurePage, page.hasSameSummary(as: accepted),
+              page.start == accepted.start, start <= accepted.retained else { return }
         perform { model, flag in
             guard let lease = model.session else { throw AtlasSavedError.unavailable }
             let next = try AtlasSavedStructurePage.decode(await model.run(lease,
                 .structureResults(generation: page.generation, start: start, limit: 64), flag: flag),
                 identity: page.identity, generation: page.generation, mode: page.mode, nameMode: page.nameMode,
                 needle: page.needle, start: start, limit: 64, policy: page.policy)
-            guard next.window == accepted.window, next.retained == accepted.retained, next.seen == accepted.seen,
-                  next.matchesSeenExact == accepted.matchesSeenExact,
-                  next.complete == accepted.complete, next.sourceLimit == accepted.sourceLimit else {
+            guard next.hasSameSummary(as: accepted) else {
                 throw AtlasSavedError.invalidResponse
             }
             guard model.session === lease, !model.closed, model.structureGeneration == page.generation else {
@@ -1656,10 +1652,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
         readerTransport: AtlasReaderTransport, search: AtlasReaderSearchTransport? = nil,
         outline: AtlasReaderOutlineTransport? = nil, document: AtlasReaderDocumentTransport? = nil) async throws -> AtlasSavedReaderCapture {
         guard structureIsCurrent, let accepted = structurePage, info?.identity == page.identity,
-              accepted.identity == page.identity, structureGeneration == page.generation, accepted.generation == page.generation,
-              accepted.start == page.start, accepted.window == page.window,
-              accepted.mode == page.mode, accepted.nameMode == page.nameMode, accepted.policy == page.policy,
-              accepted.needle.utf8.elementsEqual(page.needle.utf8),
+              structureGeneration == page.generation, accepted.hasSameSummary(as: page), accepted.start == page.start,
               page.hits.contains(where: { $0.matches(item) }), accepted.hits.contains(where: { $0.matches(item) }) else {
             throw AtlasSavedError.invalidInput
         }
