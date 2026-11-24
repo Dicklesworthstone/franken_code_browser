@@ -11,10 +11,11 @@ use fcb::search::ResourceBudget;
 use crate::{AppError, allocation, owner};
 use crate::output::{Output, MAX_ENCODED_BYTES, OUTPUT_OVERHEAD_BYTES};
 use super::super::{HostResponse, atlas_session::{AtlasSession, AtlasSessionError, AtlasSessionOptions,
-        MAX_ATLAS_DIRECTORY_BYTES, directory_path},
+        MAX_ATLAS_DIRECTORY_BYTES, MAX_ATLAS_FILE_BYTES, directory_path, file_path},
     catalog_session::CatalogDiscoveryPolicy};
 
 pub const MAX_PROJECT_DIRECTORY_BYTES: usize = MAX_ATLAS_DIRECTORY_BYTES;
+pub const MAX_PROJECT_FILE_BYTES: usize = MAX_ATLAS_FILE_BYTES;
 
 /// Response-local IDs do not authorize later source access. Paths are reversible
 /// native payloads, including names the current UTF-8-only native opener cannot
@@ -51,6 +52,22 @@ pub fn prepare_directory(root: &Path, directory: &[u8], max_files: usize,
     encode_catalog(&atlas, canceled)
 }
 
+/// Metadata for one exact member under the original project root. Siblings do
+/// not consume this catalog's allowance, so a member omitted from a wide parent
+/// catalog can still receive its own atlas. Ancestor rules and confinement use
+/// the same retained engine as directory discovery; no source payload is read.
+/// The distinct receipt closes only the selected file's discovery scope, never
+/// its parent folder or project. Deliberate exclusions may produce zero rows.
+pub fn prepare_file(root: &Path, file: &[u8], max_files: usize,
+    policy: CatalogDiscoveryPolicy, mut canceled: impl FnMut() -> bool)
+    -> Result<HostResponse, AtlasSessionError> {
+    if canceled() { return Err(AtlasSessionError::Canceled); }
+    let path = file_path(file)?;
+    let atlas = AtlasSession::open_file_with_policy(owner(), root, path,
+        AtlasSessionOptions { max_files, ..Default::default() }, policy, &mut canceled)?;
+    encode_catalog(&atlas, canceled)
+}
+
 fn encode_catalog(atlas: &AtlasSession, mut canceled: impl FnMut() -> bool)
     -> Result<HostResponse, AtlasSessionError> {
     let catalog = atlas.atlas().catalog();
@@ -62,7 +79,15 @@ fn encode_catalog(atlas: &AtlasSession, mut canceled: impl FnMut() -> bool)
     let lease = budget.try_reserve_managed(owner(), allocation(94),
         ByteLength::new((3 * MAX_ENCODED_BYTES + 4096) as u64)).map_err(|_| AppError::Admission)?;
     let mut out = Output::new(owner(), MAX_ENCODED_BYTES, &budget, allocation(1))?;
-    if let Some(directory) = catalog.directory() {
+    if let Some(file) = catalog.file() {
+        if catalog.entries().len() > 1
+            || catalog.entries().iter().any(|entry| entry.path().as_bytes() != file.as_bytes()) {
+            return Err(AppError::InvalidRange.into());
+        }
+        out.literal("{\"schema\":\"fcb.project-file-catalog/1\",\"status\":\"ok\",\"command\":\"file-catalog\",\"file\":")?;
+        out.path(&file.raw().to_path_buf())?;
+        out.literal(",\"path_basis\":\"project-root\"")?;
+    } else if let Some(directory) = catalog.directory() {
         out.literal("{\"schema\":\"fcb.project-directory-catalog/1\",\"status\":\"ok\",\"command\":\"directory-catalog\",\"directory\":")?;
         out.path(&directory.raw().to_path_buf())?;
         out.literal(",\"path_basis\":\"project-root\"")?;
@@ -105,6 +130,10 @@ fn encode_catalog(atlas: &AtlasSession, mut canceled: impl FnMut() -> bool)
 #[cfg(all(test, unix))]
 #[path = "project_directory_catalog_tests.rs"]
 mod directory_tests;
+
+#[cfg(all(test, unix))]
+#[path = "project_file_catalog_tests.rs"]
+mod file_tests;
 
 #[cfg(all(test, unix))]
 mod tests {

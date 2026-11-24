@@ -154,6 +154,45 @@ pub unsafe extern "C" fn fcb_project_directory_catalog_cancelable(root: *const c
 #[cfg(all(test, unix))]
 mod directory_tests;
 
+/// Metadata for exactly one regular file under the ORIGINAL project root.
+/// Siblings are not enumerated, so a file discovered after a bounded directory
+/// catalog can still receive its own atlas. The fcb.project-file-catalog/1 reply
+/// echoes the exact raw file path; completeness describes only that file.
+/// # Safety
+/// root/poll/context obey fcb_project_catalog_cancelable's call-scoped contract.
+/// For admitted lengths, file points to file_len initialized readable bytes in
+/// one allocation, stable until return. Invalid policy/length/file limits and
+/// null file pointers refuse before input dereference or callback polling.
+/// Free each non-null result exactly once with fcb_free_string. Worker only.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_project_file_catalog_cancelable(root: *const c_char,
+    file: *const u8, file_len: u64, max_files: u64, discovery_policy: u64,
+    poll: Option<SearchCancellationCallback>, context: *mut c_void) -> *mut c_char {
+    reply(|| {
+        let policy = match discovery_policy {
+            0 => host::catalog_session::CatalogDiscoveryPolicy::RepositoryRules,
+            1 => host::catalog_session::CatalogDiscoveryPolicy::IncludeExcluded,
+            _ => return None,
+        };
+        let max_files = usize::try_from(max_files).ok()?;
+        let file_len = usize::try_from(file_len).ok()?;
+        if !(1..=host::atlas_session::MAX_ATLAS_SESSION_FILES).contains(&max_files)
+            || !(1..=host::atlas::MAX_PROJECT_FILE_BYTES).contains(&file_len)
+            || file.is_null() { return None; }
+        let canceled = || poll.is_some_and(|p| unsafe { p(context) != 0 });
+        if canceled() { return None; }
+        let root = unsafe { cstr(root) }?;
+        let file = unsafe { std::slice::from_raw_parts(file, file_len) };
+        let result = host::atlas::prepare_file_catalog(Path::new(root),
+            file, max_files, policy, canceled).ok()?;
+        if canceled() { return None; }
+        string_out(result.as_str())
+    })
+}
+
+#[cfg(all(test, unix))]
+mod file_tests;
+
 #[cfg(test)]
 mod catalog_tests {
     use super::*;

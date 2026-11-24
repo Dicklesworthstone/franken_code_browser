@@ -62,6 +62,29 @@ char *fcb_project_directory_catalog_cancelable(const char *root,
     const uint8_t *directory, uint64_t directory_len, uint64_t max_files,
     uint64_t discovery_policy, int32_t (*poll)(void *), void *context);
 
+/* Metadata atlas of exactly one existing regular file under the ORIGINAL
+ * project root. file is 1..2048 raw Unix bytes, with up to 32 nonempty path
+ * components; no ".", "..", NUL, leading/trailing slash or normalization.
+ * Backslashes and non-UTF-8 names preserve their original bytes. max_files is
+ * 1..20000; at most one row is returned. Siblings are never enumerated and do
+ * not consume the selected file's allowance. discovery_policy is 0 or 1 as
+ * above; inherited rules, own-artifact exclusions and original grants apply.
+ * Invalid policy/length/file limits or null file pointers return null before
+ * input dereference or polling. Missing, directory and symlink targets refuse.
+ * Non-null fcb.project-file-catalog/1 JSON has command file-catalog, an exact
+ * reversible "file" echo and path_basis "project-root". Every returned row
+ * names exactly that file; discovery_complete refers ONLY to the selected
+ * file, never its parent or the project. A rule-excluded file may yield an
+ * explicitly empty catalog; unresolved policy remains incomplete. No source
+ * payload is read. This route does not change another catalog or reader.
+ * root, file, poll and context remain valid through return. Worker-only;
+ * free each non-null reply once with fcb_free_string. Cancellation, integer
+ * encoding and response-local IDs follow the existing metadata contracts.
+ */
+char *fcb_project_file_catalog_cancelable(const char *root,
+    const uint8_t *file, uint64_t file_len, uint64_t max_files,
+    uint64_t discovery_policy, int32_t (*poll)(void *), void *context);
+
 /* Progressive project file discovery with retained page/row authority.
  * Four live/retiring handles; shared identity allocator with reader/atlas/saved
  * sessions. Create reserves an EMPTY cancelable handle without filesystem I/O.

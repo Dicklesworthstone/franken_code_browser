@@ -254,4 +254,5 @@ mod tests {
 #[path = "project_catalog.rs"]
 mod project_catalog;
 pub use project_catalog::{prepare_directory as prepare_directory_catalog, MAX_PROJECT_DIRECTORY_BYTES};
+pub use project_catalog::{prepare_file as prepare_file_catalog, MAX_PROJECT_FILE_BYTES};
 pub use project_catalog::{prepare as prepare_catalog, prepare_with_policy as prepare_catalog_with_policy};
