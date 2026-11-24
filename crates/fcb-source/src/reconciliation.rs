@@ -28,7 +28,7 @@ use crate::discovery::{
 };
 use crate::old_anchor::{fnv1a, OldAnchor};
 use crate::path::NormalizedPath;
-use crate::{CancelFlag, ObservationDigest, SourceError};
+use crate::{CancelFlag, CompleteCapture, ObservationDigest, SourceError};
 
 // Compare authoritative path bytes at component boundaries. Native backslashes
 // and non-UTF8 names must not be normalized again when determining scan scope.
@@ -866,6 +866,7 @@ pub struct SourceAnnotation {
     pub file_id: FileId,
     pub revision: SourceRevision,
     pub anchor: OldAnchor,
+    /// Non-cryptographic change detector; never authority to attach to new bytes.
     pub expected_digest: u64,
     pub text: String,
 }
@@ -895,6 +896,9 @@ impl SourceAnnotation {
 pub enum OrphanReason {
     /// Content at the anchor byte offset diverged.
     ContentDiverged,
+    /// Exact original source evidence was unavailable or did not match the annotation.
+    /// Digest equality alone cannot authorize a new revision.
+    ExactWitnessUnavailable,
     /// Anchor offset exceeds the new file length.
     OffsetOutOfBounds,
     /// Path was recycled with a new identity; note cannot attach to an unrelated file (§8.8).
@@ -960,17 +964,69 @@ impl AnnotationRegistry {
         self.orphaned.len()
     }
 
-    /// Reattach active annotations for a modified file.
+    /// Preserve annotations when only a legacy digest is available.
     ///
-    /// Validates the content at the anchor against the recorded digest.
-    /// If content matches, reattaches to `new_revision`.
-    /// Otherwise, preserves the annotation as orphaned with its original evidence intact.
+    /// A differing digest can establish divergence, but an equal digest cannot
+    /// prove equality with the original captured bytes. Unlike older versions,
+    /// this compatibility method never reattaches: equal digests become
+    /// `ExactWitnessUnavailable` orphans with their original evidence intact.
+    /// Call `reattach_for_file_modification_verified` with the retained original
+    /// and newly admitted captures to authorize exact same-offset reattachment.
     pub fn reattach_for_file_modification(
         &mut self,
         file_id: FileId,
         new_revision: SourceRevision,
         new_bytes: &[u8],
         anchor_len: usize,
+    ) -> Vec<AnnotationReattachment> {
+        self.reattach_with_witness(file_id, new_revision, new_bytes, anchor_len, None)
+    }
+
+    /// Reattach by exact comparison against retained original source evidence.
+    ///
+    /// Both captures must name the same file and owner, cover the whole observed
+    /// source, and name different revisions. The caller supplies the original
+    /// accepted capture used to create the annotations; a fresh pathname read
+    /// or a capture relabeled as the old revision is not historical evidence.
+    /// Each annotation must name that original revision and a nonempty range
+    /// whose recorded digest agrees with its retained bytes. Only exact equality
+    /// at the same offset in the newly admitted capture permits reattachment.
+    ///
+    /// Invalid capture pairs are rejected before changing the registry. Missing
+    /// per-annotation evidence or divergent bytes retain an orphan with the
+    /// original revision, anchor, digest and note. Source backing is borrowed;
+    /// this worker operation neither reads files nor copies source payloads.
+    pub fn reattach_for_file_modification_verified(
+        &mut self,
+        original: &CompleteCapture,
+        current: &CompleteCapture,
+        anchor_len: usize,
+    ) -> Result<Vec<AnnotationReattachment>, SourceError> {
+        let original_request = original.request();
+        let current_request = current.request();
+        if original_request.file().owner() != current_request.file().owner() {
+            return Err(SourceError::ForeignOwner);
+        }
+        if original_request.file() != current_request.file() {
+            return Err(SourceError::MetadataMismatch);
+        }
+        if original_request.range().is_some() || current_request.range().is_some() || anchor_len == 0 {
+            return Err(SourceError::InvalidRange);
+        }
+        if original_request.revision() == current_request.revision() {
+            return Err(SourceError::StaleCapture);
+        }
+        Ok(self.reattach_with_witness(current_request.file(), current_request.revision(),
+            current.bytes(), anchor_len, Some(original)))
+    }
+
+    fn reattach_with_witness(
+        &mut self,
+        file_id: FileId,
+        new_revision: SourceRevision,
+        new_bytes: &[u8],
+        anchor_len: usize,
+        original: Option<&CompleteCapture>,
     ) -> Vec<AnnotationReattachment> {
         let mut results = Vec::new();
         let target_ids: Vec<AnnotationId> = self
@@ -983,22 +1039,38 @@ impl AnnotationRegistry {
         for id in target_ids {
             let mut ann = self.active.remove(&id).expect("target id existed");
             let offset = ann.anchor.offset;
+            let end = offset.checked_add(anchor_len);
+            let candidate = end.and_then(|end| new_bytes.get(offset..end));
+            let reason = match (candidate, original) {
+                (None, _) => Some(OrphanReason::OffsetOutOfBounds),
+                (Some(candidate), None) => Some(if fnv1a(candidate) == ann.expected_digest {
+                    OrphanReason::ExactWitnessUnavailable
+                } else {
+                    OrphanReason::ContentDiverged
+                }),
+                (Some(candidate), Some(original)) => {
+                    let witness = end.and_then(|end| original.bytes().get(offset..end));
+                    if ann.revision != original.request().revision()
+                        || ann.anchor.revision != ann.revision.get()
+                    {
+                        Some(OrphanReason::ExactWitnessUnavailable)
+                    } else if let Some(witness) = witness.filter(|bytes| fnv1a(bytes) == ann.expected_digest) {
+                        (witness != candidate).then_some(OrphanReason::ContentDiverged)
+                    } else {
+                        Some(OrphanReason::ExactWitnessUnavailable)
+                    }
+                }
+            };
 
-            let end = offset.saturating_add(anchor_len);
-            let Some(slice) = new_bytes.get(offset..end) else {
+            if let Some(reason) = reason {
                 let orphaned = OrphanedAnnotation {
                     annotation: ann,
-                    reason: OrphanReason::OffsetOutOfBounds,
+                    reason,
                     orphaned_at_revision: Some(new_revision),
                 };
                 self.orphaned.insert(id, orphaned.clone());
                 results.push(AnnotationReattachment::Orphaned(orphaned));
-                continue;
-            };
-
-            let actual_digest = fnv1a(slice);
-
-            if actual_digest == ann.expected_digest {
+            } else {
                 let new_anchor = OldAnchor::new(offset, new_revision.get());
                 ann.revision = new_revision;
                 ann.anchor = new_anchor;
@@ -1009,14 +1081,6 @@ impl AnnotationRegistry {
                     new_revision,
                     new_anchor,
                 });
-            } else {
-                let orphaned = OrphanedAnnotation {
-                    annotation: ann,
-                    reason: OrphanReason::ContentDiverged,
-                    orphaned_at_revision: Some(new_revision),
-                };
-                self.orphaned.insert(id, orphaned.clone());
-                results.push(AnnotationReattachment::Orphaned(orphaned));
             }
         }
 
