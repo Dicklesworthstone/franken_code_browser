@@ -7,6 +7,17 @@ private typealias WorkspaceStreamProgress = @convention(c) (
 @_silgen_name("fcb_atlas_open_cancelable") private func workspaceStreamOpen(
     _ owner: UInt64, _ root: UnsafePointer<CChar>?, _ maximumFiles: UInt64,
     _ poll: WorkspaceStreamPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_atlas_open_with_policy_cancelable") private func workspaceStreamOpenWithPolicy(
+    _ owner: UInt64, _ root: UnsafePointer<CChar>?, _ maximumFiles: UInt64, _ policy: UInt64,
+    _ poll: WorkspaceStreamPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_atlas_open_directory_with_policy_cancelable") private func workspaceStreamOpenDirectory(
+    _ owner: UInt64, _ root: UnsafePointer<CChar>?, _ path: UnsafePointer<UInt8>?, _ length: UInt64,
+    _ maximumFiles: UInt64, _ policy: UInt64, _ poll: WorkspaceStreamPoll?,
+    _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_atlas_open_file_with_policy_cancelable") private func workspaceStreamOpenFile(
+    _ owner: UInt64, _ root: UnsafePointer<CChar>?, _ path: UnsafePointer<UInt8>?, _ length: UInt64,
+    _ maximumFiles: UInt64, _ policy: UInt64, _ poll: WorkspaceStreamPoll?,
+    _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_stream_search_scoped_cancelable") private func workspaceStreamSearch(
     _ owner: UInt64, _ needle: UnsafePointer<CChar>?, _ maximumMatches: UInt64,
     _ maximumBytes: UInt64, _ maximumCalls: UInt64,
@@ -128,6 +139,53 @@ extension AtlasWorkspaceStreamTransport {
         progressiveSearch: { owner, request, flag, stop, progress in
             try workspaceStreamProgressive(owner, request, flag, stop, progress)
         }, domain: nativeDomain)
+}
+
+extension AtlasWorkspaceStreamTransport {
+    /// Keep a frozen visible scope in its original file/folder catalog. Opening
+    /// the parent project would spend its file allowance on unrelated siblings.
+    /// The model binds every receipt to these immutable scope/policy values.
+    static func native(catalogScope: AtlasSearchCatalogScope,
+        discoveryPolicy: AtlasDiscoveryPolicy) -> Self {
+        let base = Self.native
+        let progressive: ProgressiveSearch?
+        if let action = base.progressiveSearch {
+            progressive = { owner, request, flag, stop, progress in
+                guard request.catalogScope == catalogScope,
+                      request.discoveryPolicy == discoveryPolicy,
+                      request.pathScope.isContained(in: catalogScope) else {
+                    throw AtlasWorkspaceStreamError.invalidInput
+                }
+                return try action(owner, request, flag, stop, progress)
+            }
+        } else { progressive = nil }
+        return Self(create: base.create, open: { owner, root, flag in
+            try workspaceStreamPolling(flag) { poll, context in
+                root.withCString { root in
+                    if catalogScope.isWorkspace {
+                        return workspaceStreamOpenWithPolicy(owner, root, AtlasWorkspaceStreamLimits.files,
+                            discoveryPolicy.rawValue, poll, context)
+                    }
+                    return catalogScope.rawPath.withUnsafeBufferPointer { path in
+                        if catalogScope.kind == .file {
+                            return workspaceStreamOpenFile(owner, root, path.baseAddress, UInt64(path.count),
+                                1, discoveryPolicy.rawValue, poll, context)
+                        }
+                        return workspaceStreamOpenDirectory(owner, root, path.baseAddress, UInt64(path.count),
+                            AtlasWorkspaceStreamLimits.files, discoveryPolicy.rawValue, poll, context)
+                    }
+                }
+            }
+        }, search: { owner, request, flag in
+            guard request.catalogScope == catalogScope, request.discoveryPolicy == discoveryPolicy,
+                  request.pathScope.isContained(in: catalogScope) else {
+                throw AtlasWorkspaceStreamError.invalidInput
+            }
+            return try base.search(owner, request, flag)
+        }, page: base.page, hit: base.hit, clear: base.clear, cancel: base.cancel, close: base.close,
+            retirementFailed: base.retirementFailed, progressiveSearch: progressive, domain: base.domain,
+            retainedCatalogScope: catalogScope, retainedDiscoveryPolicy: discoveryPolicy)
+    }
 }
 
 private func workspaceStreamPolling(_ flag: AtlasSearchCancellation,

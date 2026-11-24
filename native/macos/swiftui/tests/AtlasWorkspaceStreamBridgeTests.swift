@@ -3,6 +3,7 @@ import Foundation
 @_silgen_name("workspace_stream_fixture_reset") private func reset()
 @_silgen_name("workspace_stream_fixture_mode") private func mode(_ value: Int32)
 @_silgen_name("workspace_stream_fixture_scope") private func scope(_ value: UInt32)
+@_silgen_name("workspace_stream_fixture_discovery_policy") private func discoveryPolicy(_ value: UInt64)
 @_silgen_name("workspace_stream_fixture_count") private func count(_ kind: UInt32) -> UInt32
 @_silgen_name("workspace_stream_fixture_allocations") private func allocations() -> UInt32
 @_silgen_name("workspace_stream_fixture_frees") private func frees() -> UInt32
@@ -19,7 +20,53 @@ private final class WorkspaceProgressCopies: @unchecked Sendable {
 }
 
 @main private enum AtlasWorkspaceStreamBridgeTests {
+
+    private static func scopedCatalogOpening() throws {
+        let directory = try AtlasSearchCatalogScope(directory: [0x73, 0x72, 0x63, 0x2f, 0xff, 0x5c])
+        let file = try AtlasSearchCatalogScope(file: [0x73, 0x72, 0x63, 0x2f, 0xff, 0x5c, 0x2f,
+            0x6c, 0x61, 0x74, 0x65, 0x2e, 0x72, 0x73])
+        for policy in [AtlasDiscoveryPolicy.repositoryRules, .includeExcluded] {
+            for (catalogScope, counter) in [(AtlasSearchCatalogScope.workspace, UInt32(35)), (directory, 36), (file, 37)] {
+                reset(); discoveryPolicy(policy.rawValue)
+                let transport = AtlasWorkspaceStreamTransport.native(catalogScope: catalogScope, discoveryPolicy: policy)
+                let owner = transport.create()
+                precondition(owner == 0xfedcba9876543210)
+                precondition(transport.retainedCatalogScope == catalogScope && transport.retainedDiscoveryPolicy == policy)
+                precondition(!transport.supportsDiscoveryPolicy)
+                let opened = try transport.open(owner, "/repo-é", AtlasSearchCancellation())
+                precondition(opened == "{\"fixture\":\"workspace-stream\"}")
+                precondition(count(counter) == 1 && count(1) == 1 && allocations() == frees())
+                let canceled = AtlasSearchCancellation(); canceled.cancel()
+                let entered = count(counter), polls = count(8)
+                do {
+                    _ = try transport.open(owner, "/repo-é", canceled)
+                    preconditionFailure("Canceled scoped open entered C")
+                } catch AtlasWorkspaceStreamError.canceled { }
+                precondition(count(counter) == entered && count(8) == polls)
+                for late in [Int32(4), Int32(5)] {
+                    mode(late)
+                    let flag = AtlasSearchCancellation(), before = allocations(), released = frees()
+                    do {
+                        _ = try transport.open(owner, "/repo-é", flag)
+                        preconditionFailure("Canceled scoped catalog was published")
+                    } catch AtlasWorkspaceStreamError.canceled { }
+                    precondition(flag.isCanceled && allocations() == frees())
+                    precondition(allocations() == before + (late == 4 ? 1 : 0))
+                    precondition(frees() == released + (late == 4 ? 1 : 0))
+                }
+                mode(0)
+                let unbound = try AtlasWorkspaceStreamRequest(needle: "exact é😀", maximumScanBytes: 1 << 32)
+                do {
+                    _ = try transport.search(owner, unbound, AtlasSearchCancellation())
+                    preconditionFailure("Unbound search entered a scoped retained catalog")
+                } catch AtlasWorkspaceStreamError.invalidInput { }
+                precondition(count(2) == 0 && transport.close(owner))
+            }
+        }
+    }
+
     static func main() throws {
+        try scopedCatalogOpening()
         reset()
         let transport = AtlasWorkspaceStreamTransport.native
         let owner: UInt64 = 0xfedcba9876543210, generation: UInt64 = 0x8000000100000007

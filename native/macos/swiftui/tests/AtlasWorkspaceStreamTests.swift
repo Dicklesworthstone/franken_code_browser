@@ -656,6 +656,8 @@ private final class StreamContextProbe: @unchecked Sendable {
         try progressWireTests()
         try catalogWireTests()
         try discoveryPolicyWireTests()
+        try retainedCatalogScopeWireTests()
+        try await retainedCatalogScopeModelTests()
         try await catalogModelTests()
         try await discoveryPolicyModelTests()
         try await countedModelTests()
@@ -681,6 +683,183 @@ private final class StreamContextProbe: @unchecked Sendable {
             try await Task.sleep(for: .milliseconds(5))
         }
         preconditionFailure("Timed out: " + label)
+    }
+
+
+    private static func scopedReceipt(_ value: [String: Any], scope: AtlasSearchCatalogScope,
+        policy: AtlasDiscoveryPolicy, fingerprint: String = "a") -> [String: Any] {
+        var result = value
+        result["discovery_scope"] = scope.kind.rawValue
+        result["discovery_directory"] = scope.kind == .directory ? StreamFixture.path(scope.rawPath) as Any : NSNull()
+        result["discovery_file"] = scope.kind == .file ? StreamFixture.path(scope.rawPath) as Any : NSNull()
+        result["path_basis"] = "project-root"
+        result["discovery_policy"] = policy.includesExcluded ? policy.wireName
+            : policy.wireName + ":" + String(repeating: fingerprint, count: 64)
+        for key in ["discovery_excluded_entries", "discovery_unavailable_entries",
+            "discovery_symlinks_not_followed", "discovery_special_objects"] { result[key] = "0" }
+        result["excluded_entries"] = "0"
+        result["rule_files_enabled"] = !policy.includesExcluded
+        if policy.includesExcluded { result["rule_policy"] = NSNull() }
+        return result
+    }
+
+    private static func retainedCatalogScopeWireTests() throws {
+        let owner: UInt64 = 0xfedcba9876543210
+        let raw = Array("src/late.txt".utf8), scope = try AtlasSearchCatalogScope(file: raw)
+        let policy = AtlasDiscoveryPolicy.includeExcluded
+        let membership: AtlasSearchPathScope
+#if canImport(CryptoKit)
+        membership = try AtlasSearchPathScope(visiblePaths: [raw])
+#else
+        membership = try AtlasSearchPathScope(kind: .file, path: "src/late.txt")
+#endif
+        let request = try AtlasWorkspaceStreamRequest(needle: "old", pathScope: membership,
+            discoveryPolicy: policy, catalogScope: scope)
+        let opened = scopedReceipt(StreamFixture.catalog(owner), scope: scope, policy: policy)
+        let catalog = try AtlasWorkspaceStreamCatalog.decode(StreamFixture.json(opened), owner: owner,
+            catalogScope: scope, discoveryPolicy: policy)
+        precondition(catalog.discoveryReceipt?.scope == scope && catalog.requestedDiscoveryPolicy == policy)
+        precondition(catalog.discoveryPolicy == policy.wireName)
+        let fields = ["discovery_scope", "discovery_directory", "discovery_file", "path_basis",
+            "discovery_excluded_entries", "discovery_unavailable_entries", "discovery_symlinks_not_followed",
+            "discovery_special_objects", "discovery_policy", "rule_files_enabled", "rule_policy"]
+        for field in fields {
+            var missing = opened; missing.removeValue(forKey: field)
+            rejects("missing exact-file catalog field \(field)") {
+                _ = try AtlasWorkspaceStreamCatalog.decode(StreamFixture.json(missing), owner: owner,
+                    catalogScope: scope, discoveryPolicy: policy)
+            }
+        }
+        for substitute in [try AtlasSearchCatalogScope(file: Array("src/other.txt".utf8)),
+            try AtlasSearchCatalogScope(directory: Array("src".utf8)), .workspace] {
+            rejects("substituted exact-file discovery target") {
+                _ = try AtlasWorkspaceStreamCatalog.decode(StreamFixture.json(
+                    scopedReceipt(StreamFixture.catalog(owner), scope: substitute, policy: policy)),
+                    owner: owner, catalogScope: scope, discoveryPolicy: policy)
+            }
+        }
+        var tooMany = opened; tooMany["catalogued_files"] = "2"; tooMany["workspace_files"] = "2"
+        rejects("single-file scope with sibling rows") {
+            _ = try AtlasWorkspaceStreamCatalog.decode(StreamFixture.json(tooMany), owner: owner,
+                catalogScope: scope, discoveryPolicy: policy)
+        }
+        var value = scopedReceipt(StreamFixture.report(owner, 7, request, count: 1), scope: scope, policy: policy)
+        var rows = value["hits"] as! [[String: Any]]; rows[0]["path"] = StreamFixture.path(raw); value["hits"] = rows
+        let page = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(StreamFixture.page(value)),
+            catalog: catalog, root: catalog.root, request: request)
+        let report = try AtlasWorkspaceStreamReport(summary: page.summary, hits: page.hits)
+        let target = report.target(for: report.hits[0])
+        let witness = StreamFixture.witness(value, index: 0)
+        _ = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(witness), report: report, root: catalog.root, target: target)
+        func progress(_ value: [String: Any]) -> [String: Any] {
+            var result = StreamFixture.page(value)
+            result["command"] = "progress"; result["progress_sequence"] = "1"
+            result["terminal"] = false; result["selection_available"] = false; result["search_complete"] = false
+            return result
+        }
+        _ = try AtlasWorkspaceStreamProgress.decode(StreamFixture.json(progress(value)), catalog: catalog, request: request)
+        for fault in ["sibling", "parent", "omission", "policy", "raw-root"] {
+            var changed = value, changedWitness = witness
+            let key: String, replacement: Any
+            switch fault {
+            case "sibling": key = "discovery_file"; replacement = StreamFixture.path(Array("src/other.txt".utf8))
+            case "parent": key = "discovery_scope"; replacement = "directory"
+            case "omission": key = "discovery_unavailable_entries"; replacement = "1"
+            case "policy": key = "discovery_policy"; replacement = AtlasDiscoveryPolicy.repositoryRules.wireName
+            default: key = "root_path"; replacement = StreamFixture.path(Array("/other-project".utf8))
+            }
+            changed[key] = replacement; changedWitness[key] = replacement
+            rejects("changed scope/policy on retained result page: \(fault)") {
+                _ = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(StreamFixture.page(changed)),
+                    catalog: catalog, root: catalog.root, request: request)
+            }
+            rejects("changed scope/policy on retained progress: \(fault)") {
+                _ = try AtlasWorkspaceStreamProgress.decode(StreamFixture.json(progress(changed)),
+                    catalog: catalog, request: request)
+            }
+            rejects("changed scope/policy on retained witness: \(fault)") {
+                _ = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(changedWitness),
+                    report: report, root: catalog.root, target: target)
+            }
+        }
+        let rules = AtlasDiscoveryPolicy.repositoryRules
+        let rulesRequest = try AtlasWorkspaceStreamRequest(needle: "old", pathScope: membership,
+            discoveryPolicy: rules, catalogScope: scope)
+        let rulesCatalog = try AtlasWorkspaceStreamCatalog.decode(StreamFixture.json(
+            scopedReceipt(StreamFixture.catalog(owner), scope: scope, policy: rules)), owner: owner,
+            catalogScope: scope, discoveryPolicy: rules)
+        let changedRules = scopedReceipt(value, scope: scope, policy: rules, fingerprint: "b")
+        rejects("rule observation changed after catalog acceptance") {
+            _ = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(StreamFixture.page(changedRules)),
+                catalog: rulesCatalog, root: rulesCatalog.root, request: rulesRequest)
+        }
+        // Raw names and project-level filenames remain discovery identities,
+        // including names that the ordinary UTF-8 filename box cannot express.
+        for raw in [Array("late.txt".utf8), [122, 255, 92, 47, 254, 46, 116, 120, 116]] {
+            let rawScope = try AtlasSearchCatalogScope(file: raw)
+            let exact = try AtlasWorkspaceStreamCatalog.decode(StreamFixture.json(
+                scopedReceipt(StreamFixture.catalog(owner), scope: rawScope, policy: rules)),
+                owner: owner, catalogScope: rawScope, discoveryPolicy: rules)
+            precondition(exact.discoveryReceipt?.scope.rawPath == raw)
+        }
+#if canImport(CryptoKit)
+        let empty = try AtlasSearchPathScope(visiblePaths: [])
+        let emptyRequest = try AtlasWorkspaceStreamRequest(needle: "old", pathScope: empty,
+            discoveryPolicy: policy, catalogScope: scope)
+        precondition(emptyRequest.pathScope.visibleCount == 0 && emptyRequest.catalogScope == scope)
+        var emptyValue = scopedReceipt(StreamFixture.report(owner, 8, emptyRequest, count: 0),
+            scope: scope, policy: policy)
+        emptyValue.merge(StreamFixture.scope(emptyRequest, eligible: 0), uniquingKeysWith: { _, next in next })
+        for key in ["files_examined", "payload_bytes_read", "scanned_input_bytes", "read_calls", "peak_input_buffer_bytes"] {
+            emptyValue[key] = "0"
+        }
+        let emptyPage = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(StreamFixture.page(emptyValue)),
+            catalog: catalog, root: catalog.root, request: emptyRequest)
+        precondition(emptyPage.hits.isEmpty && emptyPage.summary.complete && emptyPage.summary.payloadBytes == 0)
+        precondition(emptyPage.summary.catalogReceipt?.scope == scope && emptyPage.summary.eligibleFiles == 0)
+        rejects("visible sibling outside retained file scope") {
+            _ = try AtlasWorkspaceStreamRequest(needle: "old",
+                pathScope: AtlasSearchPathScope(visiblePaths: [Array("src/other.txt".utf8)]),
+                discoveryPolicy: policy, catalogScope: scope)
+        }
+#endif
+    }
+
+    @MainActor private static func retainedCatalogScopeModelTests() async throws {
+        let probe = StreamProbe(), base = probe.transport
+        let scope = try AtlasSearchCatalogScope(file: Array("src/late.txt".utf8))
+        let policy = AtlasDiscoveryPolicy.includeExcluded
+        let transport = AtlasWorkspaceStreamTransport(create: base.create,
+            open: { owner, root, flag in
+                guard let json = try base.open(owner, root, flag),
+                      let value = try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any] else {
+                    throw AtlasWorkspaceStreamError.invalidResponse
+                }
+                return try StreamFixture.json(scopedReceipt(value, scope: scope, policy: policy))
+            }, search: base.search, page: base.page, hit: base.hit, clear: base.clear,
+            cancel: base.cancel, close: base.close, retirementFailed: base.retirementFailed,
+            retainedCatalogScope: scope, retainedDiscoveryPolicy: policy)
+        let membership = try AtlasSearchPathScope(kind: .file, path: "src/late.txt")
+        let model = AtlasWorkspaceStreamModel(transport: transport, query: "old")
+        model.open(.init(root: "/selected-alias/", project: UUID(), browserOwner: 1, access: nil, pathScope: membership))
+        try await wait("exact-file catalog ready") { !model.busy && model.catalog != nil }
+        precondition(model.catalog?.root == StreamFixture.root)
+        precondition(model.catalog?.discoveryReceipt?.scope == scope && model.discoveryPolicy == policy)
+        precondition(!model.supportsDiscoveryPolicy && model.canSearch)
+        model.discoveryPolicy = .repositoryRules
+        precondition(!model.canSearch && probe.searchCount == 0)
+        model.discoveryPolicy = policy
+        precondition(model.canSearch)
+        let original = model.catalog
+        probe.failOpen(); model.refreshCatalog()
+        try await wait("failed exact-file refresh preserved catalog") { !model.busy }
+        precondition(model.catalog == original && model.catalog?.discoveryReceipt?.scope == scope)
+        model.close(); try await wait("scoped catalog retirement") { probe.closedCount == probe.createCount }
+        let created = probe.createCount
+        let invalid = AtlasWorkspaceStreamModel(transport: transport, query: "old")
+        invalid.open(.init(root: StreamFixture.root, project: UUID(), browserOwner: 1, access: nil))
+        precondition(!invalid.canSearch && probe.createCount == created)
+        invalid.close()
     }
 
     private static func streamExcerptWireTests() throws {

@@ -272,6 +272,7 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
          mode: AtlasWorkspaceStreamMode = .text) {
         self.transport = transport; queryText = query
         self.caseSensitive = caseSensitive; self.countAllMatches = countAllMatches; self.mode = mode
+        if transport.retainedCatalogScope != nil { self.discoveryPolicy = transport.retainedDiscoveryPolicy }
     }
     deinit { task?.cancel() }
     static func retryRetirements() { AtlasWorkspaceStreamRetirement.shared.retry() }
@@ -286,13 +287,19 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
     }
     private func currentRequest(startAfter: UInt64 = 0) throws -> AtlasWorkspaceStreamRequest {
         guard let authority else { throw AtlasWorkspaceStreamError.unavailable }
-        guard discoveryPolicy == .repositoryRules || supportsDiscoveryPolicy else {
+        if let catalogScope = transport.retainedCatalogScope {
+            guard discoveryPolicy == transport.retainedDiscoveryPolicy,
+                  authority.pathScope.isContained(in: catalogScope) else {
+                throw AtlasWorkspaceStreamError.unavailable
+            }
+        } else if discoveryPolicy != .repositoryRules && !supportsDiscoveryPolicy {
             throw AtlasWorkspaceStreamError.unavailable
         }
         return try .init(needle: queryText, maximumScanBytes: scanBytes,
             fileScope: authority.fileScope, pathScope: authority.pathScope,
             countAllMatches: effectiveCountAllMatches, caseSensitive: mode == .occurrences || caseSensitive,
-            mode: mode, pageStartAfter: startAfter, discoveryPolicy: discoveryPolicy)
+            mode: mode, pageStartAfter: startAfter, discoveryPolicy: discoveryPolicy,
+            catalogScope: transport.retainedCatalogScope)
     }
     var canRefresh: Bool { !closed && authority != nil }
     var canStopAndKeep: Bool { !closed && busy && searching && !stopping && stopFlag != nil }
@@ -359,7 +366,10 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
         cancelWork(); revokeTargets(clearEvidence: true)
         guard authority.identity.browserOwner > 0, authority.root.utf8.first == 47,
               authority.root.utf8.count <= AtlasObservedReaderLimits.maximumPathBytes,
-              !authority.root.utf8.contains(0) else { notice = AtlasWorkspaceStreamError.invalidInput.message; return }
+              !authority.root.utf8.contains(0),
+              transport.retainedCatalogScope.map({ authority.pathScope.isContained(in: $0) }) != false else {
+            notice = AtlasWorkspaceStreamError.invalidInput.message; return
+        }
         let candidate: AtlasWorkspaceStreamSession
         do { candidate = try .init(transport: transport, access: authority.access) }
         catch { notice = message(error); return }
@@ -371,20 +381,30 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
             } catch { notice = message(error) }
             return
         }
-        let (ticket, flag) = begin("Discovering a fresh catalog of at most 20,000 project files…")
+        let preparing = transport.retainedCatalogScope?.kind == .file
+            ? "Checking the selected file's metadata…"
+            : "Discovering a fresh catalog of at most 20,000 files in the selected scope…"
+        let (ticket, flag) = begin(preparing)
         opening = true; pendingSession = candidate
         let root = authority.root
         task = Task {
             do {
                 let accepted = try await io.perform(cancellation: flag, keepingAlive: [candidate]) {
                     try AtlasWorkspaceStreamCatalog.decode(candidate.transport.open(candidate.handle, root, flag),
-                        owner: candidate.handle)
+                        owner: candidate.handle,
+                        catalogScope: candidate.transport.retainedCatalogScope,
+                        discoveryPolicy: candidate.transport.retainedDiscoveryPolicy)
                 }
                 guard accepts(ticket, flag), pendingSession === candidate else { return }
                 session = candidate; pendingSession = nil; catalog = accepted; lastGeneration = 0
                 finish(ticket)
                 notice = "Catalogued \(accepted.files) files. Press Search to read file contents within the selected total byte budget."
-                if !accepted.discoveryComplete { notice += " Discovery is incomplete; results cannot cover the whole project." }
+                if !accepted.discoveryComplete { notice += " Discovery is incomplete within this catalog's scope." }
+                if accepted.files == 0, accepted.discoveryReceipt?.scope.kind == .file,
+                   let explanation = accepted.discoveryReceipt?.discoveryCoverage?.fileExplanation(
+                        policy: accepted.requestedDiscoveryPolicy) {
+                    notice += " " + explanation
+                }
             } catch { fail(error, ticket: ticket) }
         }
     }

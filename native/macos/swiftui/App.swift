@@ -500,6 +500,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     private func openWorkspaceStreamSearch() {
         guard let authority = snapshotExportSource else { return }
         let pathScope: AtlasSearchPathScope
+        let streamTransport: AtlasWorkspaceStreamTransport
         let types: AtlasSearchFileScope
         do {
             if searchPathKind == .visible {
@@ -508,9 +509,11 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                     return
                 }
                 pathScope = frozen.pathScope
+                streamTransport = .native(catalogScope: frozen.catalogScope, discoveryPolicy: projectBrowser.discoveryPolicy)
             } else {
                 pathScope = try AtlasSearchPathScope(kind: searchPathKind,
                     path: searchPathKind == .workspace ? "" : searchPathInput)
+                streamTransport = .catalogNative
             }
             types = try fileScope.searchScope(custom: customExtensions)
         } catch {
@@ -532,7 +535,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 query: query, caseSensitive: searchCaseSensitive,
                 countAllMatches: searchCountAllMatches,
                 mode: searchMode == .occurrences ? .occurrences : searchMode == .expression ? .expression : .text,
-                transport: pathScope.isVisible ? .native : .catalogNative)
+                transport: streamTransport)
         }
     }
 

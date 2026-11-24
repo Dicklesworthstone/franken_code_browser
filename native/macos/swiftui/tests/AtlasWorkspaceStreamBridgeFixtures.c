@@ -14,10 +14,12 @@ enum { CREATE, OPEN, SEARCH, PAGE, HIT, CLEAR, CANCEL, CLOSE, POLLS,
     OCCURRENCES_SEARCH, OCCURRENCES_PROGRESS, OCCURRENCES_COUNTED,
     WINDOW_SEARCH, WINDOW_PROGRESS, WINDOW_COUNTED, WINDOW_OCCURRENCES, WINDOW_LOWERCASE,
     EXPRESSION_SEARCH, EXPRESSION_PROGRESS, EXPRESSION_CASE_SENSITIVE,
-    EXPRESSION_WINDOW_SEARCH, EXPRESSION_WINDOW_PROGRESS, EXPRESSION_WINDOW_CASE_SENSITIVE, COUNTERS };
+    EXPRESSION_WINDOW_SEARCH, EXPRESSION_WINDOW_PROGRESS, EXPRESSION_WINDOW_CASE_SENSITIVE,
+    POLICY_OPEN, DIRECTORY_OPEN, FILE_OPEN, COUNTERS };
 static uint32_t counts[COUNTERS], allocations, frees;
 static int32_t mode;
 static uint32_t expected_scope;
+static uint64_t expected_discovery_policy;
 static char *owned;
 static const uint64_t owner_value = UINT64_C(0xfedcba9876543210);
 static const uint64_t generation_value = UINT64_C(0x8000000100000007);
@@ -26,9 +28,11 @@ extern void workspace_stream_fixture_cancel(void *context);
 void workspace_stream_fixture_reset(void) {
     assert(owned == NULL && allocations == frees);
     memset(counts, 0, sizeof(counts)); allocations = frees = 0; mode = 0; expected_scope = 0;
+    expected_discovery_policy = 0;
 }
 void workspace_stream_fixture_mode(int32_t value) { mode = value; }
 void workspace_stream_fixture_scope(uint32_t value) { expected_scope = value; }
+void workspace_stream_fixture_discovery_policy(uint64_t value) { expected_discovery_policy = value; }
 uint32_t workspace_stream_fixture_count(uint32_t kind) { assert(kind < COUNTERS); return counts[kind]; }
 uint32_t workspace_stream_fixture_allocations(void) { return allocations; }
 uint32_t workspace_stream_fixture_frees(void) { return frees; }
@@ -99,6 +103,41 @@ char *fcb_atlas_open_cancelable(uint64_t owner, const char *root, uint64_t maxim
     assert(owner == owner_value && maximum_files == 20000 && root != NULL);
     assert(strcmp(root, "/repo-\xc3\xa9") == 0); ++counts[OPEN]; poll_context(poll, context);
     assert(strcmp(root, "/repo-\xc3\xa9") == 0); return response(OPEN);
+}
+
+static char *scoped_open(unsigned kind, uint64_t owner, const char *root,
+    const uint8_t *path, uint64_t path_len, uint64_t maximum_files, uint64_t policy,
+    workspace_fixture_poll poll, void *context) {
+    static const uint8_t directory[] = {0x73, 0x72, 0x63, 0x2f, 0xff, 0x5c};
+    static const uint8_t file[] = {0x73, 0x72, 0x63, 0x2f, 0xff, 0x5c, 0x2f, 0x6c, 0x61, 0x74, 0x65, 0x2e, 0x72, 0x73};
+    assert(owner == owner_value && root != NULL && strcmp(root, "/repo-\xc3\xa9") == 0);
+    assert(policy == expected_discovery_policy && policy <= 1);
+    if (kind == POLICY_OPEN) {
+        assert(path == NULL && path_len == 0 && maximum_files == 20000);
+    } else {
+        const uint8_t *expected = kind == FILE_OPEN ? file : directory;
+        const size_t length = kind == FILE_OPEN ? sizeof(file) : sizeof(directory);
+        assert(path != NULL && path_len == length && memcmp(path, expected, length) == 0);
+        assert(maximum_files == (kind == FILE_OPEN ? 1 : 20000));
+    }
+    ++counts[OPEN]; ++counts[kind]; poll_context(poll, context);
+    if (kind == FILE_OPEN) { assert(path_len == sizeof(file) && memcmp(path, file, sizeof(file)) == 0); }
+    if (kind == DIRECTORY_OPEN) { assert(path_len == sizeof(directory) && memcmp(path, directory, sizeof(directory)) == 0); }
+    return response(OPEN);
+}
+char *fcb_atlas_open_with_policy_cancelable(uint64_t owner, const char *root,
+    uint64_t maximum_files, uint64_t policy, workspace_fixture_poll poll, void *context) {
+    return scoped_open(POLICY_OPEN, owner, root, NULL, 0, maximum_files, policy, poll, context);
+}
+char *fcb_atlas_open_directory_with_policy_cancelable(uint64_t owner, const char *root,
+    const uint8_t *path, uint64_t path_len, uint64_t maximum_files, uint64_t policy,
+    workspace_fixture_poll poll, void *context) {
+    return scoped_open(DIRECTORY_OPEN, owner, root, path, path_len, maximum_files, policy, poll, context);
+}
+char *fcb_atlas_open_file_with_policy_cancelable(uint64_t owner, const char *root,
+    const uint8_t *path, uint64_t path_len, uint64_t maximum_files, uint64_t policy,
+    workspace_fixture_poll poll, void *context) {
+    return scoped_open(FILE_OPEN, owner, root, path, path_len, maximum_files, policy, poll, context);
 }
 static char *fixture_search(uint64_t owner, const char *needle, uint64_t maximum_matches,
     uint64_t maximum_bytes, uint64_t maximum_calls, workspace_fixture_poll poll, void *context,

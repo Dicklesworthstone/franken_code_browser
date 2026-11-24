@@ -23,7 +23,7 @@ import AppKit
                 Spacer()
                 Button(presentation.source.pathScope.isVisible ? "Refresh file catalog" : "Reset search",
                     action: model.refreshCatalog).disabled(!model.canRefresh)
-                    .help("Release this search's results and prepare a fresh discovery of the current project")
+                    .help("Release this search's results and prepare a fresh discovery within the current search scope")
                 Button("Done") { presentation.close(); dismiss() }.keyboardShortcut(.cancelAction)
             }
             Text(verbatim: "Project: " + String(reflecting: presentation.source.root))
@@ -33,7 +33,7 @@ import AppKit
             Text("Search text, expressions or whole identifiers in the selected location and file types, including large files. UTF-8 and BOM-declared UTF-16 are recognized automatically. No per-file byte cap applies; the total byte budget limits the scan.")
                 .font(.caption).foregroundStyle(.secondary)
             Text(presentation.source.pathScope.isVisible
-                ? "This sheet keeps the displayed atlas membership and file-type selection fixed. Its frozen search catalog contains at most 20,000 files; missing requested paths are reported as incomplete coverage."
+                ? "This sheet keeps the displayed files and file-type selection fixed. Discovery uses the same file or folder focus and ignore policy as the atlas; missing requested paths are reported as incomplete coverage."
                 : "This sheet keeps the sidebar's location and file-type selection fixed. Discovery continues beyond the atlas file limit under the selected exclusion policy. The total file count remains unknown until discovery finishes.")
                 .font(.caption).foregroundStyle(.secondary)
             if model.supportsDiscoveryPolicy {
@@ -103,7 +103,7 @@ import AppKit
                 if let catalog = model.catalog {
                     Text(catalog.progressive
                         ? "Progressive project discovery · each search observes current files again"
-                        : "\(catalog.files) catalogued files · \(catalog.discoveryComplete ? "discovery complete under product exclusions" : "discovery incomplete")")
+                        : "\(catalog.files) catalogued files · \(catalog.discoveryComplete ? "discovery complete within this scope" : "discovery incomplete")")
                         .font(.caption).foregroundStyle(.secondary)
                 } else {
                     Text(model.opening ? "Discovering project files…" : "No accepted file catalog")

@@ -1292,11 +1292,12 @@ folder does not create a different root or rewrite its source paths. Existing
 metadata, capture, verification and result limits continue to apply within that
 discovery scope; limited or unavailable sources keep results explicitly partial.
 
-**Visible atlas files** uses the discovery directory of the accepted atlas whose
-membership was frozen. It retains that exact visible membership rather than
-switching to a later layout. Raw native directory and filename bytes remain the
-identity behind displayed labels, including non-UTF-8 names. A stale atlas,
-different directory or changed grant cannot silently broaden the request.
+**Visible atlas files** uses the same file, folder or project catalog as the
+accepted atlas whose membership was frozen. It retains that exact visible
+membership rather than switching to a later layout. Raw native directory and
+filename bytes remain the identity behind displayed labels, including non-UTF-8
+names. A stale atlas, different target or changed grant cannot silently broaden
+the request.
 
 Completed indexes and paused index builds are reusable only under the same
 project root, access grant, discovery policy and typed discovery scope, including
@@ -2063,11 +2064,15 @@ limits; a refusal remains visible as incomplete discovery. Matches keep their ra
 path and original bytes independently of discovery-page eviction, so a result
 from a later file can still be copied or opened in the current-context reader.
 
-Visible-atlas search continues to use the separately retained atlas catalog, with
-at most 20,000 regular files and the same explicit region membership. **Reset
-search** releases a progressive query's results and prepares another query within
-the frozen selection; **Refresh file catalog** rediscovers the visible-atlas
-catalog. The next progressive query observes current membership again, including new files.
+Visible-atlas search opens the exact file, folder or project catalog belonging
+to its frozen view and inherits that view's selected discovery policy. An exact
+file is admitted directly without spending a parent catalog's allowance on its
+siblings; folder and project catalogs retain their 20,000-file bound. The frozen
+region membership remains unchanged, and an empty selection searches no files.
+**Refresh file catalog** observes the same target and policy again. Reopen the
+sheet to choose another scope or policy. **Reset search** releases results and
+prepares another query within the frozen selection. A subsequent progressive
+query observes current membership again, including new files.
 Neither path claims an atomic workspace snapshot or treats undiscovered files as
 proven no-match results. The summary separately reports incomplete discovery,
 unexamined files, unsupported text, unavailable files, failed reads, and byte,
