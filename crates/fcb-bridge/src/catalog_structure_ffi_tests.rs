@@ -46,6 +46,8 @@ fn actual_c_api_retains_raw_path_utf16_symbols_and_installs_an_independent_reade
     let mut query = b"target".to_vec();
     let initial = open(handle, &croot, &query, 0);
     assert!(initial.contains("\"schema\":\"fcb.catalog-structure/1\""));
+    assert!(initial.contains("\"name_case\":\"sensitive\""));
+    assert!(initial.contains("\"case_sensitive\":true"));
     assert_eq!(number(&initial, "payload_bytes_read"), 0);
     query.fill(b'x');
     let complete = drain(handle); let revision = number(&complete, "revision");
@@ -100,6 +102,12 @@ fn invalid_scalars_precede_all_pointer_reads_and_cross_family_handles_refuse() {
             dangling.cast(), dangling.cast(), path_kind, dangling.cast(), hits, bytes, calls, policy) });
         assert!(error.contains("CATALOG_STRUCTURE_HANDLE_INVALID_ARGUMENT"), "{error}");
     }
+    for invalid_case in [2, u64::MAX] {
+        let error = take(unsafe { fcb_catalog_structure_open_matching_with_policy(handle,
+            dangling.cast(), 11, dangling, 1, 0, 2, 0, dangling.cast(), dangling.cast(),
+            0, dangling.cast(), 32, 1024, 1024, invalid_case, 0) });
+        assert!(error.contains("CATALOG_STRUCTURE_HANDLE_INVALID_ARGUMENT"), "{error}");
+    }
     assert!(take(fcb_catalog_structure_info(handle)).contains("CATALOG_STRUCTURE_HANDLE_NOT_OPEN"));
     assert_eq!(fcb_catalog_structure_close(handle), 1);
     assert_eq!(fcb_reader_close(reader), 1);
@@ -119,6 +127,7 @@ fn c_heading_search_counts_beyond_rows_and_preserves_discovery_policy_and_scope(
         b"target".as_ptr(), 6, 1, 2, 0, extensions.as_ptr(), std::ptr::null(), 1, directory.as_ptr(),
         1, 1024, 1024, 1) });
     assert_eq!(number(&initial, "payload_bytes_read"), 0);
+    assert!(initial.contains("\"name_case\":\"sensitive\""));
     assert!(initial.contains("\"rule_files_enabled\":false"));
     let complete = drain(handle);
     assert_eq!(number(&complete, "matches_seen"), 3, "{complete}");
@@ -131,4 +140,39 @@ fn c_heading_search_counts_beyond_rows_and_preserves_discovery_policy_and_scope(
     assert!(complete.contains("all-regular-files/no-rule-files-v1"));
     assert!(take(fcb_catalog_structure_page(handle, 11, 1, 0, 1)).contains("CATALOG_STRUCTURE_STALE_REVISION"));
     assert_eq!(fcb_catalog_structure_close(handle), 1);
+}
+
+#[test]
+fn explicit_case_policy_counts_unicode_names_and_preserves_retained_original_bytes() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let root = root();
+    fs::write(root.join(".gitignore"), b"ignored.rs\n").unwrap();
+    let source: Vec<u8> = "\u{feff}fn Target() {}\nfn TARGET_more() {}\n"
+        .encode_utf16().flat_map(u16::to_be_bytes).collect();
+    fs::write(root.join("ignored.rs"), &source).unwrap();
+    fs::write(root.join("headings.md"), "# CAFÉ\n\n## Café\n").unwrap();
+    let croot = CString::new(root.to_str().unwrap()).unwrap();
+    for (mode, query, extension, expected_hex) in [
+        (0, "target", "rs", "005400610072006700650074"),
+        (1, "café", "md", "2320434146c389"),
+    ] {
+        let extension = CString::new(extension).unwrap();
+        let handle = fcb_catalog_structure_create(); assert_ne!(handle, 0);
+        let initial = take(unsafe { fcb_catalog_structure_open_matching_with_policy(handle,
+            croot.as_ptr(), 11, query.as_ptr(), query.len() as u64, mode, 1, 0,
+            extension.as_ptr(), std::ptr::null(), 0, std::ptr::null(), 1, 1024, 1024, 0, 1) });
+        assert_eq!(number(&initial, "payload_bytes_read"), 0);
+        assert!(initial.contains("\"name_case\":\"unicode-lowercase\""));
+        assert!(initial.contains("\"case_sensitive\":false"));
+        assert!(initial.contains("\"rule_files_enabled\":false"));
+        let complete = drain(handle);
+        assert_eq!(number(&complete, "matches_seen"), 2, "{complete}");
+        assert_eq!(number(&complete, "retained_hits"), 1);
+        assert_eq!(number(&complete, "eligible_files"), 1);
+        assert!(complete.contains("\"match_count_complete\":true"));
+        assert!(complete.contains("\"page_has_more_matches\":true"));
+        let hit = take(fcb_catalog_structure_hit(handle, 11, number(&complete, "revision"), 0));
+        assert!(hit.contains(&format!("\"original_hex\":\"{expected_hex}")), "{hit}");
+        assert_eq!(fcb_catalog_structure_close(handle), 1);
+    }
 }

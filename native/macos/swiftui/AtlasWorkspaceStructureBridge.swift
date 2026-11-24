@@ -13,12 +13,13 @@ struct AtlasWorkspaceStructureTransport: Sendable {
 }
 
 @_silgen_name("fcb_catalog_structure_create") private func structureCreate() -> UInt64
-@_silgen_name("fcb_catalog_structure_open_with_policy") private func structureOpen(
+@_silgen_name("fcb_catalog_structure_open_matching_with_policy") private func structureOpen(
     _ owner: UInt64, _ root: UnsafePointer<CChar>?, _ generation: UInt64,
     _ query: UnsafePointer<UInt8>?, _ queryBytes: UInt64, _ mode: UInt64, _ nameMode: UInt64,
     _ startAfter: UInt64, _ extensions: UnsafePointer<CChar>?, _ filenames: UnsafePointer<CChar>?,
     _ pathKind: UInt64, _ path: UnsafePointer<CChar>?, _ maximumMatches: UInt64,
-    _ maximumBytes: UInt64, _ maximumCalls: UInt64, _ policy: UInt64) -> UnsafeMutablePointer<CChar>?
+    _ maximumBytes: UInt64, _ maximumCalls: UInt64, _ caseSensitive: UInt64,
+    _ policy: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_catalog_structure_advance") private func structureAdvance(
     _ owner: UInt64, _ generation: UInt64, _ revision: UInt64, _ steps: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_catalog_structure_page") private func structurePage(
@@ -46,7 +47,8 @@ extension AtlasWorkspaceStructureTransport {
                             try structureTake(structureOpen(owner, root, generation, query.baseAddress,
                                 UInt64(query.count), request.mode.code, request.nameMode.code, request.startAfter,
                                 extensions, filenames, kind, path, request.maximumMatches,
-                                request.maximumScanBytes, request.maximumReadCalls, request.discoveryPolicy.rawValue))
+                                request.maximumScanBytes, request.maximumReadCalls, request.caseSensitive ? 1 : 0,
+                                request.discoveryPolicy.rawValue))
                         }
                     }
                 }

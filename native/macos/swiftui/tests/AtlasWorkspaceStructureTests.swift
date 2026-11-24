@@ -4,8 +4,9 @@ import Foundation
     private static let owner: UInt64 = 9_007_199_254_740_997
     private static let root = Array("/private/tmp/project".utf8)
     private static func request(_ needle: String = "needle", mode: AtlasWorkspaceStructureMode = .symbols,
-        nameMode: AtlasSearchNameMode = .contains, startAfter: UInt64 = 0) throws -> AtlasWorkspaceStructureRequest {
-        try .init(needle: needle, mode: mode, nameMode: nameMode, startAfter: startAfter)
+        nameMode: AtlasSearchNameMode = .contains, caseSensitive: Bool = true,
+        startAfter: UInt64 = 0) throws -> AtlasWorkspaceStructureRequest {
+        try .init(needle: needle, mode: mode, nameMode: nameMode, caseSensitive: caseSensitive, startAfter: startAfter)
     }
     private static func decode(_ value: [String: Any], request: AtlasWorkspaceStructureRequest,
         root: [UInt8] = AtlasWorkspaceStructureTests.root, command: String = "page", offset: UInt64 = 0,
@@ -67,7 +68,7 @@ import Foundation
         for key in ["semantic_complete", "compiler_resolved"] {
             var bad = valid; bad[key] = true; refuse(bad, request: request)
         }
-        for key in ["count_all_matches", "match_count_complete", "selection_available", "truncated"] {
+        for key in ["count_all_matches", "match_count_complete", "selection_available", "truncated", "case_sensitive"] {
             var bad = valid; bad[key] = false; refuse(bad, request: request)
         }
         var rounded = valid; rounded["owner"] = NSNumber(value: owner); refuse(rounded, request: request)
@@ -121,6 +122,23 @@ import Foundation
             let exactBytes = try self.request("é", nameMode: mode)
             precondition(exactBytes.admitsName("é") && !exactBytes.admitsName("e\u{301}"))
             precondition(!exactBytes.admitsName("É"))
+        }
+        for mode in AtlasWorkspaceStructureMode.allCases {
+            let insensitive = try self.request(mode: mode, caseSensitive: false)
+            var result = WorkspaceStructureFixture.page(owner: owner, request: insensitive)
+            var hits = result["hits"] as! [[String: Any]]
+            hits[0]["name"] = "NEEDLE"; result["hits"] = hits
+            let admitted = try decode(result, request: insensitive)
+            precondition(!admitted.summary.request.caseSensitive && admitted.rows[0].name == "NEEDLE")
+            let sensitive = try self.request(mode: mode)
+            precondition(insensitive != sensitive)
+            var wrongCase = result; wrongCase["name_case"] = "sensitive"
+            refuse(wrongCase, request: insensitive)
+            wrongCase = result; wrongCase["case_sensitive"] = true
+            refuse(wrongCase, request: insensitive)
+            wrongCase = result; wrongCase.removeValue(forKey: "case_sensitive")
+            refuse(wrongCase, request: insensitive)
+            refuse(result, request: sensitive)
         }
         for needle in ["", "x\0y", String(repeating: "x", count: 1025)] {
             do { _ = try self.request(needle); preconditionFailure("Invalid query was admitted") }
@@ -198,6 +216,14 @@ import Foundation
         precondition(!retained.reader.canRefresh && retained.reader.page?.start == selected.hit.range.start)
         let retainedIdentity = retained.reader.page!.identity
 
+        model.caseSensitive = false
+        precondition(!model.authorized && !model.canSelect && model.currentReader === retained)
+        precondition(model.page?.summary.request.caseSensitive == true,
+            "Editing case policy must not relabel accepted results")
+        model.open(selected)
+        precondition(!model.busy && model.currentReader === retained)
+        model.search(); await waitFor { !model.busy }
+        precondition(model.page?.summary.request.caseSensitive == false && model.authorized)
         model.queryText = "other"
         precondition(!model.authorized && !model.canSelect && model.currentReader === retained)
         model.search(); await waitFor { !model.busy }
@@ -215,9 +241,12 @@ import Foundation
         model.laterWindow(); await waitFor { !model.busy }
         precondition(model.page?.summary.request.startAfter == 80 && fixture.log.contains("start-after:80"),
             "Next window must use the actual last retained occurrence, including gaps")
+        precondition(model.page?.summary.request.caseSensitive == false,
+            "A later result window must keep the accepted matching policy")
         precondition(model.page?.rows.count == 20 && model.canEarlierWindow && !model.canLaterWindow)
         model.earlierWindow(); await waitFor { !model.busy }
         precondition(model.page?.summary.request.startAfter == 0 && !model.canEarlierWindow)
+        precondition(model.page?.summary.request.caseSensitive == false)
 
         // Omitted labels before the final retained match cannot cause an empty
         // and potentially expensive extra observation.

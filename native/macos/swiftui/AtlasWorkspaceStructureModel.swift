@@ -10,11 +10,12 @@ import Dispatch
     private var retired = false
 
     init(source: AtlasWorkspaceStreamSource, query: String, mode: AtlasWorkspaceStructureMode,
-        nameMode: AtlasSearchNameMode, discoveryPolicy: AtlasDiscoveryPolicy,
+        nameMode: AtlasSearchNameMode, caseSensitive: Bool = true, discoveryPolicy: AtlasDiscoveryPolicy,
         transport: AtlasWorkspaceStructureTransport) {
         self.source = source
         model = .init(transport: transport, query: query, mode: mode, nameMode: nameMode,
-            discoveryPolicy: discoveryPolicy, registryDomain: AtlasReaderTransport.native.comparison?.domain,
+            caseSensitive: caseSensitive, discoveryPolicy: discoveryPolicy,
+            registryDomain: AtlasReaderTransport.native.comparison?.domain,
             makeReader: { AtlasPagedReaderModel(transport: .native, search: .native, outline: .native, document: .native) })
     }
     func start() {
@@ -175,6 +176,9 @@ private final class AtlasWorkspaceStructureSession: @unchecked Sendable {
     var nameMode: AtlasSearchNameMode {
         didSet { if oldValue != nameMode { edited() } }
     }
+    var caseSensitive: Bool {
+        didSet { if oldValue != caseSensitive { edited() } }
+    }
     var scanBytes: UInt64 = AtlasWorkspaceStructureLimits.defaultScanBytes {
         didSet { if oldValue != scanBytes { edited() } }
     }
@@ -202,9 +206,11 @@ private final class AtlasWorkspaceStructureSession: @unchecked Sendable {
     @ObservationIgnored private var previousWindows: [UInt64] = []
 
     init(transport: AtlasWorkspaceStructureTransport, query: String = "", mode: AtlasWorkspaceStructureMode = .symbols,
-        nameMode: AtlasSearchNameMode = .contains, discoveryPolicy: AtlasDiscoveryPolicy = .repositoryRules,
+        nameMode: AtlasSearchNameMode = .contains, caseSensitive: Bool = true,
+        discoveryPolicy: AtlasDiscoveryPolicy = .repositoryRules,
         registryDomain: UUID?, makeReader: @escaping @MainActor () -> AtlasPagedReaderModel) {
         self.transport = transport; queryText = query; self.mode = mode; self.nameMode = nameMode
+        self.caseSensitive = caseSensitive
         self.discoveryPolicy = discoveryPolicy; self.registryDomain = registryDomain; self.makeReader = makeReader
     }
     deinit { task?.cancel() }
@@ -227,6 +233,7 @@ private final class AtlasWorkspaceStructureSession: @unchecked Sendable {
     private func request(startAfter: UInt64) throws -> AtlasWorkspaceStructureRequest {
         guard let authority else { throw AtlasWorkspaceStructureError.unavailable }
         return try .init(needle: queryText, mode: mode, nameMode: nameMode,
+            caseSensitive: caseSensitive,
             fileScope: authority.fileScope, pathScope: authority.pathScope, discoveryPolicy: discoveryPolicy,
             maximumScanBytes: scanBytes, startAfter: startAfter)
     }

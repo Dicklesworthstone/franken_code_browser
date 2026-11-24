@@ -34,10 +34,11 @@ import Foundation
     // nonthrowing autoclosure.
     static func check(_ value: Bool) { precondition(value) }
     static func request(mode: AtlasWorkspaceStructureMode = .symbols,
-        nameMode: AtlasSearchNameMode = .contains, fileScope: AtlasSearchFileScope = .all,
+        nameMode: AtlasSearchNameMode = .contains, caseSensitive: Bool = true,
+        fileScope: AtlasSearchFileScope = .all,
         pathScope: AtlasSearchPathScope = .workspace, policy: AtlasDiscoveryPolicy = .repositoryRules)
         throws -> AtlasWorkspaceStructureRequest {
-        try .init(needle: needle, mode: mode, nameMode: nameMode, fileScope: fileScope,
+        try .init(needle: needle, mode: mode, nameMode: nameMode, caseSensitive: caseSensitive, fileScope: fileScope,
             pathScope: pathScope, discoveryPolicy: policy, maximumMatches: 137,
             maximumScanBytes: 1 << 32, maximumReadCalls: 1_048_575, startAfter: ordinal)
     }
@@ -57,14 +58,18 @@ import Foundation
         for (modeIndex, mode) in modes.enumerated() {
             for (nameIndex, nameMode) in names.enumerated() {
                 for (policyIndex, policy) in policies.enumerated() {
-                    let requested = try request(mode: mode, nameMode: nameMode, policy: policy)
-                    let result = try transport.open(owner, root, generation, requested)
-                    precondition(result == reply)
-                    expectArguments([owner, generation, UInt64(needle.utf8.count), UInt64(modeIndex),
-                        UInt64(nameIndex), ordinal, 0, 137, 1 << 32, 1_048_575, UInt64(policyIndex)])
-                    expectField(0, root); expectField(1, needle)
-                    expectField(2, nil); expectField(3, nil); expectField(4, nil)
-                    precondition(allocations() == frees())
+                    for caseSensitive in [true, false] {
+                        let requested = try request(mode: mode, nameMode: nameMode,
+                            caseSensitive: caseSensitive, policy: policy)
+                        let result = try transport.open(owner, root, generation, requested)
+                        precondition(result == reply)
+                        expectArguments([owner, generation, UInt64(needle.utf8.count), UInt64(modeIndex),
+                            UInt64(nameIndex), ordinal, 0, 137, 1 << 32, 1_048_575,
+                            caseSensitive ? 1 : 0, UInt64(policyIndex)])
+                        expectField(0, root); expectField(1, needle)
+                        expectField(2, nil); expectField(3, nil); expectField(4, nil)
+                        precondition(allocations() == frees())
+                    }
                 }
             }
         }
@@ -87,7 +92,7 @@ import Foundation
             [0xff, 0x2e, 0x6d, 0x64], Array("a.rs".utf8), Array("a.rs".utf8)
         ]), policy: .includeExcluded)
         check(try transport.open(owner, root, generation, visible) == reply)
-        precondition(argument(6) == 3 && argument(10) == 1)
+        precondition(argument(6) == 3 && argument(10) == 1 && argument(11) == 1)
         expectField(4, "612e7273,ff2e6d64")
         let noVisibleFiles = try request(pathScope: .init(visiblePaths: []))
         check(try transport.open(owner, root, generation, noVisibleFiles) == reply)

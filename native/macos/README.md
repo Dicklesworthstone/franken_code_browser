@@ -1302,9 +1302,13 @@ interaction qualification remain pending.
 Choose **Symbols** or **Headings** in the sidebar, set the location and file
 types, then open **Search project structure…**. The sheet keeps that location,
 file-type selection, original project grant and discovery policy fixed. Exact,
-prefix and substring matching apply to extracted declaration names or Markdown
-heading titles, case-sensitively. A nonempty sidebar query starts immediately;
-you can edit the query and matching rule in the sheet.
+prefix and contains matching apply to extracted declaration names and heading
+titles. **Match case** defaults on; turning it off uses Unicode scalar lowercase,
+preserving source spelling and UTF-8/UTF-16 byte ranges without full case folding
+or canonical normalization. The case policy stays fixed in each accepted query
+and its result windows. The sheet starts with the sidebar's query and case
+selection; a nonempty query starts immediately. You can edit the query, matching
+rule and case policy in the sheet.
 
 Discovery continues through bounded catalog pages instead of stopping at the
 retained atlas's file prefix. Each worker batch discovers metadata or analyzes

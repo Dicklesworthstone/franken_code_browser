@@ -37,12 +37,14 @@ struct AtlasWorkspaceStructureRequest: Equatable, Sendable {
     let needle: String
     let mode: AtlasWorkspaceStructureMode
     let nameMode: AtlasSearchNameMode
+    let caseSensitive: Bool
     let fileScope: AtlasSearchFileScope
     let pathScope: AtlasSearchPathScope
     let discoveryPolicy: AtlasDiscoveryPolicy
     let maximumMatches, maximumScanBytes, maximumReadCalls, startAfter: UInt64
 
     init(needle: String, mode: AtlasWorkspaceStructureMode, nameMode: AtlasSearchNameMode,
+        caseSensitive: Bool = true,
         fileScope: AtlasSearchFileScope = .all, pathScope: AtlasSearchPathScope = .workspace,
         discoveryPolicy: AtlasDiscoveryPolicy = .repositoryRules,
         maximumMatches: UInt64 = AtlasWorkspaceStructureLimits.maximumMatches,
@@ -55,7 +57,7 @@ struct AtlasWorkspaceStructureRequest: Equatable, Sendable {
               (1...AtlasWorkspaceStructureLimits.maximumScanBytes).contains(maximumScanBytes),
               (1...AtlasWorkspaceStructureLimits.maximumReadCalls).contains(maximumReadCalls),
               !end.overflow, end.partialValue < UInt64.max else { throw AtlasWorkspaceStructureError.invalidInput }
-        self.needle = needle; self.mode = mode; self.nameMode = nameMode
+        self.needle = needle; self.mode = mode; self.nameMode = nameMode; self.caseSensitive = caseSensitive
         self.fileScope = fileScope; self.pathScope = pathScope; self.discoveryPolicy = discoveryPolicy
         self.maximumMatches = maximumMatches; self.maximumScanBytes = maximumScanBytes
         self.maximumReadCalls = maximumReadCalls; self.startAfter = startAfter
@@ -63,14 +65,18 @@ struct AtlasWorkspaceStructureRequest: Equatable, Sendable {
 
     static func == (a: Self, b: Self) -> Bool {
         a.needle.utf8.elementsEqual(b.needle.utf8) && a.mode == b.mode && a.nameMode == b.nameMode
+            && a.caseSensitive == b.caseSensitive
             && a.fileScope == b.fileScope && a.pathScope == b.pathScope && a.discoveryPolicy == b.discoveryPolicy
             && a.maximumMatches == b.maximumMatches && a.maximumScanBytes == b.maximumScanBytes
             && a.maximumReadCalls == b.maximumReadCalls && a.startAfter == b.startAfter
     }
 
-    /// Validate the requested literal name predicate without Unicode folding or
-    /// parsing source. Rust remains the only owner of structural extraction.
+    /// Literal case-sensitive predicates can be checked against the receipt.
+    /// Rust owns Unicode scalar-lowercase comparison: Foundation's casing is
+    /// not a second matching implementation. Both policy echoes, source proof
+    /// and every original range are still validated for insensitive results.
     func admitsName(_ name: String) -> Bool {
+        guard caseSensitive else { return true }
         switch nameMode {
         case .exact: return name.utf8.elementsEqual(needle.utf8)
         case .prefix: return name.utf8.starts(with: needle.utf8)
@@ -185,7 +191,9 @@ struct AtlasWorkspaceStructureSummary: Equatable, Sendable {
               try wire.text("realized_mode") == request.mode.evidence,
               try wire.text("evidence_level") == request.mode.evidence,
               try !wire.flag("semantic_complete"), try !wire.flag("compiler_resolved"),
-              try wire.text("name_case") == "sensitive", try wire.text("name_mode") == request.nameMode.rawValue,
+              try wire.text("name_case") == (request.caseSensitive ? "sensitive" : "unicode-lowercase"),
+              try wire.flag("case_sensitive") == request.caseSensitive,
+              try wire.text("name_mode") == request.nameMode.rawValue,
               try wire.text("needle").utf8.elementsEqual(request.needle.utf8),
               try wire.text("completeness_basis") == "admitted-extraction-processing",
               request.discoveryPolicy.admits(try wire.text("discovery_policy")),

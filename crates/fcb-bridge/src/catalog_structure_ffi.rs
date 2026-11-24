@@ -49,7 +49,7 @@ pub unsafe extern "C" fn fcb_catalog_structure_open(handle: u64, root: *const c_
 }
 
 /// Explicit immutable discovery policy: 0 repository rules, 1 includes excluded
-/// regular files without reading rule configuration.
+/// regular files without reading rule configuration. Names remain case-sensitive.
 /// # Safety
 /// Valid scalars obey fcb_catalog_structure_open's pointer contract.
 #[unsafe(no_mangle)]
@@ -58,13 +58,30 @@ pub unsafe extern "C" fn fcb_catalog_structure_open_with_policy(handle: u64, roo
     start_after: u64, extensions: *const c_char, filenames: *const c_char,
     path_kind: u64, path: *const c_char, max_matches: u64, max_scan_bytes: u64,
     max_read_calls: u64, discovery_policy: u64) -> *mut c_char {
+    unsafe { fcb_catalog_structure_open_matching_with_policy(handle, root, generation, query,
+        query_bytes, mode, name_mode, start_after, extensions, filenames, path_kind, path,
+        max_matches, max_scan_bytes, max_read_calls, 1, discovery_policy) }
+}
+
+/// Immutable case and discovery policies. case_sensitive is 0 for Unicode
+/// scalar lowercase or 1 for exact case, without full folding or normalization.
+/// Counts, names and original source ranges retain the ordinary query contract.
+/// # Safety
+/// Valid scalars obey fcb_catalog_structure_open's pointer contract. Invalid
+/// tags, including case_sensitive values other than 0/1, refuse before pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_catalog_structure_open_matching_with_policy(handle: u64, root: *const c_char,
+    generation: u64, query: *const u8, query_bytes: u64, mode: u64, name_mode: u64,
+    start_after: u64, extensions: *const c_char, filenames: *const c_char,
+    path_kind: u64, path: *const c_char, max_matches: u64, max_scan_bytes: u64,
+    max_read_calls: u64, case_sensitive: u64, discovery_policy: u64) -> *mut c_char {
     reply(|| answer(handle, |searches| {
         let policy = match discovery_policy {
             0 => CatalogDiscoveryPolicy::RepositoryRules, 1 => CatalogDiscoveryPolicy::IncludeExcluded,
             _ => return Err(AccessError::InvalidArgument),
         };
         let length = number(query_bytes)?;
-        if generation == 0 || query.is_null() || length == 0 || length > MAX_CATALOG_STRUCTURE_QUERY_BYTES
+        if generation == 0 || case_sensitive > 1 || query.is_null() || length == 0 || length > MAX_CATALOG_STRUCTURE_QUERY_BYTES
             || !(1..=MAX_CATALOG_STRUCTURE_HITS as u64).contains(&max_matches)
             || !(1..=MAX_CATALOG_STRUCTURE_SCAN_BYTES).contains(&max_scan_bytes)
             || !(1..=MAX_CATALOG_STRUCTURE_READ_CALLS).contains(&max_read_calls)
@@ -86,7 +103,7 @@ pub unsafe extern "C" fn fcb_catalog_structure_open_with_policy(handle: u64, roo
         };
         let query = unsafe { std::slice::from_raw_parts(query, length) };
         let query = std::str::from_utf8(query).map_err(|_| AccessError::InvalidArgument)?;
-        let scope = unsafe { bounded_scope(extensions, filenames, kind, path) }?;
+        let scope = unsafe { bounded_scope(extensions, filenames, kind, path, case_sensitive == 1) }?;
         let root = unsafe { cstr(root) }.ok_or(AccessError::InvalidArgument)?;
         let options = CatalogStructureSearchOptions { mode, name_mode, start_after, scope,
             max_matches: number(max_matches)?, max_scan_bytes, max_read_calls };
@@ -156,13 +173,14 @@ pub extern "C" fn fcb_catalog_structure_close(handle: u64) -> u8 {
 }
 
 unsafe fn bounded_scope(extensions: *const c_char, filenames: *const c_char,
-    kind: AtlasSearchPathKind, path: *const c_char) -> Result<AtlasSearchScope, AccessError> {
+    kind: AtlasSearchPathKind, path: *const c_char, case_sensitive: bool) -> Result<AtlasSearchScope, AccessError> {
     let extensions = unsafe { bounded_optional(extensions, MAX_SEARCH_SCOPE_LIST_BYTES) }?;
     let filenames = unsafe { bounded_optional(filenames, MAX_SEARCH_SCOPE_LIST_BYTES) }?;
     let limit = if kind == AtlasSearchPathKind::Visible { MAX_SEARCH_REGION_WIRE_BYTES } else { MAX_SEARCH_SCOPE_PATH_BYTES };
     let path = unsafe { bounded_optional(path, limit) }?;
     if path.is_none() && kind != AtlasSearchPathKind::Workspace { return Err(AccessError::InvalidArgument); }
-    AtlasSearchScope::from_csv(extensions, filenames)?.with_path(kind, path.unwrap_or("")).map_err(AccessError::from)
+    AtlasSearchScope::from_csv(extensions, filenames)?.with_case_sensitive(case_sensitive)
+        .with_path(kind, path.unwrap_or("")).map_err(AccessError::from)
 }
 unsafe fn bounded_optional<'a>(pointer: *const c_char, limit: usize) -> Result<Option<&'a str>, AccessError> {
     if pointer.is_null() { return Ok(None); }

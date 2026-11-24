@@ -91,16 +91,16 @@ static char *response(void) {
 uint64_t fcb_catalog_structure_create(void) {
     begin_call(0); return UINT64_C(0xfedcba9876543210);
 }
-char *fcb_catalog_structure_open_with_policy(uint64_t handle, const char *root,
+char *fcb_catalog_structure_open_matching_with_policy(uint64_t handle, const char *root,
         uint64_t generation, const uint8_t *query, uint64_t query_bytes,
         uint64_t mode, uint64_t name_mode, uint64_t start_after,
         const char *extensions, const char *filenames, uint64_t path_kind,
         const char *path, uint64_t max_matches, uint64_t max_scan_bytes,
-        uint64_t max_read_calls, uint64_t discovery_policy) {
+        uint64_t max_read_calls, uint64_t case_sensitive, uint64_t discovery_policy) {
     begin_call(1);
     assert(query && query_bytes > 0 && query_bytes <= 1024);
     uint64_t values[] = { handle, generation, query_bytes, mode, name_mode, start_after,
-        path_kind, max_matches, max_scan_bytes, max_read_calls, discovery_policy };
+        path_kind, max_matches, max_scan_bytes, max_read_calls, case_sensitive, discovery_policy };
     memcpy(arguments, values, sizeof values);
     capture_text(0, root, 16 * 1024);
     capture_bytes(1, query, (size_t)query_bytes);

@@ -525,6 +525,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         if searchMode == .symbols || searchMode == .headings {
             workspaceStructureSearch = AtlasWorkspaceStructurePresentation(source: source, query: query,
                 mode: searchMode == .symbols ? .symbols : .headings, nameMode: searchNameMode,
+                caseSensitive: searchCaseSensitive,
                 discoveryPolicy: projectBrowser.discoveryPolicy, transport: .native)
         } else {
             workspaceStreamSearch = AtlasWorkspaceStreamPresentation(source: source,

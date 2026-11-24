@@ -31,7 +31,7 @@ import SwiftUI
                 : "Applies repository ignore rules within this fixed location and file-type scope.")
                 .font(.caption).foregroundStyle(.secondary)
             queryControls
-            Text("Discovery continues beyond the atlas file-count limit. Names match case-sensitively. Symbols use complete files up to 64 KiB; Markdown headings use complete files up to 256 KiB. Larger or unsupported files remain explicit incomplete coverage.")
+            Text("Discovery continues beyond the atlas file-count limit. Turn off Match case to compare names using Unicode lowercase. Symbols use complete files up to 64 KiB; Markdown headings use complete files up to 256 KiB. Larger or unsupported files remain explicit incomplete coverage.")
                 .font(.caption).foregroundStyle(.secondary)
             if let page = model.page {
                 coverage(page)
@@ -64,6 +64,9 @@ import SwiftUI
                     .disabled(!model.canSearch).keyboardShortcut(.defaultAction)
             }
             HStack(spacing: 8) {
+                Toggle("Match case", isOn: $model.caseSensitive)
+                    .toggleStyle(.checkbox)
+                    .help("When off, names use Unicode scalar lowercase. Original source spelling is preserved; full case folding and canonical normalization are not applied.")
                 Picker("Total source bytes", selection: $model.scanBytes) {
                     Text("256 MiB").tag(UInt64(256 * 1024 * 1024))
                     Text("1 GiB").tag(UInt64(1024 * 1024 * 1024))
@@ -92,7 +95,8 @@ import SwiftUI
     private func coverage(_ page: AtlasWorkspaceStructurePage) -> some View {
         VStack(alignment: .leading, spacing: 5) {
             Text(verbatim: "Accepted " + page.summary.request.mode.label.lowercased() + " query: "
-                + String(reflecting: page.summary.request.needle))
+                + String(reflecting: page.summary.request.needle)
+                + (page.summary.request.caseSensitive ? " · Match case" : " · Unicode lowercase"))
                 .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
             if !model.authorized {
                 Label("These results belong to the earlier query. Search again to activate results for the current inputs.",

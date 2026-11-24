@@ -17,7 +17,8 @@ use std::{mem::size_of, path::Path, sync::Arc};
 use fcb::{ArenaOwnerId, ByteLength, ByteRange, FileId, QueryGeneration, SourceRevision};
 use fcb::document::reader::{DocumentReadError, DocumentReadOptions, DocumentReader, MAX_DOCUMENT_SOURCE_BYTES};
 use fcb::search::{CapturedSymbols, CompleteCapture, SymbolError, SymbolLanguage,
-    SymbolNameMode, MAX_SYMBOL_ITEMS, MAX_SYMBOL_SOURCE_BYTES};
+    SearchMode, SymbolNameMode, UnicodeNormalization, MAX_SYMBOL_ITEMS, MAX_SYMBOL_SOURCE_BYTES};
+use fcb::search::normalized::{NormalizedCursor, SourceScalar, matched_text_capacity};
 use fcb::source::{CaptureRequest, NormalizedPath, RootGrant, SourceError};
 use fcb::store::{Sha256, Sha256Digest};
 use fcb_core::{DocumentGeneration, DocumentId, ResourceLease};
@@ -58,10 +59,12 @@ impl CatalogStructureSearchMode {
     }
 }
 
-/// Matching uses exact, case-sensitive extracted names/titles; no normalization
-/// or regex interpretation is introduced. Every query counts through its I/O
-/// bounds even after row storage fills. start_after selects a bounded ordinal
-/// window; another window starts a new observation on a new session.
+/// Matching uses extracted names/titles with the scope's immutable case policy.
+/// Case-insensitive matching uses Unicode scalar lowercase, without full case
+/// folding, canonical normalization or regex interpretation. Original source
+/// ranges and spelling are preserved. Every query counts through its I/O bounds
+/// even after row storage fills. start_after selects a bounded ordinal window;
+/// another window starts a new observation on a new session.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogStructureSearchOptions {
     pub mode: CatalogStructureSearchMode,
@@ -181,7 +184,6 @@ impl CatalogStructureSearchSession {
         options: CatalogStructureSearchOptions, policy: CatalogDiscoveryPolicy,
         mut canceled: impl FnMut() -> bool) -> Result<Self, CatalogStructureSearchError> {
         if query.is_empty() || query.len() > MAX_CATALOG_STRUCTURE_QUERY_BYTES || query.as_bytes().contains(&0)
-            || !options.scope.case_sensitive()
             || !(1..=MAX_CATALOG_STRUCTURE_HITS).contains(&options.max_matches)
             || !(1..=MAX_CATALOG_STRUCTURE_SCAN_BYTES).contains(&options.max_scan_bytes)
             || !(1..=MAX_CATALOG_STRUCTURE_READ_CALLS).contains(&options.max_read_calls)
@@ -192,8 +194,19 @@ impl CatalogStructureSearchSession {
         let generation = QueryGeneration::new(owner, generation).map_err(|_| CatalogStructureSearchError::InvalidLimits)?;
         let mut catalog = CatalogSession::open_with_policy(owner, root, policy, &mut canceled)?;
         let id = catalog.next_id()?;
+        // Contains uses the shared normalized cursor with needle-sized tables
+        // and source-scalar provenance. Admit that scratch before allocation;
+        // lowercasing never creates another copy of a complete source/name.
+        let matching_charge = if !options.scope.case_sensitive() && options.name_mode == SymbolNameMode::Contains {
+            matched_text_capacity(query, lowercase_mode()).map_err(|_| AppError::Admission)?
+                .checked_mul(size_of::<char>() + size_of::<usize>() + size_of::<SourceScalar>())
+                .and_then(|bytes| bytes.checked_add(size_of::<NormalizedCursor>()))
+                .ok_or(AppError::Admission)?
+        } else { 0 };
+        let state_charge = STATE_BYTES.checked_add(size_of::<Self>() as u64)
+            .and_then(|bytes| bytes.checked_add(matching_charge as u64)).ok_or(AppError::Admission)?;
         let lease = catalog.budget.try_reserve_managed(owner, id,
-            ByteLength::new(STATE_BYTES + size_of::<Self>() as u64)).map_err(|_| AppError::Admission)?;
+            ByteLength::new(state_charge)).map_err(|_| AppError::Admission)?;
         let hits = reserve(options.max_matches)?;
         let diagnostics = reserve(MAX_DIAGNOSTICS)?;
         let needle = query.to_owned();
@@ -366,7 +379,8 @@ impl CatalogStructureSearchSession {
                         if symbols.output_limited() { extracted.limited = Some("STRUCTURE_EXTRACTION_ITEM_LIMIT"); }
                         for symbol in symbols.candidates() {
                             check(canceled)?;
-                            if !symbol.matches_name(&self.needle, self.options.name_mode) { continue; }
+                            if !matches_name(symbol.name(), &self.needle, self.options.name_mode,
+                                self.options.scope.case_sensitive(), canceled)? { continue; }
                             self.stage_row(&mut extracted, remaining, capture.bytes().len(), symbol.id(),
                                 symbol.name_range().unwrap_or(symbol.original_range()), symbol.original_range(),
                                 symbol.name(), symbol.kind().label(), language.name(), None)?;
@@ -390,7 +404,8 @@ impl CatalogStructureSearchSession {
                             Ok(()) => {
                                 for (ordinal, heading) in document.headings().iter().enumerate() {
                                     check(canceled)?;
-                                    if !matches_name(&heading.title, &self.needle, self.options.name_mode) { continue; }
+                                    if !matches_name(&heading.title, &self.needle, self.options.name_mode,
+                                        self.options.scope.case_sensitive(), canceled)? { continue; }
                                     let range = document.original_span(heading.source_span)
                                         .map_err(|_| CatalogStructureSearchError::InvalidLimits)?;
                                     self.stage_row(&mut extracted, remaining, capture.bytes().len(), ordinal as u64 + 1,
@@ -475,9 +490,36 @@ fn document_problem(error: DocumentReadError) -> Problem {
         _ => Problem::Unsupported,
     }
 }
-fn matches_name(name: &str, needle: &str, mode: SymbolNameMode) -> bool {
-    match mode { SymbolNameMode::Exact => name == needle,
-        SymbolNameMode::Prefix => name.starts_with(needle), SymbolNameMode::Contains => name.contains(needle) }
+fn lowercase_mode() -> SearchMode {
+    SearchMode::DecodedText { case_sensitive: false, normalization: UnicodeNormalization::Exact }
+}
+fn matches_name(name: &str, needle: &str, mode: SymbolNameMode, case_sensitive: bool,
+    canceled: &mut impl FnMut() -> bool) -> Result<bool, CatalogStructureSearchError> {
+    check(canceled)?;
+    if case_sensitive {
+        return Ok(match mode { SymbolNameMode::Exact => name == needle,
+            SymbolNameMode::Prefix => name.starts_with(needle), SymbolNameMode::Contains => name.contains(needle) });
+    }
+    if mode != SymbolNameMode::Contains {
+        let mut source = name.chars().flat_map(char::to_lowercase);
+        for (index, unit) in needle.chars().flat_map(char::to_lowercase).enumerate() {
+            if index % 256 == 0 { check(canceled)?; }
+            if source.next() != Some(unit) { return Ok(false); }
+        }
+        return Ok(mode == SymbolNameMode::Prefix || source.next().is_none());
+    }
+    let mut cursor = NormalizedCursor::new(needle, lowercase_mode())
+        .map_err(|_| AppError::Admission)?.ok_or(CatalogStructureSearchError::InvalidLimits)?;
+    for (index, (start, ch)) in name.char_indices().enumerate() {
+        if index % 256 == 0 { check(canceled)?; }
+        let end = (start + ch.len_utf8()) as u64;
+        let scalar = SourceScalar { ch, raw_start: start as u64, raw_end: end,
+            decoded_start: start as u64, decoded_end: end };
+        for unit in cursor.units(ch) {
+            if cursor.push(unit, scalar).is_some() { return Ok(true); }
+        }
+    }
+    Ok(false)
 }
 fn is_markdown(path: &[u8]) -> bool {
     let basename = path.rsplit(|&byte| byte == b'/').next().unwrap_or(path);

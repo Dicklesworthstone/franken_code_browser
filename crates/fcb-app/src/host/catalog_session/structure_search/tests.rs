@@ -218,6 +218,92 @@ fn counted_name_windows_keep_matching_semantics_and_bounded_storage_separate() {
 }
 
 #[test]
+fn insensitive_symbol_windows_count_all_modes_and_keep_original_utf8_and_utf16_names() {
+    let root = fixture("name-case-windows");
+    let text = "fn Target() {}\nfn TARGET_more() {}\nfn other_tArGeT() {}\n";
+    for (file, source) in [("utf8.rs", text.as_bytes().to_vec()),
+        ("little.rs", utf16(text, true)), ("big.rs", utf16(text, false))] {
+        fs::write(root.join(file), source).unwrap();
+    }
+    for (file_index, file) in ["utf8.rs", "little.rs", "big.rs"].into_iter().enumerate() {
+        for (index, mode, expected) in [(0, SymbolNameMode::Exact, 1),
+            (1, SymbolNameMode::Prefix, 2), (2, SymbolNameMode::Contains, 3)] {
+            let mut options = symbols();
+            options.scope = AtlasSearchScope::all().with_case_sensitive(false)
+                .with_path(AtlasSearchPathKind::File, file).unwrap();
+            options.name_mode = mode; options.max_matches = 1;
+            options.start_after = if mode == SymbolNameMode::Exact { 0 } else { 1 };
+            let mut session = CatalogStructureSearchSession::open(owner(78700 + file_index as u64 * 10 + index),
+                &root, 5, "target", options, || false).unwrap();
+            drain(&mut session);
+            assert!(session.complete());
+            assert_eq!(session.matches_seen, expected);
+            assert_eq!(session.hits.len(), 1);
+            let hit = &session.hits[0];
+            let original_name = if mode == SymbolNameMode::Exact { "Target" } else { "TARGET_more" };
+            assert_eq!(hit.row.name, original_name);
+            assert_eq!(hit.row.occurrence, session.options.start_after + 1);
+            let bytes = if file_index == 0 { original_name.as_bytes().to_vec() }
+                else { utf16(original_name, file_index == 1)[2..].to_vec() };
+            assert_eq!(selected_bytes(hit), bytes);
+            let report = session.info(|| false).unwrap();
+            assert!(report.as_str().contains("\"name_case\":\"unicode-lowercase\""));
+            assert!(report.as_str().contains("\"case_sensitive\":false"));
+            assert!(report.as_str().contains("\"match_count_complete\":true"));
+            assert_eq!(report.as_str().contains("\"page_has_more_matches\":true"), mode == SymbolNameMode::Contains);
+        }
+    }
+    let mut legacy = CatalogStructureSearchSession::open(owner(78730), &root, 1,
+        "target", symbols(), || false).unwrap();
+    drain(&mut legacy);
+    assert!(legacy.complete()); assert_eq!(legacy.matches_seen, 0);
+    assert!(legacy.info(|| false).unwrap().as_str().contains("\"name_case\":\"sensitive\""));
+}
+
+#[test]
+fn insensitive_headings_use_scalar_lowercase_without_full_folding_or_normalization() {
+    let root = fixture("heading-case-provenance");
+    let text = "# CAFÉ\n\n## İ\n\n### Straße\n\n#### Kelvin\n\n##### e\u{301}\n";
+    fs::write(root.join("utf8.md"), text).unwrap();
+    fs::write(root.join("utf16.md"), utf16(text, true)).unwrap();
+    for (index, (query, mode, expected_title)) in [
+        ("café", SymbolNameMode::Exact, Some("CAFÉ")),
+        ("ca", SymbolNameMode::Prefix, Some("CAFÉ")),
+        ("fé", SymbolNameMode::Contains, Some("CAFÉ")),
+        ("i\u{307}", SymbolNameMode::Exact, Some("İ")),
+        ("\u{307}", SymbolNameMode::Contains, Some("İ")),
+        ("kelvin", SymbolNameMode::Exact, Some("Kelvin")),
+        ("STRASSE", SymbolNameMode::Exact, None),
+        ("é", SymbolNameMode::Exact, None),
+    ].into_iter().enumerate() {
+        let mut options = CatalogStructureSearchOptions::new(CatalogStructureSearchMode::Headings);
+        options.scope = AtlasSearchScope::all().with_case_sensitive(false); options.name_mode = mode;
+        let mut session = CatalogStructureSearchSession::open(owner(78740 + index as u64), &root,
+            7, query, options, || false).unwrap();
+        drain(&mut session);
+        assert!(session.complete());
+        assert_eq!(session.matches_seen, if expected_title.is_some() { 2 } else { 0 }, "{query}");
+        for hit in &session.hits {
+            assert_eq!(Some(hit.row.name.as_str()), expected_title);
+            assert!(heading_agrees_with_public_oracle(&session, hit));
+            assert_eq!(hit.source.capture.bytes(), if hit.source.path.as_bytes() == b"utf8.md" {
+                text.as_bytes().to_vec()
+            } else { utf16(text, true) });
+        }
+    }
+}
+
+#[test]
+fn insensitive_name_matching_observes_cancellation_inside_a_long_title() {
+    let name = "X".repeat(4096);
+    let mut polls = 0;
+    assert_eq!(matches_name(&name, "missing", SymbolNameMode::Contains, false, &mut || {
+        polls += 1; polls == 3
+    }), Err(CatalogStructureSearchError::Canceled));
+    assert_eq!(polls, 3);
+}
+
+#[test]
 fn stopped_and_canceled_queries_keep_only_previously_accepted_capture_receipts() {
     let root = fixture("cancel");
     for index in 0..3 { fs::write(root.join(format!("source-{index}.rs")), b"fn target() {}\n").unwrap(); }

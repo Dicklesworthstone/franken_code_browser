@@ -66,6 +66,22 @@ char *fcb_catalog_structure_open_with_policy(uint64_t handle, const char *root,
     const char *path, uint64_t max_matches, uint64_t max_scan_bytes,
     uint64_t max_read_calls, uint64_t discovery_policy);
 
+/* Explicit immutable case policy in addition to discovery_policy above.
+ * case_sensitive: 1 preserves exact case; 0 uses Unicode scalar lowercase for
+ * exact, prefix and contains matching. This is not full Unicode case folding
+ * or canonical normalization. The two legacy open functions remain sensitive.
+ * Returned name_case is "sensitive" or "unicode-lowercase", and case_sensitive
+ * echoes the accepted flag. Original spelling, UTF-8/UTF-16 source byte ranges,
+ * result-window ordinals and count-completeness guarantees are unchanged.
+ * Invalid case flags refuse before dereferencing any foreign input pointer.
+ */
+char *fcb_catalog_structure_open_matching_with_policy(uint64_t handle, const char *root,
+    uint64_t generation, const uint8_t *query, uint64_t query_bytes,
+    uint64_t mode, uint64_t name_mode, uint64_t start_after,
+    const char *extensions, const char *filenames, uint64_t path_kind,
+    const char *path, uint64_t max_matches, uint64_t max_scan_bytes,
+    uint64_t max_read_calls, uint64_t case_sensitive, uint64_t discovery_policy);
+
 char *fcb_catalog_structure_info(uint64_t handle);
 
 /* max_steps: 1..16 bounded metadata/file steps, at most 4 MiB source input per

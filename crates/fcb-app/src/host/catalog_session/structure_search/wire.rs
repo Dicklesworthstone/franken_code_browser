@@ -98,7 +98,9 @@ impl CatalogStructureSearchSession {
         out.literal(",\"requested_mode\":")?; out.quoted(self.options.mode.requested())?;
         out.literal(",\"realized_mode\":")?; out.quoted(self.options.mode.realized())?;
         out.literal(",\"evidence_level\":")?; out.quoted(self.options.mode.realized())?;
-        out.literal(",\"semantic_complete\":false,\"compiler_resolved\":false,\"name_case\":\"sensitive\",\"name_mode\":")?;
+        out.literal(",\"semantic_complete\":false,\"compiler_resolved\":false,\"name_case\":")?;
+        out.quoted(if self.options.scope.case_sensitive() { "sensitive" } else { "unicode-lowercase" })?;
+        out.literal(",\"name_mode\":")?;
         out.quoted(match self.options.name_mode { SymbolNameMode::Exact => "exact",
             SymbolNameMode::Prefix => "prefix", SymbolNameMode::Contains => "contains" })?;
         out.literal(",\"needle\":")?; out.quoted(&self.needle)?;
