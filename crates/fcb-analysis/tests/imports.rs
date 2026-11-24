@@ -106,7 +106,7 @@ fn rust_nested_macro_and_override_contexts_preserve_facts_but_withhold_path_reso
         b"wrapper!(mod child;);".as_slice(),
         b"wrapper![mod child;];".as_slice(),
         b"wrapper!{mod child;}".as_slice(),
-        b"mod inner { mod child; }".as_slice(),
+        b"fn local() { mod inner { mod child; } }".as_slice(),
         b"#[path = concat!(\"other\", \".rs\")] mod child;".as_slice(),
         b"#[cfg_attr(feature = \"x\", path = \"other.rs\")] mod child;".as_slice(),
     ] {

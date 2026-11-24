@@ -43,6 +43,53 @@ fn utf16(text: &str, big: bool) -> Vec<u8> {
     bytes
 }
 
+
+#[test]
+fn saved_inline_rust_modules_keep_exact_nested_evidence_and_offline_targets() {
+    let statement = "mod outer { mod child; use self::child::Thing; mod inner { use super::child::Thing; } }";
+    let source = utf16(&format!("// \u{1f980} retained module\r\n{statement}\r\n"), false);
+    let target = b"pub struct Thing;\n";
+    let f = Fixture::new(&[entry(b"src/lib.rs", &source), entry(b"src/outer/child.rs", target),
+        entry(b"src/child.rs", b"pub struct WrongModule;\n")], true);
+    let mut saved = f.open(58200);
+    let page = prepare(&mut saved, 1);
+    assert!(page.get("imports_complete").flag());
+    assert_eq!(page.get("links_seen").number(), 3);
+    assert_eq!(page.get("extractor").text(), "franken-markdown-d6fbd1d5/import-statements-v10");
+    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v12");
+    for (destination, statement, kind, basis) in [
+        ("child", "mod child;", "rust-module", "rust-module-file-candidate"),
+        ("self::child::Thing", "use self::child::Thing;", "rust-use", "rust-use-module-prefix-candidate"),
+        ("super::child::Thing", "use super::child::Thing;", "rust-use", "rust-use-module-prefix-candidate"),
+    ] {
+        let row = link(&page, b"src/lib.rs", destination);
+        assert_eq!(row.get("lexical_import_kind").text(), kind);
+        assert_eq!(row.get("resolution").text(), "captured");
+        assert_eq!(row.get("resolution_basis").text(), basis);
+        assert_eq!(row.get("source_digest").text(), Sha256::digest(&source).to_hex());
+        assert_eq!(range(&source, row.get("evidence_range")), &utf16(statement, false)[2..]);
+        assert_eq!(range(&source, row.get("specifier_range")), &utf16(destination, false)[2..]);
+        assert_eq!(row.get("target_path").get("hex").text(), hex(b"src/outer/child.rs"));
+        assert_eq!(row.get("target_digest").text(), Sha256::digest(target).to_hex());
+    }
+    let row = link(&page, b"src/lib.rs", "super::child::Thing");
+    let before = reads(&mut saved);
+    let incoming = json(&saved.import_page(1, Some(row.get("target_member").number()), Direction::Incoming, 0, 64, || false).unwrap());
+    assert_eq!(incoming.get("links").array(), page.get("links").array());
+    assert_eq!(reads(&mut saved), before);
+    fs::rename(&f.path, f.root.join("held-inline.fcbs")).unwrap();
+    fs::write(&f.path, b"replacement is not an archive").unwrap();
+    let id = row.get("link_id").number();
+    let (mut evidence, receipt) = saved.open_import_reader(owner(58201), 1, id, Side::Evidence, || false).unwrap();
+    assert_eq!(json(&receipt).get("selection"), row.get("evidence_range"));
+    let (mut reader, receipt) = saved.open_import_reader(owner(58202), 1, id, Side::Target, || false).unwrap();
+    assert_eq!(json(&receipt).get("source_digest").text(), Sha256::digest(target).to_hex());
+    assert!(!json(&receipt).get("live_source_reopened").flag());
+    saved.clear_imports(2, || false).unwrap(); drop(saved);
+    assert_eq!(copy_all(&mut evidence).get("original_hex").text(), hex(&source));
+    assert_eq!(copy_all(&mut reader).get("original_hex").text(), hex(target));
+}
+
 #[test]
 fn saved_rust_path_modules_preserve_utf16_attribute_evidence_and_offline_readers() {
     let statement = "#[path = \"platform/custom.rs\"] pub(crate) mod child;";
@@ -377,7 +424,7 @@ fn saved_rust_use_tree_pages_preserve_leaf_identity_and_original_utf16_evidence(
         let result = prepare(&mut saved, 1);
         assert!(result.get("imports_complete").flag());
         assert_eq!(result.get("links_seen").number(), 5);
-        assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v11");
+        assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v12");
         let rows = result.get("links").array();
         for (index, (destination, spelling)) in [
             ("crate::shared", "self"), ("crate::shared::Thing", "Thing"),
@@ -460,8 +507,8 @@ fn shared_language_extractors_publish_exact_occurrences_and_metadata_only_revers
     assert_eq!(result.get("import_generation").number(), 7);
     assert_eq!(result.get("projection").text(), "lexical-source-imports");
     assert_eq!(result.get("evidence_precision").text(), "exact-import-source-range");
-    assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v11");
-    assert_eq!(result.get("extraction_policy").text(), "rust-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v9");
+    assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v12");
+    assert_eq!(result.get("extraction_policy").text(), "rust-inline-modules-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v10");
     assert_eq!(result.get("completeness_scope").text(), "parsed-source-imports-in-saved-manifest");
     assert!(!result.get("compiler_resolved").flag());
     assert!(!result.get("semantic_complete").flag());
@@ -524,10 +571,13 @@ fn saved_rust_root_and_module_ambiguity_keep_evidence_without_target_authority()
     let root = b"use crate::choice::Item;\nuse crate::missing;\nuse external::Thing;\n";
     let consumer = b"use crate::choice;";
     let nested = b"mod inner { use super::choice; }";
+    let conditional = b"#[cfg(test)] mod inner { use super::choice; }";
+    let local = b"fn helper() { use super::choice; }";
     let overridden = b"#[path = \"actual.rs\"] mod moved; use crate::choice;";
     let f = Fixture::new(&[entry(b"src/bin/tool.rs", consumer),
         entry(b"src/choice.rs", b"pub struct Item;"), entry(b"src/choice/mod.rs", b"pub struct Item;"),
-        entry(b"src/consumer.rs", consumer), entry(b"src/lib.rs", root), entry(b"src/main.rs", b""),
+        entry(b"src/conditional.rs", conditional), entry(b"src/consumer.rs", consumer),
+        entry(b"src/lib.rs", root), entry(b"src/local.rs", local), entry(b"src/main.rs", b""),
         entry(b"src/nested.rs", nested), entry(b"src/overridden.rs", overridden)], true);
     let mut saved = f.open(57820);
     let page = prepare(&mut saved, 1);
@@ -537,7 +587,9 @@ fn saved_rust_root_and_module_ambiguity_keep_evidence_without_target_authority()
         (b"src/lib.rs", root, "crate::missing", "missing", "no-catalog-target"),
         (b"src/lib.rs", root, "external::Thing", "unresolved", "unresolved-rust-use"),
         (b"src/consumer.rs", consumer, "crate::choice", "ambiguous", "ambiguous-rust-crate-root"),
-        (b"src/nested.rs", nested, "super::choice", "unresolved", "unresolved-rust-use"),
+        (b"src/nested.rs", nested, "super::choice", "ambiguous", "ambiguous-rust-crate-root"),
+        (b"src/conditional.rs", conditional, "super::choice", "unresolved", "unresolved-rust-use"),
+        (b"src/local.rs", local, "super::choice", "unresolved", "unresolved-rust-use"),
         (b"src/overridden.rs", overridden, "crate::choice", "unresolved", "unresolved-rust-use"),
         (b"src/bin/tool.rs", consumer, "crate::choice", "unresolved", "unresolved-rust-use"),
     ];

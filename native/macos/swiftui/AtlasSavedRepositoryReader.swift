@@ -554,6 +554,9 @@ final class AtlasSavedReaderReceiptBox: @unchecked Sendable {
             if link.language == "java" {
                 return "Saved Java source candidate for \(link.destination) · imported declaration location, classpath and compiler binding are not established"
             }
+            if link.resolutionBasis == "rust-use-inline-module-candidate" {
+                return "Saved source containing inline module for \(link.destination) · module position and compiler resolution are not established"
+            }
             if link.resolutionBasis == "rust-use-module-prefix-candidate" {
                 return "Saved containing-module candidate for \(link.destination) · imported item location and compiler resolution are not established"
             }

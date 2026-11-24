@@ -64,7 +64,7 @@ fn c_imports_open_exact_statement_and_target_from_frozen_captures() {
     assert_eq!(incoming.matches("\"link_id\":").count(), 1);
     assert!(incoming.contains("\"lexical_import_kind\":\"rust-use\""), "{incoming}");
     assert!(incoming.contains("\"resolution_basis\":\"rust-use-module-prefix-candidate\""));
-    assert!(incoming.contains("\"resolver\":\"fcb-closed-catalog-imports-v11\""));
+    assert!(incoming.contains("\"resolver\":\"fcb-closed-catalog-imports-v12\""));
     assert!(incoming.contains("\"source_bytes_read\":\"0\""));
     let id = number(&incoming, "link_id");
     fs::write(root.join("src/lib.rs"), b"mod changed;\n").unwrap();
@@ -194,7 +194,7 @@ fn c_python_import_candidates_keep_exact_evidence_and_targets_after_live_edits()
     let result = finish(atlas, 1);
     assert_eq!(number(&result, "retained_links"), 1, "{result}");
     assert!(result.contains("\"language\":\"python\""));
-    assert!(result.contains("\"extraction_policy\":\"rust-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v9\""));
+    assert!(result.contains("\"extraction_policy\":\"rust-inline-modules-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v10\""));
     let filter = CString::new(hex(b"pkg/worker.py")).unwrap();
     let incoming = take(unsafe { fcb_atlas_imports_page(atlas, 1, 2, filter.as_ptr(), 0, 64) });
     assert_eq!(number(&incoming, "matching_links"), 1);

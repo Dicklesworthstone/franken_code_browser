@@ -20,9 +20,9 @@ enum AtlasSavedImportWire {
         guard w.projection == "lexical-source-imports", w.relationship_kind == "lexical-import",
               w.evidence_precision == "exact-import-source-range",
               w.resolution_domain == "declared-catalog-candidates",
-              w.extractor == "franken-markdown-d6fbd1d5/import-statements-v9",
-              w.extraction_policy == "rust-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v9",
-              w.resolver == "fcb-closed-catalog-imports-v11",
+              w.extractor == "franken-markdown-d6fbd1d5/import-statements-v10",
+              w.extraction_policy == "rust-inline-modules-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v10",
+              w.resolver == "fcb-closed-catalog-imports-v12",
               !w.compiler_resolved, !w.semantic_complete else { throw AtlasSavedError.invalidResponse }
     }
 
@@ -85,6 +85,7 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
         if resolutionBasis == "go-module-context-unavailable" { return "Captured go.mod context is unavailable or unsupported" }
         if resolutionBasis == "go-nested-module-boundary" { return "Import crosses a nested Go module; no target selected" }
         if resolutionBasis == "unresolved-java-wildcard" { return "Java on-demand import; no individual source target selected" }
+        if resolutionBasis == "rust-use-inline-module-candidate" { return "Captured source containing the inline module; module position is not identified" }
         if resolutionBasis == "java-source-file-candidate" || resolutionBasis == "java-enclosing-type-candidate" {
             let type = resolutionBasis == "java-enclosing-type-candidate" ? "Enclosing Java type candidate" : "Java source-file candidate"
             return type + (canOpenTarget ? " captured" : " recorded without source bytes")
@@ -154,7 +155,7 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
               !destination.isEmpty, destination.utf8.count <= 1024, kinds.contains(kind),
               ["captured", "unavailable", "missing", "ambiguous", "external", "unresolved"].contains(resolution),
               ["exact-relative-path", "unique-relative-module-candidate", "typescript-source-extension-candidate", "rust-path-attribute-candidate", "rust-include-file-candidate", "rust-module-file-candidate",
-               "rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "ambiguous-rust-crate-root",
+               "rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "rust-use-inline-module-candidate", "ambiguous-rust-crate-root",
                "python-relative-module-candidate", "python-absolute-module-candidate", "cpp-source-relative-include-candidate",
                "go-module-package-file-candidate", "go-module-context-unavailable", "go-nested-module-boundary",
                "java-source-file-candidate", "java-enclosing-type-candidate", "unresolved-java-wildcard",
@@ -173,7 +174,7 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
         if kind == "rust-path-module" && !["rust-path-attribute-candidate", "no-catalog-target", "unsupported-specifier"].contains(resolutionBasis) {
             throw AtlasSavedError.invalidResponse
         }
-        if ["rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "ambiguous-rust-crate-root"]
+        if ["rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "rust-use-inline-module-candidate", "ambiguous-rust-crate-root"]
             .contains(resolutionBasis) && (language != "rust" || kind != "rust-use") {
             throw AtlasSavedError.invalidResponse
         }
@@ -220,7 +221,7 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
         let acceptedBases: [String]
         switch resolution {
         case "captured", "unavailable": acceptedBases = ["exact-relative-path", "unique-relative-module-candidate", "typescript-source-extension-candidate",
-            "rust-path-attribute-candidate", "rust-include-file-candidate", "rust-module-file-candidate", "rust-use-module-file-candidate", "rust-use-module-prefix-candidate",
+            "rust-path-attribute-candidate", "rust-include-file-candidate", "rust-module-file-candidate", "rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "rust-use-inline-module-candidate",
             "python-relative-module-candidate", "python-absolute-module-candidate",
             "cpp-source-relative-include-candidate", "go-module-package-file-candidate",
             "java-source-file-candidate", "java-enclosing-type-candidate"]
@@ -242,6 +243,11 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
                   let targetBytes, targetBytes <= AtlasSavedWire.memberBytes else { throw AtlasSavedError.invalidResponse }
         } else {
             guard targetRevision == nil, targetDigest == nil, targetBytes == nil else { throw AtlasSavedError.invalidResponse }
+        }
+        if resolutionBasis == "rust-use-inline-module-candidate" {
+            guard resolution == "captured", targetMember == sourceMember, targetFile == sourceFile,
+                  targetRevision == sourceRevision, targetDigest == sourceDigest, targetBytes == sourceBytes,
+                  targetPath?.bytes == sourcePath.bytes else { throw AtlasSavedError.invalidResponse }
         }
     }
     func matches(_ other: Self) -> Bool {

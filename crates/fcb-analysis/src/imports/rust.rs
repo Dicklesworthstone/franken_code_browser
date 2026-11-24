@@ -8,32 +8,43 @@ use super::{ImportError, ImportKind, MAX_IMPORT_SPECIFIER_BYTES, MAX_STATEMENT_B
     MAX_STATEMENT_TERMINALS, Statements, Terminal, Tok, check, identifier};
 
 const MAX_USE_TREE_DEPTH: usize = 32;
+pub(super) const MAX_INLINE_MODULES: usize = 32;
+const MAX_SCOPE_DEPTH: usize = 128;
+pub(super) const CONTEXT_WORKSPACE_BYTES: usize = std::mem::size_of::<RustScopes>() + MAX_SCOPE_DEPTH;
 
 impl Statements<'_> {
     pub(super) fn rust(&mut self, canceled: &mut impl FnMut() -> bool) -> Result<(), ImportError> {
-        // A path override can change the module interpretation of other uses.
-        // Keep their evidence, but admit no conventional-path targets in that
-        // file. Nested inline modules and macro bodies likewise lack a modeled
-        // module context, even when a leaf begins with an explicit qualifier.
+        // Path overrides can change the interpretation of other conventional
+        // links. Keep exact evidence but do not infer their affected module tree.
         let mut overrides = false;
         let mut conditional_source = false;
         for i in 0..self.tokens.len() {
             if i & 255 == 0 { check(canceled)?; }
-            overrides |= self.word(i) == "#" && self.word(i + 1) == "["
-                && matches!(self.word(i + 2), "path" | "cfg_attr");
-            conditional_source |= self.word(i) == "#" && self.word(i + 1) == "!"
-                && self.word(i + 2) == "[" && matches!(self.word(i + 3), "cfg" | "cfg_attr");
+            if self.word(i) != "#" { continue; }
+            let inner = self.word(i + 1) == "!";
+            let bracket = i + if inner { 2 } else { 1 };
+            if self.word(bracket) != "[" { continue; }
+            overrides |= matches!(self.word(bracket + 1), "path" | "cfg_attr");
+            conditional_source |= inner && matches!(self.word(bracket + 1), "cfg" | "cfg_attr");
         }
-        let mut depth = 0usize;
+        // Validate the whole delimiter structure before granting any inline
+        // ancestry. An unclosed body cannot retroactively qualify earlier rows,
+        // and a mismatched/over-depth close cannot expose a false root scope.
+        let balanced = self.rust_balanced_scopes(canceled)?;
+        let mut scopes = RustScopes::new(balanced && !conditional_source);
         let mut include_data_end = 0usize;
         let mut i = 0;
         while i < self.tokens.len() {
             check(canceled)?;
             if i >= include_data_end {
-                // Another macro's token tree may be arbitrary data, or a
-                // macro_rules! template, rather than an expression at this
-                // location. Leave the existing mod/use traversal untouched.
+                // Another macro's token tree may be arbitrary data. Literal
+                // include sites keep their existing physical-source path rule.
                 if let Some(end) = self.rust_file_include(i)? {
+                    // A braced item invocation needs no following semicolon.
+                    // Expression includes do not terminate their enclosing item.
+                    if i == scopes.item_start && self.word(i + 2) == "{" {
+                        scopes.statement_end(end);
+                    }
                     i = end;
                     continue;
                 }
@@ -51,22 +62,36 @@ impl Statements<'_> {
                     && self.tokens[i + 1].end == self.tokens[i + 2].start
                     && self.tokens[i + 2].end == self.tokens[i + 3].start;
                 let name_end = i + if raw { 3 } else { 1 };
-                let semicolon = name_end + 1;
-                if self.word(semicolon) == ";" && (raw || identifier(self.word(i + 1))) {
+                let delimiter = name_end + 1;
+                if raw || identifier(self.word(i + 1)) {
+                    let name = self.word(name_end);
+                    let name_allowed = if raw { !matches!(name, "crate" | "self" | "super" | "Self" | "_") }
+                        else { self.tokens[name_end].kind != Tok::Keyword && !matches!(name, "Self" | "_") };
                     let start = self.tokens[i + 1].start; let end = self.tokens[name_end].end;
                     let text = self.text;
-                    if let Some((attribute, literal_start, literal_end, literal_allowed)) = self.rust_path_attribute(i, semicolon) {
-                        let name = self.word(name_end);
-                        let name_allowed = if raw { !matches!(name, "crate" | "self" | "super" | "Self" | "_") }
-                            else { self.tokens[name_end].kind != Tok::Keyword && !matches!(name, "Self" | "_") };
-                        self.add(ImportKind::RustPathModule, attribute, self.tokens[semicolon].end,
-                            literal_start, literal_end, &text[literal_start..literal_end],
-                            depth == 0 && !conditional_source && literal_allowed && name_allowed)?;
-                    } else {
-                        self.add(ImportKind::RustModule, self.tokens[i].start, self.tokens[semicolon].end,
-                            start, end, &text[start..end], depth == 0 && !overrides)?;
+                    if self.word(delimiter) == ";" {
+                        if let Some((attribute, literal_start, literal_end, literal_allowed)) = self.rust_path_attribute(i, delimiter) {
+                            self.add(ImportKind::RustPathModule, attribute, self.tokens[delimiter].end,
+                                literal_start, literal_end, &text[literal_start..literal_end],
+                                balanced && scopes.depth == 0 && !conditional_source && literal_allowed && name_allowed)?;
+                        } else {
+                            let context = if !overrides && name_allowed { scopes.context() } else { None };
+                            self.rust_add(ImportKind::RustModule, self.tokens[i].start, self.tokens[delimiter].end,
+                                start, end, &text[start..end], context)?;
+                        }
+                        scopes.statement_end(delimiter + 1);
+                        i = delimiter + 1; continue;
                     }
-                    i = semicolon + 1; continue;
+                    if self.word(delimiter) == "{" {
+                        // Only a named item directly in a qualified module can
+                        // establish ancestry. Attributed headers, local blocks,
+                        // unsupported visibility and macro data stay unmodeled.
+                        let inline = name_allowed && name.is_ascii() && !overrides
+                            && i >= include_data_end && self.rust_plain_module_header(scopes.item_start, i);
+                        let name = inline.then_some(&text[start..end]);
+                        if !scopes.enter(b'}', delimiter + 1, name, false) && balanced { self.diagnostics += 1; }
+                        i = delimiter + 1; continue;
+                    }
                 }
             }
             if self.keyword(i, "use") && !self.rust_raw_tail(i) {
@@ -87,12 +112,12 @@ impl Statements<'_> {
                     let text = self.text; let tokens = self.tokens;
                     let statement_start = tokens[i].start; let statement_end = tokens[j].end;
                     // Two bounded passes avoid a temporary expanded leaf tree
-                    // (and avoid half-valid output if a later branch is bad).
+                    // and any half-valid output if a later branch is bad.
                     if walk_use(text, tokens, i + 1, j, canceled, |_, _, _| Ok(()))? {
-                        let allowed = depth == 0 && !overrides;
+                        let context = if !overrides { scopes.context() } else { None };
                         if !walk_use(text, tokens, i + 1, j, canceled, |path, start, end| {
-                            self.add(ImportKind::RustUse, statement_start, statement_end,
-                                start, end, path, allowed)
+                            self.rust_add(ImportKind::RustUse, statement_start, statement_end,
+                                start, end, path, context)
                         })? { return Err(ImportError::InvalidEvidence); }
                     } else {
                         self.diagnostics += 1;
@@ -100,17 +125,76 @@ impl Statements<'_> {
                         self.add(ImportKind::RustUse, statement_start, statement_end,
                             start, end, &text[start..end], false)?;
                     }
+                    scopes.statement_end(j + 1);
                     i = j + 1; continue;
                 }
                 self.diagnostics += 1;
             }
             match self.word(i) {
-                "{" | "(" | "[" => depth = depth.saturating_add(1),
-                "}" | ")" | "]" => depth = depth.saturating_sub(1), _ => {}
+                "{" | "(" | "[" => {
+                    let close = match self.word(i) { "{" => b'}', "(" => b')', _ => b']' };
+                    let inner_attribute = self.word(i) == "[" && i >= 2 && self.word(i - 2) == "#"
+                        && self.word(i - 1) == "!" && scopes.item_start == i - 2;
+                    if !scopes.enter(close, i + 1, None, inner_attribute) && balanced { self.diagnostics += 1; }
+                }
+                "}" | ")" | "]" => {
+                    if !scopes.leave(self.word(i).as_bytes()[0], i + 1) && balanced { self.diagnostics += 1; }
+                }
+                ";" => scopes.statement_end(i + 1),
+                _ => {}
             }
             i += 1;
         }
         Ok(())
+    }
+
+    fn rust_add(&mut self, kind: ImportKind, start: usize, end: usize, spec_start: usize,
+        spec_end: usize, destination: &str, context: Option<&str>) -> Result<(), ImportError> {
+        let before = self.facts.len();
+        self.add(kind, start, end, spec_start, spec_end, destination, context.is_some())?;
+        // Output truncation or an invalid specifier must not rewrite the last
+        // previously accepted fact. Every context allocation is charged up front.
+        if self.facts.len() == before { return Ok(()); }
+        if let Some(context) = context {
+            let mut owned = String::new();
+            owned.try_reserve_exact(context.len()).map_err(|_| ImportError::ResourceDenied)?;
+            if owned.capacity() > context.len() { return Err(ImportError::ResourceDenied); }
+            owned.push_str(context);
+            self.facts.last_mut().ok_or(ImportError::InvalidEvidence)?.rust_module_context = Some(owned);
+        }
+        Ok(())
+    }
+
+    fn rust_plain_module_header(&self, start: usize, module: usize) -> bool {
+        start == module
+            || start.checked_add(1) == Some(module) && self.keyword(start, "pub")
+            || start.checked_add(4) == Some(module) && self.keyword(start, "pub")
+                && self.word(start + 1) == "(" && matches!(self.word(start + 2), "crate" | "self" | "super")
+                && self.word(start + 3) == ")"
+    }
+
+    fn rust_balanced_scopes(&mut self, canceled: &mut impl FnMut() -> bool) -> Result<bool, ImportError> {
+        let mut expected = [0u8; MAX_SCOPE_DEPTH];
+        let mut depth = 0usize;
+        for i in 0..self.tokens.len() {
+            if i & 255 == 0 { check(canceled)?; }
+            match self.word(i) {
+                "(" | "[" | "{" => {
+                    if depth == expected.len() { self.diagnostics += 1; return Ok(false); }
+                    expected[depth] = match self.word(i) { "(" => b')', "[" => b']', _ => b'}' };
+                    depth += 1;
+                }
+                ")" | "]" | "}" => {
+                    if depth == 0 || expected[depth - 1] != self.word(i).as_bytes()[0] {
+                        self.diagnostics += 1; return Ok(false);
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        if depth != 0 { self.diagnostics += 1; }
+        Ok(depth == 0)
     }
 
     // Inspect only the upstream string terminal and this fixed attribute/item
@@ -148,6 +232,64 @@ impl Statements<'_> {
         at >= 2 && self.word(at - 2) == "r" && self.word(at - 1) == "#"
             && self.tokens[at - 2].end == self.tokens[at - 1].start
             && self.tokens[at - 1].end == self.tokens[at].start
+    }
+}
+
+
+#[derive(Clone, Copy)]
+struct RustScope {
+    close: u8, qualified: bool, inner_attribute: bool,
+    path_len: usize, modules: usize, item_start: usize,
+}
+struct RustScopes {
+    stack: [RustScope; MAX_SCOPE_DEPTH], depth: usize,
+    path: [u8; MAX_IMPORT_SPECIFIER_BYTES], path_len: usize, modules: usize,
+    qualified: bool, poisoned: bool, item_start: usize,
+}
+impl RustScopes {
+    fn new(qualified: bool) -> Self {
+        Self { stack: [RustScope { close: 0, qualified: false, inner_attribute: false,
+            path_len: 0, modules: 0, item_start: 0 }; MAX_SCOPE_DEPTH],
+            depth: 0, path: [0; MAX_IMPORT_SPECIFIER_BYTES], path_len: 0, modules: 0,
+            qualified, poisoned: false, item_start: 0 }
+    }
+    fn context(&self) -> Option<&str> {
+        if !self.qualified || self.poisoned { return None; }
+        std::str::from_utf8(&self.path[..self.path_len]).ok()
+    }
+    fn statement_end(&mut self, after: usize) {
+        if self.qualified { self.item_start = after; }
+    }
+    fn enter(&mut self, close: u8, after: usize, inline: Option<&str>, inner_attribute: bool) -> bool {
+        if self.poisoned { return true; }
+        if self.depth == self.stack.len() { self.poisoned = true; return false; }
+        self.stack[self.depth] = RustScope { close, qualified: self.qualified, inner_attribute,
+            path_len: self.path_len, modules: self.modules, item_start: self.item_start };
+        self.depth += 1;
+        let parent_qualified = self.qualified;
+        self.qualified = false;
+        self.item_start = after;
+        if let Some(name) = inline.filter(|_| parent_qualified) {
+            let separator = if self.path_len == 0 { 0 } else { 2 };
+            let end = self.path_len + separator + name.len();
+            if self.modules == MAX_INLINE_MODULES || end > self.path.len() { return false; }
+            if separator != 0 { self.path[self.path_len..self.path_len + 2].copy_from_slice(b"::"); }
+            self.path[self.path_len + separator..end].copy_from_slice(name.as_bytes());
+            self.path_len = end; self.modules += 1; self.qualified = true;
+        }
+        true
+    }
+    fn leave(&mut self, close: u8, after: usize) -> bool {
+        if self.poisoned { return true; }
+        if self.depth == 0 || self.stack[self.depth - 1].close != close {
+            self.poisoned = true; return false;
+        }
+        self.depth -= 1;
+        let frame = self.stack[self.depth];
+        self.path_len = frame.path_len; self.modules = frame.modules;
+        self.qualified = frame.qualified; self.item_start = frame.item_start;
+        if self.qualified && (close == b'}' || frame.inner_attribute) { self.item_start = after; }
+        true
     }
 }
 

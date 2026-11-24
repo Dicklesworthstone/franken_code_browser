@@ -83,9 +83,9 @@ fn final_self_and_raw_keywords_keep_the_module_path_and_leaf_spelling() {
 }
 
 #[test]
-fn nested_and_path_override_contexts_keep_evidence_without_module_authority() {
+fn unmodeled_and_path_override_contexts_keep_evidence_without_module_authority() {
     for source in [
-        b"mod inner { use crate::{one, two}; }".as_slice(),
+        b"#[cfg(test)] mod inner { use crate::{one, two}; }".as_slice(),
         b"fn run() { use crate::{one, two}; }".as_slice(),
         b"wrapper! { use crate::{one, two}; }".as_slice(),
         b"#[path = \"alternate.rs\"] mod child; use crate::{one, two};".as_slice(),
@@ -183,4 +183,144 @@ fn large_group_cancellation_discards_all_candidate_output() {
     assert!(matches!(build_with(source.as_bytes(), 200, || {
         polls += 1; polls >= complete_polls / 2
     }), Err(ImportError::Canceled)));
+}
+
+
+#[test]
+fn named_inline_context_is_separate_from_exact_destinations_and_spans() {
+    let source = b"#![forbid(unsafe_code)]\npub mod outer { mod child; use self::child::{Thing, Other}; pub(crate) mod r#type { use super::child::Thing; } mod sibling { mod leaf; } } use crate::after;";
+    let imports = build(source, 20);
+    assert!(imports.is_complete());
+    assert_eq!(paths(&imports), ["child", "self::child::Thing", "self::child::Other",
+        "super::child::Thing", "leaf", "crate::after"]);
+    let contexts = imports.facts().iter().map(|fact| fact.rust_module_context()).collect::<Vec<_>>();
+    assert_eq!(contexts, [Some("outer"), Some("outer"), Some("outer"),
+        Some("outer::r#type"), Some("outer::sibling"), Some("")]);
+    assert_eq!(specifiers(&imports, source), [b"child".as_slice(), b"Thing", b"Other",
+        b"super::child::Thing", b"leaf", b"crate::after"]);
+    assert_eq!(imports.source_bytes(1).unwrap(), b"mod child;");
+    assert_eq!(imports.source_bytes(2).unwrap(), b"use self::child::{Thing, Other};");
+    assert_eq!(imports.source_bytes(4).unwrap(), b"use super::child::Thing;");
+    assert!(imports.facts().iter().all(|fact| fact.resolution_allowed()));
+}
+
+#[test]
+fn inline_context_resumes_after_opaque_bodies_without_leaking_scope_or_macro_data() {
+    let source = br#"mod outer {
+        fn helper() { mod local { use self::hidden; } }
+        wrapper! { mod generated { use self::generated; } }
+        const TEXT: &str = "mod fake { use self::fake; }";
+        mod child;
+        mod inner { use super::child; }
+        use self::child;
+    }
+    mod sibling { mod child; }
+    use crate::after;"#;
+    let imports = build(source, 20);
+    assert_eq!(paths(&imports), ["self::hidden", "self::generated", "child",
+        "super::child", "self::child", "child", "crate::after"]);
+    assert_eq!(imports.facts().iter().map(|fact| fact.rust_module_context()).collect::<Vec<_>>(),
+        [None, None, Some("outer"), Some("outer::inner"), Some("outer"), Some("sibling"), Some("")]);
+    assert!(imports.is_complete());
+    let after_include = build(b"include! { \"generated.rs\" } mod outer { mod child; }", 20);
+    assert!(after_include.is_complete());
+    assert_eq!(paths(&after_include), ["generated.rs", "child"]);
+    assert_eq!(after_include.facts()[1].rust_module_context(), Some("outer"),
+        "a braced item include must finish its item without requiring a semicolon");
+    for source in [
+        "fn run() { mod local { mod child; } }",
+        "const VALUE: () = { mod local { mod child; } };",
+        "wrapper!(mod generated { mod child; });",
+        "macro_rules! recipe { () => { mod generated { mod child; } } }",
+        "#[cfg(test)] mod conditional { mod child; }",
+        "#[custom_attribute] mod transformed { mod child; }",
+        "pub(in crate) mod restricted { mod child; }",
+        "unsafe mod invalid { mod child; }",
+        "mod caf\u{e9} { mod child; }",
+        "#![cfg(test)] mod conditional { mod child; }",
+        "#![path = \"elsewhere\"] mod overridden { mod child; }",
+    ] {
+        let imports = build(source.as_bytes(), 20);
+        assert_eq!(imports.facts().len(), 1, "{source}");
+        assert_eq!(imports.facts()[0].destination(), "child");
+        assert!(!imports.facts()[0].resolution_allowed(), "{source}");
+        assert_eq!(imports.facts()[0].rust_module_context(), None, "{source}");
+    }
+}
+
+#[test]
+fn malformed_or_excessive_delimiters_never_qualify_a_partial_body_or_false_root_tail() {
+    for source in [
+        "mod outer { use self::child;",
+        "mod outer { use self::child; ) } use crate::tail;",
+        "} mod outer { use self::child; } use crate::tail;",
+    ] {
+        let imports = build(source.as_bytes(), 20);
+        assert!(!imports.is_complete()); assert!(imports.diagnostics() > 0);
+        assert!(!imports.facts().is_empty());
+        assert!(imports.facts().iter().all(|fact| !fact.resolution_allowed() && fact.rust_module_context().is_none()));
+    }
+    let source = format!("{}use self::child;{} use crate::tail;", "{".repeat(129), "}".repeat(129));
+    let imports = build(source.as_bytes(), 20);
+    assert!(!imports.is_complete());
+    assert_eq!(paths(&imports), ["self::child", "crate::tail"]);
+    assert!(imports.facts().iter().all(|fact| fact.rust_module_context().is_none()));
+}
+
+#[test]
+fn inline_depth_context_bytes_and_output_truncation_have_explicit_bounds() {
+    for depth in [32, 33] {
+        let source = format!("{}use self::child;{} use crate::tail;", "mod a {".repeat(depth), "}".repeat(depth));
+        let imports = build(source.as_bytes(), 20);
+        assert_eq!(paths(&imports), ["self::child", "crate::tail"]);
+        assert_eq!(imports.facts()[0].resolution_allowed(), depth == 32);
+        assert_eq!(imports.is_complete(), depth == 32);
+        if depth == 32 {
+            let expected = vec!["a"; depth].join("::");
+            assert_eq!(imports.facts()[0].rust_module_context(), Some(expected.as_str()));
+        } else { assert_eq!(imports.facts()[0].rust_module_context(), None); }
+        assert_eq!(imports.facts()[1].rust_module_context(), Some(""), "a bounded opaque body does not corrupt its parent");
+    }
+    for length in [MAX_IMPORT_SPECIFIER_BYTES, MAX_IMPORT_SPECIFIER_BYTES + 1] {
+        let name = "a".repeat(length);
+        let source = format!("mod {name} {{ mod child; }}");
+        let imports = build(source.as_bytes(), 20);
+        assert_eq!(imports.facts().len(), 1);
+        assert_eq!(imports.facts()[0].resolution_allowed(), length == MAX_IMPORT_SPECIFIER_BYTES);
+        assert_eq!(imports.is_complete(), length == MAX_IMPORT_SPECIFIER_BYTES);
+        if length == MAX_IMPORT_SPECIFIER_BYTES {
+            assert_eq!(imports.facts()[0].rust_module_context(), Some(name.as_str()));
+        }
+    }
+    let imports = build(b"mod outer { mod first; } mod later { mod second; }", 1);
+    assert!(imports.truncated()); assert_eq!(imports.links_seen(), 2);
+    assert_eq!(paths(&imports), ["first"]);
+    assert_eq!(imports.facts()[0].rust_module_context(), Some("outer"),
+        "an omitted fact must not replace the previous retained fact's context");
+}
+
+#[test]
+fn inline_context_capacity_remains_admitted_after_parser_scratch_is_released() {
+    use std::mem::size_of;
+    use fcb_analysis::imports::ImportFact;
+    let name = "a".repeat(MAX_IMPORT_SPECIFIER_BYTES);
+    let source = format!("mod {name} {{ use self::child; }}");
+    let request = || CaptureRequest::new(FileId::new(owner(), 1).unwrap(), SourceRevision::new(owner(), 1).unwrap()).unwrap();
+    let budget = ResourceBudget::new(owner(), ByteLength::new(256 * 1024 * 1024)).unwrap();
+    let imports = CapturedImports::build(source.as_bytes(), request(), QueryGeneration::new(owner(), 1).unwrap(),
+        ImportLanguage::Rust, 1, &budget, ResourceAllocationId::new(1).unwrap(), || false).unwrap();
+    let expected = size_of::<CapturedImports<'_>>() + size_of::<ImportFact>() + "self::child".len() + name.len();
+    assert_eq!(budget.accounting().reserved().get(), expected as u64);
+    assert_eq!(imports.facts()[0].rust_module_context(), Some(name.as_str()));
+    drop(imports);
+    assert_eq!(budget.accounting().reserved().get(), 0);
+    assert!(matches!(CapturedImports::build(source.as_bytes(), request(), QueryGeneration::new(owner(), 1).unwrap(),
+        ImportLanguage::Rust, 1, &budget, ResourceAllocationId::new(1).unwrap(),
+        || budget.accounting().reserved().get() > 0), Err(ImportError::Canceled)));
+    assert_eq!(budget.accounting().reserved().get(), 0);
+    let other = CapturedImports::build(b"import os", request(), QueryGeneration::new(owner(), 2).unwrap(),
+        ImportLanguage::Python, 1, &budget, ResourceAllocationId::new(1).unwrap(), || false).unwrap();
+    assert_eq!(other.facts()[0].rust_module_context(), None);
+    assert_eq!(budget.accounting().reserved().get(),
+        (size_of::<CapturedImports<'_>>() + size_of::<ImportFact>() + 2) as u64);
 }

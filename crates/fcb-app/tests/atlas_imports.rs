@@ -19,6 +19,51 @@ use fcb_app::host::{HostResponse, atlas_session::{AtlasSession, AtlasSessionOpti
         MAX_ATLAS_IMPORT_SOURCE_BYTES}};
 use support::{Json, parse};
 
+
+#[test]
+fn inline_rust_modules_resolve_nested_candidates_from_retained_captures() {
+    let source = b"mod outer { mod child; use self::child::Thing; mod inner { use super::child::Thing; } }\n";
+    let target = b"pub struct Thing;\n";
+    let mut f = Fixture::new(&[("src/lib.rs", source), ("src/outer/child.rs", target),
+        ("src/child.rs", b"pub struct WrongModule;\n")]);
+    f.build(1);
+    fs::write(f.root.join("src/lib.rs"), b"mod replaced;\n").unwrap();
+    fs::write(f.root.join("src/outer/child.rs"), b"pub struct Replacement;\n").unwrap();
+    let page = f.prepare(1, 1);
+    assert!(page.get("relationships_complete").flag());
+    assert_eq!(page.get("links_seen").number(), 3);
+    assert_eq!(page.get("extractor").text(), "franken-markdown-d6fbd1d5/import-statements-v10");
+    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v12");
+    for (destination, statement, kind, basis) in [
+        ("child", b"mod child;".as_slice(), "rust-module", "rust-module-file-candidate"),
+        ("self::child::Thing", b"use self::child::Thing;", "rust-use", "rust-use-module-prefix-candidate"),
+        ("super::child::Thing", b"use super::child::Thing;", "rust-use", "rust-use-module-prefix-candidate"),
+    ] {
+        let row = link(&page, b"src/lib.rs", destination);
+        assert_eq!(row.get("lexical_import_kind").text(), kind);
+        assert_eq!(row.get("resolution").text(), "captured");
+        assert_eq!(row.get("resolution_basis").text(), basis);
+        assert_eq!(row.get("source_sha256").text(), Sha256::digest(source).to_hex());
+        assert_eq!(range(row.get("evidence_range"), source), statement);
+        assert_eq!(range(row.get("specifier_range"), source), destination.as_bytes());
+        assert_eq!(row.get("target_path").get("hex").text(), hex(b"src/outer/child.rs"));
+        assert_eq!(row.get("target_sha256").text(), Sha256::digest(target).to_hex());
+    }
+    let incoming = f.page(1, Direction::Incoming, Some(b"src/outer/child.rs"), 0, 64);
+    assert_eq!(incoming.get("links").array(), page.get("links").array());
+    assert_eq!(incoming.get("source_bytes_read").number(), 0);
+    let row = link(&page, b"src/lib.rs", "super::child::Thing");
+    let id = row.get("link_id").number();
+    let (evidence, receipt) = f.search.open_import_reader(&f.atlas, owner(73220), 1, id, Side::Evidence, || false).unwrap();
+    assert_eq!(json(&receipt).get("relationship"), row);
+    let (reader, receipt) = f.search.open_import_reader(&f.atlas, owner(73221), 1, id, Side::Target, || false).unwrap();
+    assert_eq!(json(&receipt).get("source_sha256").text(), Sha256::digest(target).to_hex());
+    assert!(!json(&receipt).get("source_reopened").flag());
+    f.search.clear_index(&f.atlas, 2, || false).unwrap();
+    assert_eq!(evidence.capture().bytes(), source);
+    assert_eq!(reader.capture().bytes(), target);
+}
+
 #[test]
 fn explicit_rust_module_paths_navigate_exact_retained_sources() {
     let statement = b"#[path = \"platform/custom.rs\"] pub(crate) mod child;";
@@ -197,9 +242,9 @@ fn coverage(page: &Json) {
     assert_eq!(page.get("evidence_precision").text(), "exact-import-source-range");
     assert_eq!(page.get("relationship_kind").text(), "lexical-import");
     assert_eq!(page.get("resolution_domain").text(), "declared-catalog-candidates");
-    assert_eq!(page.get("extractor").text(), "franken-markdown-d6fbd1d5/import-statements-v9");
-    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v11");
-    assert_eq!(page.get("extraction_policy").text(), "rust-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v9");
+    assert_eq!(page.get("extractor").text(), "franken-markdown-d6fbd1d5/import-statements-v10");
+    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v12");
+    assert_eq!(page.get("extraction_policy").text(), "rust-inline-modules-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v10");
     assert!(!page.get("compiler_resolved").flag()); assert!(!page.get("semantic_complete").flag());
     assert_eq!(page.get("source_files").number(), page.get("captured_source_files").number()
         + page.get("capture_unavailable_source_files").number() + page.get("outside_capture_scope_source_files").number()
@@ -603,10 +648,13 @@ fn rust_root_and_module_ambiguity_preserve_evidence_and_never_guess_a_target() {
     let root = b"use crate::choice::Item;\nuse crate::missing;\nuse external::Thing;\n";
     let consumer = b"use crate::choice;";
     let nested = b"mod inner { use super::choice; }";
+    let conditional = b"#[cfg(test)] mod inner { use super::choice; }";
+    let local = b"fn helper() { use super::choice; }";
     let overridden = b"#[path = \"actual.rs\"] mod moved; use crate::choice;";
     let mut f = Fixture::new(&[("src/lib.rs", root), ("src/main.rs", b""),
         ("src/choice.rs", b"pub struct Item;"), ("src/choice/mod.rs", b"pub struct Item;"),
         ("src/consumer.rs", consumer), ("src/nested.rs", nested),
+        ("src/conditional.rs", conditional), ("src/local.rs", local),
         ("src/overridden.rs", overridden), ("src/bin/tool.rs", consumer)]);
     f.build(1);
     let page = f.prepare(1, 1);
@@ -616,7 +664,9 @@ fn rust_root_and_module_ambiguity_preserve_evidence_and_never_guess_a_target() {
         (b"src/lib.rs", root, "crate::missing", "missing", "no-catalog-target"),
         (b"src/lib.rs", root, "external::Thing", "unresolved", "unresolved-rust-use"),
         (b"src/consumer.rs", consumer, "crate::choice", "ambiguous", "ambiguous-rust-crate-root"),
-        (b"src/nested.rs", nested, "super::choice", "unresolved", "unresolved-rust-use"),
+        (b"src/nested.rs", nested, "super::choice", "ambiguous", "ambiguous-rust-crate-root"),
+        (b"src/conditional.rs", conditional, "super::choice", "unresolved", "unresolved-rust-use"),
+        (b"src/local.rs", local, "super::choice", "unresolved", "unresolved-rust-use"),
         (b"src/overridden.rs", overridden, "crate::choice", "unresolved", "unresolved-rust-use"),
         (b"src/bin/tool.rs", consumer, "crate::choice", "unresolved", "unresolved-rust-use"),
     ];
@@ -962,7 +1012,7 @@ fn python_relative_imports_share_incoming_navigation_and_exact_retained_readers(
     let page = f.prepare(1, 1);
     assert!(page.get("relationships_complete").flag(), "{page:?}");
     assert_eq!(page.get("retained_links").number(), 5);
-    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v11");
+    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v12");
 
     let row = link(&page, b"pkg/main.py", ".worker");
     assert_eq!(row.get("language").text(), "python");

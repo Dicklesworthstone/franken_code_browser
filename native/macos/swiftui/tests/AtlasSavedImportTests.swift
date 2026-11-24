@@ -63,8 +63,8 @@ private final class SavedImportFixture: @unchecked Sendable {
         ["projection": "lexical-source-imports", "relationship_kind": "lexical-import",
          "evidence_precision": "exact-import-source-range", "resolution_domain": "declared-catalog-candidates",
          "compiler_resolved": false, "semantic_complete": false,
-         "extractor": "franken-markdown-d6fbd1d5/import-statements-v9",
-         "extraction_policy": "rust-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v9", "resolver": "fcb-closed-catalog-imports-v11"]
+         "extractor": "franken-markdown-d6fbd1d5/import-statements-v10",
+         "extraction_policy": "rust-inline-modules-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v10", "resolver": "fcb-closed-catalog-imports-v12"]
     }
     func link(_ id: UInt64) -> [String: Any] {
         let target = base.members[id == 1 ? 3 : 4]
@@ -248,6 +248,35 @@ private final class SavedImportFixture: @unchecked Sendable {
             var old = value; old["resolver"] = "fcb-closed-catalog-imports-v2"
             reject { _ = try decode(old) }
         }
+        var inline = original, inlineRow = fixture.link(1)
+        inlineRow["lexical_import_kind"] = "rust-use"; inlineRow["destination"] = "self::*"
+        inlineRow["resolution_basis"] = "rust-use-inline-module-candidate"
+        for (target, source) in [("target_member", "source_member"), ("target_file_id", "source_file_id"),
+            ("target_path", "source_path"), ("target_revision", "source_revision"),
+            ("target_digest", "source_digest"), ("target_bytes", "source_bytes")] {
+            inlineRow[target] = inlineRow[source]
+        }
+        inline["links"] = [inlineRow, fixture.link(2)]
+        let inlineLink = try decode(inline).links[0]
+        precondition(inlineLink.canOpenTarget && inlineLink.targetMember == inlineLink.sourceMember
+            && inlineLink.resolutionLabel.contains("inline module"))
+        let inlineCapture = AtlasSavedReaderCapture(reader: source.reader, owner: source.owner, member: source.member,
+            origin: .importLink(generation: 1, link: inlineLink, side: .target), archiveIdentity: identity)
+        precondition(inlineCapture.evidenceLabel.contains("inline module")
+            && inlineCapture.evidenceLabel.contains("module position and compiler resolution are not established"))
+        for (field, changed) in [("target_member", "3" as Any), ("target_file_id", "4"),
+            ("target_path", fixture.base.path(Array("src/other.rs".utf8), "src/other.rs")),
+            ("target_revision", "4"), ("target_digest", String(repeating: "f", count: 64)),
+            ("target_bytes", "1"), ("lexical_import_kind", "rust-module")] {
+            var bad = inline, changedRow = inlineRow
+            changedRow[field] = changed; bad["links"] = [changedRow, fixture.link(2)]
+            reject { _ = try decode(bad) }
+        }
+        var unavailableInline = inline, unavailableRow = inlineRow
+        unavailableRow["resolution"] = "unavailable"
+        for field in ["target_revision", "target_digest", "target_bytes"] { unavailableRow[field] = NSNull() }
+        unavailableInline["links"] = [unavailableRow, fixture.link(2)]
+        reject { _ = try decode(unavailableInline) }
         var ambiguous = original, rows = original["links"] as! [[String: Any]]
         for i in rows.indices {
             rows[i]["lexical_import_kind"] = "rust-use"; rows[i]["destination"] = "crate::saved"
@@ -712,13 +741,33 @@ private final class SavedImportFixture: @unchecked Sendable {
         try javascriptLoadWire(f, identity: identity)
         precondition(accepted.complete && accepted.links[0].sourcePath.bytes == f.base.rawPath)
         precondition(accepted.links[0].canOpenTarget && !accepted.links[1].canOpenTarget)
+        // Scripted host evidence for conventional inline modules keeps source
+        // provenance; the Rust host fixtures perform the actual extraction.
+        for (destination, kind, basis) in [
+            ("child", "rust-module", "rust-module-file-candidate"),
+            ("self::child::Thing", "rust-use", "rust-use-module-prefix-candidate"),
+            ("super::child::Thing", "rust-use", "rust-use-module-prefix-candidate")
+        ] {
+            var nested = f.page(identity.owner, generation: 1), row = f.link(1)
+            row["destination"] = destination; row["lexical_import_kind"] = kind; row["resolution_basis"] = basis
+            row["target_path"] = f.base.path(Array("src/outer/child.rs".utf8), "src/outer/child.rs")
+            nested["links"] = [row, f.link(2)]
+            let candidate = try decode(nested).links[0], source = accepted.links[0]
+            precondition(candidate.canOpenTarget && candidate.targetPath?.bytes == Array("src/outer/child.rs".utf8))
+            precondition(candidate.sourceMember == source.sourceMember && candidate.sourceRevision == source.sourceRevision
+                && candidate.sourceDigest == source.sourceDigest && candidate.sourcePath.bytes == source.sourcePath.bytes
+                && candidate.evidence == source.evidence && candidate.specifier == source.specifier)
+        }
         var interrupted = f.page(identity.owner, generation: 1); interrupted["member_read_calls"] = "1048576"
         let interruptedPage = try decode(interrupted)
         precondition(interruptedPage.readCalls > interruptedPage.sourceBytes, "interrupted snapshot attempts can exceed byte count")
         for (field, value) in [("owner", "99" as Any), ("compiler_resolved", true), ("source_members", "0"),
             ("member_bytes_read", "33554433"), ("retained_source_payload_bytes", "1"), ("next_offset", "1"),
             ("limit", "63"), ("import_generation", "2"), ("peak_source_bytes", "1048577"),
-            ("max_member_source_bytes", "131072")] {
+            ("max_member_source_bytes", "131072"),
+            ("extractor", "franken-markdown-d6fbd1d5/import-statements-v9"),
+            ("extraction_policy", "rust-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v9"),
+            ("resolver", "fcb-closed-catalog-imports-v11")] {
             var invalid = f.page(identity.owner, generation: 1); invalid[field] = value
             reject { _ = try decode(invalid) }
         }

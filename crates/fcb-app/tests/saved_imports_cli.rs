@@ -230,3 +230,66 @@ fn large_saved_imports_enter_desk_and_copy_exact_evidence_after_archive_close() 
         assert!(!f.root.join("pkg/main.py").exists() && !f.root.join("pkg/helper.py").exists());
     }
 }
+
+#[test]
+fn inline_rust_imports_open_exact_utf16_evidence_and_offline_desk_targets_through_stdio() {
+    let prefix = "// \u{1f980} retained source\r\nmod outer {\r\npub mod child;\r\n";
+    let statement = "use self::child::Thing;";
+    let target = b"pub struct Thing;\n";
+    for big in [false, true] {
+        let encode = |text: &str, bom: bool| {
+            let mut bytes = if !bom { Vec::new() } else if big { vec![0xfe, 0xff] } else { vec![0xff, 0xfe] };
+            for unit in text.encode_utf16() {
+                bytes.extend_from_slice(&if big { unit.to_be_bytes() } else { unit.to_le_bytes() });
+            }
+            bytes
+        };
+        let source = encode(&format!("{prefix}{statement}\r\n}}\r\n"), true);
+        let f = Fixture::new(&[
+            entry(b"src/\xff/lib.rs", &source), entry(b"src/\xff/outer/child.rs", target),
+        ], true);
+        let script = format!(
+            "0\tsaved-open\t{}\n\
+             0\tsaved-imports-build\t1\t9\t64\t4096\n\
+             0\tsaved-imports-page\t1\t9\t0\t64\n\
+             0\tsaved-importers\t1\t9\t1\t0\t64\n\
+             0\tsaved-import-source\t1\t9\t2\n\
+             5\tcopy\t1\n\
+             5\tsaved-import-target\t1\t9\t2\n\
+             7\tread\t2\t0\t128\t4\n\
+             7\tsaved-close\t1\n\
+             7\tcopy\t1\n\
+             7\tread\t2\t0\t128\t4\n\
+             7\tquit\n", f.path.display());
+        let (exit, rows) = invoke(&script);
+        assert_eq!(exit, EXIT_OK); assert_eq!(rows.len(), 12);
+        let page = result(&rows[2]); let links = page.get("links").array();
+        assert!(page.get("imports_complete").flag());
+        assert!(!page.get("compiler_resolved").flag()); assert!(!page.get("semantic_complete").flag());
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].get("lexical_import_kind").text(), "rust-module");
+        assert_eq!(links[0].get("destination").text(), "child");
+        let imported = &links[1];
+        assert_eq!(imported.get("lexical_import_kind").text(), "rust-use");
+        assert_eq!(imported.get("destination").text(), "self::child::Thing");
+        assert_eq!(imported.get("resolution").text(), "captured");
+        assert_eq!(imported.get("resolution_basis").text(), "rust-use-module-prefix-candidate");
+        for link in links {
+            assert_eq!(link.get("target_member").number(), 1);
+            assert_eq!(link.get("target_path").get("hex").text(), hex(b"src/\xff/outer/child.rs"));
+        }
+        assert_eq!(result(&rows[3]).get("links").array(), links);
+        let selected = result(&rows[4]).get("selection");
+        assert_eq!(selected.get("start").number(), encode(prefix, true).len() as u64);
+        assert_eq!(selected.get("end").number() - selected.get("start").number(), encode(statement, false).len() as u64);
+        assert_eq!(selected, imported.get("evidence_range"));
+        assert_eq!(result(&rows[5]).get("original_hex").text(), hex(&encode(statement, false)));
+        assert_eq!(result(&rows[6]).get("selection"), &Json::Null);
+        assert_eq!(result(&rows[7]).get("text").text(), std::str::from_utf8(target).unwrap());
+        assert_eq!(rows[8].get("saved_import_generation"), &Json::Null);
+        assert_eq!(result(&rows[9]).get("original_hex").text(), hex(&encode(statement, false)));
+        assert_eq!(result(&rows[10]).get("text").text(), std::str::from_utf8(target).unwrap());
+        assert_eq!(rows[11].get("accepted_revision").number(), 7);
+        assert!(!f.root.join("src").exists(), "navigation must use saved captures, not live source files");
+    }
+}

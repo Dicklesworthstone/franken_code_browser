@@ -350,6 +350,17 @@ attribute and path retain exact original-byte evidence. Conditional attributes,
 macros and unsupported spellings stay unresolved; no Cargo or compiler inference
 is introduced. Native and executable regression verification remain pending.
 
+**Rust imports now navigate through named inline modules.** Inside a plain
+`mod outer { … }` body, child-module declarations and qualified
+`self`/`super` imports retain the containing module's directory. Matching
+`crate::` paths can also cross a known inline ancestor without requiring a
+separate file for that ancestor. Links to an inline module itself open the
+same captured source. The live-project, saved-repository and Reading Desk
+routes preserve exact statement evidence, including UTF-16 and native paths.
+Ambiguous roots, unsupported scopes and exhausted bounds remain explicit.
+See [project import navigation](native/macos/README.md#project-import-navigation)
+for the qualified subset. Executable and physical-Mac verification remain pending.
+
 **TypeScript imports can navigate from emitted extensions to captured source.**
 In TypeScript and TSX files, a relative import such as `./worker.js` can open a
 unique captured `worker.ts`, `worker.tsx`, or `worker.d.ts` when the exact written

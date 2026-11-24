@@ -38,8 +38,8 @@ pub const MAX_IMPORT_ITEMS: usize = 4096;
 pub const MAX_IMPORT_SPECIFIER_BYTES: usize = 1024;
 const MAX_STATEMENT_TERMINALS: usize = 1024;
 const MAX_STATEMENT_BYTES: usize = 16 * 1024;
-pub const IMPORT_EXTRACTOR: &str = "franken-markdown-d6fbd1d5/import-statements-v9";
-pub const IMPORT_POLICY: &str = "rust-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v9";
+pub const IMPORT_EXTRACTOR: &str = "franken-markdown-d6fbd1d5/import-statements-v10";
+pub const IMPORT_POLICY: &str = "rust-inline-modules-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v10";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImportLanguage { Rust, JavaScript, TypeScript, Jsx, Tsx, Python, Cpp, Go, Java }
@@ -107,7 +107,7 @@ impl std::error::Error for ImportError {}
 #[derive(Debug, Eq, PartialEq)]
 pub struct ImportFact {
     id: u64, kind: ImportKind, destination: String, original_range: ByteRange,
-    specifier_range: ByteRange, resolution_allowed: bool,
+    specifier_range: ByteRange, resolution_allowed: bool, rust_module_context: Option<String>,
 }
 impl ImportFact {
     pub const fn id(&self) -> u64 { self.id }
@@ -128,6 +128,12 @@ impl ImportFact {
     pub const fn original_range(&self) -> ByteRange { self.original_range }
     pub const fn specifier_range(&self) -> ByteRange { self.specifier_range }
     pub const fn resolution_allowed(&self) -> bool { self.resolution_allowed }
+    /// Proven named inline ancestors for conventional Rust mod/use candidates.
+    /// An empty context is the source file's own module. Names retain their
+    /// lexical spelling (including r#); source ranges and destination do not
+    /// include this separate context. None withholds conventional navigation
+    /// from unmodeled scopes and is also used by unrelated import kinds.
+    pub fn rust_module_context(&self) -> Option<&str> { self.rust_module_context.as_deref() }
 }
 pub struct CapturedImports<'source> {
     source: &'source [u8], request: CaptureRequest, generation: QueryGeneration,
@@ -201,7 +207,9 @@ impl<'source> CapturedImports<'source> {
             facts.capacity().checked_mul(size_of::<ImportFact>())
                 .and_then(|bytes| bytes.checked_add(size_of::<Self>()))
                 .ok_or(ImportError::ResourceDenied)?,
-            |bytes, fact| bytes.checked_add(fact.destination.capacity()).ok_or(ImportError::ResourceDenied))?;
+            |bytes, fact| bytes.checked_add(fact.destination.capacity())
+                .and_then(|bytes| bytes.checked_add(fact.rust_module_context.as_ref().map_or(0, String::capacity)))
+                .ok_or(ImportError::ResourceDenied))?;
         if retained > charge { return Err(ImportError::ResourceDenied); }
         lease.reconcile(ByteLength::new(retained as u64)).map_err(|_| ImportError::ResourceDenied)?;
         check(&mut canceled)?;
@@ -275,13 +283,15 @@ fn build_charge(source_bytes: usize, decoded_capacity: usize, language: ImportLa
     };
     SourceMap::workspace_bytes(source_bytes, decoded_capacity).map_err(source_map_error)?
         .checked_add(decoded_capacity.max(1).checked_mul(lexical_bytes_per_byte).ok_or(ImportError::ResourceDenied)?)
-        .and_then(|bytes| max_items.checked_mul(size_of::<ImportFact>() + MAX_IMPORT_SPECIFIER_BYTES)
+        .and_then(|bytes| max_items.checked_mul(size_of::<ImportFact>() + MAX_IMPORT_SPECIFIER_BYTES
+            + if language == ImportLanguage::Rust { MAX_IMPORT_SPECIFIER_BYTES } else { 0 })
             .and_then(|facts| bytes.checked_add(facts)))
         .and_then(|bytes| MAX_STATEMENT_TERMINALS.checked_mul(size_of::<usize>())
             .and_then(|terminals| bytes.checked_add(terminals)))
         // Fixed grammar arrays and bounded recursion, with no source-sized
         // temporary path strings. Each retained specifier is separately capped.
         .and_then(|bytes| bytes.checked_add(size_of::<CapturedImports<'_>>() + 16 * 1024))
+        .and_then(|bytes| bytes.checked_add(if language == ImportLanguage::Rust { rust::CONTEXT_WORKSPACE_BYTES } else { 0 }))
         .ok_or(ImportError::ResourceDenied)
 }
 
@@ -354,7 +364,7 @@ impl<'a> Statements<'a> {
         if owned.capacity() > destination.len() { return Err(ImportError::ResourceDenied); }
         owned.push_str(destination);
         self.facts.push(ImportFact { id: self.facts.len() as u64 + 1, kind, destination: owned,
-            original_range, specifier_range, resolution_allowed: allowed });
+            original_range, specifier_range, resolution_allowed: allowed, rust_module_context: None });
         Ok(())
     }
     fn javascript(&mut self, canceled: &mut impl FnMut() -> bool) -> Result<(), ImportError> {

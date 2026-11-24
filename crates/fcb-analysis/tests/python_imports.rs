@@ -42,8 +42,8 @@ fn python_language_and_policy_are_explicit_for_sources_and_stubs() {
     assert_eq!(ImportLanguage::Python.name(), "python");
     assert_eq!(ImportKind::PythonImport.name(), "python-import");
     assert_eq!(ImportKind::PythonFrom.name(), "python-from");
-    assert_eq!(IMPORT_POLICY, "rust-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v9");
-    assert_eq!(IMPORT_EXTRACTOR, "franken-markdown-d6fbd1d5/import-statements-v9");
+    assert_eq!(IMPORT_POLICY, "rust-inline-modules-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v10");
+    assert_eq!(IMPORT_EXTRACTOR, "franken-markdown-d6fbd1d5/import-statements-v10");
     assert_eq!(ImportLanguage::from_path(b"pkg.py/data.txt"), None);
 }
 

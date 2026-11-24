@@ -151,7 +151,7 @@ mod tests {
     fn fact(kind: ImportKind, destination: &str) -> ImportFact {
         let range = ByteRange::new(ByteOffset::new(0), ByteOffset::new(1)).unwrap();
         ImportFact { id: 1, kind, destination: destination.to_owned(), original_range: range,
-            specifier_range: range, resolution_allowed: true }
+            specifier_range: range, resolution_allowed: true, rust_module_context: None }
     }
     fn resolve(source: &[u8], kind: ImportKind, destination: &str, paths: &[&[u8]]) -> ImportResolution<usize> {
         super::super::resolve_import(source, &fact(kind, destination),

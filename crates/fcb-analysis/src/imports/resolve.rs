@@ -53,7 +53,9 @@ impl<T> ImportResolution<T> {
 /// closed-catalog source candidate, without compiler ordering or configuration.
 /// If absent and extensionless, a finite set of source extensions and index files is admitted
 /// only when exactly one path exists. Rust uses conventional file modules for
-/// a top-level external mod. Eligible qualified use leaves navigate conventional
+/// external mod declarations in qualified file and named inline module scopes.
+/// Inline ancestors contribute child directories while retaining the physical
+/// source as their containing file. Eligible qualified use leaves navigate conventional
 /// module files through the bounded policy in `rust`; a remaining item suffix
 /// is explicitly a module-prefix candidate, never a definition location.
 /// A single supported top-level #[path] attribute admits only its exact
@@ -111,7 +113,7 @@ pub fn resolve_import<T: Copy + Eq>(
         return ImportResolution::without(Unresolved, "unsupported-specifier");
     }
     if fact.kind() == ImportKind::RustModule {
-        return rust_module(source_path, destination, &mut lookup);
+        return rust::resolve_module(source_path, fact, &mut lookup);
     }
     if matches!(fact.kind(), ImportKind::PythonImport | ImportKind::PythonFrom) {
         return python_module(source_path, fact.kind(), destination, &mut lookup);
@@ -182,28 +184,6 @@ fn cpp_include<T: Copy + Eq>(source_path: &[u8], fact: &ImportFact,
         Some(target) => ImportResolution::local(target, "cpp-source-relative-include-candidate"),
         None => ImportResolution::without(ImportResolutionKind::Missing, "no-catalog-target"),
     }
-}
-
-fn rust_module<T: Copy + Eq>(
-    source_path: &[u8], destination: &str, lookup: &mut impl FnMut(&[u8]) -> Option<T>,
-) -> ImportResolution<T> {
-    let unsupported = || ImportResolution::without(ImportResolutionKind::Unresolved, "unsupported-specifier");
-    let name = destination.strip_prefix("r#").unwrap_or(destination);
-    // The extractor owns Rust identifier semantics. This independent path gate
-    // prevents forged separators and accepts literal Unicode identifier bytes.
-    if name.is_empty() || name.chars().any(|c| c.is_whitespace() || c.is_control())
-        || name.as_bytes().iter().copied().any(|b| matches!(b, b'/' | b'\\' | b'.' | b':' | b'#' | b'?' | b'%')) {
-        return unsupported();
-    }
-    let file = source_path.rsplit(|b| *b == b'/').next().unwrap_or_default();
-    let Some(stem) = file.strip_suffix(b".rs") else { return unsupported(); };
-    if stem.is_empty() { return unsupported(); }
-    let Some(mut path) = CatalogPath::parent(source_path) else { return unsupported(); };
-    if !matches!(file, b"lib.rs" | b"main.rs" | b"mod.rs") && !path.push(stem) {
-        return unsupported();
-    }
-    if !path.push(name.as_bytes()) { return unsupported(); }
-    candidates(&mut path, &[b".rs", b"/mod.rs"], "rust-module-file-candidate", lookup)
 }
 
 fn python_module<T: Copy + Eq>(
@@ -314,7 +294,8 @@ mod tests {
     fn fact(kind: ImportKind, destination: &str) -> ImportFact {
         let range = ByteRange::new(ByteOffset::new(0), ByteOffset::new(1)).unwrap();
         ImportFact { id: 1, kind, destination: destination.to_owned(), original_range: range,
-            specifier_range: range, resolution_allowed: true }
+            specifier_range: range, resolution_allowed: true,
+            rust_module_context: matches!(kind, ImportKind::RustModule | ImportKind::RustUse).then(String::new) }
     }
     fn resolve(source: &[u8], kind: ImportKind, destination: &str, paths: &[&[u8]]) -> ImportResolution<usize> {
         resolve_import(source, &fact(kind, destination), |path| paths.iter().position(|candidate| *candidate == path))

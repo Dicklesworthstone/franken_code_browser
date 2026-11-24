@@ -53,6 +53,8 @@ struct AtlasProjectLinkReaderReceipt: Sendable {
         let targetDescription: String
         if link.importEvidence?.language == "java" {
             targetDescription = "Opened the retained Java source candidate at the beginning. The imported declaration's position, classpath and compiler binding are not established."
+        } else if link.importEvidence?.resolutionBasis == "rust-use-inline-module-candidate" {
+            targetDescription = "Opened the retained source containing the inline module at the beginning. The exact module position and compiler resolution are not established."
         } else if link.importEvidence?.resolutionBasis == "rust-use-module-prefix-candidate" {
             targetDescription = "Opened the retained containing-module candidate at the beginning. The imported item location and compiler resolution are not established."
         } else {

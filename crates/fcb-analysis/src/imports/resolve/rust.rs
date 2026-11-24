@@ -4,7 +4,9 @@
 //!
 //! This is navigation policy, not rustc name resolution. No Cargo configuration,
 //! module declarations in other files, editions, cfg, macro expansion, reexports,
-//! or custom target layouts are inferred. Explicit top-level #[path] literals
+//! or custom target layouts are inferred. Proven named inline ancestors retain
+//! their containing source file while contributing conventional child directories.
+//! Explicit top-level #[path] literals
 //! have a separate exact source-relative route. The extractor alone decides
 //! whether the statement's lexical context permits this policy. Its flattened
 //! path is data; this module does not tokenize source again.
@@ -18,12 +20,13 @@
 
 use super::{CatalogPath, ImportFact, ImportResolution, ImportResolutionKind,
     MAX_IMPORT_RESOLUTION_PATH_BYTES, candidates};
-use super::super::MAX_IMPORT_SPECIFIER_BYTES;
+use super::super::{MAX_IMPORT_SPECIFIER_BYTES, rust::MAX_INLINE_MODULES};
 
 const MAX_ROOT_ANCESTORS: usize = 64;
 const MAX_PATH_COMPONENTS: usize = 128;
 const EXACT: &str = "rust-use-module-file-candidate";
 const PREFIX: &str = "rust-use-module-prefix-candidate";
+const INLINE: &str = "rust-use-inline-module-candidate";
 
 /// An explicit module path or literal file inclusion is relative to the directory
 /// containing its source, including flat modules such as `src/parent.rs`.
@@ -49,6 +52,78 @@ pub(super) fn resolve_literal_path<T: Copy + Eq>(
     }
 }
 
+
+/// Context comes from the source-specific grammar, never from path guesses.
+/// Keep only the ASCII filesystem spelling qualified by the conventional route.
+struct InlineContext<'a> { parts: [&'a str; MAX_INLINE_MODULES], count: usize }
+impl<'a> InlineContext<'a> {
+    fn new(fact: &'a ImportFact) -> Option<Self> {
+        let context = fact.rust_module_context()?;
+        if context.len() > MAX_IMPORT_SPECIFIER_BYTES { return None; }
+        let mut result = Self { parts: [""; MAX_INLINE_MODULES], count: 0 };
+        if context.is_empty() { return Some(result); }
+        for spelling in context.split("::") {
+            let name = spelling.strip_prefix("r#").unwrap_or(spelling);
+            if result.count == result.parts.len() || !ascii_module_name(name) { return None; }
+            result.parts[result.count] = name; result.count += 1;
+        }
+        Some(result)
+    }
+    fn append(&self, path: &mut CatalogPath) -> bool {
+        self.parts[..self.count].iter().all(|name| path.push(name.as_bytes()))
+    }
+    /// Only exact prefixes of this fact's known inline ancestry may bypass a
+    /// file-module probe. An arbitrary missing directory is never an inline mod.
+    fn contains(&self, path: &[u8], source_base: &[u8]) -> bool {
+        let Some(mut tail) = path.strip_prefix(source_base) else { return false; };
+        if !source_base.is_empty() {
+            let Some(after) = tail.strip_prefix(b"/") else { return false; };
+            tail = after;
+        }
+        if tail.is_empty() { return false; }
+        let mut count = 0usize;
+        for part in tail.split(|&byte| byte == b'/') {
+            if count == self.count || part != self.parts[count].as_bytes() { return false; }
+            count += 1;
+        }
+        count != 0
+    }
+}
+
+/// A source's conventional module directory is a borrowed prefix of its exact
+/// native path. No UTF-8 conversion or normalization of parent bytes occurs.
+fn source_module_base<'a>(source: &'a [u8], file: &[u8]) -> &'a [u8] {
+    if matches!(file, b"lib.rs" | b"main.rs" | b"mod.rs") {
+        &source[..source.iter().rposition(|&byte| byte == b'/').unwrap_or(0)]
+    } else { &source[..source.len() - 3] }
+}
+
+pub(super) fn resolve_module<T: Copy + Eq>(
+    source: &[u8], fact: &ImportFact, lookup: &mut impl FnMut(&[u8]) -> Option<T>,
+) -> ImportResolution<T> {
+    let unsupported = || ImportResolution::without(ImportResolutionKind::Unresolved, "unsupported-specifier");
+    let Some(context) = InlineContext::new(fact) else { return unsupported(); };
+    if !fact.resolution_allowed() { return unsupported(); }
+    let destination = fact.destination();
+    let name = destination.strip_prefix("r#").unwrap_or(destination);
+    // Preserve the external-module route's literal Unicode filename evidence;
+    // only inline ancestry requires its separately qualified ASCII spelling.
+    if name.is_empty() || name.len() > MAX_IMPORT_SPECIFIER_BYTES
+        || name.chars().any(|c| c.is_whitespace() || c.is_control())
+        || name.as_bytes().iter().copied().any(|b| matches!(b, b'/' | b'\\' | b'.' | b':' | b'#' | b'?' | b'%')) {
+        return unsupported();
+    }
+    let file = source.rsplit(|b| *b == b'/').next().unwrap_or_default();
+    let Some(stem) = file.strip_suffix(b".rs") else { return unsupported(); };
+    if stem.is_empty() { return unsupported(); }
+    let Some(mut path) = CatalogPath::parent(source) else { return unsupported(); };
+    if !matches!(file, b"lib.rs" | b"main.rs" | b"mod.rs") && !path.push(stem) {
+        return unsupported();
+    }
+    if !context.append(&mut path) || !path.push(name.as_bytes()) { return unsupported(); }
+    candidates(&mut path, &[b".rs", b"/mod.rs"], "rust-module-file-candidate", lookup)
+}
+
 #[derive(Clone, Copy)]
 struct Root<T> { directory_len: usize, target: T }
 
@@ -67,9 +142,11 @@ pub(super) fn resolve_use<T: Copy + Eq>(
         || destination.len() > MAX_IMPORT_SPECIFIER_BYTES {
         return unresolved();
     }
+    let Some(context) = InlineContext::new(fact) else { return unresolved(); };
     let file = source.rsplit(|&byte| byte == b'/').next().unwrap_or_default();
     let Some(stem) = file.strip_suffix(b".rs") else { return unresolved(); };
     if stem.is_empty() { return unresolved(); }
+    let source_base = source_module_base(source, file);
 
     let mut parts = [""; MAX_PATH_COMPONENTS];
     let mut count = 0usize;
@@ -113,13 +190,16 @@ pub(super) fn resolve_use<T: Copy + Eq>(
     // file owns children under its stem; mod.rs owns children beside itself.
     if from_crate {
         path.len = root.directory_len;
-    } else if !matches!(file, b"lib.rs" | b"main.rs" | b"mod.rs") && !path.push(stem) {
-        return unresolved();
-    }
-    if !from_crate && file == b"mod.rs" && path.len == root.directory_len {
-        // A mod.rs next to the inferred root is not evidence of how that file
-        // was installed in a module tree (it may itself be a custom root).
-        return unresolved();
+    } else {
+        if !matches!(file, b"lib.rs" | b"main.rs" | b"mod.rs") && !path.push(stem) {
+            return unresolved();
+        }
+        if file == b"mod.rs" && path.len == root.directory_len {
+            // Check the physical module base BEFORE adding inline components:
+            // an inline body cannot establish how a custom mod.rs was installed.
+            return unresolved();
+        }
+        if !context.append(&mut path) { return unresolved(); }
     }
     for _ in 0..parents {
         if path.len <= root.directory_len { return unresolved(); }
@@ -127,13 +207,13 @@ pub(super) fn resolve_use<T: Copy + Eq>(
         if path.len < root.directory_len { return unresolved(); }
     }
 
-    // self/super name a containing module independently of the trailing item.
-    // Its file may be useful even when an imported item has no file of its own.
-    // crate::Unknown deliberately does NOT fall back to the crate root: no
-    // named module prefix has been established for that unrecognized path.
+    // Inline self/super prefixes still live in the captured physical source.
+    // Only climbs beyond every inline ancestor leave that source's own module.
+    // crate::Unknown deliberately does NOT fall back to the root file.
+    let mut inline = !from_crate && parents < context.count;
     let mut containing = if from_crate {
         None
-    } else if parents == 0 {
+    } else if parents <= context.count {
         lookup(source)
     } else if path.len == root.directory_len {
         Some(root.target)
@@ -148,25 +228,32 @@ pub(super) fn resolve_use<T: Copy + Eq>(
     if first == count {
         if from_crate { containing = Some(root.target); }
         return match containing {
-            Some(target) => ImportResolution::local(target, EXACT),
+            Some(target) => ImportResolution::local(target, if inline { INLINE } else { EXACT }),
             None => ImportResolution::without(ImportResolutionKind::Missing, "no-catalog-target"),
         };
     }
     for part in &parts[first..count] {
         if !path.push(part.as_bytes()) { return unresolved(); }
+        if context.contains(path.bytes(), source_base) {
+            // The named body is already proven in this exact source. Files
+            // merely sharing its name do not replace that inline declaration.
+            containing = lookup(source); inline = true;
+            continue;
+        }
         let candidate = candidates(&mut path, &[b".rs", b"/mod.rs"], EXACT, lookup);
+        inline = false;
         match candidate.kind {
             ImportResolutionKind::Local => containing = candidate.target,
             ImportResolutionKind::Missing => {
                 return containing.map_or(candidate, |target| ImportResolution::local(target, PREFIX));
             }
-            // Unprobeable paths and ambiguous intermediate modules cannot be
-            // hidden by a previously found prefix or a more specific filename.
+            // Unprobeable paths and ambiguous external modules cannot be hidden
+            // by a known inline prefix or a more specific filename.
             _ => return candidate,
         }
     }
     match containing {
-        Some(target) => ImportResolution::local(target, EXACT),
+        Some(target) => ImportResolution::local(target, if inline { INLINE } else { EXACT }),
         None => ImportResolution::without(ImportResolutionKind::Missing, "no-catalog-target"),
     }
 }

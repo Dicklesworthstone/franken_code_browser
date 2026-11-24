@@ -41,6 +41,9 @@ import Foundation
             ("projection", "compiler-imports"), ("relationship_kind", "parsed-markdown-link"),
             ("evidence_precision", "whole-captured-markdown-document"), ("extractor", "unknown"),
             ("resolver", "compiler"), ("extraction_policy", "all-languages"),
+            ("extractor", "franken-markdown-d6fbd1d5/import-statements-v9"),
+            ("extraction_policy", "rust-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v9"),
+            ("resolver", "fcb-closed-catalog-imports-v11"),
             ("source_bytes_read", "1"), ("read_calls", "1"), ("max_source_bytes", "131072"),
             ("max_source_bytes", "262144"),
             ("pending_source_files", "1"), ("retained_links", "71")
@@ -109,6 +112,27 @@ import Foundation
                 row[key] = key == "source_link_id" ? "2" : "changed"
                 bad["relationship"] = row; reject(bad)
             }
+        }
+
+        // Inline-module context is resolved by the engine and has no new wire
+        // authority. Nested targets retain the exact source identity and range.
+        for (destination, kind, basis) in [
+            ("child", "rust-module", "rust-module-file-candidate"),
+            ("self::child::Thing", "rust-use", "rust-use-module-prefix-candidate"),
+            ("super::child::Thing", "rust-use", "rust-use-module-prefix-candidate")
+        ] {
+            var nested = valid, nestedRows = valid["links"] as! [[String: Any]]
+            for i in nestedRows.indices {
+                nestedRows[i]["destination"] = destination; nestedRows[i]["lexical_import_kind"] = kind
+                nestedRows[i]["resolution_basis"] = basis
+                nestedRows[i]["target_path"] = ProjectLinksFixture.path("src/outer/child.rs")
+            }
+            nested["links"] = nestedRows
+            let candidate = try decode(nested, index: index).links[0]
+            precondition(candidate.canOpenTarget && candidate.importEvidence?.kind == kind)
+            precondition(candidate.target?.path.bytes == Array("src/outer/child.rs".utf8))
+            precondition(candidate.source == link.source && candidate.evidenceRange == link.evidenceRange,
+                "Nested module resolution must not replace retained source evidence")
         }
 
         // The other projection's envelope cannot be decoded by changing a command.
@@ -397,6 +421,49 @@ import Foundation
         let page = try decode(partial, index: index)
         precondition(!page.complete && page.summary.contains("1 unsupported") && page.links[0].canOpenTarget)
         partial["relationships_complete"] = true; refuse(partial, index: index)
+    }
+
+    /// A proven inline ancestor targets this exact source capture, with no
+    /// separate module-byte location or permission to substitute another file.
+    private static func inlineRustUseWire(_ index: AtlasPreparedIndex) throws {
+        var value = ProjectLinksFixture.importPage(owner: index.basis.owner, generation: 1, command: "imports-page")
+        var rows = value["links"] as! [[String: Any]]
+        for i in rows.indices {
+            rows[i]["lexical_import_kind"] = "rust-use"; rows[i]["destination"] = "self::*"
+            rows[i]["resolution_basis"] = "rust-use-inline-module-candidate"
+            for (target, source) in [("target_file_id", "source_file_id"), ("target_path", "source_path"),
+                ("target_revision", "source_revision"), ("target_sha256", "source_sha256"), ("target_bytes", "source_bytes")] {
+                rows[i][target] = rows[i][source]
+            }
+        }
+        value["links"] = rows
+        let link = try decode(value, index: index).links[0]
+        precondition(link.canOpenTarget && link.target == link.source && link.label.contains("inline module"))
+        for (field, changed) in [
+            ("target_file_id", "4" as Any), ("target_path", ProjectLinksFixture.path("src/other.rs")),
+            ("target_revision", "2"), ("target_sha256", String(repeating: "f", count: 64)),
+            ("target_bytes", "1"), ("lexical_import_kind", "rust-module")
+        ] {
+            var bad = value, changedRows = rows
+            changedRows[0][field] = changed; bad["links"] = changedRows; refuse(bad, index: index)
+        }
+        for state in ["unavailable", "uncaptured", "outside-capture-scope"] {
+            var bad = value, changedRows = rows
+            changedRows[0]["resolution"] = state
+            for field in ["target_revision", "target_sha256", "target_bytes"] { changedRows[0][field] = NSNull() }
+            bad["links"] = changedRows; refuse(bad, index: index)
+        }
+        for side in [AtlasProjectLinkSide.evidence, .target] {
+            var receipt = ProjectLinksFixture.importReceipt(owner: index.basis.owner, reader: 77,
+                generation: 1, link: 1, side: .evidence)
+            receipt["side"] = side.rawValue; receipt["relationship"] = rows[0]
+            receipt["initial_original_offset"] = side == .evidence ? "11" : "0"
+            let admitted = try AtlasProjectLinkReaderReceipt.decode(ProjectLinksFixture.json(receipt), index: index,
+                generation: 1, link: link, side: side, destination: 77)
+            precondition(admitted.info.identity.pathBytes == link.source.path.bytes)
+            precondition(admitted.initialOriginalOffset == (side == .evidence ? 11 : 0))
+            if side == .target { precondition(admitted.navigationDescription.contains("inline module")) }
+        }
     }
 
     /// A use leaf may identify a conventional module file or only the module
@@ -739,6 +806,7 @@ import Foundation
         try javascriptLoadWire(index)
         try typescriptSourceWire(index)
         try rustUseWire(index)
+        try inlineRustUseWire(index)
         try rustPathModuleWire(index)
         let live = ProjectLinksFixture(includesImports: true)
         let model = AtlasProjectLinksModel(root: "/project", transport: live.transport)

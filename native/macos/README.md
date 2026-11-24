@@ -1809,8 +1809,9 @@ aliases, nested groups, grouped `self`, and glob imports. For example,
 `crate::worker::Task`. Each occurrence keeps the exact original statement and
 the original bytes of its own leaf (`self` or `Task`); the displayed destination
 is a normalized path, not a verbatim source excerpt. Malformed or over-budget
-trees remain unresolved evidence with partial coverage. Nested scopes, macros,
-and explicit path overrides do not acquire conventional file-resolution authority.
+trees remain unresolved evidence with partial coverage. Function/local blocks,
+macros, attributed inline-module headers and explicit path overrides do not
+acquire conventional module-context authority.
 
 Qualified Rust `crate::`, `self::` and repeated `super::` paths can navigate
 conventional module candidates in the captured catalog. The resolver checks
@@ -1819,6 +1820,36 @@ remain ambiguous. A qualified path with a known module prefix, such as
 `crate::worker::Task`, can open the captured worker module as a **containing-module
 candidate**. The row and opened reader distinguish this from an exact module-file
 candidate: neither establishes the imported item's definition or compiler binding.
+
+Plain named inline modules now carry their containing-module context. For
+example, in a captured `src/lib.rs`:
+
+```rust
+mod outer {
+    mod child;
+    use self::child::Thing;
+    mod inner {
+        use super::child::Thing;
+    }
+}
+```
+
+All three statements can navigate the unique `src/outer/child.rs` or
+`src/outer/child/mod.rs` candidate. A competing `src/child.rs` is not substituted.
+Flat module files add their stem before the inline directories; `lib.rs`,
+`main.rs` and `mod.rs` use their containing directory. `self` and repeated
+`super` first follow the named inline ancestry. A `crate::` path can cross an
+inline ancestor proven in that same source without inventing an enclosing
+module file. A link to the inline module itself opens its existing captured
+source and is labeled separately from an external module file or item-prefix
+candidate.
+
+The displayed destination and original statement/leaf bytes remain unchanged;
+module context only informs the bounded catalog lookup. Qualification admits
+at most 32 named inline ancestors, 1,024 bytes of context and 128 enclosing
+delimiters. Malformed/unbalanced scopes or exhausted context limits preserve
+lexical evidence without granting a guessed target. These rules serve Project
+Imports, Saved Repository Imports and the saved-import Reading Desk commands.
 
 Root inference uses the nearest conventional `lib.rs` or `main.rs`, with bounded
 ancestor and path-component traversal. It stops at automatic-target boundaries
