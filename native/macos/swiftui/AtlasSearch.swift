@@ -218,9 +218,14 @@ enum AtlasSearchMode: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .symbols: return 65_536
         case .headings: return 262_144
-        case .occurrences: return 33_554_432
+        case .occurrences: return 32 * 1024 * 1024
         case .text, .expression: return 0
         }
+    }
+    /// The atlas captures at most 1 MiB per file even when the shared extractor
+    /// can analyze larger Reader and saved-repository captures.
+    var atlasStructureFileByteLimit: UInt64 {
+        min(structureFileByteLimit, 1024 * 1024)
     }
     var resultLabel: String {
         switch self {
@@ -237,7 +242,7 @@ enum AtlasSearchMode: String, CaseIterable, Identifiable, Sendable {
         case .expression: return "Quoted phrases, required terms, -excluded terms, path: and lang: filters. All terms apply to the same captured file; results select the first positive term."
         case .symbols: return "Case-sensitive heuristic declaration candidates in Rust, Python, JavaScript, TypeScript, Go, C/C++ and Swift. Compiler resolution and references are not claimed."
         case .headings: return "Case-sensitive Markdown heading names from the shared parser, with canonical slugs and original source ranges."
-        case .occurrences: return "Exact, case-sensitive whole-token names, including comments and literals. Shared token rules preserve Unicode spelling without normalization; results do not establish compiler-resolved references. Files above 32 MiB or with unsupported text encoding remain outside coverage."
+        case .occurrences: return "Exact, case-sensitive whole-token names, including comments and literals. Shared token rules preserve Unicode spelling without normalization; results do not establish compiler-resolved references. Atlas captures admit up to 1 MiB per file; Reader and saved-repository captures admit up to 32 MiB. Unsupported text encoding remains outside coverage."
         }
     }
     var placeholder: String {

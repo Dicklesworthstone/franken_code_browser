@@ -69,7 +69,7 @@ import Dispatch
                 check(report.complete && report.mode == mode && !report.countAllMatches,
                     "Each structural mode searches the same complete captured source universe")
                 check(report.nameMode == mode.effectiveNameMode(.prefix)
-                    && report.structureCoverage?.fileByteLimit == mode.structureFileByteLimit,
+                    && report.structureCoverage?.fileByteLimit == mode.atlasStructureFileByteLimit,
                     "Structural name policy and extraction bounds survive the report boundary")
                 check(report.indexStatus?.reused == true && report.indexStatus?.verifiedFiles == 2
                     && report.indexStatus?.skippedFiles == 0 && report.indexStatus?.verificationBytes == 4196,
@@ -98,6 +98,27 @@ import Dispatch
             do { _ = try search(worker, .symbols); preconditionFailure("Missing structural capability accepted") }
             catch AtlasSearchError.unavailable { checks += 1 }
             check(f.count("create:") == 0, "Legacy transports refuse structural requests before any discovery or capture")
+        }
+        do {
+            let f = IndexedFixture()
+            f.configure { $0.files = 1; $0.captureBytes = 1024 * 1024 }
+            let report = try search(AtlasIndexedSearch(transport: f.structuralTransport), .occurrences)
+            check(report.complete && report.structureCoverage?.fileByteLimit == 1024 * 1024
+                && report.hits[0].captureByteLength == 1024 * 1024,
+                "Indexed occurrences admit the complete atlas capture above the old extractor ceiling")
+            check(report.capture?.target(report.hits[0]) != nil,
+                "The larger indexed occurrence keeps its exact captured source authority")
+        }
+        for wrongLimit in ["524288", "33554432"] {
+            let f = IndexedFixture()
+            f.patch { phase, original in
+                var value = original
+                if phase == "query-step" { value["structure_file_byte_limit"] = wrongLimit }
+                return value
+            }
+            do { _ = try search(AtlasIndexedSearch(transport: f.structuralTransport), .occurrences)
+                preconditionFailure("Indexed occurrence coverage accepted another surface's source limit") }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
         }
         do {
             let f = IndexedFixture()

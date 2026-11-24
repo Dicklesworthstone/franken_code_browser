@@ -79,6 +79,7 @@ struct AtlasReferenceInventory: Sendable {
     let retained: UInt64
     let matchesCounted: UInt64
     let limited: Bool
+    var sourceLimit: UInt64 = AtlasReferencePage.sourceLimit
     var window: AtlasReferenceWindow? = nil
 
     var countComplete: Bool { window?.countComplete ?? !limited }
@@ -87,7 +88,7 @@ struct AtlasReferenceInventory: Sendable {
         identity.matches(other.identity) && generation == other.generation
             && name.utf8.elementsEqual(other.name.utf8) && maxItems == other.maxItems
             && retained == other.retained && matchesCounted == other.matchesCounted
-            && limited == other.limited && window == other.window
+            && limited == other.limited && sourceLimit == other.sourceLimit && window == other.window
     }
 }
 
@@ -96,6 +97,8 @@ struct AtlasReferenceInventory: Sendable {
 struct AtlasReferencePage: Sendable {
     static let maxItems: UInt64 = 4096
     static let sourceLimit: UInt64 = 32 * 1024 * 1024
+    /// Older bridges remain usable only inside the source limit they declare.
+    static let legacySourceLimit: UInt64 = 512 * 1024
     static let nameBytes = 1024
     let id: UUID
     let inventory: AtlasReferenceInventory
@@ -152,7 +155,9 @@ struct AtlasReferencePage: Sendable {
                   wire.selection_namespace == "reference", wire.evidence_level == "whole-token-text-candidate",
                   wire.includes_comments_and_literals, !wire.compiler_resolved, !wire.semantic_complete,
                   wire.line_semantics == "LF-counted-source-lines",
-                  AtlasReaderWire.integer(wire.max_source_bytes) == sourceLimit,
+                  let declaredLimit = AtlasReaderWire.integer(wire.max_source_bytes),
+                  declaredLimit == sourceLimit || declaredLimit == legacySourceLimit,
+                  identity.capturedBytes <= declaredLimit,
                   AtlasReaderWire.integer(wire.max_items) == maxItems,
                   let retained = AtlasReaderWire.integer(wire.retained_references), retained <= maxItems,
                   let counted = AtlasReaderWire.integer(wire.matches_counted), counted <= identity.capturedBytes,
@@ -215,7 +220,7 @@ struct AtlasReferencePage: Sendable {
             }
             let basis = AtlasReferenceInventory(identity: identity, generation: generation, name: name,
                 maxItems: maxItems, retained: retained, matchesCounted: counted, limited: wire.output_limited,
-                window: acceptedWindow)
+                sourceLimit: declaredLimit, window: acceptedWindow)
             if let inventory, !inventory.matches(basis) { throw AtlasReaderError.invalidResponse }
             // Every exact occurrence has the same encoded byte width. Standard
             // String views provide that width without duplicating token policy

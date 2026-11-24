@@ -7,7 +7,8 @@ use fcb::{ArenaOwnerId, ByteRange};
 use fcb::search::symbols::ReferenceError;
 use fcb_app::{EXIT_OK, EXIT_PARTIAL};
 use fcb_app::host::reader::{ReaderSession, ReaderSessionError, MAX_READER_REFERENCE_PAGE,
-    MAX_READER_REFERENCE_NAME_BYTES, MAX_READER_REFERENCES, MAX_READER_REFERENCE_SOURCE_BYTES};
+    MAX_READER_REFERENCE_NAME_BYTES, MAX_READER_REFERENCES, MAX_READER_REFERENCE_SOURCE_BYTES,
+    MAX_READER_SOURCE_BYTES};
 
 fn reader(bytes: &[u8]) -> ReaderSession {
     ReaderSession::from_bytes(ArenaOwnerId::new(9511).unwrap(), Path::new("retained.rs"), bytes, || false).unwrap()
@@ -43,7 +44,7 @@ fn token_occurrences_include_comments_and_literals_without_substring_false_posit
     assert!(first.as_str().contains("\"compiler_resolved\":false"));
     assert!(first.as_str().contains("\"semantic_complete\":false"));
     assert!(first.as_str().contains("\"name_case\":\"sensitive\""));
-    count(first.as_str(), "max_source_bytes", MAX_READER_REFERENCE_SOURCE_BYTES as u64);
+    count(first.as_str(), "max_source_bytes", 32 * 1024 * 1024);
     for id in 1..=4 {
         assert_eq!(selected(&r, r.reference_range(1, id).unwrap()), b"target");
     }
@@ -250,6 +251,40 @@ fn occurrence_limit_is_independent_of_outline_limit_and_reader_refusals_do_not_l
 }
 
 #[test]
+fn occurrence_windows_reach_the_reader_capture_ceiling_with_exact_copy_and_no_reread() {
+    assert_eq!(MAX_READER_REFERENCE_SOURCE_BYTES, MAX_READER_SOURCE_BYTES);
+    let mut source = vec![b' '; MAX_READER_SOURCE_BYTES];
+    source[..4].copy_from_slice(b"foo\n");
+    let start = source.len() - 3;
+    source[start..].copy_from_slice(b"foo");
+    let mut r = reader(&source);
+    let address = r.capture().bytes().as_ptr();
+    let result = r.prepare_references_window(1, "foo", 1, true, 1, || false).unwrap();
+    assert_eq!(result.exit_code(), EXIT_OK);
+    count(result.as_str(), "max_source_bytes", 32 * 1024 * 1024);
+    count(result.as_str(), "matches_counted", 2);
+    count(result.as_str(), "retained_references", 1);
+    count(result.as_str(), "occurrence_id", 2);
+    assert!(result.as_str().contains("\"count_complete\":true"));
+    assert!(result.as_str().contains("\"has_more_matches\":false"));
+    let range = r.reference_range(1, 1).unwrap();
+    assert_eq!((range.start().get(), range.end().get()), (start as u64, source.len() as u64));
+    assert_eq!(selected(&r, range), b"foo");
+    let window = r.reference_window(1, 1, 64, || false).unwrap();
+    count(window.as_str(), "reference_line", 2);
+    count(window.as_str(), "additional_source_bytes_read", 0);
+    assert!(window.as_str().contains("\"original_hex\":\"666f6f\""));
+    let copy = r.copy_reference(1, 1, || false).unwrap();
+    assert!(copy.as_str().contains("\"original_hex\":\"666f6f\""));
+    assert_eq!(r.capture().bytes().as_ptr(), address);
+    assert_eq!(r.capture().bytes(), source);
+    drop(r);
+    source.push(b' ');
+    assert_eq!(ReaderSession::from_bytes(ArenaOwnerId::new(9515).unwrap(),
+        Path::new("oversized.rs"), &source, || false).err(), Some(ReaderSessionError::InvalidLimits));
+}
+
+#[test]
 fn invalid_names_ranges_pages_and_exhausted_generations_do_not_alias() {
     for name in ["", "two words", "1token", "foo.bar", "nul\0", "line\n"] {
         let mut r = reader(b"token");
@@ -294,7 +329,10 @@ fn later_counted_windows_keep_utf16_source_and_distinct_local_and_global_ids() {
         let encode = |text: &str| -> Vec<u8> {
             text.encode_utf16().flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect()
         };
-        let source = encode(&format!("\u{feff}😀\r\n{}", "foo\r\n".repeat(5005)));
+        // Remains below this route's 1 MiB capture admission while exercising
+        // occurrence windows well beyond the former 512 KiB analysis limit.
+        let source = encode(&format!("\u{feff}{}😀\r\n{}", " ".repeat(300_000), "foo\r\n".repeat(5005)));
+        assert!(source.len() > 512 * 1024 && source.len() < 1024 * 1024);
         let expected = encode("foo");
         let path = fixture().join("source.rs"); fs::write(&path, &source).unwrap();
         let mut r = ReaderSession::open(ArenaOwnerId::new(9514).unwrap(), &path, 1024 * 1024, || false).unwrap();
@@ -318,7 +356,7 @@ fn later_counted_windows_keep_utf16_source_and_distinct_local_and_global_ids() {
         assert!(second_page.as_str().contains("\"next_offset\":null"));
         count(second_page.as_str(), "next_match_offset", 4224);
         let range = r.reference_range(2, 65).unwrap();
-        assert_eq!((range.start().get(), range.end().get()), (41_610, 41_616));
+        assert_eq!((range.start().get(), range.end().get()), (641_610, 641_616));
         assert_eq!(selected(&r, range), expected);
         // Global ordinals are display/navigation metadata, never local IDs.
         assert!(r.reference_range(2, 4161).is_err());
@@ -378,13 +416,14 @@ fn window_counting_zero_storage_full_width_offsets_and_lookahead_are_independent
 
 #[test]
 fn counted_tail_cancellation_and_refused_window_preserve_accepted_rows_and_source() {
-    let source = format!("old {}", "foo ".repeat(5005));
+    let source = format!("old {}{}", " ".repeat(600_000), "foo ".repeat(5005));
     let mut r = reader(source.as_bytes()); prepare(&mut r, 1, "old");
     let before = r.reference_range(1, 1).unwrap();
     let mut polls = 0;
-    let result = r.prepare_references_window(2, "foo", 1, true, 0, || { polls += 1; polls == 5 });
+    // Decoder polls reach beyond 512 KiB before this replacement is canceled.
+    let result = r.prepare_references_window(2, "foo", 1, true, 0, || { polls += 1; polls == 288 });
     assert_eq!(result.err(), Some(ReaderSessionError::Reference(ReferenceError::Canceled)));
-    assert_eq!(polls, 5);
+    assert_eq!(polls, 288);
     assert_eq!(r.reference_generation(), Some(1));
     assert_eq!(r.reference_range(1, 1).unwrap(), before);
     assert!(r.prepare_references_window(2, "foo", 1, true, 4096, || false).is_err());

@@ -246,7 +246,7 @@ enum AtlasIndexedStructure {
               !value.kind.isEmpty, value.kind.utf8.count <= 64, !value.kind.utf8.contains(0),
               !value.language.isEmpty, value.language.utf8.count <= 64,
               value.candidate > 0, value.candidate <= 4096,
-              let bytes = hit.captureByteLength, bytes <= mode.structureFileByteLimit,
+              let bytes = hit.captureByteLength, bytes <= mode.atlasStructureFileByteLimit,
               value.evidenceStart <= hit.start, value.evidenceEnd >= hit.end,
               value.evidenceEnd <= bytes else { return false }
         if let slug = value.headingSlug, slug.utf8.count > 4096 || slug.utf8.contains(0) { return false }
@@ -300,7 +300,7 @@ enum AtlasIndexedStructure {
             extractionLimitedFiles: w.count("extraction_limited_files", upTo: unavailable),
             metadataOmitted: w.count("structure_metadata_omitted", upTo: 4096 * 4096),
             metadataBytes: w.count("structure_metadata_bytes", upTo: 8 * 1024 * 1024))
-        guard coverage.fileByteLimit == mode.structureFileByteLimit,
+        guard coverage.fileByteLimit == mode.atlasStructureFileByteLimit,
               coverage.unsupportedFiles + coverage.extractionLimitedFiles <= unavailable,
               coverage.unsupportedFiles + scanned <= examined,
               coverage.metadataOmitted == 0 || unavailable > 0 else { throw AtlasIndexWire.invalid() }

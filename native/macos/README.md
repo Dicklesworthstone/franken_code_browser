@@ -1853,10 +1853,12 @@ list and atlas overlays. The captured-index switch is inactive for this mode.
 All file extensions can participate when their source encoding is supported;
 this mode does not rely on the declaration extractor's language list.
 
-The native query retains at most 1,000 matches, examines at most 4,096 files and
-spends at most 32 MiB of source-read work. The shared occurrence extractor admits
-**32 MiB per complete file**, with UTF-8 and BOM-marked UTF-16 in either byte
-order. Oversized sources, malformed text, read failures and exhausted budgets
+The native atlas query retains at most 1,000 matches, examines at most 4,096 files
+and spends at most 32 MiB of source-read work. Its live and indexed captures admit
+**1 MiB per file**. The shared occurrence extractor also serves Reader and saved
+repositories, where complete captures may reach **32 MiB**. UTF-8 and BOM-marked
+UTF-16 in either byte order preserve original source ranges. Oversized sources,
+malformed text, read failures and exhausted budgets
 remain explicit incomplete coverage. Reaching the result allowance alone does
 not prove omitted matches: the query can continue checking later files for a
 further whole-token occurrence.
@@ -2893,6 +2895,8 @@ capture; the exact total and global occurrence numbers stay separate from the
 window-local IDs used to activate and copy rows. A new window replays the bounded
 capture without allocating or retaining its skipped prefix. Legacy transports
 retain their capped inventory and report a lower bound when it is incomplete.
+Older receipts advertising a 512 KiB source limit remain usable for captures
+within that declared limit; metadata pages must preserve the accepted limit.
 Files outside the source/name bounds remain available through the ordinary reader.
 
 Occurrence extraction decodes one bounded source window at a time and carries

@@ -170,6 +170,35 @@ fn occurrence_counts_exceed_row_limits_across_members_and_encoded_windows() {
 }
 
 #[test]
+fn large_saved_occurrence_windows_keep_counts_and_exact_source_beyond_old_extractor_and_capture_limits() {
+    let budget = budget();
+    let mut bytes = vec![b' '; 2 * 1024 * 1024];
+    bytes[..6].copy_from_slice(b"needle");
+    bytes.extend_from_slice(b"needle needle");
+    let limits = SnapshotLimits { max_file_bytes: 32 * 1024 * 1024, ..SnapshotLimits::default() };
+    let encoded = SnapshotBytes::encode(owner(), true, "large-occurrence-v1",
+        &[entry(b"large.txt", &bytes)], limits, &budget, allocation(1), || false).unwrap();
+    let mut saved = PagedSnapshot::open(Cursor::new(encoded.bytes().to_vec()), owner(),
+        SnapshotLimits::paged(), &budget, allocation(2), || false).unwrap();
+    drop(encoded);
+    let opts = options(StructureMode::Occurrences, 1);
+    let first = run_matching(&mut saved, "needle", opts, 0, true, true, &budget);
+    assert!(first.is_complete()); assert!(first.matches_seen_exact());
+    assert_eq!(first.matches_seen(), 3); assert_eq!(first.next_match_offset(), Some(1));
+    drop(first);
+    let tail = run_matching(&mut saved, "needle", opts, 2, true, true, &budget);
+    assert!(tail.is_complete()); assert!(tail.matches_seen_exact());
+    assert_eq!(tail.matches_seen(), 3); assert_eq!(tail.skipped_matches(), 2);
+    assert_eq!(tail.hits().len(), 1); assert_eq!(tail.next_match_offset(), None);
+    let hit = &tail.hits()[0];
+    assert_eq!(hit.original_range().start().get(), 2 * 1024 * 1024 + 7);
+    assert_eq!(hit.original_range().end().get(), bytes.len() as u64);
+    let capture = hit.open(&mut saved, opts.generation, &budget,
+        [allocation(30), allocation(31)], || false).unwrap();
+    assert_eq!(capture.bytes(), bytes);
+}
+
+#[test]
 fn metadata_omissions_preserve_exact_counts_and_consumed_continuation_positions() {
     let budget = budget();
     let long_name = format!("needle_{}", "x".repeat(4096));

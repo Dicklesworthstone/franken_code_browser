@@ -57,7 +57,7 @@ private final class OccurrenceReports: @unchecked Sendable {
             "includes_comments_and_literals": true, "compiler_resolved": false,
             "token_policy": AtlasSearchOccurrencePolicy.tokenPolicy,
             "name_syntax": AtlasSearchOccurrencePolicy.nameSyntax, "unicode_normalization": "none",
-            "structure_file_byte_limit": "33554432", "unsupported_structure_files": "0",
+            "structure_file_byte_limit": "1048576", "unsupported_structure_files": "0",
             "extraction_limited_files": "0", "structure_metadata_omitted": "0",
             "structure_metadata_bytes": String(total * name.utf8.count),
             "discovery_complete": true, "search_in_progress": running, "search_complete": complete,
@@ -127,7 +127,7 @@ private final class OccurrenceReports: @unchecked Sendable {
     }
 
     @MainActor private static func largerCapturesKeepRetainedReaders() throws {
-        for bytes in [UInt64(524_304), 33_554_432] {
+        for bytes in [UInt64(524_304), 1_048_576] {
             for utf16 in [false, true] {
                 let name = "éx", width = UInt64(utf16 ? name.utf16.count * 2 : name.utf8.count)
                 let range = ["start": String(bytes - width), "end": String(bytes)]
@@ -175,6 +175,9 @@ private final class OccurrenceReports: @unchecked Sendable {
         try largerCapturesKeepRetainedReaders()
         check(AtlasSearchMode.occurrences.code == 4 && !AtlasSearchMode.occurrences.isTextual,
             "Occurrences uses the structural live path, never the literal index")
+        check(AtlasSearchMode.occurrences.structureFileByteLimit == 32 * 1024 * 1024
+            && AtlasSearchMode.occurrences.atlasStructureFileByteLimit == 1024 * 1024,
+            "Larger retained occurrence extraction preserves the atlas capture bound")
         check(!AtlasSearchMode.occurrences.supportsNameMatching
               && AtlasSearchMode.symbols.supportsNameMatching && AtlasSearchMode.headings.supportsNameMatching,
             "Prefix/contains control belongs only to declaration and heading names")
@@ -293,7 +296,7 @@ private final class OccurrenceReports: @unchecked Sendable {
             ("name_syntax", "arbitrary-text" as Any), ("unicode_normalization", "NFC" as Any),
             ("name_mode", "prefix" as Any), ("name_case", "insensitive" as Any),
             ("requested_mode", "symbols" as Any), ("realized_mode", "heuristic-outline-candidate" as Any),
-            ("evidence_level", "exact-decoded-literal" as Any), ("structure_file_byte_limit", "1048576" as Any),
+            ("evidence_level", "exact-decoded-literal" as Any), ("structure_file_byte_limit", "33554432" as Any),
             ("structure_file_byte_limit", "524288" as Any)
         ] {
             try rejected("wrong " + key) { $0[key] = wrong }
@@ -320,7 +323,8 @@ private final class OccurrenceReports: @unchecked Sendable {
                 structure["evidence_range"] = row["original_range"]; row["structure"] = structure
             }
         }
-        try rejected("oversize occurrence capture") { editFirst(&$0) { $0["capture_byte_length"] = "33554433" } }
+        try rejected("oversize atlas occurrence capture") { editFirst(&$0) { $0["capture_byte_length"] = "1048577" } }
+        try rejected("extractor cap substituted for atlas coverage") { $0["structure_file_byte_limit"] = "33554432" }
         try rejected("literal namespace mixed into occurrence") { editFirst(&$0) { $0["matched_text"] = "run" } }
         try rejected("wrong preview spelling") {
             editFirst(&$0) { $0["excerpt"] = [

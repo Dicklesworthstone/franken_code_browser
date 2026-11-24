@@ -200,7 +200,8 @@ impl RetainedAtlasSearch {
         options: AtlasIndexedStructureOptions, canceled: impl FnMut() -> bool)
         -> Result<HostResponse, AtlasSearchError> {
         let limits = AtlasSearchOptions { max_matches: options.max_matches,
-            max_files: MAX_ATLAS_SEARCH_FILES, max_file_bytes: options.mode.source_limit(),
+            max_files: MAX_ATLAS_SEARCH_FILES,
+            max_file_bytes: options.mode.source_limit().min(AtlasSearchOptions::default().max_file_bytes),
             max_source_bytes: MAX_ATLAS_SEARCH_SOURCE_BYTES };
         self.begin_structure_inner(atlas, generation, needle, scope,
             AtlasStructureOptions { mode: options.mode, name_mode: options.name_mode, limits },
@@ -219,7 +220,8 @@ impl RetainedAtlasSearch {
         options: AtlasIndexedStructureOptions, window: AtlasResultWindow,
         canceled: impl FnMut() -> bool) -> Result<HostResponse, AtlasSearchError> {
         let limits = AtlasSearchOptions { max_matches: options.max_matches,
-            max_files: MAX_ATLAS_SEARCH_FILES, max_file_bytes: options.mode.source_limit(),
+            max_files: MAX_ATLAS_SEARCH_FILES,
+            max_file_bytes: options.mode.source_limit().min(AtlasSearchOptions::default().max_file_bytes),
             max_source_bytes: MAX_ATLAS_SEARCH_SOURCE_BYTES };
         self.begin_structure_inner(atlas, generation, needle, scope,
             AtlasStructureOptions { mode: options.mode, name_mode: options.name_mode, limits },

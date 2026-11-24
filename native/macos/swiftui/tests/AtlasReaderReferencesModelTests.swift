@@ -73,18 +73,22 @@ private enum ReferenceModelFixture {
     }
 }
 
-/// This capture exceeds one 64 KiB reader page. Every advertised occurrence is
+/// These captures exceed one 64 KiB reader page and can include a large prefix
+/// beyond the former 512 KiB occurrence ceiling. Every advertised occurrence is
 /// present in the original UTF-16 bytes, including the surrogate-pair suffix.
 /// Selection responses contain only bounded context around the requested row.
 private struct ReferenceWindowFixture: Sendable {
     static let name = "café𐐀"
     let copies: UInt64
     let littleEndian: Bool
+    let leadingBytes: UInt64
     let raw: [UInt8]
 
-    init(littleEndian: Bool, copies: UInt64 = 5_005) {
+    init(littleEndian: Bool, copies: UInt64 = 5_005, leadingSpaces: Int = 0) {
         self.littleEndian = littleEndian; self.copies = copies
-        let text = "😀\r\n" + String(repeating: Self.name + "\r\n", count: Int(copies))
+        leadingBytes = UInt64(leadingSpaces) * 2
+        let text = String(repeating: " ", count: leadingSpaces)
+            + "😀\r\n" + String(repeating: Self.name + "\r\n", count: Int(copies))
         raw = (littleEndian ? [255, 254] : [254, 255]) + text.utf16.flatMap {
             littleEndian ? [UInt8($0 & 255), UInt8($0 >> 8)] : [UInt8($0 >> 8), UInt8($0 & 255)]
         }
@@ -96,7 +100,7 @@ private struct ReferenceWindowFixture: Sendable {
         return out
     }
     func original(_ ordinal: UInt64) -> (UInt64, UInt64) {
-        let start = 10 + (ordinal - 1) * 16
+        let start = leadingBytes + 10 + (ordinal - 1) * 16
         return (start, start + 12)
     }
     func page(owner: UInt64, origin: String, generation: UInt64, name: String,
@@ -353,11 +357,11 @@ private final class ReferenceModelDriver: @unchecked Sendable {
 
     @MainActor private static func windowRegressions() {
         for littleEndian in [true, false] {
-            let fixture = ReferenceWindowFixture(littleEndian: littleEndian)
+            let fixture = ReferenceWindowFixture(littleEndian: littleEndian, leadingSpaces: 300_000)
             let driver = ReferenceModelDriver(windows: fixture), model = opened(driver)
-            check(fixture.raw.count == 80_090 && model.page?.end == 65_536
+            check(fixture.raw.count == 680_090 && model.page?.end == 65_536
                 && model.page?.nextOffset == 65_536 && model.supportsReferenceWindows,
-                "large retained UTF-16 fixture lost its bounded source page or capability")
+                "capture beyond 512 KiB lost its bounded source page or occurrence capability")
             let source = model.source
             find(model, ReferenceWindowFixture.name)
             let first = model.referencePage!, firstTarget = first.target(id: 1)!
@@ -381,7 +385,7 @@ private final class ReferenceModelDriver: @unchecked Sendable {
             check(later.inventory.generation == 2 && later.inventory.retained == 909
                 && later.inventory.matchesCounted == 5005 && later.inventory.countComplete && !later.inventory.limited
                 && later.rows.count == 64 && later.rows.first?.id == 1 && later.rows.first?.ordinal == 4097
-                && later.rows.first?.range.start == 65_546 && later.rows.first?.range.end == 65_558
+                && later.rows.first?.range.start == 665_546 && later.rows.first?.range.end == 665_558
                 && later.rows.first?.line == 4098 && later.nextOffset == 64,
                 "later window lost exact source ranges, global ordinals, or local metadata IDs")
             check(later.summary.contains("matches 4097–5005 retained")
@@ -404,8 +408,8 @@ private final class ReferenceModelDriver: @unchecked Sendable {
             model.nextReferencePage()
             wait("later-window metadata page") { !model.busy && model.referencePage?.request.start == 64 }
             check(model.referencePage?.rows.first?.id == 65 && model.referencePage?.rows.first?.ordinal == 4161
-                && model.referencePage?.rows.first?.range.start == 66_570
-                && model.referencePage?.rows.first?.range.end == 66_582
+                && model.referencePage?.rows.first?.range.start == 666_570
+                && model.referencePage?.rows.first?.range.end == 666_582
                 && model.referencePage?.inventory.window?.request.offset == 4096
                 && model.canReferenceBack && model.canReferenceWindowBack && model.source === selectedSource
                 && model.referenceHex == nil, "metadata paging lost window inventory or replaced the displayed source")

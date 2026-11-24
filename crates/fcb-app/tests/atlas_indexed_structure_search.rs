@@ -251,6 +251,35 @@ fn all_structural_modes_reuse_original_captures_and_revision_after_live_paths_ch
 }
 
 #[test]
+fn indexed_occurrence_queries_and_windows_admit_the_full_capture_bound_without_widening_it() {
+    let mut source = vec![b' '; 1024 * 1024];
+    source[..6].copy_from_slice(b"needle");
+    let tail_start = source.len() - 6;
+    source[tail_start..].copy_from_slice(b"needle");
+    let fixture = Fixture::new(&[("large.txt", &source)]);
+    let atlas = fixture.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
+    search.prepare_index(&atlas, 1, index_options(), || false).unwrap();
+    fs::write(fixture.0.join("large.txt"), b"changed working file").unwrap();
+    let settings = options(AtlasStructureMode::Occurrences);
+    search.begin_indexed_structure(&atlas, 2, 1, "needle", AtlasSearchScope::all(), settings, || false).unwrap();
+    let all = finish(&mut search, &atlas, 2);
+    count(&all, "structure_file_byte_limit", 1024 * 1024);
+    count(&all, "retained_hits", 2); count(&all, "verification_source_bytes", source.len() as u64);
+    assert!(all.contains("\"search_complete\":true"));
+    search.begin_indexed_structure_window(&atlas, 3, 1, "needle", AtlasSearchScope::all(), settings,
+        AtlasResultWindow { result_offset: 1, count_all_matches: true }, || false).unwrap();
+    let tail = finish(&mut search, &atlas, 3);
+    count(&tail, "structure_file_byte_limit", 1024 * 1024);
+    count(&tail, "matches_seen", 2); count(&tail, "retained_hits", 1);
+    let hit = search.hit(&atlas, 3, 1).unwrap();
+    assert_eq!(hit.original_range.start().get(), tail_start as u64);
+    let (reader, receipt) = search.open_reader(&atlas, ArenaOwnerId::new(31621).unwrap(),
+        3, 1, || false).unwrap();
+    assert!(receipt.as_str().contains("\"source_reopened\":false"));
+    assert_eq!(reader.capture().bytes(), source);
+}
+
+#[test]
 fn capture_scope_widening_stays_pending_while_narrowing_and_empty_scopes_can_finish() {
     let source = b"fn needle() {}\n";
     let fixture = Fixture::new(&[("a.rs", source), ("src/a.rs", source),
@@ -442,7 +471,7 @@ fn large_captured_occurrences_count_and_activate_after_index_and_live_source_cha
     count(&receipt, "matches_seen", 2);
     count(&receipt, "retained_hits", 1);
     count(&receipt, "occurrence_id", 2);
-    count(&receipt, "structure_file_byte_limit", 32 * 1024 * 1024);
+    count(&receipt, "structure_file_byte_limit", 1024 * 1024);
     assert!(receipt.contains("\"search_complete\":true"));
     assert!(receipt.contains("\"has_more_matches\":false"));
     let hit = search.hit(&atlas, 2, 1).unwrap();

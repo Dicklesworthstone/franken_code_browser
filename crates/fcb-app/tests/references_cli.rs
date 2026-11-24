@@ -174,19 +174,17 @@ fn malformed_and_unread_sources_cannot_publish_complete_absence() {
 
 #[test]
 fn reference_search_accepts_larger_files_without_relaxing_outline_limits() {
-    let fixture = Fixture::new(); let mut bytes = vec![b' '; 768 * 1024]; bytes.extend_from_slice(b"foo");
+    let fixture = Fixture::new(); let mut bytes = vec![b' '; 2 * 1024 * 1024]; bytes.extend_from_slice(b"foo");
     fixture.file("large.rs", &bytes);
     let (exit, json) = invoke(&fixture.file_args("large.rs", "foo"), || false);
     assert_eq!(exit, EXIT_OK);
-    assert_eq!(json.get("candidates").array()[0].get("original_range").get("start").number(), 768 * 1024);
-    let outline = vec!["symbols".into(), fixture.root().join("large.rs").into_os_string(),
-        "--name".into(), "foo".into(), "--json".into()];
+    assert_eq!(json.get("candidates").array()[0].get("original_range").get("start").number(), 2 * 1024 * 1024);
+    let outline = vec!["symbols".into(), fixture.root().join("large.rs").into_os_string(), "--json".into()];
     let (exit, json) = invoke(&outline, || false);
     assert_eq!(exit, EXIT_PARTIAL);
     assert_eq!(json.get("notices").array()[0].get("reason").text(), "SYMBOL_SOURCE_LIMIT");
-    fixture.file("denied.txt", b"");
-    fs::OpenOptions::new().write(true).open(fixture.root().join("denied.txt")).unwrap()
-        .set_len(fcb::search::symbols::MAX_REFERENCE_SOURCE_BYTES as u64 + 1).unwrap();
+    assert_eq!(json.get("stats").get("member_payload_bytes_read").number(), 0);
+    fs::File::create(fixture.root().join("denied.txt")).unwrap().set_len(32 * 1024 * 1024 + 1).unwrap();
     let (exit, json) = invoke(&fixture.file_args("denied.txt", "foo"), || false);
     assert_eq!(exit, EXIT_PARTIAL);
     assert_eq!(json.get("notices").array()[0].get("reason").text(), "REFERENCE_SOURCE_LIMIT");
@@ -206,6 +204,24 @@ fn saved_references_are_offline_and_raw_member_paths_are_reversible() {
     assert_eq!(json.get("candidates").array().len(), 1);
     assert_eq!(json.get("candidates").array()[0].get("path").get("hex").text(), hex);
     assert!(json.get("stats").get("archive_validation_bytes").number() > 0);
+}
+
+#[test]
+fn saved_reference_search_reads_paged_members_beyond_the_compact_archive_limit_offline() {
+    let fixture = Fixture::new();
+    let mut bytes = vec![b' '; 2 * 1024 * 1024]; bytes.extend_from_slice(b"foo");
+    fixture.file("large.txt", &bytes);
+    let args = vec!["snapshot".into(), "save".into(), fixture.root().into_os_string(),
+        "--output".into(), fixture.archive().into_os_string(), "--max-file-bytes".into(),
+        "33554432".into(), "--json".into()];
+    assert_eq!(invoke(&args, || false).0, EXIT_OK);
+    fs::rename(fixture.root(), fixture.0.join("retired-root")).unwrap();
+    let (exit, json) = invoke(&fixture.saved_args("foo"), || false);
+    assert_eq!(exit, EXIT_OK); assert!(!json.get("live_roots_accessed").flag());
+    assert!(json.get("text_candidates_complete").flag());
+    assert_eq!(json.get("candidates").array().len(), 1);
+    assert_eq!(json.get("candidates").array()[0].get("original_range").get("start").number(), 2 * 1024 * 1024);
+    assert_eq!(json.get("stats").get("member_payload_bytes_read").number(), bytes.len() as u64);
 }
 
 #[test]

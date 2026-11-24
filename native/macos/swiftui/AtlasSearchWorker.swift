@@ -545,7 +545,7 @@ private struct SearchStream {
                 extractionLimitedFiles: count(extraction, max: min(scanned, unavailable)),
                 metadataOmitted: count(omitted, max: 4096 * 4096),
                 metadataBytes: count(bytes, max: 8 * 1024 * 1024))
-            guard coverage.fileByteLimit == mode.structureFileByteLimit,
+            guard coverage.fileByteLimit == mode.atlasStructureFileByteLimit,
                   coverage.unsupportedFiles + coverage.extractionLimitedFiles <= unavailable,
                   coverage.unsupportedFiles + scanned <= examined,
                   coverage.metadataOmitted == 0 || unavailable > 0,
@@ -621,7 +621,7 @@ private struct SearchStream {
                   !value.language.isEmpty, value.language.utf8.count <= 64,
                   value.evidence_level == mode.evidence,
                   value.heading_slug == nil || (value.heading_slug!.utf8.count <= 4096 && !value.heading_slug!.utf8.contains(0)),
-                  length <= mode.structureFileByteLimit else { throw invalid() }
+                  length <= mode.atlasStructureFileByteLimit else { throw invalid() }
             let candidate = try number(value.candidate_id)
             let evidenceStart = try number(value.evidence_range.start)
             let evidenceEnd = try number(value.evidence_range.end)

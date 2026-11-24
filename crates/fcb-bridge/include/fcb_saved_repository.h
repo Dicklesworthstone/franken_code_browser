@@ -461,7 +461,7 @@ char *fcb_saved_open_expression_hit_reader(uint64_t handle, uint64_t reader,
  *
  * max_hits is 0..4096 (zero probes existence). max_source_bytes bounds aggregate
  * source reads, at most 64 MiB. Per-member analysis limits are 64 KiB for
- * symbols, 256 KiB for headings and 512 KiB for occurrences, also subject to the
+ * symbols, 256 KiB for headings and 32 MiB for occurrences, also subject to the
  * archive's capture limits. Unsupported/unavailable sources, source-work limits
  * and retained-result truncation remain explicit; inspect complete and counters.
  * Search does not use or detach the optional literal posting index.

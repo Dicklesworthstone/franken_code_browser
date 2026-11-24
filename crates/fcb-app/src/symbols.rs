@@ -37,6 +37,7 @@ Options: --language rust|python|javascript|typescript|jsx|tsx|go|cpp|swift|java|
 Lists declaration candidates from bounded outline recognition, NOT compiler definitions.\n\
 Default name matching is exact and case-sensitive. Omit --name to list the outline.\n\
 --references searches exact whole tokens in all admitted text files (32 MiB/file).\n\
+The aggregate --max-bytes allowance still defaults to 8 MiB (at most 64 MiB).\n\
 Comments and string literals participate; these are NOT compiler-resolved references.\n\
 ASCII letters/digits/_/$ and conservative non-ASCII runs form reference tokens.\n\
 --match prefix/contains is incompatible with --references; --language only labels it.\n\
@@ -366,7 +367,8 @@ fn saved_workspace(settings: &Settings, source: &Path, state: &mut RunState, out
     budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool) -> Result<bool, Failure> {
     let native = input::absolute(source)?;
     let (file, _) = input::open_regular(&native)?;
-    let mut archive = PagedSnapshot::open(file, owner(), SnapshotLimits::default(), budget, allocation(202), &mut *canceled)
+    let limits = if settings.references { SnapshotLimits::paged() } else { SnapshotLimits::default() };
+    let mut archive = PagedSnapshot::open(file, owner(), limits, budget, allocation(202), &mut *canceled)
         .map_err(|error| if canceled() { Failure::canceled() } else { Failure::new(error.code()) })?;
     state.stats.validation_bytes = archive.directory().validation_stats().bytes_read;
     let chosen = settings.member.as_ref().map(|path| archive.directory().find_path(path.as_bytes())

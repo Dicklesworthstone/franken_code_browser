@@ -23,7 +23,8 @@ extern "C" {
  * Scope membership is frozen BEFORE source, file or result quotas.
  * max_matches/max_files: 1..4096; max_source_bytes: 1..32 MiB actual I/O work.
  * max_file_bytes: 1..1 MiB, intersected with the extractor's cap: 64 KiB for
- * symbols, 256 KiB for headings, 512 KiB for occurrences. Oversized/unsupported/refused files are explicit
+ * symbols, 256 KiB for headings, 32 MiB for occurrences (the atlas capture
+ * limit still restricts occurrences to 1 MiB). Oversized/unsupported/refused files are explicit
  * unavailable coverage. Symbol languages currently follow the public library's
  * Rust/Python/JS/TS/Go/C-family candidate extractor. Headings use FrankenMarkdown
  * canonical titles, duplicate-safe slugs and original-source provenance.

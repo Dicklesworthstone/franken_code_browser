@@ -101,13 +101,17 @@ private struct ReferenceFixture {
         let rebuilt = try decode(fixture.page())
         precondition(page.inventory.matches(rebuilt.inventory) && page.target(id: 1) != rebuilt.target(id: 1),
             "page token must reject old UI events even when source and generation match")
+        var legacyWire = fixture.page(); legacyWire["max_source_bytes"] = "524288"
+        let legacy = try decode(legacyWire)
+        precondition(legacy.inventory.sourceLimit == 524288 && !legacy.inventory.matches(page.inventory),
+            "legacy bridges remain compatible only under their own retained source limit")
 
         for (key, value) in [
             ("owner", "8"), ("file_id", "2"), ("source_revision", "2"),
             ("reference_generation", "01"), ("reference_generation", "2"),
             ("command", "symbols"), ("selection_namespace", "outline"),
             ("evidence_level", "compiler-resolved"), ("name_case", "insensitive"),
-            ("line_semantics", "native-wrapped-lines"), ("max_source_bytes", "524288"),
+            ("line_semantics", "native-wrapped-lines"), ("max_source_bytes", "524289"),
             ("max_source_bytes", "33554433"),
             ("max_items", "4095"), ("retained_references", "3"), ("matches_counted", "3"),
             ("next_offset", "2"), ("additional_source_bytes_read", "1"), ("encoding", "unsupported")
@@ -168,6 +172,11 @@ private struct ReferenceFixture {
             info: manyInfo, generation: 1, name: many.name, request: nextRequest, inventory: first.inventory)
         precondition(next.rows.first?.id == 65 && next.rows.count == 66 && next.nextOffset == nil)
         precondition(next.target(id: 1) == nil && next.target(id: 65)?.occurrence.range.start == 642)
+        var changedLimit = many.page(nextRequest, preparing: false); changedLimit["max_source_bytes"] = "524288"
+        reject("source policy changed between pages of an accepted inventory") {
+            _ = try AtlasReferencePage.decode(ReferenceFixture.json(changedLimit), info: manyInfo,
+                generation: 1, name: many.name, request: nextRequest, inventory: first.inventory)
+        }
         var stranded = many.page(); stranded["next_offset"] = NSNull()
         reject("nonterminal page without continuation") {
             _ = try AtlasReferencePage.decode(ReferenceFixture.json(stranded), info: manyInfo,
@@ -240,11 +249,49 @@ private struct ReferenceFixture {
         retainedReceipt.removeValue(forKey: "accepted_reference_generation")
         _ = try AtlasReaderInfo.decodeRetainedInitialization(ReferenceFixture.json(retainedReceipt),
             handle: 7, pathBytes: Array("source.rs".utf8))
+        try sourceLimitRegressions()
         try largerCapturesPreserveExactRanges()
         try windowRegressions()
         print("Occurrence wire, exact spelling, source ranges, paging and evidence regressions passed.")
     }
 
+    private static func sourceLimitRegressions() throws {
+        // Protocol fixtures exercise advertised capture/range admission without
+        // constructing a source-sized native buffer. Rust tests scan real bytes.
+        let fixture = ReferenceFixture(name: "foo", copies: 1)
+        func decode(bytes: UInt64, declaredLimit: UInt64) throws -> AtlasReferencePage {
+            var header = fixture.header("info")
+            header["captured_bytes"] = String(bytes); header["encoding"] = "utf8"
+            let info = try AtlasReaderInfo.decode(ReferenceFixture.json(header), handle: 7, path: "source.rs")
+            var wire = fixture.page()
+            wire["captured_bytes"] = String(bytes); wire["encoding"] = "utf8"
+            wire["max_source_bytes"] = String(declaredLimit)
+            wire["references"] = [["reference_id": "1", "line": "1",
+                "original_range": ReferenceFixture.range(bytes - 3, bytes)] as [String: Any]]
+            return try AtlasReferencePage.decode(ReferenceFixture.json(wire), info: info,
+                generation: 1, name: fixture.name, request: .initial, preparing: true)
+        }
+        let current: UInt64 = 32 * 1024 * 1024, legacy: UInt64 = 512 * 1024
+        precondition(AtlasReferencePage.sourceLimit == current && AtlasReferencePage.legacySourceLimit == legacy)
+        for bytes in [legacy + 1, current] {
+            let page = try decode(bytes: bytes, declaredLimit: current)
+            precondition(page.rows[0].range == AtlasOutlineRange(start: bytes - 3, end: bytes)
+                && page.inventory.countComplete && page.inventory.sourceLimit == current)
+            try AtlasReaderRequest.reference(page.target(id: 1)!).validate(capturedBytes: bytes)
+        }
+        _ = try decode(bytes: legacy, declaredLimit: legacy)
+        reject("legacy receipt admitted a capture beyond its declared source limit") {
+            _ = try decode(bytes: legacy + 1, declaredLimit: legacy)
+        }
+        reject("occurrence receipt exceeded the retained reader capture ceiling") {
+            _ = try decode(bytes: current + 1, declaredLimit: current)
+        }
+        for unknown in [legacy - 1, legacy + 1, current + 1] {
+            reject("unknown occurrence source policy was silently accepted") {
+                _ = try decode(bytes: legacy, declaredLimit: unknown)
+            }
+        }
+    }
 
     private static func largerCapturesPreserveExactRanges() throws {
         // Wire fixtures exercise the boundary without allocating a 32 MiB Swift

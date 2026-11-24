@@ -51,7 +51,7 @@ Structure options: --name-mode exact|prefix|contains --limit N --max-source-byte
 Structural queries inspect the whole saved archive with case-sensitive names (default exact).\n\
 Occurrences require exact whole-token names; comments and string literals participate.\n\
 Declarations are heuristic candidates; headings have qualified original-byte ranges.\n\
-Structure limits: 4096 hits; 64 MiB aggregate source; 64/256/512 KiB per symbol/heading/occurrence file.\n\
+Structure limits: 4096 hits; 64 MiB aggregate source; symbols 64 KiB, headings 256 KiB, occurrences 32 MiB per file.\n\
 Zero source allowance stops before a nonempty eligible member; zero hits probes existence.\n\
 Expressions: quoted phrases, whitespace conjunctions, -excluded terms, path: and lang:/type: filters.\n\
 Expression work: --max-scan-bytes N, default 256 MiB across ALL predicate and primary scans.\n\

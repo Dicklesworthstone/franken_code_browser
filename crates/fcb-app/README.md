@@ -1384,7 +1384,9 @@ and byte offset to inspect source.
 `--limit` accepts 0–4096 (default 100); zero probes existence without retaining
 a row. `--max-source-bytes` accepts 0–67,108,864 bytes (default 64 MiB) across
 all loaded members. Per-member extraction limits remain 64 KiB for symbols,
-256 KiB for headings, and 32 MiB for occurrences. Source, extraction and
+256 KiB for headings, and 32 MiB for occurrences. Occurrence extraction uses
+bounded decoder windows across each complete captured member, including bytes
+after the displayed result window. Source, extraction and
 metadata limits, unavailable members, unsupported inputs, incomplete archive
 discovery, and observed additional matches all prevent complete coverage.
 JSON reports these counts and `state`, `workspace_complete` and

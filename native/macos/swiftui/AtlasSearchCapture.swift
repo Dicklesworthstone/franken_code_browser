@@ -172,7 +172,7 @@ enum AtlasSearchCaptureFactory {
                       structure.kind == "identifier-occurrence", structure.language == "text",
                       structure.headingSlug == nil,
                       structure.evidenceStart == hit.start, structure.evidenceEnd == hit.end,
-                      (hit.captureByteLength ?? UInt64.max) <= mode.structureFileByteLimit else { return nil }
+                      (hit.captureByteLength ?? UInt64.max) <= mode.atlasStructureFileByteLimit else { return nil }
             }
             // The exact reader proves the source spelling at the selected
             // original-byte range, even when the workspace query ignored case.

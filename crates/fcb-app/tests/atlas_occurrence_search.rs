@@ -9,7 +9,7 @@ use support::{Json, parse};
 use std::{collections::BTreeMap, fs, path::PathBuf,
     sync::atomic::{AtomicU64, Ordering}};
 use fcb::ArenaOwnerId;
-use fcb::search::{SymbolNameMode, symbols::{MAX_REFERENCE_ITEMS, MAX_REFERENCE_SOURCE_BYTES}};
+use fcb::search::{SymbolNameMode, symbols::MAX_REFERENCE_ITEMS};
 use fcb_app::host::{HostResponse, atlas_session::{AtlasSession, AtlasSessionOptions},
     atlas_search::{AtlasSearchError, AtlasSearchOptions, AtlasSearchPathKind,
         AtlasSearchScope, AtlasStructureMode, AtlasStructureOptions, RetainedAtlasSearch}};
@@ -111,11 +111,11 @@ fn cross_file_occurrences_respect_whole_tokens_and_include_comments_and_literals
     let atlas = fixture.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
     let begin = json(search.begin_structure(&atlas, 1, "run", AtlasSearchScope::all(),
         options(), || false).unwrap());
-    policy(&begin, MAX_REFERENCE_SOURCE_BYTES as u64);
+    policy(&begin, options().limits.max_file_bytes as u64);
     count(&begin, "source_bytes_read", 0); count(&begin, "read_calls", 0);
     count(&begin, "retained_hits", 0);
     let page = finish(&mut search, &atlas, 1);
-    policy(&page, MAX_REFERENCE_SOURCE_BYTES as u64);
+    policy(&page, options().limits.max_file_bytes as u64);
     assert!(page.get("search_complete").flag());
     assert!(!page.get("truncated").flag());
     count(&page, "scanned_files", 3); count(&page, "matching_files", 2);
@@ -378,23 +378,25 @@ fn progressive_reader_activation_and_retained_copy_survive_disk_changes_and_canc
 }
 
 #[test]
-fn the_default_query_budget_admits_a_full_512_kib_file_and_refuses_the_next_byte_before_io() {
-    let mut exact = vec![b' '; MAX_REFERENCE_SOURCE_BYTES];
-    exact[MAX_REFERENCE_SOURCE_BYTES - 3..].copy_from_slice(b"run");
-    let beyond = vec![b' '; MAX_REFERENCE_SOURCE_BYTES + 1];
+fn occurrence_extraction_reaches_the_full_atlas_capture_limit_and_refuses_the_next_byte_before_io() {
+    let file_limit = AtlasSearchOptions::default().max_file_bytes;
+    assert_eq!(file_limit, 1024 * 1024);
+    let mut exact = vec![b' '; file_limit];
+    exact[file_limit - 3..].copy_from_slice(b"run");
+    let beyond = vec![b' '; file_limit + 1];
     let fixture = Fixture::new(&[("a-exact.txt", &exact), ("b-beyond.txt", &beyond)]);
     let atlas = fixture.open();
     let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
     let defaults = AtlasStructureOptions::new(AtlasStructureMode::Occurrences);
     search.begin_structure(&atlas, 1, "run", file_scope("a-exact.txt"), defaults, || false).unwrap();
     let page = finish(&mut search, &atlas, 1);
-    policy(&page, MAX_REFERENCE_SOURCE_BYTES as u64);
+    policy(&page, file_limit as u64);
     assert!(page.get("search_complete").flag());
-    count(&page, "source_bytes_read", MAX_REFERENCE_SOURCE_BYTES as u64);
-    count(&page, "retained_source_bytes", MAX_REFERENCE_SOURCE_BYTES as u64);
+    count(&page, "source_bytes_read", file_limit as u64);
+    count(&page, "retained_source_bytes", file_limit as u64);
     count(&page, "retained_hits", 1); count(&page, "unavailable_files", 0);
     assert_eq!(range(&page.get("hits").array()[0]),
-        (MAX_REFERENCE_SOURCE_BYTES as u64 - 3, MAX_REFERENCE_SOURCE_BYTES as u64));
+        (file_limit as u64 - 3, file_limit as u64));
     drop(search);
     let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
     search.begin_structure(&atlas, 1, "run", file_scope("b-beyond.txt"), defaults, || false).unwrap();
@@ -406,8 +408,8 @@ fn the_default_query_budget_admits_a_full_512_kib_file_and_refuses_the_next_byte
 }
 
 #[test]
-fn a_replacement_decoder_admission_failure_retains_the_old_inventory_and_allows_a_smaller_retry() {
-    let mut large = vec![b' '; MAX_REFERENCE_SOURCE_BYTES];
+fn a_full_capture_replacement_cancels_transactionally_and_retries_with_bounded_decoder_scratch() {
+    let mut large = vec![b' '; AtlasSearchOptions::default().max_file_bytes];
     large[..3].copy_from_slice(b"run");
     let fixture = Fixture::new(&[("a-small.txt", b"run"), ("b-large.txt", &large)]);
     let atlas = fixture.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
@@ -416,20 +418,25 @@ fn a_replacement_decoder_admission_failure_retains_the_old_inventory_and_allows_
     finish(&mut search, &atlas, 1);
     let old = search.hit(&atlas, 1, 1).unwrap();
     let old_progress = search.progress(&atlas, 1).unwrap();
-    // Both default query envelopes stay admitted until successful replacement.
-    // Adding the shared 512 KiB decoder lease must explicitly refuse this
-    // overlap rather than silently accepting an empty partial inventory.
+    // Keep the old query usable while a larger replacement captures and
+    // decodes. Cancellation cannot publish its provisional inventory.
     search.begin_structure(&atlas, 2, "run", file_scope("b-large.txt"), defaults, || false).unwrap();
-    let error = search.step(&atlas, 2, || false).err().unwrap();
-    assert_eq!(error.to_string(), "REFERENCE_RESOURCE_DENIED");
+    let mut polls = 0;
+    assert!(search.step(&atlas, 2, || { polls += 1; polls > 100 }).is_err());
+    assert!(polls > 100);
     assert_eq!(search.pending_generation(), None);
     assert_eq!(search.hit(&atlas, 1, 1).unwrap(), old);
     assert_eq!(search.progress(&atlas, 1).unwrap(), old_progress);
     assert!(search.hit(&atlas, 2, 1).is_err());
     let (mut reader, _) = search.open_reader(&atlas, reader_owner(), 1, 1, || false).unwrap();
     assert_eq!(json(reader.copy_range(0, 3, || false).unwrap()).get("original_hex").text(), "72756e");
-    search.begin_structure(&atlas, 3, "run", file_scope("a-small.txt"), defaults, || false).unwrap();
+    // The shared decoder now uses a fixed window. Overlapping accepted and
+    // replacement queries must admit this 1 MiB capture without the old
+    // source-sized decoder reservation failure.
+    search.begin_structure(&atlas, 3, "run", file_scope("b-large.txt"), defaults, || false).unwrap();
     let retry = finish(&mut search, &atlas, 3);
     assert!(retry.get("search_complete").flag()); count(&retry, "retained_hits", 1);
+    count(&retry, "source_bytes_read", large.len() as u64);
     assert!(search.hit(&atlas, 1, 1).is_err());
+    assert_eq!(json(reader.copy_range(0, 3, || false).unwrap()).get("original_hex").text(), "72756e");
 }

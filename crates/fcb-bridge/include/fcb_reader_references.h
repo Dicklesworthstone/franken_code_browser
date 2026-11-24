@@ -30,9 +30,12 @@ extern "C" {
  * name must be nonempty NUL-terminated UTF-8 <=1024 bytes, readable and stable
  * until return. It must be one admitted token and cannot begin with an ASCII
  * digit. max_items is 0..4096; zero permits a one-occurrence lookahead only.
- * Complete captures up to 32 MiB use bounded decoder windows; malformed or
- * unsupported text fails explicitly. Reader capture and occurrence admission
- * share this source ceiling; other analysis services retain their own limits.
+ * Complete retained sources up to the reader's 32 MiB capture ceiling are
+ * supported. Decoder scratch is bounded independently of source size;
+ * original bytes remain borrowed from the reader. Source capture/admission
+ * limits still apply, and other analysis services retain their own limits.
+ * Malformed/unsupported text fails explicitly and remains readable without
+ * an occurrence inventory.
  *
  * Each attempt uses a strictly increasing reference generation independent of
  * ordinary Find, outline and document generations. Failed/canceled attempts

@@ -404,7 +404,7 @@ final class IndexedFixture: @unchecked Sendable {
                 value["name_mode"] = s.nameMode.rawValue; value["name_case"] = "sensitive"
                 value["evidence_level"] = mode.evidence; value["semantic_complete"] = false
                 value["completeness_basis"] = "admitted-extraction-processing"
-                value["structure_file_byte_limit"] = String(mode.structureFileByteLimit)
+                value["structure_file_byte_limit"] = String(mode.atlasStructureFileByteLimit)
                 value["unsupported_structure_files"] = "0"; value["extraction_limited_files"] = "0"
                 value["structure_metadata_omitted"] = String(metadataOmitted); value["structure_metadata_bytes"] = String(count * 128)
                 value["fallback_files"] = "0"; value["verification_source_bytes"] = String(scanned == 0 ? 0 : c.captureBytes + (scanned - 1) * 100)

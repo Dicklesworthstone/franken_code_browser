@@ -159,7 +159,7 @@ fn utf16_occurrences_keep_byte_identity_and_include_comments_without_prefix_matc
     assert_eq!(exit, EXIT_OK); assert_eq!(result.get("retained_hits").number(), 2);
     assert!(result.get("includes_comments_and_literals").flag()); assert!(!result.get("compiler_resolved").flag());
     assert_eq!(result.get("evidence_level").text(), "whole-token-text-candidate");
-    assert_eq!(result.get("per_file_source_limit").number(), 512 * 1024);
+    assert_eq!(result.get("per_file_source_limit").number(), 32 * 1024 * 1024);
     let hits = result.get("hits").array();
     assert_eq!(hits[0].get("path").get("hex").text(), "7261772dff2e7273");
     assert_eq!(hits[0].get("original_range").get("start").number(), 2);

@@ -22,6 +22,8 @@ use fcb_core::{ByteLength, ByteOffset, ByteRange, DecodedUtf8Offset, DecodedUtf8
 use fcb_search::identifier::{IdentifierCursor, MAX_IDENTIFIER_BYTES, token_scalar, validate_identifier};
 use fcb_source::{CaptureEncodingMap, CaptureRequest, DetectedEncoding, SpanKind, StatefulChunkDecoder, detect_encoding};
 
+/// Complete-capture ceiling, independent of decoder scratch and retained rows.
+/// Callers still apply their own source-capture and managed-memory admission.
 pub const MAX_REFERENCE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_REFERENCE_ITEMS: usize = 4096;
 pub const MAX_REFERENCE_NAME_BYTES: usize = MAX_IDENTIFIER_BYTES;
@@ -540,7 +542,8 @@ mod tests {
         let budget = ResourceBudget::new(owner(), ByteLength::new(1024 * 1024)).unwrap();
         let request = CaptureRequest::new(file(), revision()).unwrap();
         assert!(matches!(CapturedReferences::build(&bytes, request, generation(), "foo", None, 1,
-            &budget, ResourceAllocationId::new(1).unwrap(), || false), Err(ReferenceError::SourceLimit)));
+            &budget, ResourceAllocationId::new(1).unwrap(),
+            || panic!("oversized source reached decoder work")), Err(ReferenceError::SourceLimit)));
         let other = QueryGeneration::new(ArenaOwnerId::new(877).unwrap(), 1).unwrap();
         assert!(matches!(CapturedReferences::build(b"foo", request, other, "foo", None, 1,
             &budget, ResourceAllocationId::new(1).unwrap(), || false), Err(ReferenceError::OwnerMismatch)));
@@ -680,13 +683,76 @@ mod bounded_window_tests {
         // Source backing belongs to the caller. The 2 MiB analysis admission cannot
         // cover the former 384-times-whole-source map at either source ceiling.
         let mut bytes = vec![b' '; MAX_REFERENCE_SOURCE_BYTES];
-        let start = bytes.len() - 3;
-        bytes[start..].copy_from_slice(b"foo");
-        let refs = query(&bytes, "foo", 1, 0, true);
-        assert!(refs.is_complete());
-        assert_eq!(refs.total_matches_counted(), 1);
-        assert_eq!(refs.candidates()[0].original_range().start().get(), start as u64);
+        bytes[..4].copy_from_slice(b"foo\n");
+        let start = bytes.len() - 11;
+        bytes[start..].copy_from_slice(b"foo foo foo");
+        let refs = query(&bytes, "foo", 1, 2, true);
+        assert!(refs.is_complete() && refs.output_limited());
+        assert_eq!(refs.total_matches_counted(), 4);
+        assert_eq!(refs.candidates().len(), 1);
+        let hit = &refs.candidates()[0];
+        assert_eq!(hit.id(), 1);
+        assert_eq!((hit.original_range().start().get(), hit.original_range().end().get()),
+            ((start + 4) as u64, (start + 7) as u64));
+        assert_eq!((hit.decoded_range().start().get(), hit.decoded_range().end().get()),
+            ((start + 4) as u64, (start + 7) as u64));
+        assert_eq!(hit.line(), 2);
         assert_eq!(refs.source_bytes(1).unwrap(), b"foo");
+    }
+
+    #[test]
+    fn large_utf16_counted_windows_preserve_far_tail_byte_and_decoded_coordinates() {
+        let prefix = 600_000;
+        let text = format!("{}𐐀\r\nfoo foo foo", " ".repeat(prefix));
+        for encoding in [DetectedEncoding::Utf16Le, DetectedEncoding::Utf16Be] {
+            let bytes = encode(&text, encoding);
+            assert!(bytes.len() > 1024 * 1024);
+            let refs = query(&bytes, "foo", 1, 1, true);
+            assert!(refs.is_complete() && refs.output_limited());
+            assert_eq!(refs.total_matches_counted(), 3);
+            assert_eq!(refs.candidates().len(), 1);
+            let hit = &refs.candidates()[0];
+            // BOM (2), spaces (2 each), surrogate pair (4), CRLF (4),
+            // and one skipped ASCII token plus delimiter (8).
+            let raw_start = 2 * prefix as u64 + 18;
+            let decoded_start = prefix as u64 + 10;
+            assert_eq!((hit.original_range().start().get(), hit.original_range().end().get()),
+                (raw_start, raw_start + 6));
+            assert_eq!((hit.decoded_range().start().get(), hit.decoded_range().end().get()),
+                (decoded_start, decoded_start + 3));
+            assert_eq!(hit.line(), 2);
+            assert_eq!(refs.source_bytes(1).unwrap(), &encode("foo", encoding)[2..]);
+        }
+    }
+
+    #[test]
+    fn malformed_far_tail_and_cancellation_beyond_the_old_ceiling_never_publish_prefixes() {
+        let mut bytes = vec![b' '; MAX_REFERENCE_SOURCE_BYTES];
+        bytes[..8].copy_from_slice(b"foo foo ");
+        let last = bytes.len() - 1;
+        bytes[last] = 0xff;
+        // Lookahead stopped matching near the start; validation must still
+        // inspect the actual end of the entire 32 MiB capture.
+        let error = CapturedReferences::build_window(&bytes, request(), generation(), "foo",
+            None, 1, 0, false, &budget(), allocation(), || false).err();
+        assert_eq!(error, Some(ReferenceError::UnsupportedEncoding));
+        bytes[last] = b' ';
+        let budget = budget();
+        let mut polls = 0;
+        // Two decoder polls per later window after matching stops. This reaches
+        // past 512 KiB before cancellation, without relying on wall-clock races.
+        let cancel_at = 2 * (512 * 1024 / WINDOW) + 32;
+        let error = CapturedReferences::build_window(&bytes, request(), generation(), "foo",
+            None, 1, 0, false, &budget, allocation(), || { polls += 1; polls == cancel_at }).err();
+        assert_eq!(error, Some(ReferenceError::Canceled));
+        assert_eq!(polls, cancel_at);
+        // Failure releases its entire decoder/row reservation. A new request
+        // reuses the same allocation ID and the same 2 MiB scratch budget.
+        let retried = CapturedReferences::build_window(&bytes, request(), generation(), "foo",
+            None, 0, 0, true, &budget, allocation(), || false).unwrap();
+        assert!(retried.is_complete() && retried.output_limited());
+        assert!(retried.candidates().is_empty());
+        assert_eq!(retried.total_matches_counted(), 2);
     }
 
     #[test]

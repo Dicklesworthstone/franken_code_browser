@@ -40,8 +40,9 @@ impl ReaderSession {
 
     /// Find exact same-token text occurrences, including declarations, comments
     /// and literals. This is not compiler reference resolution. The shared
-    /// engine admits at most 32 MiB of valid UTF-8/BOM-marked UTF-16 source,
-    /// independently of the ordinary reader and declaration-outline limits.
+    /// engine admits up to the reader's 32 MiB capture ceiling for valid
+    /// UTF-8/BOM-marked UTF-16, independently of declaration-outline limits.
+    /// Decoder scratch and retained rows stay bounded independently of source size.
     ///
     /// A zero cap probes existence. The engine counts at most one unstored
     /// occurrence to distinguish an exact cap from a truncated inventory.

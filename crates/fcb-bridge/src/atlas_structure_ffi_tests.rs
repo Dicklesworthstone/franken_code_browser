@@ -103,7 +103,7 @@ fn c_workspace_occurrences_preserve_scope_tokens_and_exact_utf16_capture_after_r
         "\"includes_comments_and_literals\":true", "\"compiler_resolved\":false",
         "\"semantic_complete\":false", "\"unicode_normalization\":\"none\"",
         "\"name_syntax\":\"single-token-no-leading-ascii-digit\"",
-        "\"structure_file_byte_limit\":\"524288\"", "\"kind\":\"identifier-occurrence\"",
+        "\"structure_file_byte_limit\":\"1048576\"", "\"kind\":\"identifier-occurrence\"",
         "\"language\":\"text\""] {
         assert!(found.contains(fragment), "missing {fragment}: {found}");
     }
@@ -155,7 +155,7 @@ fn c_occurrence_query_rejects_non_tokens_nonexact_modes_and_foreign_input_withou
 #[test]
 fn c_occurrence_caps_and_bad_encoding_report_partial_coverage_without_fabricated_misses() {
     let _guard = FFI_TEST_LOCK.lock().unwrap();
-    let oversized = vec![b' '; 512 * 1024 + 1];
+    let oversized = vec![b' '; 1024 * 1024 + 1];
     let bad = [b'n', b'e', b'e', b'd', b'l', b'e', 255];
     let fixture = Fixture::new(&[("a.txt", b"needle needle"), ("b.txt", &oversized), ("c.txt", &bad)]);
     assert!(begin(fixture.handle, 1, "needle", 0, 100).contains("\"status\":\"ok\""));

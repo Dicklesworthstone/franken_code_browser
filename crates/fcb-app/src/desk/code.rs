@@ -37,7 +37,7 @@ and references. Failed/canceled attempts consume their generation but preserve\n
 the previous result. Ordinary search, documents and repository work are separate.\n\
 IDs are one-based; page offsets are zero-based and page counts are 1..128.\n\
 Outline input: at most 64 KiB with existing complexity guards, 1..4096 items.\n\
-Reference input: at most 512 KiB, limit 0..4096; a zero limit probes existence.\n\
+Reference input: at most 32 MiB, limit 0..4096; a zero limit probes existence.\n\
 Unavailable analysis leaves the exact source readable. Limits/counts/heuristic\n\
 evidence remain explicit; a limited inventory is never an exhaustive negative.\n\
 Only code-select/code-ref-select change desk revision. Use ordinary copy and\n\
