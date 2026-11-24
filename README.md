@@ -236,6 +236,23 @@ preserving the previous trail and all its visits. The CLI offers the same immuta
 workflow. This source implementation still requires
 independent native verification.
 
+**Saved trails can be revised without reopening their source archives.**
+The CLI can rename a trail, revise one visit's rationale, move a visit to a final
+position, or remove a visit. Each edit creates a new FCBT file linked to the
+previous digest; retained visits keep their exact source references, including
+repeated visits and references to unavailable archives. Positions are one-based:
+
+```sh
+fcb trail edit reading.fcbt --title "Trace the request lifecycle" --output renamed.fcbt
+fcb trail edit renamed.fcbt --item 3 --note "Return here after the parser" --output annotated.fcbt
+fcb trail edit annotated.fcbt --item 3 --to 1 --output reordered.fcbt
+fcb trail edit reordered.fcbt --item 2 --remove --output shortened.fcbt
+```
+
+Removing the last visit leaves a valid empty trail. Existing destinations are
+refused; `--json` includes the edit, parent digest, resulting trail identity and
+filesystem effect. This source addition awaits independent executable verification.
+
 **Native trail exports can include several saved repository versions.**
 Choose **Export source pack… → Include other saved archives…** and select the
 additional captures. The export combines exact selections and notes in one JSON

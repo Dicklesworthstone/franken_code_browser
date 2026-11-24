@@ -54,6 +54,11 @@ impl Fixture {
         for archive in archives { args.extend(["--archive".into(), archive.as_os_str().to_owned()]); }
         args
     }
+    fn edit(&self, trail: &PathBuf, destination: &PathBuf, action: &[&str]) -> Vec<OsString> {
+        let mut args = vec!["trail".into(), "edit".into(), trail.as_os_str().to_owned(),
+            "--output".into(), destination.as_os_str().to_owned(), "--json".into()];
+        args.extend(action.iter().map(OsString::from)); args
+    }
     fn mixed_trail(&self) -> (PathBuf, PathBuf, PathBuf) {
         let old = self.archive("old.fcbs", b"a.rs", b"old-one");
         let new = self.archive("new.fcbs", b"a.rs", b"new-two");
@@ -602,4 +607,149 @@ fn actual_binary_exports_both_captures_and_multi_archive_cancellation_preserves_
         || fs::metadata(&written).is_ok_and(|m| m.len() > 0));
     assert_eq!(exit, EXIT_CANCELED); assert_eq!(receipt.get("effect").text(), "complete-file-sync-unconfirmed");
     assert!(parse(&fs::read(written).unwrap()).unwrap().get("complete").flag());
+}
+
+#[test]
+fn offline_edits_preserve_mixed_archive_visits_repeats_and_exact_parent_chain() {
+    let f = Fixture::new(); let (old, new, original) = f.mixed_trail();
+    let before = fs::read(&original).unwrap(); let prior = TrailView::open(&before, || false).unwrap();
+    // The supplied archive locations are no longer available. Edits have only
+    // the trail reference file and an explicit new destination.
+    fs::rename(&old, f.0.join("moved-old.fcbs")).unwrap();
+    fs::rename(&new, f.0.join("moved-new.fcbs")).unwrap();
+    let renamed = f.0.join("renamed.fcbt");
+    let (code, receipt) = invoke(&f.edit(&original, &renamed, &["--title", "A deliberate reading order"]), || false);
+    assert_eq!(code, EXIT_OK); assert_eq!(receipt.get("command").text(), "trail-edit");
+    assert_eq!(receipt.get("edit").get("kind").text(), "rename");
+    assert_eq!(receipt.get("edit").get("title").text(), "A deliberate reading order");
+    assert_eq!(receipt.get("parent_digest").text(), prior.digest().to_hex());
+    assert!(!receipt.get("source_verified").flag()); assert!(receipt.get("source_anchors_unchanged").flag());
+    assert_eq!(receipt.get("archive_payload_bytes_read").number(), 0);
+    let renamed_bytes = fs::read(&renamed).unwrap(); let renamed_view = TrailView::open(&renamed_bytes, || false).unwrap();
+    assert_eq!(renamed_view.title(), "A deliberate reading order");
+    assert_eq!(renamed_view.entries().collect::<Result<Vec<_>, _>>().unwrap(),
+        prior.entries().collect::<Result<Vec<_>, _>>().unwrap());
+
+    let annotated = f.0.join("annotated.fcbt"); let note = "Revisit \u{03bb}\n\u{001b}[31muser rationale";
+    let (code, receipt) = invoke(&f.edit(&renamed, &annotated, &["--item", "3", "--note", note]), || false);
+    assert_eq!(code, EXIT_OK); assert_eq!(receipt.get("edit").get("item").number(), 3);
+    assert_eq!(receipt.get("edit").get("rationale").text(), note);
+    let annotated_bytes = fs::read(&annotated).unwrap(); let annotated_view = TrailView::open(&annotated_bytes, || false).unwrap();
+    assert_eq!(annotated_view.parent_digest(), Some(renamed_view.digest()));
+    assert_eq!(annotated_view.entry(2).unwrap().rationale, note);
+    assert_eq!(annotated_view.entry(0).unwrap(), prior.entry(0).unwrap());
+    assert_eq!(annotated_view.entry(1).unwrap(), prior.entry(1).unwrap());
+    assert_eq!(annotated_view.entry(2).unwrap().archive, prior.entry(2).unwrap().archive);
+    assert_eq!(annotated_view.entry(2).unwrap().range, prior.entry(2).unwrap().range);
+
+    let moved = f.0.join("moved.fcbt");
+    let (code, receipt) = invoke(&f.edit(&annotated, &moved, &["--item", "1", "--to", "3"]), || false);
+    assert_eq!(code, EXIT_OK); assert_eq!(receipt.get("edit").get("position").number(), 3);
+    let moved_bytes = fs::read(&moved).unwrap(); let moved_view = TrailView::open(&moved_bytes, || false).unwrap();
+    assert_eq!(moved_view.parent_digest(), Some(annotated_view.digest()));
+    for (to, from) in [1, 2, 0].into_iter().enumerate() {
+        assert_eq!(moved_view.entry(to).unwrap(), annotated_view.entry(from).unwrap());
+    }
+    let restored = f.0.join("restored.fcbt");
+    assert_eq!(invoke(&f.edit(&moved, &restored, &["--item", "3", "--to", "1"]), || false).0, EXIT_OK);
+    let restored_bytes = fs::read(&restored).unwrap(); let restored_view = TrailView::open(&restored_bytes, || false).unwrap();
+    assert_eq!(restored_view.entries().collect::<Result<Vec<_>, _>>().unwrap(),
+        annotated_view.entries().collect::<Result<Vec<_>, _>>().unwrap());
+
+    let removed = f.0.join("removed.fcbt");
+    let (code, receipt) = invoke(&f.edit(&restored, &removed, &["--item", "2", "--remove"]), || false);
+    assert_eq!(code, EXIT_OK); assert_eq!(receipt.get("items").number(), 2);
+    let removed_bytes = fs::read(&removed).unwrap(); let removed_view = TrailView::open(&removed_bytes, || false).unwrap();
+    assert_eq!(removed_view.parent_digest(), Some(restored_view.digest()));
+    assert_eq!(removed_view.entry(0).unwrap(), annotated_view.entry(0).unwrap());
+    assert_eq!(removed_view.entry(1).unwrap(), annotated_view.entry(2).unwrap());
+    assert_eq!(removed_view.reference_bytes(), 6);
+    assert_eq!(fs::read(&original).unwrap(), before);
+    assert_eq!(fs::read(&renamed).unwrap(), renamed_bytes);
+    assert_eq!(fs::read(&annotated).unwrap(), annotated_bytes);
+}
+
+#[test]
+fn editing_raw_path_notes_and_removing_the_final_visit_keeps_a_valid_empty_trail() {
+    let f = Fixture::new(); let archive = f.archive("raw.fcbs", b"\xff.rs", b"abc");
+    let mut add = f.add(&archive, 1, 3); add[3] = "--member-hex".into(); add[4] = "ff2e7273".into();
+    assert_eq!(invoke(&add, || false).0, EXIT_OK);
+    let source = fs::read(f.trail()).unwrap(); let prior = TrailView::open(&source, || false).unwrap();
+    let annotated = f.0.join("empty-note.fcbt");
+    assert_eq!(invoke(&f.edit(&f.trail(), &annotated, &["--item", "1", "--note", ""]), || false).0, EXIT_OK);
+    let annotated_bytes = fs::read(&annotated).unwrap(); let view = TrailView::open(&annotated_bytes, || false).unwrap();
+    let entry = view.entry(0).unwrap();
+    assert_eq!(entry.path, b"\xff.rs"); assert_eq!(entry.rationale, "");
+    assert_eq!(entry.source, prior.entry(0).unwrap().source);
+    assert_eq!(entry.source_length, 3); assert_eq!(entry.range, prior.entry(0).unwrap().range);
+    let empty = f.0.join("empty.fcbt");
+    assert_eq!(invoke(&f.edit(&annotated, &empty, &["--item", "1", "--remove"]), || false).0, EXIT_OK);
+    let empty_bytes = fs::read(&empty).unwrap(); let empty_view = TrailView::open(&empty_bytes, || false).unwrap();
+    assert!(empty_view.is_empty()); assert_eq!(empty_view.reference_bytes(), 0);
+    assert_eq!(empty_view.parent_digest(), Some(view.digest()));
+    let titled = f.0.join("empty-title.fcbt");
+    assert_eq!(invoke(&f.edit(&empty, &titled, &["--title", ""]), || false).0, EXIT_OK);
+    let titled_bytes = fs::read(&titled).unwrap(); let titled_view = TrailView::open(&titled_bytes, || false).unwrap();
+    assert!(titled_view.is_empty()); assert_eq!(titled_view.title(), "");
+    assert_eq!(titled_view.parent_digest(), Some(empty_view.digest()));
+    let mut append = add; append[12] = f.0.join("append-after-empty.fcbt").into_os_string();
+    append.extend(["--from".into(), titled.into_os_string()]);
+    assert_eq!(invoke(&append, || false).0, EXIT_OK);
+    assert_eq!(fs::read(f.trail()).unwrap(), source);
+}
+
+#[test]
+fn invalid_edits_and_existing_destinations_never_modify_the_parent_or_create_output() {
+    let f = Fixture::new(); let archive = f.archive("a.fcbs", b"a.rs", b"abc");
+    assert_eq!(invoke(&f.add(&archive, 0, 3), || false).0, EXIT_OK);
+    let before = fs::read(f.trail()).unwrap(); let destination = f.0.join("not-created.fcbt");
+    for action in [
+        vec!["--item", "2", "--remove"], vec!["--item", "1", "--to", "2"],
+        vec!["--item", "2", "--note", "text"], vec!["--title", "new", "--item", "1", "--remove"],
+        vec!["--title", "new", "--archive", "never-opened.fcbs"],
+    ] {
+        let (code, receipt) = invoke(&f.edit(&f.trail(), &destination, &action), || false);
+        assert_eq!(code, EXIT_ERROR); assert_eq!(receipt.get("effect").text(), "none");
+        assert!(!destination.exists()); assert_eq!(fs::read(f.trail()).unwrap(), before);
+    }
+    for (option, value) in [("--title", "\u{03bb}".repeat(129)), ("--note", "\u{03bb}".repeat(2049))] {
+        let mut edit = f.edit(&f.trail(), &destination, &[]);
+        if option == "--note" { edit.extend(["--item".into(), "1".into()]); }
+        edit.extend([option.into(), value.into()]);
+        assert_eq!(invoke(&edit, || false).0, EXIT_ERROR); assert!(!destination.exists());
+    }
+    let (code, receipt) = invoke(&f.edit(&f.trail(), &f.trail(), &["--title", "must not overwrite"]), || false);
+    assert_eq!(code, EXIT_ERROR); assert_eq!(receipt.get("error").get("code").text(), "TRAIL_DESTINATION_EXISTS");
+    assert_eq!(receipt.get("effect").text(), "none"); assert_eq!(fs::read(f.trail()).unwrap(), before);
+}
+
+#[test]
+fn edited_trails_report_creation_cancellation_and_lost_response_without_rollback() {
+    let f = Fixture::new(); let archive = f.archive("a.fcbs", b"a.rs", b"abc");
+    assert_eq!(invoke(&f.add(&archive, 0, 3), || false).0, EXIT_OK);
+    let before = fs::read(f.trail()).unwrap();
+    for (phase, effect) in ["none", "destination-created-incomplete", "complete-file-sync-unconfirmed"].into_iter().enumerate() {
+        let destination = f.0.join(format!("canceled-{phase}.fcbt"));
+        let (code, receipt) = invoke(&f.edit(&f.trail(), &destination, &["--title", "new"]), || match phase {
+            0 => true, 1 => destination.exists(), _ => fs::metadata(&destination).is_ok_and(|m| m.len() > 0),
+        });
+        assert_eq!(code, EXIT_CANCELED); assert_eq!(receipt.get("effect").text(), effect);
+        match phase {
+            0 => assert!(!destination.exists()),
+            1 => assert_eq!(fs::metadata(&destination).unwrap().len(), 0),
+            _ => assert!(TrailView::open(&fs::read(&destination).unwrap(), || false).is_ok()),
+        }
+        assert_eq!(fs::read(f.trail()).unwrap(), before);
+    }
+    struct Broken;
+    impl Write for Broken {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> { Err(io::ErrorKind::BrokenPipe.into()) }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+    let destination = f.0.join("saved-without-reply.fcbt"); let mut error = Vec::new();
+    assert_eq!(run(&f.edit(&f.trail(), &destination, &["--title", "Saved revision"]),
+        &mut NeverRead, &mut Broken, &mut error, || false), EXIT_ERROR);
+    assert!(String::from_utf8(error).unwrap().contains("effect=complete-file-sync-requested"));
+    let bytes = fs::read(destination).unwrap(); let saved = TrailView::open(&bytes, || false).unwrap();
+    assert_eq!(saved.title(), "Saved revision"); assert_eq!(fs::read(f.trail()).unwrap(), before);
 }

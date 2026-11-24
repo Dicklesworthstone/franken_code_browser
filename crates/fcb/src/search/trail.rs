@@ -85,6 +85,80 @@ pub fn append_selection(owner: ArenaOwnerId, previous: Option<TrailView<'_>>, ti
         &entries, budget, allocations[1], canceled)
 }
 
+/// One metadata-only change to an immutable reading trail. Ordinals identify
+/// visits, including repeated selections of the same exact source range.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TrailEdit<'a> {
+    Rename { title: &'a str },
+    SetRationale { ordinal: usize, rationale: &'a str },
+    /// Move a visit to its final zero-based position, strictly below the current
+    /// visit count. Other visits retain their relative order.
+    Move { ordinal: usize, destination: usize },
+    Remove { ordinal: usize },
+}
+
+/// Create a new immutable trail generation without opening any source archive
+/// or live path. Exact archive/source digests, raw paths, source lengths and
+/// original-byte ranges remain unchanged for every retained visit. Removing the
+/// last visit produces a valid empty trail; no implicit deduplication occurs.
+///
+/// Every successful edit, including a no-op, links to the previous digest.
+/// Operation bounds and UTF-8 byte limits are checked before allocating. The
+/// caller keeps the old artifact admitted while this function admits the
+/// metadata scratch and the new artifact, including their encoding overlap.
+pub fn edit_trail(owner: ArenaOwnerId, previous: TrailView<'_>, edit: TrailEdit<'_>,
+    budget: &ResourceBudget, allocations: [ResourceAllocationId; 2],
+    mut canceled: impl FnMut() -> bool) -> Result<TrailBytes, TrailError> {
+    let count = previous.len();
+    let retained_count = match edit {
+        TrailEdit::Rename { title } => {
+            if title.len() > fcb_store::trail::MAX_TRAIL_TITLE_BYTES { return Err(TrailError::Text); }
+            count
+        }
+        TrailEdit::SetRationale { ordinal, rationale } => {
+            if ordinal >= count { return Err(TrailError::MissingItem); }
+            if rationale.len() > fcb_store::trail::MAX_RATIONALE_BYTES { return Err(TrailError::Text); }
+            count
+        }
+        TrailEdit::Move { ordinal, destination } => {
+            if ordinal >= count || destination >= count { return Err(TrailError::MissingItem); }
+            count
+        }
+        TrailEdit::Remove { ordinal } => {
+            if ordinal >= count { return Err(TrailError::MissingItem); }
+            count - 1
+        }
+    };
+    if allocations[0] == allocations[1] { return Err(TrailError::Limit); }
+    if canceled() { return Err(TrailError::Canceled); }
+    let charge = retained_count.checked_mul(size_of::<TrailEntry<'_>>())
+        .and_then(|n| n.checked_add(size_of::<Vec<TrailEntry<'_>>>()))
+        .ok_or(TrailError::Limit)?;
+    let _scratch = budget.try_reserve_managed(owner, allocations[0], ByteLength::new(charge as u64))
+        .map_err(|_| TrailError::ResourceDenied)?;
+    let mut entries = Vec::new(); entries.try_reserve_exact(retained_count).map_err(|_| TrailError::ResourceDenied)?;
+    if entries.capacity() > retained_count { return Err(TrailError::ResourceDenied); }
+    for (ordinal, entry) in previous.entries().enumerate() {
+        if canceled() { return Err(TrailError::Canceled); }
+        let entry = entry?;
+        let entry = match edit {
+            TrailEdit::Remove { ordinal: selected } if selected == ordinal => continue,
+            TrailEdit::SetRationale { ordinal: selected, rationale } if selected == ordinal => {
+                TrailEntry { rationale, ..entry }
+            }
+            _ => entry,
+        };
+        entries.push(entry);
+    }
+    if canceled() { return Err(TrailError::Canceled); }
+    if let TrailEdit::Move { ordinal, destination } = edit {
+        let entry = entries.remove(ordinal);
+        entries.insert(destination, entry);
+    }
+    let title = match edit { TrailEdit::Rename { title } => title, _ => previous.title() };
+    TrailBytes::encode(owner, title, Some(previous.digest()), &entries, budget, allocations[1], canceled)
+}
+
 /// Check reference readiness using already validated archive metadata. This
 /// does not claim that a later payload read succeeded; open() does that check.
 pub fn resolve_selection(entry: TrailEntry<'_>, directory: &SnapshotDirectory) -> Result<usize, TrailReadError> {

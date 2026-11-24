@@ -7,7 +7,7 @@ use fcb::search::{QueryGeneration, ResourceAllocationId, ResourceBudget, ReaderL
 use fcb::search::snapshot::{SnapshotBytes, SnapshotEntry, SnapshotData, SnapshotLimits};
 use fcb::search::paged_snapshot::PagedSnapshot;
 use fcb::search::trail::{TrailBytes, TrailView, TrailEntry, TrailNavigator, TrailReadError, TrailError,
-    pin_selection, append_selection, resolve_selection, MAX_TRAIL_ITEMS};
+    pin_selection, append_selection, edit_trail, TrailEdit, resolve_selection, MAX_TRAIL_ITEMS};
 
 fn owner() -> ArenaOwnerId { ArenaOwnerId::new(811).unwrap() }
 fn allocation(n: u64) -> ResourceAllocationId { ResourceAllocationId::new(n).unwrap() }
@@ -308,4 +308,195 @@ fn export_reverifies_mutated_archive_payload_and_counts_failed_verification_work
     let item = fresh.next(&mut archive, &budget, [allocation(5), allocation(6)], || false).unwrap().unwrap();
     let TrailExportOutcome::Verified(capture) = item.outcome else { panic!("restored exact bytes should verify") };
     assert_eq!(capture.selected_bytes(), b"abc"); assert!(fresh.stats().complete());
+}
+
+
+// Deliberately no archive handle: curation edits references and user notes,
+// never opens or reauthorizes source payloads. Keep non-UTF-8 paths, a range
+// beyond platform indexing, another archive and a repeated visit in one route.
+fn curation_entries() -> [TrailEntry<'static>; 3] {
+    use fcb::search::trail::Sha256Digest;
+    let first = TrailEntry { archive: Sha256Digest::new([1; 32]), source: Sha256Digest::new([2; 32]),
+        source_length: u64::MAX, path: b"src/\xff\\first.rs", range: range(u64::MAX - 9, u64::MAX),
+        rationale: "first visit" };
+    let second = TrailEntry { archive: Sha256Digest::new([3; 32]), source: Sha256Digest::new([4; 32]),
+        source_length: 8, path: b"other/utf16.rs", range: range(3, 7), rationale: "inside a UTF-16 unit" };
+    [first, second, TrailEntry { rationale: "return to first", ..first }]
+}
+
+#[test]
+fn curation_changes_only_requested_metadata_and_invalidates_old_delivery() {
+    let budget = budget(); let entries = curation_entries();
+    let saved = TrailBytes::encode(owner(), "original route", None, &entries, &budget, allocation(1), || false).unwrap();
+    let original = saved.bytes().to_vec(); let view = TrailView::open(saved.bytes(), || false).unwrap();
+    let target = TrailNavigator::new(view, generation(7)).target().unwrap().unwrap();
+    let renamed = edit_trail(owner(), view, TrailEdit::Rename { title: "追跡\nroute" },
+        &budget, [allocation(2), allocation(3)], || false).unwrap();
+    let renamed_view = TrailView::open(renamed.bytes(), || false).unwrap();
+    assert_eq!(renamed_view.title(), "追跡\nroute");
+    assert_eq!(renamed_view.parent_digest(), Some(view.digest()));
+    assert_eq!(renamed_view.entries().collect::<Result<Vec<_>, _>>().unwrap(), entries);
+    assert_eq!(renamed_view.reference_bytes(), view.reference_bytes());
+    let revised = edit_trail(owner(), renamed_view, TrailEdit::SetRationale {
+        ordinal: 2, rationale: "Revisit exact bytes 🧭\r\n" }, &budget, [allocation(2), allocation(4)], || false).unwrap();
+    let revised_view = TrailView::open(revised.bytes(), || false).unwrap();
+    let mut expected = entries; expected[2].rationale = "Revisit exact bytes 🧭\r\n";
+    assert_eq!(revised_view.entries().collect::<Result<Vec<_>, _>>().unwrap(), expected);
+    assert_eq!(revised_view.title(), renamed_view.title());
+    assert_eq!(revised_view.parent_digest(), Some(renamed_view.digest()));
+    assert_eq!(revised_view.reference_bytes(), 22);
+    assert_eq!(saved.bytes(), original, "editing never mutates the prior portable artifact");
+    assert_eq!(target.validate_delivery(view.digest(), generation(7)), Ok(()));
+    assert_eq!(target.validate_delivery(revised_view.digest(), generation(7)), Err(TrailReadError::StaleDelivery));
+    assert_eq!(target.entry(), entries[0], "retained old targets keep the exact old reference");
+}
+
+#[test]
+fn curation_move_uses_final_ordinals_and_keeps_repeated_visits_distinct() {
+    let budget = budget(); let entries = curation_entries();
+    let saved = TrailBytes::encode(owner(), "move route", None, &entries, &budget, allocation(1), || false).unwrap();
+    let view = TrailView::open(saved.bytes(), || false).unwrap();
+    for (ordinal, destination, order) in [
+        (0, 2, [1, 2, 0]), (2, 0, [2, 0, 1]), (0, 1, [1, 0, 2]), (1, 1, [0, 1, 2]),
+    ] {
+        let moved = edit_trail(owner(), view, TrailEdit::Move { ordinal, destination },
+            &budget, [allocation(2), allocation(3)], || false).unwrap();
+        let moved_view = TrailView::open(moved.bytes(), || false).unwrap();
+        assert_eq!(moved_view.entries().collect::<Result<Vec<_>, _>>().unwrap(), order.map(|i| entries[i]));
+        assert_eq!(moved_view.reference_bytes(), view.reference_bytes());
+        assert_eq!(moved_view.title(), view.title());
+        assert_eq!(moved_view.parent_digest(), Some(view.digest()));
+        assert_ne!(moved_view.digest(), view.digest(), "even a no-op move is a derived immutable generation");
+    }
+    assert_eq!(view.entries().collect::<Result<Vec<_>, _>>().unwrap(), entries);
+}
+
+#[test]
+fn curation_removes_only_selected_visit_and_keeps_empty_trails_editable() {
+    let budget = budget(); let entries = curation_entries();
+    let saved = TrailBytes::encode(owner(), "remove route", None, &entries, &budget, allocation(1), || false).unwrap();
+    let view = TrailView::open(saved.bytes(), || false).unwrap();
+    for (ordinal, order) in [(0, [1, 2]), (1, [0, 2]), (2, [0, 1])] {
+        let removed = edit_trail(owner(), view, TrailEdit::Remove { ordinal },
+            &budget, [allocation(2), allocation(3)], || false).unwrap();
+        let removed_view = TrailView::open(removed.bytes(), || false).unwrap();
+        let expected = order.map(|i| entries[i]);
+        assert_eq!(removed_view.entries().collect::<Result<Vec<_>, _>>().unwrap(), expected);
+        assert_eq!(removed_view.reference_bytes(), expected.iter().map(|e| e.range.len().get()).sum::<u64>());
+        assert_eq!(removed_view.parent_digest(), Some(view.digest()));
+        assert_eq!(removed_view.title(), view.title());
+    }
+    let point = TrailEntry { source_length: 0, range: range(0, 0), rationale: "empty-source point", ..entries[0] };
+    let sole = TrailBytes::encode(owner(), "keep this title", None, &[point], &budget, allocation(4), || false).unwrap();
+    let sole_view = TrailView::open(sole.bytes(), || false).unwrap();
+    let empty = edit_trail(owner(), sole_view, TrailEdit::Remove { ordinal: 0 },
+        &budget, [allocation(2), allocation(3)], || false).unwrap();
+    let empty_view = TrailView::open(empty.bytes(), || false).unwrap();
+    assert!(empty_view.is_empty()); assert_eq!(empty_view.reference_bytes(), 0);
+    assert_eq!(empty_view.title(), "keep this title"); assert_eq!(empty_view.parent_digest(), Some(sole_view.digest()));
+    assert!(TrailNavigator::new(empty_view, generation(1)).target().unwrap().is_none());
+    let renamed = edit_trail(owner(), empty_view, TrailEdit::Rename { title: "start again" },
+        &budget, [allocation(2), allocation(5)], || false).unwrap();
+    let renamed_view = TrailView::open(renamed.bytes(), || false).unwrap();
+    assert!(renamed_view.is_empty()); assert_eq!(renamed_view.title(), "start again");
+    assert_eq!(renamed_view.parent_digest(), Some(empty_view.digest()));
+    let resumed = append_selection(owner(), Some(renamed_view), "", point,
+        &budget, [allocation(2), allocation(6)], || false).unwrap();
+    let resumed_view = TrailView::open(resumed.bytes(), || false).unwrap();
+    assert_eq!(resumed_view.entry(0).unwrap(), point); assert_eq!(resumed_view.title(), "start again");
+    assert_eq!(sole_view.entry(0).unwrap(), point);
+}
+
+#[test]
+fn curation_validates_ordinals_and_utf8_byte_limits_before_resource_admission() {
+    let budget = budget(); let entries = curation_entries();
+    let saved = TrailBytes::encode(owner(), "limits", None, &entries, &budget, allocation(1), || false).unwrap();
+    let view = TrailView::open(saved.bytes(), || false).unwrap();
+    let tiny = ResourceBudget::new(owner(), ByteLength::new(1)).unwrap();
+    for edit in [
+        TrailEdit::SetRationale { ordinal: 3, rationale: "" },
+        TrailEdit::Move { ordinal: 3, destination: 0 },
+        TrailEdit::Move { ordinal: 0, destination: 3 },
+        TrailEdit::Remove { ordinal: usize::MAX },
+    ] {
+        assert!(matches!(edit_trail(owner(), view, edit, &tiny, [allocation(2), allocation(3)], || false),
+            Err(TrailError::MissingItem)));
+        assert_eq!(tiny.accounting().reserved().get(), 0);
+    }
+    let title = "é".repeat(128); let rationale = "🦀".repeat(1024);
+    let long_title = format!("{title}x"); let long_rationale = format!("{rationale}x");
+    for edit in [TrailEdit::Rename { title: &long_title },
+        TrailEdit::SetRationale { ordinal: 0, rationale: &long_rationale }] {
+        assert!(matches!(edit_trail(owner(), view, edit, &tiny, [allocation(2), allocation(3)], || false),
+            Err(TrailError::Text)));
+        assert_eq!(tiny.accounting().reserved().get(), 0);
+    }
+    let renamed = edit_trail(owner(), view, TrailEdit::Rename { title: &title },
+        &budget, [allocation(2), allocation(3)], || false).unwrap();
+    let renamed_view = TrailView::open(renamed.bytes(), || false).unwrap();
+    assert_eq!(renamed_view.title().len(), 256);
+    let annotated = edit_trail(owner(), renamed_view, TrailEdit::SetRationale { ordinal: 0, rationale: &rationale },
+        &budget, [allocation(2), allocation(4)], || false).unwrap();
+    let annotated_view = TrailView::open(annotated.bytes(), || false).unwrap();
+    assert_eq!(annotated_view.entry(0).unwrap().rationale.len(), 4096);
+    let cleared = edit_trail(owner(), annotated_view, TrailEdit::SetRationale { ordinal: 0, rationale: "" },
+        &budget, [allocation(2), allocation(5)], || false).unwrap();
+    assert_eq!(TrailView::open(cleared.bytes(), || false).unwrap().entry(0).unwrap().rationale, "");
+    let untitled = edit_trail(owner(), annotated_view, TrailEdit::Rename { title: "" },
+        &budget, [allocation(2), allocation(6)], || false).unwrap();
+    assert_eq!(TrailView::open(untitled.bytes(), || false).unwrap().title(), "");
+}
+
+#[test]
+fn canceled_or_denied_curation_releases_candidate_memory_and_keeps_original_bytes() {
+    let budget = budget(); let entries = curation_entries();
+    let saved = TrailBytes::encode(owner(), "preserve", None, &entries, &budget, allocation(1), || false).unwrap();
+    let original = saved.bytes().to_vec(); let view = TrailView::open(saved.bytes(), || false).unwrap();
+    let baseline = budget.accounting();
+    for admitted in [0, 1, 2] {
+        let mut observed = false;
+        let result = edit_trail(owner(), view, TrailEdit::Rename { title: "candidate" },
+            &budget, [allocation(2), allocation(3)], || {
+                let cancel = budget.accounting().active_allocations() >= baseline.active_allocations() + admitted;
+                observed |= cancel; cancel
+            });
+        assert!(matches!(result, Err(TrailError::Canceled))); assert!(observed);
+        assert_eq!(budget.accounting().reserved(), baseline.reserved());
+        assert_eq!(budget.accounting().active_allocations(), baseline.active_allocations());
+        assert_eq!(saved.bytes(), original);
+    }
+    assert!(matches!(edit_trail(owner(), view, TrailEdit::Remove { ordinal: 0 },
+        &budget, [allocation(2), allocation(2)], || false), Err(TrailError::Limit)));
+    assert!(matches!(edit_trail(owner(), view, TrailEdit::Rename { title: "candidate" },
+        &budget, [allocation(2), allocation(1)], || false), Err(TrailError::ResourceDenied)),
+        "the new artifact cannot reuse the still-admitted old artifact allocation");
+    let tiny = ResourceBudget::new(owner(), ByteLength::new(1)).unwrap();
+    assert!(matches!(edit_trail(owner(), view, TrailEdit::Rename { title: "candidate" },
+        &tiny, [allocation(2), allocation(3)], || false), Err(TrailError::ResourceDenied)));
+    assert_eq!(tiny.accounting().reserved().get(), 0);
+    assert_eq!(budget.accounting().reserved(), baseline.reserved());
+    assert_eq!(saved.bytes(), original);
+}
+
+#[test]
+fn removing_a_visit_recovers_full_trail_capacity_without_evicting_other_notes() {
+    let budget = budget(); let first = curation_entries()[0];
+    let visits = vec![first; MAX_TRAIL_ITEMS];
+    let saved = TrailBytes::encode(owner(), "full route", None, &visits, &budget, allocation(1), || false).unwrap();
+    let view = TrailView::open(saved.bytes(), || false).unwrap();
+    let later = TrailEntry { rationale: "new explicit visit", ..first };
+    assert!(matches!(append_selection(owner(), Some(view), "", later, &budget,
+        [allocation(2), allocation(3)], || false), Err(TrailError::Limit)));
+    let removed = edit_trail(owner(), view, TrailEdit::Remove { ordinal: MAX_TRAIL_ITEMS - 1 },
+        &budget, [allocation(2), allocation(3)], || false).unwrap();
+    let removed_view = TrailView::open(removed.bytes(), || false).unwrap();
+    assert_eq!(removed_view.len(), MAX_TRAIL_ITEMS - 1);
+    assert!(removed_view.entries().all(|entry| entry.unwrap() == first));
+    let appended = append_selection(owner(), Some(removed_view), "", later, &budget,
+        [allocation(2), allocation(4)], || false).unwrap();
+    let appended_view = TrailView::open(appended.bytes(), || false).unwrap();
+    assert_eq!(appended_view.len(), MAX_TRAIL_ITEMS);
+    assert_eq!(appended_view.entry(MAX_TRAIL_ITEMS - 1).unwrap(), later);
+    assert_eq!(appended_view.parent_digest(), Some(removed_view.digest()));
+    assert_eq!(view.entry(MAX_TRAIL_ITEMS - 1).unwrap(), first, "the original full trail remains untouched");
 }

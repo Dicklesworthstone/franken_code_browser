@@ -2,7 +2,8 @@
 
 //! User-owned reference/annotation export. Every write is explicitly selected,
 //! exclusive, bounded, and reported separately from response delivery. Existing
-//! files are never removed or overwritten. Offline reads need an explicit archive.
+//! files are never removed or overwritten. Source reads need an explicit archive;
+//! edits to trail metadata preserve references without opening source archives.
 
 use std::{ffi::OsString, fs::{File, OpenOptions}, io::{self, Read, Write}, path::{Path, PathBuf}};
 use fcb::{ByteLength, ByteOffset, ByteRange};
@@ -10,7 +11,7 @@ use fcb::search::{RawPath, ReaderLimits, ReadingTarget, ReadingSeekState, Readin
 use fcb::search::paged_snapshot::PagedSnapshot;
 use fcb::search::snapshot::SnapshotLimits;
 use fcb::search::trail::{TrailView, TrailError, TrailNavigator, TrailEntry, MAX_TRAIL_BYTES,
-    pin_selection, append_selection};
+    pin_selection, append_selection, edit_trail, TrailEdit};
 use fcb_core::ResourceLease;
 use crate::{AppError, SCHEMA, MANAGED_BYTES, EXIT_OK, EXIT_ERROR, EXIT_PARTIAL, EXIT_CANCELED,
     owner, allocation, generation, file_id, revision, input};
@@ -25,6 +26,12 @@ const MAX_EXPORT_VALIDATION_BYTES: u64 = 256 * 1024 * 1024;
 const HELP: &str = "fcb trail add ARCHIVE --member NAME --start N --end N --output NEW_TRAIL [--note TEXT] [--json]\n\
   Append without overwriting: add ... --from EXISTING_TRAIL --output NEW_TRAIL\n\
   Native names: --member-hex HEX instead of --member NAME; optional --title for a new trail.\n\
+fcb trail edit TRAIL --title TEXT --output NEW_TRAIL [--json]\n\
+fcb trail edit TRAIL --item N --note TEXT --output NEW_TRAIL [--json]\n\
+fcb trail edit TRAIL --item N --to N --output NEW_TRAIL [--json]\n\
+fcb trail edit TRAIL --item N --remove --output NEW_TRAIL [--json]\n\
+  One edit per new revision; --to is the final one-based position. No source archive is needed.\n\
+  Other visits and exact source references are preserved, including unavailable sources and repeated visits.\n\
 fcb trail inspect TRAIL [--limit N] [--json]\n\
 fcb trail read TRAIL --archive ARCHIVE [--item N] [--bytes N] [--lines N] [--raw] [--json]\n\
 fcb trail export TRAIL --archive ARCHIVE [--archive ANOTHER_ARCHIVE ...] --output NEW_PACK [--format json] [--json]\n\
@@ -40,11 +47,13 @@ Items are one-based. Ranges are half-open original bytes, never text columns.\n\
 Trails contain user notes and source references, not source payloads or access grants.\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Mode { Help, Add, Inspect, Read, Export }
+enum Mode { Help, Add, Edit, Inspect, Read, Export }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EditAction { Rename, SetRationale, Move, Remove }
 struct Settings {
     mode: Mode, source: Option<PathBuf>, archives: Vec<PathBuf>, previous: Option<PathBuf>, output: Option<PathBuf>,
     member: Option<Vec<u8>>, start: Option<u64>, end: Option<u64>, note: String, title: String,
-    item: usize, limit: usize, bytes: usize, lines: usize, raw: bool, json: bool,
+    item: usize, position: usize, edit: Option<EditAction>, limit: usize, bytes: usize, lines: usize, raw: bool, json: bool,
     export_source_bytes: u64, export_bytes: usize, export_characters: usize, export_validation_bytes: u64,
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -68,7 +77,7 @@ impl From<AppError> for Failure { fn from(e: AppError) -> Self { fail(e) } }
 
 fn takes_value(arg: &str) -> bool {
     matches!(arg, "--member" | "--member-hex" | "--start" | "--end" | "--note" | "--title" | "--from"
-        | "--output" | "--archive" | "--item" | "--limit" | "--bytes" | "--lines" | "--format"
+        | "--output" | "--archive" | "--item" | "--to" | "--limit" | "--bytes" | "--lines" | "--format"
         | "--max-source-bytes" | "--max-output-bytes" | "--max-output-chars" | "--max-validation-bytes")
 }
 fn wants_json(args: &[OsString]) -> bool {
@@ -91,12 +100,12 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
     let mode = match args.first().and_then(|arg| arg.to_str()) {
         None | Some("help" | "--help" | "-h") => Mode::Help,
         Some("add") => Mode::Add, Some("inspect") => Mode::Inspect, Some("read") => Mode::Read,
-        Some("export") => Mode::Export,
+        Some("edit") => Mode::Edit, Some("export") => Mode::Export,
         _ => return Err(Failure::new("TRAIL_UNKNOWN_COMMAND")),
     };
     let mut s = Settings { mode, source: None, archives: Vec::new(), previous: None, output: None, member: None,
         start: None, end: None, note: String::new(), title: "Reading trail".to_owned(),
-        item: 1, limit: if mode == Mode::Export { 128 } else { 100 }, bytes: 64 * 1024, lines: 100,
+        item: 1, position: 1, edit: None, limit: if mode == Mode::Export { 128 } else { 100 }, bytes: 64 * 1024, lines: 100,
         raw: false, json: false, export_source_bytes: 32 * 1024 * 1024,
         export_bytes: 4 * 1024 * 1024, export_characters: 4 * 1024 * 1024,
         export_validation_bytes: MAX_EXPORT_VALIDATION_BYTES };
@@ -112,6 +121,7 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
                 "--lines" => 4096, "--raw" => 8192, "--format" => 16384,
                 "--max-source-bytes" => 32768, "--max-output-bytes" => 65536,
                 "--max-output-chars" => 131072, "--max-validation-bytes" => 262144,
+                "--remove" => 524288, "--to" => 1048576,
                 _ => return Err(Failure::new("CLI_UNKNOWN_OPTION")),
             };
             if seen & bit != 0 && !(option == "--archive" && mode == Mode::Export) {
@@ -120,6 +130,7 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
             seen |= bit;
             if option == "--json" { s.json = true; continue; }
             if option == "--raw" { s.raw = true; continue; }
+            if option == "--remove" { continue; }
             let value = args.get(i).ok_or_else(|| Failure::new("CLI_MISSING_VALUE"))?; i += 1;
             if matches!(option, "--archive" | "--from" | "--output") {
                 if value.is_empty() { return Err(Failure::new("CLI_MISSING_VALUE")); }
@@ -154,6 +165,7 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
             match option {
                 "--start" => s.start = Some(n), "--end" => s.end = Some(n),
                 "--item" if (1..=1024).contains(&n) => s.item = n as usize,
+                "--to" if (1..=1024).contains(&n) => s.position = n as usize,
                 "--limit" if n <= 1024 => s.limit = n as usize,
                 "--bytes" if (4..=256 * 1024).contains(&n) => s.bytes = n as usize,
                 "--lines" if (1..=4096).contains(&n) => s.lines = n as usize,
@@ -168,11 +180,22 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
             s.source = Some(PathBuf::from(arg));
         }
     }
+    if mode == Mode::Edit {
+        // Exact action masks prevent combined edits and silently ignored options.
+        s.edit = match seen & !(1 | 128) {
+            bits if bits == 32 => Some(EditAction::Rename),
+            bits if bits == (512 | 16) => Some(EditAction::SetRationale),
+            bits if bits == (512 | 1048576) => Some(EditAction::Move),
+            bits if bits == (512 | 524288) => Some(EditAction::Remove),
+            _ => None,
+        };
+    }
     let valid = match s.mode {
         Mode::Help => s.source.is_none() && seen & !1 == 0,
         Mode::Add => s.source.is_some() && s.member.is_some() && s.start.is_some() && s.end.is_some()
             && s.output.is_some() && seen & !(1 | 2 | 4 | 8 | 16 | 32 | 64 | 128) == 0
             && !(s.previous.is_some() && seen & 32 != 0),
+        Mode::Edit => s.source.is_some() && s.output.is_some() && s.edit.is_some(),
         Mode::Inspect => s.source.is_some() && seen & !(1 | 1024) == 0,
         Mode::Read => s.source.is_some() && s.archives.len() == 1 && seen & !(1 | 256 | 512 | 2048 | 4096 | 8192) == 0
             && !(s.raw && seen & 4096 != 0),
@@ -218,7 +241,7 @@ fn error_output(out: &mut Output, json: bool, e: &Failure, effect: Effect) -> Re
     out.literal("{\"schema\":")?; out.quoted(SCHEMA)?;
     out.literal(",\"status\":\"error\",\"complete\":false,\"effect\":")?; out.quoted(effect.name())?;
     out.literal(",\"error\":{\"code\":")?; out.quoted(&e.code)?;
-    out.literal(",\"subsystem\":\"trail\",\"retryable\":false,\"next_action\":\"Supply the exact saved archive; inspect any created destination before retrying.\"}}\n")
+    out.literal(",\"subsystem\":\"trail\",\"retryable\":false,\"next_action\":\"Run fcb trail help; inspect any created destination before retrying.\"}}\n")
 }
 fn begin(out: &mut Output, command: &str) -> Result<(), OutputError> {
     out.literal("{\"schema\":")?; out.quoted(SCHEMA)?;
@@ -233,6 +256,24 @@ fn metadata(out: &mut Output, view: TrailView<'_>) -> Result<(), OutputError> {
     out.literal(",\"items\":")?; out.integer(view.len() as u64)?;
     out.literal(",\"referenced_bytes_including_repeats\":")?; out.integer(view.reference_bytes())?;
     out.literal(",\"contains_source_payloads\":false,\"contains_user_text\":true")
+}
+fn edit_output(out: &mut Output, edit: TrailEdit<'_>) -> Result<(), OutputError> {
+    let (kind, item, position, title, rationale) = match edit {
+        TrailEdit::Rename { title } => ("rename", None, None, Some(title), None),
+        TrailEdit::SetRationale { ordinal, rationale } => ("set-rationale", Some(ordinal), None, None, Some(rationale)),
+        TrailEdit::Move { ordinal, destination } => ("move", Some(ordinal), Some(destination), None, None),
+        TrailEdit::Remove { ordinal } => ("remove", Some(ordinal), None, None, None),
+    };
+    out.literal(",\"edit\":{\"kind\":")?; out.quoted(kind)?;
+    out.literal(",\"item\":")?;
+    if let Some(item) = item { out.integer(item as u64 + 1)?; } else { out.literal("null")?; }
+    out.literal(",\"position\":")?;
+    if let Some(position) = position { out.integer(position as u64 + 1)?; } else { out.literal("null")?; }
+    out.literal(",\"title\":")?;
+    if let Some(title) = title { out.quoted(title)?; } else { out.literal("null")?; }
+    out.literal(",\"rationale\":")?;
+    if let Some(rationale) = rationale { out.quoted(rationale)?; } else { out.literal("null")?; }
+    out.literal("},\"source_verified\":false,\"source_anchors_unchanged\":true,\"archive_payload_bytes_read\":\"0\"")
 }
 pub(crate) fn entry_output(out: &mut Output, entry: TrailEntry<'_>, ordinal: usize) -> Result<(), OutputError> {
     out.literal("{\"item\":")?; out.integer(ordinal as u64 + 1)?;
@@ -277,6 +318,29 @@ fn execute(s: &Settings, out: &mut Output, budget: &ResourceBudget, effect: &mut
     }
     let loaded = load_trail(source, budget, canceled)?;
     let view = TrailView::open(&loaded.bytes, &mut *canceled)?;
+    if s.mode == Mode::Edit {
+        let edit = match s.edit.ok_or_else(|| Failure::new("CLI_INCOMPATIBLE_OPTIONS"))? {
+            EditAction::Rename => TrailEdit::Rename { title: &s.title },
+            EditAction::SetRationale => TrailEdit::SetRationale { ordinal: s.item - 1, rationale: &s.note },
+            EditAction::Move => TrailEdit::Move { ordinal: s.item - 1, destination: s.position - 1 },
+            EditAction::Remove => TrailEdit::Remove { ordinal: s.item - 1 },
+        };
+        let encoded = edit_trail(owner(), view, edit, budget, [allocation(203), allocation(204)], &mut *canceled)?;
+        let revised = TrailView::open(encoded.bytes(), &mut *canceled)?;
+        let destination = input::absolute(s.output.as_deref().ok_or_else(|| Failure::new("TRAIL_OUTPUT_REQUIRED"))?)?;
+        // Build the complete receipt before exclusive creation. Once creation
+        // starts, the existing writer reports effects independently of delivery.
+        if s.json {
+            begin(out, "trail-edit")?; metadata(out, revised)?; edit_output(out, edit)?;
+            out.literal(",\"effect\":\"complete-file-sync-requested\",\"destination\":")?; out.path(&destination)?;
+            out.literal(",\"power_loss_qualified\":false,\"complete\":true}\n")?;
+        } else {
+            out.literal("Saved revised reading trail to ")?; out.path(&destination)?;
+            out.literal("\nPrevious trail unchanged. Retained visits keep their exact source references; no source payloads were read.\n")?;
+        }
+        write_new(&destination, encoded.bytes(), effect, canceled)?;
+        return Ok(EXIT_OK);
+    }
     if s.mode == Mode::Export { return export::run(s, view, out, budget, effect, canceled); }
     if s.mode == Mode::Inspect {
         if s.json {
@@ -429,6 +493,45 @@ mod tests {
         assert!(parse(&args(&["export", "a", "--archive", "b", "--output", "new", "--max-output-chars", "0"])).is_err());
         assert!(parse(&args(&["export", "a", "--archive", "b", "--output", "new", "--format", "json", "--format", "json"])).is_err());
         assert!(parse(&args(&["export", "a", "--archive", "b", "--output", "new", "--max-source-bytes", "0", "--limit", "0"])).is_ok());
+    }
+
+    #[test]
+    fn edit_requires_exactly_one_action_and_explicit_one_based_visit_positions() {
+        let valid = [
+            (vec!["--title", ""], EditAction::Rename),
+            (vec!["--item", "1", "--note", ""], EditAction::SetRationale),
+            (vec!["--item", "1024", "--to", "1"], EditAction::Move),
+            (vec!["--item", "1", "--remove"], EditAction::Remove),
+        ];
+        for (operation, kind) in valid {
+            let mut request = args(&["edit", "trail", "--output", "new"]);
+            request.extend(args(&operation));
+            assert_eq!(parse(&request).unwrap().edit, Some(kind));
+        }
+        for operation in [
+            vec![], vec!["--item", "1"], vec!["--note", "text"], vec!["--remove"],
+            vec!["--to", "1"], vec!["--title", "title", "--item", "1"],
+            vec!["--item", "1", "--note", "text", "--remove"],
+            vec!["--item", "1", "--to", "2", "--remove"],
+            vec!["--item", "1", "--remove", "--remove"],
+            vec!["--item", "0", "--remove"], vec!["--item", "1", "--to", "0"],
+            vec!["--item", "1025", "--remove"], vec!["--item", "1", "--to", "1025"],
+            vec!["--title", "title", "--archive", "archive"],
+            vec!["--title", "title", "--from", "parent"],
+            vec!["--title", "title", "--limit", "1"],
+        ] {
+            let mut request = args(&["edit", "trail", "--output", "new"]);
+            request.extend(args(&operation));
+            assert!(parse(&request).is_err(), "{request:?}");
+        }
+        assert!(parse(&args(&["edit", "trail", "--title", "new"])).is_err());
+        assert!(parse(&args(&["edit", "--title", "new", "--output", "new"])).is_err());
+        assert!(parse(&args(&["add", "a", "--member", "x", "--start", "0", "--end", "1",
+            "--output", "new", "--remove"])).is_err());
+        assert!(!wants_json(&args(&["edit", "trail", "--title", "--json"])));
+        assert!(!wants_json(&args(&["edit", "trail", "--item", "1", "--note", "--json"])));
+        assert!(!wants_json(&args(&["edit", "trail", "--item", "1", "--to", "--json"])));
+        assert!(wants_json(&args(&["edit", "trail", "--item", "1", "--remove", "--json"])));
     }
 
     #[test]
