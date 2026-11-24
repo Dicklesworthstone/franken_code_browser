@@ -36,6 +36,16 @@ char *fcb_desk_state(uint64_t handle);
  * Label/body contracts match fcb_desk_annotate; late cancel is not rollback. */
 char *fcb_desk_import_observation(uint64_t handle, uint64_t expected, uint64_t attempt,
     uint64_t reader, uint64_t observation, uint64_t start, uint64_t end);
+/* Keep a search result's full lossless captured excerpt as an observed passage.
+ * family=0: frozen atlas stream, revision MUST be 0. family=1: progressive
+ * catalog stream, revision MUST be the accepted nonzero publication revision.
+ * generation/index bind the accepted result; engine-owned bytes, decoder and
+ * source observation supply all provenance. No current source path is read.
+ * Both handles stay alive through return. Unsupported partial evidence or
+ * malformed text fails without importing. Reconcile a lost reply with state;
+ * never blindly repeat an attempt. Return/free ownership matches other calls. */
+char *fcb_desk_import_stream_excerpt(uint64_t handle, uint64_t expected, uint64_t attempt,
+    uint64_t stream, uint64_t family, uint64_t generation, uint64_t revision, uint64_t index);
 char *fcb_desk_observed_passage(uint64_t handle, uint64_t expected, uint64_t passage);
 char *fcb_desk_edit_observed_passage(uint64_t handle, uint64_t expected, uint64_t attempt,
     uint64_t passage, uint64_t sequence, const char *label, const uint8_t *body, uint64_t body_bytes);

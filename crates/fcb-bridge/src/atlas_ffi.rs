@@ -12,6 +12,7 @@ use super::{cstr, reply, string_out};
 use super::atlas_sessions::{AccessError, AtlasSessions, Command};
 
 static ATLASES: OnceLock<AtlasSessions> = OnceLock::new();
+pub(super) fn registry() -> Option<&'static AtlasSessions> { ATLASES.get() }
 fn answer(handle: u64, work: impl FnOnce(&AtlasSessions) -> Result<HostResponse, AccessError>) -> Option<*mut c_char> {
     let result = match ATLASES.get() { Some(atlases) => work(atlases), None => Err(AccessError::Unknown) };
     match result { Ok(response) => string_out(response.as_str()), Err(error) => string_out(&error.json(handle)) }

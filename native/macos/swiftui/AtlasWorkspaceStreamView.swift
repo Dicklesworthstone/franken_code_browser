@@ -6,6 +6,9 @@ import AppKit
     let desk: AtlasReadingDeskModel
     @State private var model: AtlasWorkspaceStreamModel
     @State private var copyNotice = ""
+    @State private var keptExcerpt: AtlasDeskStreamImport?
+    @State private var priorPassages: Set<UInt64> = []
+    @State private var observedDraft: AtlasDeskObservedNoteDraft?
     @Environment(\.dismiss) private var dismiss
     @FocusState private var queryFocused: Bool
 
@@ -143,6 +146,17 @@ import AppKit
             Divider()
             Text(model.notice).font(.caption).textSelection(.enabled)
             if !copyNotice.isEmpty { Text(copyNotice).font(.caption).foregroundStyle(.secondary) }
+            if let keptExcerpt {
+                HStack {
+                    Text(desk.notice).font(.caption).textSelection(.enabled)
+                    Spacer()
+                    Button("Read kept excerpt or add note…") {
+                        if let target = desk.keptStreamExcerpt(keptExcerpt, excluding: priorPassages) {
+                            observedDraft = AtlasDeskObservedNoteDraft(target: target)
+                        }
+                    }.disabled(desk.keptStreamExcerpt(keptExcerpt, excluding: priorPassages) == nil)
+                }
+            }
             if let coverage = model.coverage {
                 Text(coverage).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
             }
@@ -158,6 +172,9 @@ import AppKit
         .onChange(of: model.witness?.target) { _, _ in copyNotice = "" }
         .sheet(item: Binding(get: { model.currentContext }, set: { if $0 == nil { model.closeContext() } })) { context in
             AtlasObservedReaderView(presentation: context, desk: desk)
+        }
+        .sheet(item: $observedDraft) { draft in
+            AtlasDeskObservedPassageView(model: desk, draft: draft)
         }
     }
 
@@ -314,6 +331,13 @@ import AppKit
                         Button("Copy excerpt hex") { copyExcerpt(witness, hex: true) }
                     }
                 }
+                Button("Keep captured excerpt") {
+                    let previous = Set(desk.state?.observedPassages.map(\.id) ?? [])
+                    if let target = desk.keepStreamExcerpt(reader: model) {
+                        priorPassages = previous; keptExcerpt = target
+                    }
+                }.disabled(!desk.canKeepStreamExcerpt(reader: model))
+                    .help("Keep the lossless captured excerpt with its original byte locations, then read it or add a note. Unseen source remains unknown; no file is reopened.")
                 Button("Read current context") { model.readCurrentContext(transport: .native) }
                     .disabled(!model.canReadCurrentContext)
                 Text("Explicitly opens the current canonical pathname under this project's access grant. The retained literal must match the newly read original bytes before a highlight is applied.")

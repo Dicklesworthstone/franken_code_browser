@@ -21,6 +21,7 @@ pub mod snapshot_comparison;
 pub mod catalog_session;
 mod document_fragment;
 pub use catalog_session::finder as file_finder_session;
+pub use crate::stream_context::RetainedSearchExcerpt;
 
 use std::{ffi::OsString, io::{self, Read, Write}, mem::size_of, path::Path};
 use fcb::{ByteLength, ByteOffset, ByteRange, SourceRevision};

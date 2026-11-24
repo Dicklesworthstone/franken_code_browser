@@ -15,6 +15,7 @@ use super::{cstr, reply, string_out};
 use super::catalog_stream_sessions::{AccessError, CatalogStreamSessions, Command};
 
 static STREAMS: OnceLock<CatalogStreamSessions> = OnceLock::new();
+pub(super) fn registry() -> Option<&'static CatalogStreamSessions> { STREAMS.get() }
 fn answer(handle: u64, work: impl FnOnce(&CatalogStreamSessions) -> Result<HostResponse, AccessError>)
     -> Option<*mut c_char> {
     let result = match STREAMS.get() { Some(streams) => work(streams), None => Err(AccessError::Unknown) };

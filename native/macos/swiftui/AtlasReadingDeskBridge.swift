@@ -44,6 +44,9 @@ extension AtlasDeskRecoveryService {
     _ reader: UInt64, _ start: UInt64, _ end: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_desk_import_observation") private func fcb_desk_import_observation(_ h: UInt64, _ revision: UInt64,
     _ attempt: UInt64, _ reader: UInt64, _ observation: UInt64, _ start: UInt64, _ end: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_desk_import_stream_excerpt") private func fcb_desk_import_stream_excerpt(_ h: UInt64,
+    _ revision: UInt64, _ attempt: UInt64, _ stream: UInt64, _ family: UInt64, _ generation: UInt64,
+    _ queryRevision: UInt64, _ index: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_desk_observed_passage") private func fcb_desk_observed_passage(_ h: UInt64, _ revision: UInt64,
     _ passage: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_desk_edit_observed_passage") private func fcb_desk_edit_observed_passage(_ h: UInt64, _ revision: UInt64,
@@ -137,6 +140,12 @@ extension AtlasReadingDeskTransport {
             }
         }, forget: { handle, revision, attempt, passage, sequence in
             take(fcb_desk_forget_observed_passage(handle, revision, attempt, passage, sequence))
+        }), stream: AtlasDeskStreamTransport(domain: AtlasWorkspaceStreamTransport.nativeDomain,
+        keep: { handle, revision, attempt, owner, family, generation, queryRevision, index in
+            guard owner > 0, generation > 0, index < 256,
+                  (family == 0 && queryRevision == 0) || (family == 1 && queryRevision > 0) else { return nil }
+            return take(fcb_desk_import_stream_excerpt(handle, revision, attempt, owner,
+                family, generation, queryRevision, index))
         }))
 
     private static func take(_ pointer: UnsafeMutablePointer<CChar>?) -> String? {

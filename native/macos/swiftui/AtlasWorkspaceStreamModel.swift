@@ -299,6 +299,43 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
     var canSelect: Bool { !closed && !busy && reportAuthorized && session != nil && report != nil }
     var canScanLater: Bool { canSelect && report?.summary.nextStartAfter != nil }
     var canScanEarlier: Bool { canSelect && (report?.summary.request.pageStartAfter ?? 0) > 0 }
+
+    var retentionDomain: UUID? { transport.domain }
+    var witnessForRetention: AtlasWorkspaceStreamWitness? {
+        guard canSelect, let report, let witness, report.admits(witness.target) else { return nil }
+        return witness
+    }
+
+    /// Uses the same retained query and worker as selection. A canceled or stale
+    /// delivery can follow an accepted receiver mutation; the receiver reconciles.
+    func withRetainedWitness<Value: Sendable>(target: AtlasWorkspaceStreamTarget, revision: UInt64?,
+        _ work: @escaping @Sendable (UInt64) throws -> Value) async throws -> Value {
+        try Task.checkCancellation()
+        guard witnessForRetention?.target == target, report?.summary.revision == revision,
+              let original = session else { throw AtlasWorkspaceStreamError.unavailable }
+        // canSelect excludes pending work. Do not cancel an idle stream merely
+        // to transfer its accepted evidence to another registry.
+        let ticket = UUID(), cancellation = AtlasSearchCancellation()
+        operation = ticket; flag = cancellation; busy = true
+        notice = "Keeping the captured search excerpt…"
+        do {
+            let value = try await withTaskCancellationHandler(operation: {
+                try await io.perform(cancellation: cancellation, keepingAlive: [original]) {
+                    try work(original.handle)
+                }
+            }, onCancel: { cancellation.cancel(); original.cancel() })
+            guard accepts(ticket, cancellation), session === original, reportAuthorized,
+                  report?.admits(target) == true, report?.summary.revision == revision,
+                  witness?.target == target else { throw AtlasWorkspaceStreamError.canceled }
+            finish(ticket)
+            notice = "The reading desk is checking the captured excerpt. No source file was reread."
+            return value
+        } catch {
+            fail(error, ticket: ticket)
+            throw error
+        }
+    }
+
     var canReadCurrentContext: Bool {
         guard canSelect, let report, let witness else { return false }
         return report.admits(witness.target)

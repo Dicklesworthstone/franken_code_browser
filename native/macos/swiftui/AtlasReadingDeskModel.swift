@@ -150,6 +150,8 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
     var readerDomain: UUID? { transport.readerDomain }
     var observedDomain: UUID? { transport.observed?.domain }
     var supportsObservedPassages: Bool { transport.observed != nil }
+    var streamDomain: UUID? { transport.stream?.domain }
+    var supportsStreamExcerpts: Bool { transport.stream != nil && transport.observed != nil }
     var supportsRecovery: Bool { recovery != nil }
     /// A failed attempt can advance lastAttempt without changing any personal
     /// work. Only the accepted model revision participates in dirty tracking.
@@ -687,8 +689,28 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
     /// a complete capture, or authority to reopen the source label.
     func keepObserved(_ target: AtlasDeskObservedImport, sourceDomain: UUID,
         using source: @escaping @MainActor (@escaping @Sendable (UInt64) throws -> String?) async throws -> String?) {
-        guard canOperate, !hasUnverifiedChanges, target.isValid, let observed = transport.observed,
-              observed.domain == sourceDomain else { return }
+        guard let observed = transport.observed, observed.domain == sourceDomain else { return }
+        keepObservation(target, using: source) { desk, revision, attempt, reader in
+            observed.keep(desk, revision, attempt, reader, target.originObservation,
+                target.selection.start, target.selection.end)
+        }
+    }
+
+    func keepStreamExcerpt(_ target: AtlasDeskStreamImport, sourceDomain: UUID,
+        using source: @escaping @MainActor (@escaping @Sendable (UInt64) throws -> String?) async throws -> String?) {
+        guard target.isValid, transport.observed != nil, let stream = transport.stream,
+              stream.domain == sourceDomain else { return }
+        keepObservation(target.observation, using: source) { desk, revision, attempt, owner in
+            stream.keep(desk, revision, attempt, owner, target.family, target.generation, target.revision, target.index)
+        }
+    }
+
+    /// Both source registries share attempt reconciliation. Lost delivery never
+    /// repeats an import that may already have added a durable passage.
+    private func keepObservation(_ target: AtlasDeskObservedImport,
+        using source: @escaping @MainActor (@escaping @Sendable (UInt64) throws -> String?) async throws -> String?,
+        importing: @escaping @Sendable (UInt64, UInt64, UInt64, UInt64) -> String?) {
+        guard canOperate, !hasUnverifiedChanges, target.isValid else { return }
         perform { model, _, cancellation in
             let lease = try await model.ensureStarted(cancellation)
             guard let original = model.state else { throw AtlasReadingDeskError.unavailable }
@@ -706,8 +728,7 @@ private final class AtlasDeskCancellation: @unchecked Sendable {
                     try cancellation.check()
                     guard reader == target.originOwner else { throw AtlasReadingDeskError.invalidInput }
                     return withExtendedLifetime(lease) {
-                        observed.keep(lease.handle, original.revision, attempt, reader,
-                            target.originObservation, target.selection.start, target.selection.end)
+                        importing(lease.handle, original.revision, attempt, reader)
                     }
                 }
                 accepted = try AtlasDeskState.decode(json, handle: lease.handle, acceptedAttempt: attempt)

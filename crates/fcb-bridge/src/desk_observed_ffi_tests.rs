@@ -62,3 +62,71 @@ fn c_observed_passage_outlives_source_and_round_trips_length_prefixed_notes() {
     assert!(retained.contains("\"additional_source_bytes_read\":\"0\""));
     assert!(consume(fcb_desk_observed_passage(desk, 2, passage)).contains("DESK_HANDLE_UNKNOWN"));
 }
+
+
+#[test]
+fn c_stream_excerpt_import_preserves_both_query_families_and_rejects_cross_family_handles() {
+    use crate::{atlas_ffi, atlas_sessions, catalog_stream_ffi};
+    let _guard = crate::reader_ffi::FFI_TEST_LOCK.lock().unwrap();
+    for family in [0, 1] {
+        let desk = fcb_desk_create(); assert_ne!(desk, 0); ok(fcb_desk_start(desk));
+        let stream = if family == 0 { atlas_ffi::fcb_atlas_create() }
+            else { catalog_stream_ffi::fcb_catalog_stream_create() };
+        assert_ne!(stream, 0); assert_ne!(stream, desk);
+        let root = std::env::temp_dir().join(format!("fcb-desk-stream-abi-{}-{stream}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("evidence.rs");
+        let bytes: Vec<_> = "\u{feff}prefix needle suffix 😀\r\n".encode_utf16().flat_map(u16::to_be_bytes).collect();
+        fs::write(&path, &bytes).unwrap();
+        let croot = CString::new(root.as_os_str().as_encoded_bytes()).unwrap();
+        let (generation, revision) = if family == 0 {
+            ok(unsafe { atlas_ffi::fcb_atlas_open(stream, croot.as_ptr(), 64) });
+            let report = atlas_ffi::registry().unwrap().execute_stream(stream,
+                atlas_sessions::StreamCommand::Search { needle: "needle",
+                    options: fcb_app::host::atlas_stream_search::AtlasStreamSearchOptions::default() },
+                || false).unwrap();
+            (field(report.as_str(), "query_generation"), 0)
+        } else {
+            let query = b"needle";
+            ok(unsafe { catalog_stream_ffi::fcb_catalog_stream_open(stream, croot.as_ptr(), 7,
+                query.as_ptr(), query.len() as u64, 0, 1, 1, 0, std::ptr::null(), std::ptr::null(),
+                0, std::ptr::null(), 32, 1024 * 1024, 1024) });
+            let mut report = ok(catalog_stream_ffi::fcb_catalog_stream_info(stream));
+            for _ in 0..1000 {
+                if report.contains("\"more\":false") { break; }
+                report = ok(catalog_stream_ffi::fcb_catalog_stream_advance(stream, 7, field(&report, "revision"), 256));
+            }
+            assert!(report.contains("\"more\":false"));
+            (7, field(&report, "revision"))
+        };
+        for (bad_family, bad_generation, bad_revision, bad_index) in [
+            (2, generation, revision, 0), (family, 0, revision, 0),
+            (family, generation, if family == 0 { 1 } else { 0 }, 0),
+            (family, generation, revision, u64::MAX),
+            (1 - family, generation, if family == 0 { 1 } else { 0 }, 0),
+        ] {
+            let rejected = consume(fcb_desk_import_stream_excerpt(desk, 0, 1, stream,
+                bad_family, bad_generation, bad_revision, bad_index));
+            assert!(rejected.contains("\"status\":\"error\""), "{rejected}");
+            assert!(rejected.contains("\"schema\":\"fcb.reading-desk/1\""));
+        }
+        assert!(ok(fcb_desk_state(desk)).contains("\"observed_passages\":[]"));
+        fs::write(&path, b"replacement source").unwrap();
+        let imported = ok(fcb_desk_import_stream_excerpt(desk, 0, 1, stream, family, generation, revision, 0));
+        assert!(imported.contains("\"encoding\":\"utf16be\""));
+        assert!(imported.contains("\"path_hex\":\"65766964656e63652e7273\""));
+        let passage = field(&imported, "passage");
+        let closed = if family == 0 { atlas_ffi::fcb_atlas_close(stream) }
+            else { catalog_stream_ffi::fcb_catalog_stream_close(stream) };
+        assert_eq!(closed, 1);
+        assert!(consume(fcb_desk_import_stream_excerpt(desk, 1, 2, stream, family, generation, revision, 0))
+            .contains("\"status\":\"error\""));
+        let pending = fcb_desk_observed_passage(desk, 1, passage);
+        assert_eq!(fcb_desk_close(desk), 1);
+        let read = ok(pending);
+        assert!(read.contains("\"text\":\"prefix needle suffix 😀\\r\\n\""));
+        assert!(read.contains("\"additional_source_bytes_read\":\"0\""));
+        assert!(read.contains("\"whole_file_immutable\":false"));
+        assert!(!read.contains("replacement source"));
+    }
+}

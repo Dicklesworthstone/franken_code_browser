@@ -127,7 +127,7 @@ extension AtlasWorkspaceStreamTransport {
         retirementFailed: { NSLog("Large-file workspace search retirement could not be confirmed") },
         progressiveSearch: { owner, request, flag, stop, progress in
             try workspaceStreamProgressive(owner, request, flag, stop, progress)
-        })
+        }, domain: nativeDomain)
 }
 
 private func workspaceStreamPolling(_ flag: AtlasSearchCancellation,

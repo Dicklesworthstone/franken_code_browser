@@ -161,7 +161,7 @@ private enum StreamFixture {
     }
     /// Explicit source bytes supply the fixture oracle. The production engine
     /// tests separately exercise the circular history and actual file reads.
-    static func withContext(_ report: [String: Any], followingBytes: Int? = nil) -> [String: Any] {
+    static func withContext(_ report: [String: Any], followingBytes: Int? = nil, digest: String? = nil) -> [String: Any] {
         var value = report, rows = report["hits"] as! [[String: Any]]
         var total = 0
         for index in rows.indices {
@@ -198,6 +198,7 @@ private enum StreamFixture {
                     UInt64(prefix.utf8.count + literal.utf8.count))
                 context["text_has_replacements"] = false; context["text_unavailable_reason"] = NSNull()
             }
+            if let digest { context["extent_sha256"] = digest }
             rows[index]["context"] = context
         }
         value["hits"] = rows; value["capture_kind"] = "literal-witnesses-with-context"
@@ -317,6 +318,7 @@ private final class StreamProbe: @unchecked Sendable {
     private var searchGate: ObservedReaderGate?, hitGate: ObservedReaderGate?, pageGate: ObservedReaderGate?
     private var badSearch = false, badPage = false, badOpen = false, staleSearch = false
     private var matchWindows = false
+    private var retainedContext = false
     private var searches = 0, hits = 0, pages = 0, active = 0, mostActive = 0, created = 0
     private var closed = Set<UInt64>(), released = Set<String>()
     private var closeAllowed = true, retirementFailures = 0
@@ -369,6 +371,10 @@ private final class StreamProbe: @unchecked Sendable {
     var stopCanceledWork: Bool { locked { stoppedWithCancellation } }
     var cancelCount: Int { locked { cancelCalls } }
     func enableMatchWindows() { locked { matchWindows = true } }
+    func enableRetainedContext() { locked { retainedContext = true } }
+    private func retainContext(_ report: [String: Any]) -> [String: Any] {
+        locked { retainedContext } ? StreamFixture.withContext(report, digest: String(repeating: "a", count: 64)) : report
+    }
     func blockSearch(_ gate: ObservedReaderGate) { locked { searchGate = gate } }
     func blockHit(_ gate: ObservedReaderGate) { locked { hitGate = gate } }
     func blockPage(_ gate: ObservedReaderGate) { locked { pageGate = gate } }
@@ -410,6 +416,7 @@ private final class StreamProbe: @unchecked Sendable {
                 count: request.countAllMatches ? 256 : 40,
                 primaryNeedle: request.mode == .expression ? expressionPrimary : nil)
         if request.countAllMatches && !windows { report = StreamFixture.counted(report, matches: 2_000, matchingFiles: 1) }
+        report = retainContext(report)
         locked { reports[owner] = report }
         if fails { report["scope"] = "visible-only" } // Backend already replaced before bad delivery.
         return try StreamFixture.json(StreamFixture.page(report))
@@ -448,6 +455,7 @@ private final class StreamProbe: @unchecked Sendable {
             report = StreamFixture.counted(report, matches: stop.isRequested ? 1_000 : 2_000,
                 matchingFiles: stop.isRequested ? 1 : 2)
         }
+        report = retainContext(report)
         locked { reports[owner] = report }
         return try StreamFixture.json(StreamFixture.page(report))
     }
@@ -465,13 +473,14 @@ private final class StreamProbe: @unchecked Sendable {
             var value = CatalogStreamFixture.report(owner, generation, request, revision: revision,
                 discovered: discovered, pending: 1, terminal: false)
             if poisoned { value["pending_catalogued_files"] = String(discovered + 1) }
+            value = retainContext(value)
             publish(try StreamFixture.json(CatalogStreamFixture.progress(value)))
             guard !flag.isCanceled else { throw AtlasWorkspaceStreamError.canceled }
         }
         gate?.wait()
         guard !flag.isCanceled else { throw AtlasWorkspaceStreamError.canceled }
-        let value = CatalogStreamFixture.report(owner, generation, request,
-            pending: stop.isRequested ? 1 : 0, stopped: stop.isRequested)
+        let value = retainContext(CatalogStreamFixture.report(owner, generation, request,
+            pending: stop.isRequested ? 1 : 0, stopped: stop.isRequested))
         locked { reports[owner] = value }
         return try StreamFixture.json(CatalogStreamFixture.page(value))
     }
@@ -499,6 +508,106 @@ private final class StreamProbe: @unchecked Sendable {
         return try StreamFixture.json(value)
     }
 }
+
+/// A receiver fixture models only the Desk protocol. Source extraction and
+/// actual live-file mutation are exercised by the Rust bridge regressions.
+private final class StreamDeskFixture: @unchecked Sendable {
+    let domain = UUID()
+    let owner: UInt64 = 0x8000000000000021
+    private let lock = NSLock()
+    private var target: AtlasDeskStreamImport?
+    private var context: AtlasRetainedSearchContext?
+    private var revision: UInt64 = 0, attempt: UInt64 = 0
+    private var passages: [[String: Any]] = []
+    private var lost = false, refuse = false
+    private var gate: ObservedReaderGate?
+    private var mutations = 0, stateReads = 0
+    var mutationCount: Int { locked { mutations } }
+    var reconciliationCount: Int { locked { stateReads } }
+    func configure(_ target: AtlasDeskStreamImport, context: AtlasRetainedSearchContext) {
+        locked { self.target = target; self.context = context }
+    }
+    func loseReply() { locked { lost = true } }
+    func refuseNext() { locked { refuse = true } }
+    func blockNextKeep(_ gate: ObservedReaderGate) { locked { self.gate = gate } }
+    private func locked<T>(_ work: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return work() }
+    private func json(_ object: [String: Any]) -> String { try! StreamFixture.json(object) }
+    private func header(_ command: String) -> [String: Any] {
+        ["schema": "fcb.reading-desk/1", "status": "ok", "command": command, "owner": String(owner),
+         "model_revision": String(revision), "last_attempt": String(attempt),
+         "additional_source_bytes_read": "0", "native_presented": false]
+    }
+    private func observation() -> [String: Any] {
+        let target = self.target!.observation
+        return ["observation": "1", "origin_owner": String(target.originOwner), "origin_file": String(target.originFile),
+            "origin_observation": String(target.originObservation), "path": "escaped retained source",
+            "path_hex": target.pathHex, "encoding": target.encoding, "consistency": target.consistency,
+            "extent_sha256": target.extentSHA256,
+            "captured_range": ObservedReaderFixture.range(target.capturedRange.start, target.capturedRange.end),
+            "observed_length": String(target.observedLength),
+            "final_observed_length": target.finalObservedLength.map(String.init) as Any? ?? NSNull(),
+            "capture_kind": "observed-extent", "whole_file_immutable": false, "source_reopened": false]
+    }
+    private func state() -> String {
+        var out = header("state")
+        out["panes"] = [[String: Any]](); out["bookmarks"] = [[String: Any]](); out["active_pane"] = NSNull()
+        out["retained_sources"] = passages.isEmpty ? "0" : "1"
+        out["retained_source_bytes"] = passages.isEmpty ? "0" : String(target!.observation.capturedRange.count)
+        out["can_go_back"] = false; out["can_go_forward"] = false
+        out["persistence"] = "explicit-checkpoint"; out["autosave"] = false
+        out["observations"] = passages.isEmpty ? [] : [observation()]
+        out["observed_passages"] = passages
+        return json(out)
+    }
+    var transport: AtlasReadingDeskTransport {
+        .init(create: { self.owner }, run: { handle, request in
+            self.locked {
+                precondition(handle == self.owner)
+                switch request {
+                case .start: return self.state()
+                case .state: self.stateReads += 1; return self.state()
+                default: return nil
+                }
+            }
+        }, cancel: { _ in true }, close: { _ in true }, retirementFailed: { },
+        observed: .init(domain: domain, keep: { _, _, _, _, _, _, _ in
+            preconditionFailure("Stream excerpts must use their own registry")
+        }, read: { handle, expected, id in
+            self.locked {
+                guard handle == self.owner, expected == self.revision, let target = self.target, let context = self.context,
+                      let passage = self.passages.first(where: { $0["passage"] as? String == String(id) }) else { return nil }
+                let selected = target.observation.selection, captured = target.observation.capturedRange
+                let raw = Array(context.originalHex.utf8)
+                let start = Int(selected.start - captured.start) * 2, end = Int(selected.end - captured.start) * 2
+                var out = self.header("observed-passage")
+                out["observation"] = self.observation(); out["passage"] = passage
+                out["text"] = context.displayText!; out["original_hex"] = String(decoding: raw[start..<end], as: UTF8.self)
+                out["contains_replacements"] = false; out["capture_kind"] = "observed-extent"
+                out["whole_file_immutable"] = false; out["source_reopened"] = false
+                return self.json(out)
+            }
+        }, edit: { _, _, _, _, _, _, _ in nil }, forget: { _, _, _, _, _ in nil }),
+        stream: .init(domain: domain, keep: { handle, expected, next, owner, family, generation, revision, index in
+            precondition(!Thread.isMainThread)
+            let gate = self.locked { let value = self.gate; self.gate = nil; return value }
+            gate?.wait()
+            return self.locked {
+                guard handle == self.owner, expected == self.revision, next > self.attempt, let target = self.target else { return nil }
+                precondition(owner == target.observation.originOwner && family == target.family
+                    && generation == target.generation && revision == target.revision && index == target.index)
+                self.attempt = next
+                if self.refuse { self.refuse = false; return self.state() }
+                let selected = target.observation.selection
+                self.passages.append(["passage": String(self.passages.count + 1), "observation": "1", "update_sequence": "1",
+                    "label": "Kept excerpt", "body": "", "selection": ObservedReaderFixture.range(selected.start, selected.end)])
+                self.revision = next; self.mutations += 1
+                if self.lost { self.lost = false; return nil }
+                return self.state()
+            }
+        }))
+    }
+}
+
 private final class StreamGrant {
     let probe: StreamProbe
     let label: String
@@ -559,6 +668,8 @@ private final class StreamContextProbe: @unchecked Sendable {
         try await matchWindowModelTests()
         try await scopedModelTests()
         try await lifetimeTests()
+        try streamExcerptWireTests()
+        try await streamExcerptDeskTests()
         print("Workspace stream wire/model/context fixtures passed; no native presentation qualification claimed")
     }
     private static func rejects(_ label: String, _ work: () throws -> Void) {
@@ -571,6 +682,168 @@ private final class StreamContextProbe: @unchecked Sendable {
         }
         preconditionFailure("Timed out: " + label)
     }
+
+    private static func streamExcerptWireTests() throws {
+        let owner: UInt64 = 700, request = try AtlasWorkspaceStreamRequest(needle: "é😀")
+        let catalog = try AtlasWorkspaceStreamCatalog.decode(StreamFixture.json(StreamFixture.catalog(owner)), owner: owner)
+        func witness(_ value: [String: Any]) throws -> AtlasWorkspaceStreamWitness {
+            let page = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(StreamFixture.page(value)),
+                catalog: catalog, root: catalog.root, request: request)
+            let report = try AtlasWorkspaceStreamReport(summary: page.summary, hits: page.hits)
+            return try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(StreamFixture.witness(value, index: 0)),
+                report: report, root: catalog.root, target: report.target(for: report.hits[0]))
+        }
+        for encoding in [AtlasObservedReaderEncoding.utf8, .utf16le, .utf16be] {
+            let value = StreamFixture.withContext(StreamFixture.report(owner, 1, request, count: 1, encoding: encoding),
+                digest: String(repeating: "a", count: 64))
+            let accepted = try witness(value), context = accepted.context!
+            let kept = AtlasDeskStreamImport(witness: accepted, revision: nil)!
+            precondition(kept.family == 0 && kept.revision == 0
+                && kept.observation.pathHex == "7372632fff2e747874"
+                && kept.observation.selection.start == context.originalRange.start + 4
+                && kept.observation.selection.end == context.originalRange.end - 4
+                && kept.observation.capturedRange.count == context.originalRange.count,
+                "Displayed label or decoded offsets replaced exact escaped-path/original-byte provenance")
+            precondition(AtlasDeskStreamImport(witness: accepted, revision: 1) == nil)
+            // A lossless projection can start inside the nominal four-byte
+            // guard after the shared decoder floors a scalar boundary.
+            let unit = encoding == .utf8 ? 1 : 2
+            let before = encoding == .utf8 ? String(repeating: "a😀", count: 32)
+                : String(repeating: "a😀", count: 26) + "aa"
+            let after = String(repeating: "s", count: 160 / unit)
+            let prefix = String(before.dropFirst())
+            var floored = value, flooredRows = floored["hits"] as! [[String: Any]]
+            var flooredContext = flooredRows[0]["context"] as! [String: Any]
+            flooredContext["original_hex"] = ObservedReaderFixture.hex(
+                AtlasObservedReaderSearchRequest.originalBytes(before + request.needle + after, encoding: encoding))
+            flooredContext["text"] = prefix + request.needle + String(after.dropLast(4 / unit))
+            flooredContext["text_original_range"] = ObservedReaderFixture.range(
+                context.originalRange.start + UInt64(unit), context.originalRange.end - 4)
+            flooredContext["match_decoded_range"] = ObservedReaderFixture.range(UInt64(prefix.utf8.count),
+                UInt64(prefix.utf8.count + request.needle.utf8.count))
+            flooredRows[0]["context"] = flooredContext; floored["hits"] = flooredRows
+            let insufficientPrefix = try witness(floored)
+            precondition(insufficientPrefix.context!.displayText != nil
+                && AtlasDeskStreamImport(witness: insufficientPrefix, revision: nil) == nil,
+                "A scalar-aligned excerpt bypassed the recorded extent's prefix guard")
+            var changed = value, rows = changed["hits"] as! [[String: Any]]
+            var wire = rows[0]["context"] as! [String: Any]
+            wire.removeValue(forKey: "extent_sha256"); rows[0]["context"] = wire; changed["hits"] = rows
+            precondition(AtlasDeskStreamImport(witness: try witness(changed), revision: nil) == nil,
+                "Legacy excerpt without a digest acquired retention authority")
+            wire["extent_sha256"] = String(repeating: "z", count: 64); rows[0]["context"] = wire; changed["hits"] = rows
+            rejects("malformed retained excerpt digest") { _ = try witness(changed) }
+            wire["extent_sha256"] = String(repeating: "a", count: 64)
+            wire["text_original_range"] = NSNull(); rows[0]["context"] = wire; changed["hits"] = rows
+            rejects("missing original text mapping") { _ = try witness(changed) }
+            let partial = StreamFixture.withContext(StreamFixture.report(owner, 1, request, count: 1, encoding: encoding),
+                followingBytes: 10, digest: String(repeating: "a", count: 64))
+            precondition(AtlasDeskStreamImport(witness: try witness(partial), revision: nil) == nil,
+                "Incomplete context was relabeled as an unchanged complete observation")
+
+            var eof = StreamFixture.report(owner, 1, request, count: 1, encoding: encoding)
+            var eofRows = eof["hits"] as! [[String: Any]]
+            let eofRange = eofRows[0]["original_range"] as! [String: String]
+            let length = UInt64(eofRange["end"]!)!
+            eofRows[0]["observed_length"] = String(length)
+            eofRows[0]["final_observed_length"] = String(length)
+            eof["hits"] = eofRows
+            let knownEOF = try witness(StreamFixture.withContext(eof, digest: String(repeating: "a", count: 64)))
+            precondition(knownEOF.context!.textRange!.end == knownEOF.context!.originalRange.end
+                && AtlasDeskStreamImport(witness: knownEOF, revision: nil) != nil,
+                "A verified unchanged EOF unnecessarily required unknown following bytes")
+            for consistency in ["changed-during-read", "metadata-unavailable"] {
+                var unknown = eof, unknownRows = eofRows
+                unknownRows[0]["consistency"] = consistency; unknownRows[0]["file_complete"] = false
+                unknownRows[0]["final_observed_length"] = consistency == "changed-during-read" ? String(length + 1) as Any : NSNull()
+                unknown["hits"] = unknownRows; unknown["incomplete_files"] = "1"; unknown["search_complete"] = false
+                let unproven = try witness(StreamFixture.withContext(unknown, digest: String(repeating: "a", count: 64)))
+                precondition(unproven.context!.displayText != nil
+                    && AtlasDeskStreamImport(witness: unproven, revision: nil) == nil,
+                    "Unknown EOF bypassed the recorded extent's four-byte suffix guard")
+            }
+        }
+    }
+
+    @MainActor private static func streamExcerptDeskTests() async throws {
+        for progressive in [false, true] {
+            let probe = StreamProbe(), fixture = StreamDeskFixture()
+            probe.enableRetainedContext()
+            var transport = progressive ? probe.catalogTransport : probe.transport
+            transport.domain = fixture.domain
+            let model = AtlasWorkspaceStreamModel(transport: transport, query: "old")
+            model.open(.init(root: StreamFixture.root, project: UUID(), browserOwner: 1, access: nil))
+            try await wait("excerpt catalog") { !model.busy && model.catalog != nil }
+            model.search(); try await wait("excerpt search") { !model.busy && model.reportAuthorized }
+            let report = model.report!
+            model.select(report.target(for: report.hits[0]))
+            try await wait("retained excerpt witness") { !model.busy && model.witness != nil }
+            let witness = model.witness!, target = AtlasDeskStreamImport(witness: witness, revision: report.summary.revision)!
+            fixture.configure(target, context: witness.context!)
+            let desk = AtlasReadingDeskModel(transport: fixture.transport)
+            let foreign = AtlasReadingDeskModel(transport: StreamDeskFixture().transport)
+            precondition(!foreign.canKeepStreamExcerpt(reader: model), "Equal handles crossed an unrelated registry")
+            foreign.close()
+            let searches = probe.searchCount, hits = probe.hitCount
+            fixture.loseReply()
+            precondition(desk.keepStreamExcerpt(reader: model) != nil)
+            try await wait("lost excerpt import reconciled") { !desk.busy && desk.state?.observedPassages.count == 1 }
+            precondition(fixture.mutationCount == 1 && fixture.reconciliationCount == 1
+                && probe.searchCount == searches && probe.hitCount == hits
+                && desk.state?.panes.isEmpty == true && desk.hasUnsavedContents && desk.canSaveCheckpoint)
+            let saved = desk.keptStreamExcerpt(target, excluding: [])!
+            precondition(saved.passage.selection.start == witness.context!.textRange!.start
+                && saved.passage.selection.end == witness.context!.textRange!.end)
+            // A refused second import must not make the direct reader button
+            // open the passage left in lastKeptObservedPassage by the first.
+            let prior = Set(desk.state!.observedPassages.map(\.id))
+            fixture.refuseNext()
+            precondition(desk.keepStreamExcerpt(reader: model) != nil)
+            try await wait("refused excerpt import") { !desk.busy }
+            precondition(desk.keptStreamExcerpt(target, excluding: prior) == nil && fixture.mutationCount == 1)
+            model.close()
+            try await wait("excerpt source retired") { probe.closedCount == probe.createCount }
+            let page = try await desk.readObservedPassage(saved)
+            precondition(page.text == witness.context!.displayText && page.text.contains("old")
+                && page.withLocationText.contains("\"whole_file_immutable\":false")
+                && probe.searchCount == searches && probe.hitCount == hits,
+                "Saved source required reopening or lost its exact retained spelling after source close")
+            precondition(!desk.canKeepStreamExcerpt(reader: model))
+            desk.close()
+        }
+
+        for replace in [false, true] {
+            let probe = StreamProbe(), fixture = StreamDeskFixture()
+            probe.enableRetainedContext()
+            var transport = probe.transport; transport.domain = fixture.domain
+            let model = AtlasWorkspaceStreamModel(transport: transport, query: "old")
+            model.open(.init(root: StreamFixture.root, project: UUID(), browserOwner: 1, access: nil))
+            try await wait("race catalog") { !model.busy && model.catalog != nil }
+            model.search(); try await wait("race search") { !model.busy && model.reportAuthorized }
+            let report = model.report!
+            model.select(report.target(for: report.hits[0]))
+            try await wait("race retained witness") { !model.busy && model.witness != nil }
+            let witness = model.witness!, target = AtlasDeskStreamImport(witness: witness, revision: nil)!
+            fixture.configure(target, context: witness.context!)
+            let desk = AtlasReadingDeskModel(transport: fixture.transport)
+            let gate = ObservedReaderGate(); fixture.blockNextKeep(gate)
+            precondition(desk.keepStreamExcerpt(reader: model) != nil)
+            try await wait("entered excerpt import") { gate.entered }
+            if replace { model.queryText = "new"; model.search() } else { model.close() }
+            precondition(!desk.canKeepStreamExcerpt(reader: model))
+            gate.release()
+            try await wait("revoked import reconciled") { !desk.busy && desk.state?.observedPassages.count == 1 }
+            precondition(fixture.mutationCount == 1 && fixture.reconciliationCount == 1)
+            if replace { try await wait("replacement query") { !model.busy && model.reportAuthorized } }
+            let saved = desk.keptStreamExcerpt(target, excluding: [])!
+            let page = try await desk.readObservedPassage(saved)
+            precondition(page.text.contains("old") && page.text == witness.context!.displayText,
+                "A newer query or source close retargeted an already accepted excerpt")
+            model.close(); desk.close()
+            try await wait("race source retirement") { probe.closedCount == probe.createCount }
+        }
+    }
+
     private static func retainedContextWireTests() throws {
         let owner: UInt64 = 700
         let catalog = try AtlasWorkspaceStreamCatalog.decode(StreamFixture.json(StreamFixture.catalog(owner)),

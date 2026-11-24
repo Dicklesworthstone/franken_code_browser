@@ -24,10 +24,12 @@ struct AtlasRetainedSearchContext: Equatable, Sendable {
     let textRange, matchedTextRange: AtlasObservedByteRange?
     let hasReplacements: Bool?
     let unavailableReason: String?
+    /// Optional on legacy receipts. Keeping an excerpt requires this engine witness.
+    var extentSHA256: String? = nil
 
     static func == (a: Self, b: Self) -> Bool {
         a.requestedRange == b.requestedRange && a.originalRange == b.originalRange
-            && a.complete == b.complete && a.originalHex == b.originalHex
+            && a.complete == b.complete && a.originalHex == b.originalHex && a.extentSHA256 == b.extentSHA256
             && a.text.map({ Array($0.utf8) }) == b.text.map({ Array($0.utf8) })
             && a.textRange == b.textRange && a.matchedTextRange == b.matchedTextRange
             && a.hasReplacements == b.hasReplacements && a.unavailableReason == b.unavailableReason
@@ -72,6 +74,9 @@ struct AtlasRetainedSearchContext: Equatable, Sendable {
               AtlasObservedReaderWire.validHex(w.original_hex, bytes: original.count) else {
             throw AtlasObservedReaderError.invalidResponse
         }
+        if let digest = w.extent_sha256, !AtlasObservedReaderWire.validHex(digest, bytes: 32) {
+            throw AtlasObservedReaderError.invalidResponse
+        }
         let textRange = w.text_original_range, matchedText = w.match_decoded_range
         if let text = w.text {
             guard w.text_unavailable_reason == nil, let textRange, let matchedText, let replacements = w.text_has_replacements,
@@ -109,11 +114,13 @@ struct AtlasRetainedSearchContext: Equatable, Sendable {
         }
         return Self(requestedRange: requested, originalRange: original, complete: w.complete,
             originalHex: w.original_hex, text: w.text, textRange: textRange, matchedTextRange: matchedText,
-            hasReplacements: w.text_has_replacements, unavailableReason: w.text_unavailable_reason)
+            hasReplacements: w.text_has_replacements, unavailableReason: w.text_unavailable_reason,
+            extentSHA256: w.extent_sha256)
     }
 
     struct Wire: Decodable {
         let state, original_hex: String
+        let extent_sha256: String?
         let requested_range, original_range, match_range: AtlasObservedByteRange
         let complete: Bool
         let text, text_unavailable_reason: String?
@@ -124,6 +131,7 @@ struct AtlasRetainedSearchContext: Equatable, Sendable {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             state = try c.decode(String.self, forKey: .state)
             original_hex = try c.decode(String.self, forKey: .original_hex)
+            extent_sha256 = try c.decodeIfPresent(String.self, forKey: .extent_sha256)
             requested_range = try c.decode(AtlasObservedByteRange.self, forKey: .requested_range)
             original_range = try c.decode(AtlasObservedByteRange.self, forKey: .original_range)
             match_range = try c.decode(AtlasObservedByteRange.self, forKey: .match_range)
@@ -135,7 +143,7 @@ struct AtlasRetainedSearchContext: Equatable, Sendable {
             text_has_replacements = try c.decode(Bool?.self, forKey: .text_has_replacements)
         }
         private enum CodingKeys: CodingKey {
-            case state, original_hex, requested_range, original_range, match_range, complete,
+            case state, original_hex, extent_sha256, requested_range, original_range, match_range, complete,
                  text, text_unavailable_reason, text_original_range, match_decoded_range, text_has_replacements
         }
     }

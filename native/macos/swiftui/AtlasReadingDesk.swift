@@ -521,6 +521,22 @@ struct AtlasDeskObservedTransport: Sendable {
     let forget: @Sendable (UInt64, UInt64, UInt64, UInt64, UInt64) -> String?
 }
 
+
+/// One immutable stream result authorizes an engine-owned excerpt import.
+struct AtlasDeskStreamImport: Sendable {
+    let observation: AtlasDeskObservedImport
+    let family, generation, revision, index: UInt64
+    var isValid: Bool {
+        observation.isValid && generation > 0 && index < 256
+            && ((family == 0 && revision == 0) || (family == 1 && revision > 0))
+    }
+}
+
+struct AtlasDeskStreamTransport: Sendable {
+    let domain: UUID
+    let keep: @Sendable (UInt64, UInt64, UInt64, UInt64, UInt64, UInt64, UInt64, UInt64) -> String?
+}
+
 struct AtlasDeskState: Sendable {
     let owner: UInt64
     let revision: UInt64
@@ -951,16 +967,18 @@ struct AtlasReadingDeskTransport: Sendable {
     /// equal numeric handle in a different embedded transport is not authority.
     let readerDomain: UUID?
     let observed: AtlasDeskObservedTransport?
+    let stream: AtlasDeskStreamTransport?
 
     init(create: @escaping @Sendable () -> UInt64,
         run: @escaping @Sendable (UInt64, AtlasDeskRequest) -> String?,
         cancel: @escaping @Sendable (UInt64) -> Bool,
         close: @escaping @Sendable (UInt64) -> Bool,
         retirementFailed: @escaping @Sendable () -> Void,
-        readerDomain: UUID? = nil, observed: AtlasDeskObservedTransport? = nil) {
+        readerDomain: UUID? = nil, observed: AtlasDeskObservedTransport? = nil,
+        stream: AtlasDeskStreamTransport? = nil) {
         self.create = create; self.run = run; self.cancel = cancel; self.close = close
         self.retirementFailed = retirementFailed; self.readerDomain = readerDomain
-        self.observed = observed
+        self.observed = observed; self.stream = stream
     }
 }
 

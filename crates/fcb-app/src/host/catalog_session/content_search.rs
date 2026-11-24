@@ -268,6 +268,21 @@ impl CatalogContentSearchSession {
         self.validate_revision(generation, revision)?;
         self.witness(position, canceled)
     }
+    /// Retain this exact accepted row's excerpt without reading a path. Both
+    /// query and publication revision must still match before borrowing bytes.
+    pub fn retained_excerpt(&mut self, generation: u64, revision: u64, position: usize,
+        mut canceled: impl FnMut() -> bool)
+        -> Result<crate::host::RetainedSearchExcerpt<'_>, CatalogContentSearchError> {
+        check(&mut canceled)?; self.validate_active()?;
+        self.validate_revision(generation, revision)?;
+        let ids = [self.catalog.next_id()?, self.catalog.next_id()?, self.catalog.next_id()?];
+        let hit = self.hits.get(position).ok_or(CatalogContentSearchError::MissingHit)?;
+        let context = self.retained_context(hit)?;
+        Ok(context.retain(hit.path.raw().as_bytes(), hit.file.final_length,
+            hit.file.consistency.ok_or(CatalogContentSearchError::MissingHit)?,
+            &self.catalog.budget, ids, &mut canceled)?)
+    }
+
     /// A predecessor retry replays the current accepted result without another
     /// read. Revision advances BEFORE work/output, so consumed metadata and
     /// source bytes remain recoverable after cancellation or output denial.

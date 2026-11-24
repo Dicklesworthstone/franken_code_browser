@@ -8,6 +8,7 @@ struct AtlasReaderTransport: Sendable {
     static let native = Self()
 }
 enum AtlasObservedReaderTransport { static let nativeDomain = UUID() }
+enum AtlasWorkspaceStreamTransport { static let nativeDomain = UUID() }
 
 @_silgen_name("desk_observed_fixture_reset") private func reset()
 @_silgen_name("desk_observed_fixture_mode") private func mode(_ value: UInt64)
@@ -49,6 +50,23 @@ enum AtlasObservedReaderTransport { static let nativeDomain = UUID() }
         precondition(observed.edit(h, r, a, o, 1, "nul\0label", body) == nil)
         precondition(observed.edit(h, r, a, o, 1, "label", String(repeating: "x", count: 16_385)) == nil)
         precondition(calls() == before, "Rejected inputs never cross the ABI")
+
+        let stream = AtlasReadingDeskTransport.native.stream!
+        precondition(stream.domain == AtlasWorkspaceStreamTransport.nativeDomain)
+        reset()
+        precondition(stream.keep(h, r, a, reader, 0, o, 0, 255) == "{}")
+        for (index, value) in [h, r, a, reader, 0, o, 0, 255].enumerated() {
+            precondition(argument(UInt64(index)) == value)
+        }
+        precondition(stream.keep(h, r, a, reader, 1, o, h + 5, 254) == "{}")
+        precondition(argument(4) == 1 && argument(6) == h + 5 && argument(7) == 254)
+        precondition(calls() == 2 && frees() == 2)
+        for (family, revision) in [(UInt64(2), UInt64(1)), (0, 1), (1, 0)] {
+            precondition(stream.keep(h, r, a, reader, family, o, revision, 0) == nil)
+        }
+        precondition(stream.keep(h, r, a, 0, 0, o, 0, 0) == nil)
+        precondition(stream.keep(h, r, a, reader, 0, 0, 0, 0) == nil)
+        precondition(stream.keep(h, r, a, reader, 0, o, 0, 256) == nil && calls() == 2)
 
         reset(); mode(1)
         precondition(observed.read(h, r, o) == nil && calls() == 1 && frees() == 0)

@@ -50,6 +50,11 @@ char *fcb_desk_import_observation(uint64_t h, uint64_t revision, uint64_t attemp
     const uint64_t values[] = {h, revision, attempt, reader, observation, start, end};
     record(values, 7); return reply();
 }
+char *fcb_desk_import_stream_excerpt(uint64_t h, uint64_t revision, uint64_t attempt,
+    uint64_t stream, uint64_t family, uint64_t generation, uint64_t query_revision, uint64_t index) {
+    const uint64_t values[] = {h, revision, attempt, stream, family, generation, query_revision, index};
+    record(values, 8); return reply();
+}
 char *fcb_desk_observed_passage(uint64_t h, uint64_t revision, uint64_t passage) {
     const uint64_t values[] = {h, revision, passage};
     record(values, 3); return reply();

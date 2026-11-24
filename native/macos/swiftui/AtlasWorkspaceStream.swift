@@ -113,6 +113,9 @@ final class AtlasWorkspaceStreamStop: @unchecked Sendable {
 }
 
 struct AtlasWorkspaceStreamTransport: Sendable {
+    /// Shared only by the app's native stream registries and their Desk importer.
+    static let nativeDomain = UUID()
+    var domain: UUID?
     typealias ProgressiveSearch = @Sendable (UInt64, AtlasWorkspaceStreamRequest,
         AtlasSearchCancellation, AtlasWorkspaceStreamStop, @Sendable (String) -> Void) throws -> String?
     let create: @Sendable () -> UInt64
@@ -146,12 +149,12 @@ struct AtlasWorkspaceStreamTransport: Sendable {
          close: @escaping @Sendable (UInt64) -> Bool,
          retirementFailed: @escaping @Sendable () -> Void,
          progressiveSearch: ProgressiveSearch? = nil, catalogSearch: CatalogSearch? = nil,
-         supportsDiscoveryPolicy: Bool = false) {
+         supportsDiscoveryPolicy: Bool = false, domain: UUID? = nil) {
         self.create = create; self.open = open; self.search = search; self.page = page
         self.hit = hit; self.clear = clear; self.cancel = cancel; self.close = close
         self.retirementFailed = retirementFailed; self.progressiveSearch = progressiveSearch
         self.catalogSearch = catalogSearch
-        self.supportsDiscoveryPolicy = supportsDiscoveryPolicy
+        self.supportsDiscoveryPolicy = supportsDiscoveryPolicy; self.domain = domain
     }
 }
 

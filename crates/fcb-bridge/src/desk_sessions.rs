@@ -15,6 +15,7 @@ use fcb_app::host::{HostResponse, desk::{DeskCommand, DeskError, DeskLimits, Des
 use fcb_core::{ArenaOwnerId, ByteLength, ResourceAllocationId, ResourceBudget, ResourceLease};
 use super::reader_sessions::{self, ReaderSessions};
 use super::observed_reader_sessions::{self, ObservedReaderSessions};
+use super::{atlas_sessions, catalog_stream_sessions};
 
 pub(super) const MAX_DESK_SESSIONS: usize = 2;
 
@@ -24,6 +25,7 @@ pub(super) enum AccessError {
     InvalidArgument, Desk(DeskSessionError), Checkpoint(CheckpointIoError),
     Reader(reader_sessions::AccessError), ReaderTransfer(DeskReaderError), Comparison(DeskComparisonError),
     ObservedReader(observed_reader_sessions::AccessError),
+    AtlasStream(atlas_sessions::AccessError), CatalogStream(catalog_stream_sessions::AccessError),
 }
 impl From<DeskSessionError> for AccessError { fn from(e: DeskSessionError) -> Self { Self::Desk(e) } }
 impl From<CheckpointIoError> for AccessError { fn from(e: CheckpointIoError) -> Self { Self::Checkpoint(e) } }
@@ -32,6 +34,12 @@ impl From<DeskReaderError> for AccessError { fn from(e: DeskReaderError) -> Self
 impl From<DeskComparisonError> for AccessError { fn from(e: DeskComparisonError) -> Self { Self::Comparison(e) } }
 impl From<observed_reader_sessions::AccessError> for AccessError {
     fn from(e: observed_reader_sessions::AccessError) -> Self { Self::ObservedReader(e) }
+}
+impl From<atlas_sessions::AccessError> for AccessError {
+    fn from(e: atlas_sessions::AccessError) -> Self { Self::AtlasStream(e) }
+}
+impl From<catalog_stream_sessions::AccessError> for AccessError {
+    fn from(e: catalog_stream_sessions::AccessError) -> Self { Self::CatalogStream(e) }
 }
 impl std::fmt::Display for AccessError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -45,6 +53,7 @@ impl std::fmt::Display for AccessError {
             Self::Reader(e) => return write!(f, "{e}"), Self::ReaderTransfer(e) => return write!(f, "{e}"),
             Self::Comparison(e) => return write!(f, "{e}"),
             Self::ObservedReader(e) => return write!(f, "{e}"),
+            Self::AtlasStream(e) => return write!(f, "{e}"), Self::CatalogStream(e) => return write!(f, "{e}"),
         })
     }
 }
@@ -54,7 +63,12 @@ impl AccessError {
             Self::Canceled | Self::Closed => true,
             Self::Desk(e) => e.is_canceled(), Self::Checkpoint(e) => e.is_canceled(),
             Self::Reader(e) => e.canceled(), Self::ReaderTransfer(e) => e.is_canceled(),
-            Self::Comparison(e) => e.is_canceled(), Self::ObservedReader(e) => e.canceled(), _ => false,
+            Self::Comparison(e) => e.is_canceled(), Self::ObservedReader(e) => e.canceled(),
+            Self::CatalogStream(e) => e.canceled(),
+            Self::AtlasStream(e) => matches!(e, atlas_sessions::AccessError::Canceled | atlas_sessions::AccessError::Closed
+                | atlas_sessions::AccessError::Stream(fcb_app::host::atlas_stream_search::AtlasStreamSearchError::Canceled
+                    | fcb_app::host::atlas_stream_search::AtlasStreamSearchError::App(fcb_app::AppError::Canceled))),
+            _ => false,
         }
     }
     pub(super) fn json(self, handle: u64) -> String {
@@ -276,6 +290,36 @@ impl DeskSessions {
             }, &mut *desk_stop)
         })
     }
+    /// Preserve a frozen-atlas search excerpt under its accepted query owner.
+    pub(super) fn import_atlas_stream_excerpt(&self, handle: u64, streams: &atlas_sessions::AtlasSessions,
+        stream: u64, expected: u64, attempt: u64, generation: u64, position: usize,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
+        self.with_session(handle, canceled, |desk, desk_stop| {
+            streams.with_retained_stream(stream, |source, atlas, source_stop| {
+                let excerpt = source.retained_excerpt(atlas, generation, position, &mut *source_stop)
+                    .map_err(atlas_sessions::AccessError::from)?;
+                desk.import_search_excerpt(expected, attempt, &excerpt, &mut *source_stop)?;
+                Ok(desk.state(&mut *source_stop)?)
+            }, &mut *desk_stop)
+        })
+    }
+
+    /// Progressive queries also bind the publication revision: a row from an
+    /// earlier advance cannot silently select a newer result at the same index.
+    pub(super) fn import_catalog_stream_excerpt(&self, handle: u64,
+        streams: &catalog_stream_sessions::CatalogStreamSessions, stream: u64,
+        expected: u64, attempt: u64, generation: u64, revision: u64, position: usize,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
+        self.with_session(handle, canceled, |desk, desk_stop| {
+            streams.with_retained(stream, |source, source_stop| {
+                let excerpt = source.retained_excerpt(generation, revision, position, &mut *source_stop)
+                    .map_err(catalog_stream_sessions::AccessError::from)?;
+                desk.import_search_excerpt(expected, attempt, &excerpt, &mut *source_stop)?;
+                Ok(desk.state(&mut *source_stop)?)
+            }, &mut *desk_stop)
+        })
+    }
+
     /// Open a desk pane through the same retained reader registry used by file,
     /// search and pinned readers. The destination must already be admitted and
     /// empty. Source and destination cells survive the complete worker call;

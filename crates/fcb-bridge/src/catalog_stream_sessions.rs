@@ -43,7 +43,7 @@ impl std::fmt::Display for AccessError {
     }
 }
 impl AccessError {
-    fn canceled(self) -> bool {
+    pub(super) fn canceled(self) -> bool {
         match self {
             Self::Canceled | Self::Closed => true,
             Self::Search(error) => error.is_canceled(),
@@ -167,6 +167,24 @@ impl CatalogStreamSessions {
         cell.validate(epoch)?;
         result.map_err(AccessError::from)
     }
+    /// Hold the exact accepted query while another owner imports a retained
+    /// excerpt. Try-locking avoids reciprocal waits; late cancel suppresses the
+    /// reply without pretending to undo an already accepted Desk mutation.
+    pub(super) fn with_retained<T, E: From<AccessError>>(&self, handle: u64,
+        work: impl FnOnce(&mut CatalogContentSearchSession, &mut dyn FnMut() -> bool) -> Result<T, E>,
+        mut canceled: impl FnMut() -> bool) -> Result<T, E> {
+        let cell = self.get(handle)?;
+        let epoch = cell.epoch.load(Ordering::Acquire);
+        let mut state = lock(&cell.state)?;
+        cell.validate(epoch)?;
+        if canceled() { return Err(AccessError::Canceled.into()); }
+        let session = state.as_mut().ok_or(AccessError::NotOpen)?;
+        let result = work(session, &mut || cell.validate(epoch).is_err() || canceled());
+        cell.validate(epoch)?;
+        if canceled() { return Err(AccessError::Canceled.into()); }
+        result
+    }
+
     pub(super) fn cancel(&self, handle: u64) -> Result<(), AccessError> {
         let cell = self.get(handle)?;
         if cell.closed.load(Ordering::Acquire) { return Err(AccessError::Closed); }

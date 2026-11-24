@@ -130,6 +130,32 @@ pub extern "C" fn fcb_desk_import_observation(handle: u64, expected: u64, attemp
         desks.import_observation(handle, readers, reader, expected, attempt, observation, start, end, || false)
     }))
 }
+/// Keep the accepted search result's full lossless captured excerpt, including
+/// its original observation and bounded decoder context. Family 0 is a frozen
+/// atlas query and requires revision 0; family 1 is a progressive catalog query
+/// and requires its exact nonzero publication revision. The engine derives all
+/// bytes, offsets and provenance. There are no pathname or text arguments.
+/// Both handles remain alive through return. Lost replies require Desk state
+/// reconciliation before retry. Free every non-null result with fcb_free_string.
+#[unsafe(no_mangle)]
+pub extern "C" fn fcb_desk_import_stream_excerpt(handle: u64, expected: u64, attempt: u64,
+    stream: u64, family: u64, generation: u64, revision: u64, index: u64) -> *mut c_char {
+    reply(|| answer(handle, |desks| {
+        let index = number(index)?;
+        if generation == 0 { return Err(AccessError::InvalidArgument); }
+        match family {
+            0 if revision == 0 => {
+                let streams = super::atlas_ffi::registry().ok_or(AccessError::InvalidArgument)?;
+                desks.import_atlas_stream_excerpt(handle, streams, stream, expected, attempt, generation, index, || false)
+            }
+            1 if revision > 0 => {
+                let streams = super::catalog_stream_ffi::registry().ok_or(AccessError::InvalidArgument)?;
+                desks.import_catalog_stream_excerpt(handle, streams, stream, expected, attempt, generation, revision, index, || false)
+            }
+            _ => Err(AccessError::InvalidArgument),
+        }
+    }))
+}
 /// Read exact saved original bytes and logical text, without source I/O.
 #[unsafe(no_mangle)]
 pub extern "C" fn fcb_desk_observed_passage(handle: u64, expected: u64, passage: u64) -> *mut c_char {

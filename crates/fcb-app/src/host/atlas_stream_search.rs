@@ -530,6 +530,22 @@ impl RetainedAtlasStreamSearch {
         self.finish(atlas, out, false, &mut || false)
     }
 
+    /// Resolve an accepted result into an exact observed excerpt. The original
+    /// path/capture/range remains bound to this query; no source file is reopened.
+    pub fn retained_excerpt<'a>(&mut self, atlas: &'a AtlasSession, generation: u64,
+        position: usize, mut canceled: impl FnMut() -> bool)
+        -> Result<super::RetainedSearchExcerpt<'a>, AtlasStreamSearchError> {
+        check(&mut canceled)?; self.validate(atlas)?;
+        let snapshot = self.snapshot(generation)?.clone();
+        let hit = snapshot.hits.get(position).ok_or(AtlasStreamSearchError::MissingHit)?;
+        let entry = atlas.atlas().catalog().entry(hit.hit.file()).ok_or(AtlasStreamSearchError::WrongAtlas)?;
+        let ids = [self.next_id()?, self.next_id()?, self.next_id()?];
+        let context = snapshot.context(hit)?;
+        Ok(context.retain(entry.path().raw().as_bytes(), hit.file.final_length(),
+            hit.file.consistency().ok_or(AtlasStreamSearchError::MissingHit)?,
+            &self.budget, ids, &mut canceled)?)
+    }
+
     pub fn clear(&mut self, atlas: &AtlasSession) -> Result<HostResponse, AtlasStreamSearchError> {
         self.validate(atlas)?;
         let generation = self.next_generation()?;

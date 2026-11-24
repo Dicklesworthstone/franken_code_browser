@@ -194,9 +194,10 @@ fn sparse_source_above_the_complete_capture_limit_has_bounded_search_and_exact_a
     assert_eq!(file.write_at(b"edited\n", offset).unwrap(), 7);
     let captured = json(&reader.open_search_excerpt(1, 0, || false).unwrap());
     assert_eq!(bounds(captured.get("captured_range")), (offset - 160, length));
-    assert_eq!(bounds(captured.get("visible_range")), (offset - 156, length));
+    // Eight captured prefix bytes leave the decoder guard after scalar alignment.
+    assert_eq!(bounds(captured.get("visible_range")), (offset - 152, length));
     assert_eq!(captured.get("find_hit").get("verification").text(), "retained-original-search-bytes");
-    assert_eq!(bounds(captured.get("find_hit").get("decoded_utf8_range")), (156, 163));
+    assert_eq!(bounds(captured.get("find_hit").get("decoded_utf8_range")), (152, 159));
     assert_eq!(captured.get("text"), context.get("text"));
     let page = captured.get("observation").number();
     let copied = json(&reader.copy_range(page, offset, offset + 7, || false).unwrap());

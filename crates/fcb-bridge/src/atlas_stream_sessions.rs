@@ -131,6 +131,29 @@ impl AtlasSessions {
         result.map_err(AccessError::from)
     }
 
+    /// Borrow this accepted stream provider under both owners' cancellation
+    /// epochs. The caller may import its leased excerpt, but never a pathname.
+    pub(crate) fn with_retained_stream<T, E: From<AccessError>>(&self, handle: u64,
+        work: impl FnOnce(&mut fcb_app::host::atlas_stream_search::RetainedAtlasStreamSearch,
+            &AtlasSession, &mut dyn FnMut() -> bool) -> Result<T, E>,
+        mut canceled: impl FnMut() -> bool) -> Result<T, E> {
+        let cell = self.get(handle)?;
+        let epoch = cell.epoch.load(Ordering::Acquire);
+        let mut state = lock(&cell.state)?;
+        cell.validate(epoch)?;
+        if canceled() { return Err(AccessError::Canceled.into()); }
+        let session = state.as_mut().ok_or(AccessError::NotOpen)?;
+        session.synchronize(epoch);
+        let result = work(&mut session.stream, &session.atlas,
+            &mut || cell.validate(epoch).is_err() || canceled());
+        if let Err(error) = cell.validate(epoch) {
+            session.cancel_work();
+            return Err(error.into());
+        }
+        if canceled() { return Err(AccessError::Canceled.into()); }
+        result
+    }
+
     pub(crate) fn execute_stream(&self, handle: u64, command: StreamCommand<'_>,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, AccessError> {
         let cell = self.get(handle)?;

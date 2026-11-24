@@ -36,7 +36,7 @@ extension AtlasWorkspaceStreamTransport {
             try catalogStreamSearch(owner: owner, root: root, generation: generation,
                 request: request, flag: flag, stop: stop, progress: progress)
         }, page: { try catalogStreamTake(catalogStreamPage($0, $1, $2, $3, $4)) },
-            hit: { try catalogStreamTake(catalogStreamHit($0, $1, $2, $3)) }), supportsDiscoveryPolicy: true)
+            hit: { try catalogStreamTake(catalogStreamHit($0, $1, $2, $3)) }), supportsDiscoveryPolicy: true, domain: nativeDomain)
 }
 
 /// Scheduling and bounded receipt copying only. Traversal, matching, scope

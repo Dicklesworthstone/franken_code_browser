@@ -2060,6 +2060,21 @@ hex** continue to copy only the exact match's decoded spelling and encoded bytes
 Selecting or copying these retained values performs no source I/O and remains
 meaningful after the working-tree file changes or disappears.
 
+Choose **Keep captured excerpt** to retain the verified displayed context in the
+Reading Desk. The action uses the selected result's existing captured bytes and
+performs no additional source reads. After Keep succeeds, **Read kept excerpt or
+add note…** opens that exact saved passage directly. Its readable context,
+original-byte coordinates, encoding and observation evidence remain available
+after the search closes, a replacement query runs or the live path changes.
+The retained record describes the captured excerpt and its known bounds; it
+does not claim an immutable whole file.
+
+Keep requires an accepted result with a verified lossless text mapping and
+enough captured decoder context. Unavailable or replacement-containing text
+remains inspectable through the existing copy actions. Stale results cannot
+enter the Desk through a newer query, and an unconfirmed Keep is reconciled
+before the same action can be submitted again.
+
 **Read current context** explicitly opens the current canonical pathname
 under the current project access grant, creates an independent observed reader,
 and checks the literal's original bytes before highlighting. Changed bytes are
@@ -2109,10 +2124,13 @@ passage above 4 GiB keeps its actual position in the original file. Malformed
 input retains its exact original bytes while replacement text is disclosed.
 
 The Desk shares 32 retained-source slots, 32 personal-record slots and 32 MiB of
-original bytes across complete captures, bookmarks and observed passages. Several
-passages from the same current observation share its backing bytes. Selected
-passages are bounded to 256 KiB. Forgetting the last passage releases its
-observation; forgetting one passage preserves any others that share it.
+original bytes across complete captures, bookmarks and observed passages.
+Selections from the same captured extent share its backing bytes. Different
+excerpts from one source observation retain separate extents and personal
+records; their metadata and overlapping original bytes must agree. Each new
+extent and passage counts against the existing limits. Selected passages are
+bounded to 256 KiB. Forgetting the last passage releases its observation;
+forgetting one passage preserves any others that share it.
 
 Explicit checkpoints and **Recovery… → Enable automatic recovery** include
 observed context and accepted notes in FCBK 1.2. Existing 1.0 and 1.1 checkpoints

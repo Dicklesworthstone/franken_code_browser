@@ -37,6 +37,22 @@ impl DeskSession {
         }
     }
 
+    /// Keep an engine-resolved search excerpt with its real origin observation.
+    /// The source owns the bytes and path provenance; neither a rendered string
+    /// nor a current pathname can substitute for this retained capability.
+    pub fn import_search_excerpt(&mut self, expected: u64, attempt: u64,
+        excerpt: &crate::host::RetainedSearchExcerpt<'_>, mut canceled: impl FnMut() -> bool)
+        -> Result<DeskObservationChange, DeskSessionError> {
+        self.validate_mutation(expected, attempt)?;
+        check(&mut canceled)?;
+        let allocation = self.next_id()?;
+        let first_source_identity = self.claim_source_identity()?;
+        let changed = self.desk.import_observation(expected, attempt, &excerpt.extent,
+            excerpt.path, excerpt.encoding, excerpt.selection, first_source_identity, allocation, canceled)?;
+        self.next_source = self.next_source.max(changed.next_source_identity);
+        Ok(changed)
+    }
+
     /// Read a saved passage, including after its source reader has closed or
     /// its checkpoint has been restored. There is no live-path fallback.
     pub fn observed_passage(&mut self, expected: u64, passage: u64,
