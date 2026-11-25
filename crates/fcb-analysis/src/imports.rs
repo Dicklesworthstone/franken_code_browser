@@ -23,6 +23,9 @@ mod rust_include;
 mod go;
 mod java;
 pub use resolve::{resolve_import, ImportResolution, ImportResolutionKind};
+pub use resolve::{CapturedCargoManifest, CargoManifestLocation, CargoDependencyLocation,
+    find_cargo_manifest, is_rust_dependency_import, resolve_rust_dependency_import,
+    MAX_CARGO_MANIFEST_SOURCE_BYTES};
 pub use resolve::{CapturedGoModule, GoModuleLocation, find_go_module, go_package_source,
     resolve_go_import, MAX_GO_MODULE_SOURCE_BYTES};
 

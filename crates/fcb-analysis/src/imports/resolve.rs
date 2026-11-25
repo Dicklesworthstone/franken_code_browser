@@ -1,16 +1,22 @@
 #![forbid(unsafe_code)]
 
 //! A finite, explicit path policy over a caller's closed file catalog.
-//! No filesystem, package manifest, compiler configuration or URL is consulted.
+//! No filesystem, compiler configuration or URL is consulted. Separate Rust and
+//! Go metadata routes accept only bounded captures explicitly supplied by callers.
 //! A local target is a navigable lexical candidate, not compiler resolution.
 use super::{ImportFact, ImportKind, ImportLanguage};
 
 mod rust;
+mod cargo;
 mod go;
 mod java;
 mod python;
 pub use go::{CapturedGoModule, GoModuleLocation, find_go_module, go_package_source,
     resolve_go_import, MAX_GO_MODULE_SOURCE_BYTES};
+
+pub use cargo::{CapturedCargoManifest, CargoManifestLocation, CargoDependencyLocation,
+    find_cargo_manifest, is_rust_dependency_import, resolve_rust_dependency_import,
+    MAX_CARGO_MANIFEST_SOURCE_BYTES};
 
 pub const MAX_IMPORT_RESOLUTION_PATH_BYTES: usize = 16 * 1024;
 
