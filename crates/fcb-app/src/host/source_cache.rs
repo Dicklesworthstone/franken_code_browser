@@ -6,12 +6,15 @@
 //! Artifact publication guarantees atomic visibility, not power-loss durability.
 //! Rebuildable entries deliberately avoid per-artifact durable flushes; a lost
 //! or corrupt entry after power loss is a miss, never a change to source files.
+//! Quota pressure reclaims recognized derived artifacts, oldest modification
+//! first. Returned Arc payloads remain independently owned by their readers;
+//! the destination of an explicit repair is protected until publication.
 use std::{collections::VecDeque, fs::{self, File, OpenOptions}, io::{Read, Write},
-    path::{Component, Path, PathBuf}, sync::Arc};
+    path::{Component, Path, PathBuf}, sync::Arc, time::SystemTime};
 use fcb::{ByteLength, document::source_highlight::canonical_language};
 use fcb::search::ResourceBudget;
 use fcb::store::{EnvelopeLimits, EnvelopeReader, EnvelopeSchema, EnvelopeWriter, Sha256,
-    Sha256Digest, UnknownPolicy};
+    Sha256Digest, UnknownPolicy, FRAME_LEN};
 use fcb_core::ResourceLease;
 use super::{HostError, HostResponse, MAX_HOST_TEXT_BYTES, source_document};
 use crate::{AppError, allocation, owner, output::MAX_RESPONSE_BYTES};
@@ -39,8 +42,12 @@ pub struct CacheStats {
     pub source_bytes_read: u64, pub lexer_calls: u64, pub ram_hits: u64,
     pub disk_hits: u64, pub misses: u64, pub corrupt: u64, pub writes: u64,
     pub write_refusals: u64,
+    pub evicted_entries: u64, pub evicted_bytes: u64,
 }
 struct Hot { domain: &'static str, key: Sha256Digest, bytes: Arc<[u8]> }
+struct Reclaimable {
+    domain: &'static str, key: Sha256Digest, bytes: u64, modified: SystemTime,
+}
 pub struct SourceCache {
     root: PathBuf, marker: Vec<u8>, _lock: File, limits: CacheLimits,
     disk_bytes: u64, entries: usize, next_temp: u64,
@@ -182,6 +189,69 @@ impl SourceCache {
         }
         self.hot_bytes += bytes.len(); self.hot.push_back(Hot { domain, key, bytes });
     }
+    /// Reserve disk/entry overlap before creating a publication candidate. Only
+    /// recognized source/native envelopes in this explicitly owned namespace
+    /// are eligible. Unknown files, interrupted candidates, the namespace owner
+    /// and lock, and the incumbent being repaired are never reclamation targets.
+    /// A plan that cannot make enough room changes nothing. An I/O failure after
+    /// reclamation may leave fewer derived entries, but never altered readers
+    /// or an eagerly deleted repair destination.
+    fn make_room(&mut self, incoming: u64, domain: &'static str, key: Sha256Digest) -> Result<(), CacheError> {
+        if incoming > self.limits.disk_bytes { return Err(CacheError::Limit); }
+        let fits = |entries: usize, bytes: u64| entries < self.limits.entries
+            && incoming <= self.limits.disk_bytes.saturating_sub(bytes);
+        if fits(self.entries, self.disk_bytes) { return Ok(()); }
+        let mut candidates = Vec::new();
+        candidates.try_reserve_exact(self.entries).map_err(|_| CacheError::Admission)?;
+        if candidates.capacity() > MAX_ENTRIES { return Err(CacheError::Admission); }
+        let mut visited = 0usize;
+        for entry in fs::read_dir(&self.root).map_err(|_| CacheError::Root)? {
+            let entry = entry.map_err(|_| CacheError::Root)?;
+            let name = entry.file_name();
+            if name == "owner" || name == "lock" { continue; }
+            visited += 1;
+            if visited > self.entries { return Err(CacheError::Conflict); }
+            let Some((entry_domain, entry_key)) = artifact_name(&name) else { continue; };
+            if entry_domain == domain && entry_key == key { continue; }
+            let path = entry.path();
+            let meta = fs::symlink_metadata(&path).map_err(|_| CacheError::Root)?;
+            if !meta.is_file() || meta.file_type().is_symlink() { return Err(CacheError::Root); }
+            require_private(&meta)?;
+            // Check the bounded envelope prefix as well as its generated name.
+            // A user file placed under a cache-like name is still preserved.
+            if !artifact_prefix(&path, entry_domain, entry_key, meta.len()) { continue; }
+            let modified = meta.modified().map_err(|_| CacheError::Io)?;
+            candidates.push(Reclaimable { domain: entry_domain, key: entry_key, bytes: meta.len(), modified });
+        }
+        candidates.sort_unstable_by(|a, b| a.modified.cmp(&b.modified)
+            .then_with(|| a.domain.cmp(b.domain)).then_with(|| a.key.as_bytes().cmp(b.key.as_bytes())));
+        let (mut entries, mut bytes, mut selected) = (self.entries, self.disk_bytes, 0usize);
+        while !fits(entries, bytes) {
+            let candidate = candidates.get(selected).ok_or(CacheError::Limit)?;
+            entries = entries.checked_sub(1).ok_or(CacheError::Conflict)?;
+            bytes = bytes.checked_sub(candidate.bytes).ok_or(CacheError::Conflict)?;
+            selected += 1;
+        }
+        for candidate in candidates.iter().take(selected) {
+            self.validate()?;
+            let path = self.path(candidate.domain, candidate.key);
+            let meta = fs::symlink_metadata(&path).map_err(|_| CacheError::Root)?;
+            if !meta.is_file() || meta.file_type().is_symlink() { return Err(CacheError::Root); }
+            require_private(&meta)?;
+            if meta.len() != candidate.bytes || meta.modified().ok() != Some(candidate.modified)
+                || !artifact_prefix(&path, candidate.domain, candidate.key, meta.len()) {
+                return Err(CacheError::Conflict);
+            }
+            fs::remove_file(&path).map_err(|_| CacheError::Io)?;
+            self.entries -= 1; self.disk_bytes -= candidate.bytes;
+            self.stats.evicted_entries = self.stats.evicted_entries.saturating_add(1);
+            self.stats.evicted_bytes = self.stats.evicted_bytes.saturating_add(candidate.bytes);
+            if let Some(index) = self.hot.iter().position(|h| h.domain == candidate.domain && h.key == candidate.key) {
+                if let Some(old) = self.hot.remove(index) { self.hot_bytes -= old.bytes.len(); }
+            }
+        }
+        Ok(())
+    }
     fn put(&mut self, domain: &'static str, key: Sha256Digest, bytes: &[u8], limit: usize, replace_rejected: bool) -> Result<(), CacheError> {
         if bytes.len() > limit { return Err(CacheError::Limit); }
         self.validate()?;
@@ -194,11 +264,12 @@ impl SourceCache {
         let mut out = EnvelopeWriter::new(SCHEMA);
         out.put_str(domain); out.put_bytes(key.as_bytes()); out.put_bytes(bytes);
         let encoded = out.finish();
-        if encoded.len() > limit + OVERHEAD || encoded.len() as u64 > self.limits.disk_bytes.saturating_sub(self.disk_bytes)
-            || self.entries >= self.limits.entries { return Err(CacheError::Limit); }
+        if encoded.len() > limit + OVERHEAD { return Err(CacheError::Limit); }
         let destination = self.path(domain, key);
         regular_or_absent(&destination)?;
-        self.next_temp = self.next_temp.checked_add(1).ok_or(CacheError::Limit)?;
+        let next_temp = self.next_temp.checked_add(1).ok_or(CacheError::Limit)?;
+        self.make_room(encoded.len() as u64, domain, key)?;
+        self.next_temp = next_temp;
         let temporary = self.root.join(format!("pending-{}-{}", std::process::id(), self.next_temp));
         let mut file = private_options().write(true).create_new(true).open(&temporary).map_err(|_| CacheError::Io)?;
         // Count before writing so failures cannot silently reset accounting.
@@ -220,6 +291,42 @@ impl SourceCache {
         self.stats.writes = self.stats.writes.saturating_add(1);
         self.remember(domain, key, Arc::from(bytes)); Ok(())
     }
+}
+fn artifact_name(name: &std::ffi::OsStr) -> Option<(&'static str, Sha256Digest)> {
+    let name = name.to_str()?;
+    let (domain, hex) = if let Some(hex) = name.strip_prefix("source-") { ("source", hex) }
+        else { ("native", name.strip_prefix("native-")?) };
+    let hex = hex.strip_suffix(".bin")?;
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) { return None; }
+    Some((domain, Sha256Digest::from_hex(hex).ok()?))
+}
+/// Identity/framing check for reclamation, not a claim that the payload checksum
+/// is valid. At most 86 bytes and 128 read calls are used per candidate. Corrupt
+/// payloads stay disposable, while unrelated contents cannot become cache data
+/// merely by using a matching filename.
+fn artifact_prefix(path: &Path, domain: &str, key: Sha256Digest, length: u64) -> bool {
+    let Ok(mut file) = File::open(path) else { return false; };
+    let Ok(meta) = file.metadata() else { return false; };
+    if !meta.is_file() || meta.len() != length || require_private(&meta).is_err() { return false; }
+    let mut prefix = [0u8; 86];
+    let (mut offset, mut calls) = (0usize, 0usize);
+    while offset < prefix.len() {
+        if calls == 128 { return false; }
+        calls += 1;
+        match file.read(&mut prefix[offset..]) {
+            Ok(0) => return false, Ok(n) => offset += n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {},
+            Err(_) => return false,
+        }
+    }
+    let number = |start: usize| u64::from_le_bytes(prefix[start..start + 8].try_into().expect("fixed prefix"));
+    prefix[..4] == SCHEMA.magic && prefix[4..8] == SCHEMA.schema_id.to_le_bytes()
+        && prefix[8..10] == SCHEMA.major.to_le_bytes() && prefix[10..12] == SCHEMA.minor.to_le_bytes()
+        && prefix[12..16] == [0; 4] && number(16).checked_add(FRAME_LEN as u64) == Some(length)
+        && number(24) == 6 && &prefix[32..38] == domain.as_bytes()
+        && number(38) == 32 && &prefix[46..78] == key.as_bytes()
+        && number(78).checked_add(62) == Some(number(16))
+        && number(78) <= if domain == "source" { MAX_RESPONSE_BYTES as u64 } else { MAX_NATIVE_BYTES as u64 }
 }
 fn decode(raw: &[u8], domain: &str, key: Sha256Digest, limit: usize) -> Result<Vec<u8>, CacheError> {
     let mut reader = EnvelopeReader::open(raw, SCHEMA,

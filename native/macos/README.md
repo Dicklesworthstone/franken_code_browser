@@ -2568,6 +2568,15 @@ an obsolete candidate from publishing. The existing resident document, glyph,
 run, tile, pixel and retirement limits still apply; the cache does not keep an
 extra collection of evicted source documents in memory.
 
+The shared source/native store reclaims recognized derived artifacts, oldest
+modification first, when its default **4,096-entry / 512 MiB** bound would block
+a new write. Active readers retain their immutable in-memory payloads. Unrelated
+files and interrupted publication candidates are preserved, and an artifact
+being repaired stays protected until its replacement publishes. Writes still
+fall back to source preparation when no safe set of artifacts can free enough
+space. Quota-boundary regression sources are included; executable verification
+remains pending.
+
 `swiftui/tests/test-viewport-residency.sh` includes real-codec worker scenarios
 for warm restoration, identical-length source edits, source/key mismatches,
 font changes, corrupt archives, refitted geometry, lower pixel budgets, denied

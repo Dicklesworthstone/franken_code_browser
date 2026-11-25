@@ -206,3 +206,150 @@ fn concurrent_readers_observe_complete_envelopes_during_native_republication() {
     done.store(true, Ordering::Release);
     assert!(reader.join().unwrap() >= 2);
 }
+
+#[test]
+fn full_entry_cache_reclaims_oldest_artifact_without_invalidating_borrowed_bytes() {
+    use std::time::{Duration, UNIX_EPOCH};
+    let (root, _) = fixture();
+    let oldest = Sha256::digest(b"oldest");
+    let recent = Sha256::digest(b"recent");
+    let incoming = Sha256::digest(b"incoming");
+    let limits = CacheLimits { ram_bytes: 1024, disk_bytes: 10000, entries: 2 };
+    let mut cache = SourceCache::open(&root, limits).unwrap();
+    cache.put_native(oldest, b"old exact pixels").unwrap();
+    cache.put_native(recent, b"recent exact pixels").unwrap();
+    let retained = cache.get_native(oldest).unwrap().unwrap();
+    for (key, seconds) in [(oldest, 1), (recent, 2)] {
+        fs::OpenOptions::new().write(true).open(root.join(format!("native-{}.bin", key.to_hex())))
+            .unwrap().set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(seconds))).unwrap();
+    }
+    cache.put_native(incoming, b"new exact pixels").unwrap();
+    assert_eq!(cache.stats().evicted_entries, 1);
+    assert!(cache.stats().evicted_bytes > 0);
+    assert_eq!(retained.as_ref(), b"old exact pixels");
+    assert!(cache.get_native(oldest).unwrap().is_none());
+    assert_eq!(cache.get_native(recent).unwrap().unwrap().as_ref(), b"recent exact pixels");
+    assert_eq!(cache.get_native(incoming).unwrap().unwrap().as_ref(), b"new exact pixels");
+    drop(cache);
+    let mut reopened = SourceCache::open(&root, limits).unwrap();
+    assert!(reopened.get_native(oldest).unwrap().is_none());
+    assert_eq!(reopened.get_native(incoming).unwrap().unwrap().as_ref(), b"new exact pixels");
+}
+
+#[test]
+fn full_disk_cache_reclaims_enough_entries_and_remains_within_quota() {
+    let (root, _) = fixture();
+    let first = Sha256::digest(b"first disk entry");
+    let second = Sha256::digest(b"second disk entry");
+    let incoming = Sha256::digest(b"larger disk entry");
+    let limits = CacheLimits { ram_bytes: 0, disk_bytes: 1050, entries: 8 };
+    let mut cache = SourceCache::open(&root, limits).unwrap();
+    cache.put_native(first, &[1; 100]).unwrap();
+    cache.put_native(second, &[2; 200]).unwrap();
+    let before = cache.disk_bytes();
+    cache.put_native(incoming, &[3; 800]).unwrap();
+    assert_eq!(cache.stats().evicted_entries, 2);
+    assert_eq!(cache.stats().evicted_bytes, before);
+    assert!(cache.disk_bytes() <= limits.disk_bytes);
+    assert!(cache.get_native(first).unwrap().is_none());
+    assert!(cache.get_native(second).unwrap().is_none());
+    assert_eq!(cache.get_native(incoming).unwrap().unwrap().as_ref(), &[3; 800]);
+}
+
+#[test]
+fn impossible_new_artifact_does_not_evict_existing_cache_entries() {
+    let (root, _) = fixture();
+    let first = Sha256::digest(b"keep first");
+    let second = Sha256::digest(b"keep second");
+    let incoming = Sha256::digest(b"too large");
+    let mut cache = SourceCache::open(&root,
+        CacheLimits { ram_bytes: 0, disk_bytes: 1000, entries: 2 }).unwrap();
+    cache.put_native(first, b"first").unwrap();
+    cache.put_native(second, b"second").unwrap();
+    let before = cache.disk_bytes();
+    assert_eq!(cache.put_native(incoming, &[0; 1000]), Err(CacheError::Limit));
+    assert_eq!(cache.stats().evicted_entries, 0);
+    assert_eq!(cache.disk_bytes(), before);
+    assert_eq!(cache.get_native(first).unwrap().unwrap().as_ref(), b"first");
+    assert_eq!(cache.get_native(second).unwrap().unwrap().as_ref(), b"second");
+}
+
+#[test]
+fn repair_reclaims_other_artifacts_and_keeps_incumbent_until_replacement() {
+    let (root, _) = fixture();
+    let key = Sha256::digest(b"repair target");
+    let other = Sha256::digest(b"disposable neighbor");
+    let mut cache = SourceCache::open(&root,
+        CacheLimits { ram_bytes: 1024, disk_bytes: 10000, entries: 2 }).unwrap();
+    cache.put_native(key, b"old retained pixels").unwrap();
+    cache.put_native(other, b"rebuildable neighbor").unwrap();
+    let old = cache.get_native(key).unwrap().unwrap();
+    cache.repair_native(key, b"new pixels").unwrap();
+    assert_eq!(old.as_ref(), b"old retained pixels");
+    assert_eq!(cache.get_native(key).unwrap().unwrap().as_ref(), b"new pixels");
+    assert!(cache.get_native(other).unwrap().is_none());
+    assert_eq!(cache.stats().evicted_entries, 1);
+}
+
+fn private_test_file(path: &std::path::Path, bytes: &[u8]) {
+    let mut options = fs::OpenOptions::new(); options.write(true).create_new(true);
+    #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+    options.open(path).unwrap().write_all(bytes).unwrap();
+}
+
+#[test]
+fn quota_reclamation_preserves_unrelated_files_even_with_cache_shaped_names() {
+    let (root, _) = fixture();
+    let old = Sha256::digest(b"actual artifact");
+    let incoming = Sha256::digest(b"replacement artifact");
+    let impostor = root.join(format!("native-{}.bin", Sha256::digest(b"not cache data").to_hex()));
+    let notes = root.join("notes.txt");
+    let mut cache = SourceCache::open(&root,
+        CacheLimits { ram_bytes: 0, disk_bytes: 10000, entries: 3 }).unwrap();
+    cache.put_native(old, b"disposable").unwrap();
+    private_test_file(&notes, b"personal note");
+    private_test_file(&impostor, b"unrelated payload with a cache-shaped name");
+    cache.put_native(incoming, b"new artifact").unwrap();
+    assert_eq!(cache.stats().evicted_entries, 1);
+    assert_eq!(fs::read(notes).unwrap(), b"personal note");
+    assert_eq!(fs::read(impostor).unwrap(), b"unrelated payload with a cache-shaped name");
+    assert_eq!(cache.get_native(incoming).unwrap().unwrap().as_ref(), b"new artifact");
+}
+
+#[test]
+fn insufficient_reclaimable_space_preserves_every_existing_file() {
+    let (root, _) = fixture();
+    let old = Sha256::digest(b"small actual artifact");
+    let incoming = Sha256::digest(b"large new artifact");
+    let mut cache = SourceCache::open(&root,
+        CacheLimits { ram_bytes: 0, disk_bytes: 1000, entries: 3 }).unwrap();
+    cache.put_native(old, b"old").unwrap();
+    let notes = root.join("notes.txt");
+    private_test_file(&notes, &[7; 500]);
+    // The new artifact alone fits, but retaining the unrelated file leaves too
+    // little capacity. Preflight must refuse before deleting the one candidate.
+    assert_eq!(cache.put_native(incoming, &[9; 600]), Err(CacheError::Limit));
+    assert_eq!(cache.stats().evicted_entries, 0);
+    assert_eq!(cache.get_native(old).unwrap().unwrap().as_ref(), b"old");
+    assert_eq!(fs::read(notes).unwrap(), [7; 500]);
+}
+
+#[test]
+fn repeated_source_edits_keep_the_newest_cache_usable_after_reopen() {
+    let (root, source) = fixture();
+    let limits = CacheLimits { ram_bytes: 0, disk_bytes: 10000, entries: 1 };
+    let mut cache = SourceCache::open(&root, limits).unwrap();
+    for version in 0..5 {
+        fs::write(&source, format!("fn version_{version}() {{}}\n")).unwrap();
+        let response = cache.source(&source, || false).unwrap().0;
+        assert_eq!(response.as_str(), source_document::read(&source, || false).unwrap().as_str());
+    }
+    assert_eq!(cache.stats().evicted_entries, 4);
+    assert_eq!(cache.stats().write_refusals, 0);
+    drop(cache);
+    let mut reopened = SourceCache::open(&root, limits).unwrap();
+    assert_eq!(reopened.source(&source, || false).unwrap().0.as_str(),
+        source_document::read(&source, || false).unwrap().as_str());
+    assert_eq!(reopened.stats().lexer_calls, 0);
+    assert_eq!(reopened.stats().disk_hits, 1);
+}
