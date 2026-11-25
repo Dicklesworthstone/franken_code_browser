@@ -1632,6 +1632,14 @@ opening current files under its capture identity. A successful window receives
 fresh query and presentation identities, keeping delayed clicks from selecting
 a different occurrence with the same local row number.
 
+Opening a late Text or Expression result seeks the captured match by its exact
+original byte range. After the first adjacent reader page, activation narrows
+the remaining occurrence ordinals instead of replaying every intervening page.
+This keeps dense files navigable within the existing 64-request and 64 MiB
+verification-work limits. UTF-16 offsets, overlapping matches, raw filename bytes,
+capture identity and cancellation keep the same exact-source checks; an unverified
+or inconsistent search response cannot authorize a selection.
+
 The shared engine, host, C ABI, native worker and transport have regression
 sources for later windows, overlapping matches, UTF-16, expression predicates,
 all three structural modes, metadata omissions, independent counting,

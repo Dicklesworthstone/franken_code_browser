@@ -100,19 +100,62 @@ enum AtlasCapturedReader {
         var report = try await find(selected.needle)
         var cursor: UInt64 = 0
         var previousGeneration: UInt64 = 0
+        // Zero-based occurrence positions, not byte offsets passed as ranks.
+        // An exact literal has at most one occurrence starting at an original
+        // byte, so the selected start provides a conservative finite ceiling.
+        // UTF-16, BOMs and gaps can make this ceiling much larger than the count.
+        var lower: UInt64 = 0
+        var upper = selected.start + 1 // start < end <= capturedBytes
+        var exactTotal: UInt64?
         while true {
             try checkCurrent()
             guard report.identity.matches(identity), report.generation > previousGeneration,
                   report.needle.utf8.elementsEqual(selected.needle.utf8),
-                  report.options == .init(),
-                  report.hits.count <= Int(AtlasReaderFindReport.maxHits),
-                  report.skippedMatches == cursor,
-                  report.pageStartAfter == cursor || (pageCount == 1 && report.pageStartAfter == nil) else {
+                  report.options == .init(), report.expression == nil,
+                  report.matchesSeen <= identity.capturedBytes,
+                  report.retainedLimit > 0, report.retainedLimit <= AtlasReaderFindReport.maxHits,
+                  report.hits.count <= Int(report.retainedLimit) else {
                 throw AtlasReaderError.invalidResponse
             }
-            // Long exact witnesses can lower the retained row allowance. A
-            // workspace selection may therefore occur after the first page.
-            // Rebind only its exact original range in the current generation.
+            if let pageStart = report.pageStartAfter {
+                // A rank beyond EOF is a valid empty completed page. It proves
+                // an upper bound, not a changed source or a cursor substitution.
+                let skipped = min(cursor, report.matchesSeen)
+                guard pageStart == cursor, report.skippedMatches == skipped,
+                      UInt64(report.hits.count) == min(report.retainedLimit, report.matchesSeen - skipped),
+                      report.hasMoreMatches == (report.matchesSeen - skipped > UInt64(report.hits.count)) else {
+                    throw AtlasReaderError.invalidResponse
+                }
+            } else {
+                guard pageCount == 1, cursor == 0, report.skippedMatches == 0 else {
+                    throw AtlasReaderError.invalidResponse
+                }
+            }
+            if let exactTotal {
+                guard report.matchesSeen <= exactTotal,
+                      !report.complete || report.matchesSeen == exactTotal else {
+                    throw AtlasReaderError.invalidResponse
+                }
+            }
+            if report.complete { exactTotal = report.matchesSeen }
+            var previousStart: UInt64?
+            for (index, hit) in report.hits.enumerated() {
+                guard hit.index == UInt64(index), hit.occurrence > 0,
+                      hit.occurrence <= report.matchesSeen,
+                      hit.start < hit.end, hit.end <= identity.capturedBytes,
+                      hit.occurrence <= hit.start + 1,
+                      previousStart.map({ hit.start > $0 }) ?? true,
+                      hit.matchedText.utf8.elementsEqual(selected.needle.utf8) else {
+                    throw AtlasReaderError.invalidResponse
+                }
+                if report.pageStartAfter != nil {
+                    let (expected, overflow) = cursor.addingReportingOverflow(UInt64(index) + 1)
+                    guard !overflow, hit.occurrence == expected else { throw AtlasReaderError.invalidResponse }
+                }
+                // Overlapping literal occurrences are valid; only starts must
+                // increase. Comparing the preceding end would skip long hits.
+                previousStart = hit.start
+            }
             let matches = report.hits.indices.filter {
                 report.hits[$0].start == selected.start && report.hits[$0].end == selected.end
             }
@@ -125,15 +168,32 @@ enum AtlasCapturedReader {
             guard matches.isEmpty else {
                 throw AtlasReaderError.engine("CAPTURED_SEARCH_HIT_UNAVAILABLE")
             }
-            // A legacy table has no continuation authority. A continuation is
-            // derived only from a validated global occurrence, never a byte
-            // offset, the look-ahead count, or a page-local hit index.
-            guard report.pageStartAfter != nil, report.hasMoreMatches,
-                  let nextPage, let last = report.hits.last,
-                  last.occurrence > cursor, last.occurrence <= report.matchesSeen else {
+            // Legacy tables cannot authorize rank probes. A partial scan that
+            // stopped for another reason cannot establish absent later ranks.
+            guard report.pageStartAfter != nil, let nextPage,
+                  report.complete || (report.state == "match-limit" && report.hasMoreMatches) else {
                 throw AtlasReaderError.engine("CAPTURED_SEARCH_HIT_UNAVAILABLE")
             }
-            cursor = last.occurrence
+            if report.complete { upper = min(upper, report.matchesSeen) }
+            if let first = report.hits.first, let last = report.hits.last {
+                if selected.start < first.start { upper = min(upper, cursor) }
+                else if selected.start > last.start { lower = max(lower, last.occurrence) }
+                else {
+                    // The source-ordered page straddles the requested start
+                    // but has no exact range. Never select a nearby occurrence.
+                    throw AtlasReaderError.engine("CAPTURED_SEARCH_HIT_UNAVAILABLE")
+                }
+            } else if !report.complete {
+                throw AtlasReaderError.engine("CAPTURED_SEARCH_HIT_UNAVAILABLE")
+            }
+            guard lower < upper else { throw AtlasReaderError.engine("CAPTURED_SEARCH_HIT_UNAVAILABLE") }
+            // Keep the adjacent page cheap for ordinary selections, then
+            // halve the possible ranks instead of replaying every preceding
+            // page. A dense 1 MiB capture remains within the same 64 MiB cap.
+            let next = pageCount == 1 && report.hits.last.map({ selected.start > $0.start }) == true
+                ? lower : lower + (upper - lower) / 2
+            guard next != cursor else { throw AtlasReaderError.invalidResponse }
+            cursor = next
             previousGeneration = report.generation
             try reserveScan()
             report = try await nextPage(selected.needle, cursor)

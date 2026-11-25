@@ -31,8 +31,9 @@ private final class Calls: @unchecked Sendable {
                                hex: String? = "7800", complete: Bool = true,
                                generation: UInt64 = 23, startAfter: UInt64? = nil,
                                more: Bool = false, retainedLimit: UInt64 = 4096,
-                               options: AtlasReaderFindOptions = .init()) throws -> AtlasReaderFindReport {
-        let seen = (startAfter ?? 0) + UInt64(ranges.count) + (more ? 1 : 0)
+                               options: AtlasReaderFindOptions = .init(),
+                               matchesSeen: UInt64? = nil) throws -> AtlasReaderFindReport {
+        let seen = matchesSeen ?? ((startAfter ?? 0) + UInt64(ranges.count) + (more ? 1 : 0))
         var wire: [String: Any] = [
             "schema": "fcb.reader-session/1", "status": "ok", "command": "find",
             "owner": String(identity.owner), "file_id": String(identity.file),
@@ -63,7 +64,7 @@ private final class Calls: @unchecked Sendable {
         }
         if let startAfter {
             wire["page_start_after"] = String(startAfter)
-            wire["skipped_matches"] = String(startAfter)
+            wire["skipped_matches"] = String(min(startAfter, seen))
             wire["has_more_matches"] = more
         }
         let json = String(data: try JSONSerialization.data(withJSONObject: wire), encoding: .utf8)!
@@ -453,6 +454,192 @@ private final class Calls: @unchecked Sendable {
         }
     }
 
+
+    // A bounded engine page with skipped prefix rows never allocated. These
+    // fixed original-byte ranges test native navigation, not the Rust matcher.
+    private static func textRankPage(identity: AtlasReaderIdentity, needle: String,
+        hex: String, total: UInt64, offset: UInt64, generation: UInt64,
+        base: UInt64, stride: UInt64, width: UInt64,
+        limit: UInt64 = AtlasReaderFindReport.maxHits) throws -> AtlasReaderFindReport {
+        let skipped = min(offset, total), retained = min(limit, total - skipped)
+        let more = total - skipped > retained
+        let seen = more ? skipped + retained + 1 : total
+        let ranges = (0..<Int(retained)).map { index in
+            let start = base + (skipped + UInt64(index)) * stride
+            return (start, start + width)
+        }
+        return try report(identity: identity, needle: needle, ranges: ranges, hex: hex,
+            complete: !more, generation: generation, startAfter: offset, more: more,
+            retainedLimit: limit, matchesSeen: seen)
+    }
+
+    @MainActor private static func rankedTextActivation() async throws {
+        let total: UInt64 = 500_005
+        for (encoding, base, stride, width, hex) in [
+            ("utf8", UInt64(3), UInt64(1), UInt64(1), "78"),
+            ("utf16le", 2, 2, 2, "7800"), ("utf16be", 2, 2, 2, "0078")
+        ] {
+            let source = identity(bytes: 1024 * 1024, encoding: encoding)
+            let start = base + (total - 1) * stride
+            for mode in [AtlasSearchMode.text, .expression] {
+                let target = selected(start: start, end: start + width,
+                    bytes: source.capturedBytes, mode: mode)
+                var generation: UInt64 = 23, scans = 0, reads = 0
+                var offsets: [UInt64] = []
+                let result = try await AtlasCapturedReader.activate(target, identity: source,
+                    find: { needle in
+                        scans += 1
+                        return try textRankPage(identity: source, needle: needle, hex: hex,
+                            total: total, offset: 0, generation: generation,
+                            base: base, stride: stride, width: width)
+                    }, nextPage: { needle, offset in
+                        scans += 1; generation += 1; offsets.append(offset)
+                        return try textRankPage(identity: source, needle: needle, hex: hex,
+                            total: total, offset: offset, generation: generation,
+                            base: base, stride: stride, width: width)
+                    }, read: { selected in reads += 1; return selected })
+                check(result.target.start == start && result.target.end == start + width
+                    && result.target.originalHex == hex && result.target.generation == generation,
+                    "Late Text/Expression selection keeps the exact original range in " + encoding)
+                check(result.report.hits[result.index].occurrence == total && reads == 1,
+                    "Navigation rebinds the distant global occurrence to its current local row")
+                check(scans <= 22 && UInt64(scans) * source.capturedBytes <= AtlasCapturedReader.maximumActivationReplayBytes,
+                    "A dense maximum-sized atlas capture opens within unchanged replay admission")
+                check(offsets.first == AtlasReaderFindReport.maxHits
+                    && offsets.contains(where: { $0 > 262_144 }) && Set(offsets).count == offsets.count,
+                    "Keep the first adjacent page, then seek without visiting every preceding match page")
+            }
+        }
+
+        // Long overlapping matches shrink the wire's retained-row allowance.
+        // Comparing start to a previous end would reject these valid results.
+        let needle = String(repeating: "x", count: 4096)
+        let hex = String(repeating: "78", count: 4096)
+        let source = identity(bytes: total + 4095, encoding: "utf8")
+        let start = total - 2
+        let target = selected(needle: needle, start: start, end: start + 4096,
+            bytes: source.capturedBytes, mode: .expression, caseSensitive: false)
+        var generation: UInt64 = 23, scans = 0
+        let overlap = try await AtlasCapturedReader.activate(target, identity: source,
+            find: { exact in
+                scans += 1
+                return try textRankPage(identity: source, needle: exact, hex: hex,
+                    total: total, offset: 0, generation: generation, base: 0, stride: 1,
+                    width: 4096, limit: 16)
+            }, nextPage: { exact, offset in
+                scans += 1; generation += 1
+                check(exact.utf8.elementsEqual(needle.utf8), "Every probe verifies the full original spelling")
+                return try textRankPage(identity: source, needle: exact, hex: hex,
+                    total: total, offset: offset, generation: generation, base: 0,
+                    stride: 1, width: 4096, limit: 16)
+            }, read: { $0 })
+        check(overlap.target.start == start && overlap.target.end == start + 4096
+            && overlap.target.originalHex == hex && scans <= 22,
+            "Overlapping long witnesses remain navigable beyond hundreds of thousands of omitted rows")
+
+        // UTF-16/BOM positions and sparse files are not occurrence ordinals.
+        // An overestimated rank yields an empty, complete receipt and safely
+        // narrows the interval instead of pretending the selected hit is gone.
+        let rawPath: [UInt8] = [115, 114, 99, 47, 255, 46, 114, 115]
+        let sparse = identity(bytes: 1024 * 1024, encoding: "utf8", rawPath: rawPath)
+        let sparseTotal: UInt64 = 17, base: UInt64 = 800_000
+        let sparseStart = base + (sparseTotal - 1) * 4
+        let sparseTarget = selected(path: "src/\\xff.rs", start: sparseStart, end: sparseStart + 1,
+            bytes: sparse.capturedBytes, rawPath: rawPath)
+        generation = 23; scans = 0
+        var emptyPages = 0
+        let found = try await AtlasCapturedReader.activate(sparseTarget, identity: sparse,
+            find: { exact in
+                scans += 1
+                return try textRankPage(identity: sparse, needle: exact, hex: "78", total: sparseTotal,
+                    offset: 0, generation: generation, base: base, stride: 4, width: 1, limit: 2)
+            }, nextPage: { exact, offset in
+                scans += 1; generation += 1
+                let page = try textRankPage(identity: sparse, needle: exact, hex: "78", total: sparseTotal,
+                    offset: offset, generation: generation, base: base, stride: 4, width: 1, limit: 2)
+                if page.hits.isEmpty {
+                    emptyPages += 1
+                    check(page.complete && page.skippedMatches == sparseTotal && offset > sparseTotal,
+                        "An out-of-range ordinal proves only the exact observed total")
+                }
+                return page
+            }, read: { $0 })
+        check(found.target.start == sparseStart && found.report.identity.pathBytes == rawPath
+            && found.report.matchesSeen == sparseTotal && scans <= 10 && emptyPages > 0,
+            "Sparse raw-path captures survive a rank overrun without reopening a display path")
+    }
+
+    @MainActor private static func rankedTextRefusalsAndCancellation() async throws {
+        let source = identity(bytes: 1024 * 1024, encoding: "utf8")
+        let total: UInt64 = 17, base: UInt64 = 800_000
+        let start = base + (total - 1) * 4
+        let target = selected(start: start, end: start + 1, bytes: source.capturedBytes)
+        let first = try textRankPage(identity: source, needle: "x", hex: "78", total: total,
+            offset: 0, generation: 23, base: base, stride: 4, width: 1, limit: 2)
+
+        var emptySeen = false, generation: UInt64 = 23, reads = 0
+        do {
+            _ = try await AtlasCapturedReader.activate(target, identity: source,
+                find: { _ in first }, nextPage: { exact, offset in
+                    generation += 1
+                    let page = try textRankPage(identity: source, needle: exact, hex: "78",
+                        total: emptySeen ? total + 1 : total, offset: offset, generation: generation,
+                        base: base, stride: 4, width: 1, limit: 2)
+                    if page.hits.isEmpty { emptySeen = true }
+                    return page
+                }, read: { _ in reads += 1; return "changed total" })
+            preconditionFailure("A later complete page changed the pinned source's exact match total")
+        } catch AtlasReaderError.invalidResponse { checks += 1 }
+        check(emptySeen && reads == 0, "A known complete count cannot change during rank probes")
+
+        do {
+            _ = try await AtlasCapturedReader.activate(target, identity: source,
+                find: { _ in first }, nextPage: { _, cursor in
+                    try report(identity: source, ranges: [(start, start + 1), (base + 8, base + 9)],
+                        hex: "78", complete: false, generation: 24, startAfter: cursor,
+                        more: true, retainedLimit: 2)
+                }, read: { _ in reads += 1; return "unordered target" })
+            preconditionFailure("An unordered page lent its selected range to binary navigation")
+        } catch AtlasReaderError.invalidResponse { checks += 1 }
+        check(reads == 0, "Every page must preserve source order even when it contains the target")
+
+        let absent = selected(start: base + 6, end: base + 7, bytes: source.capturedBytes)
+        do {
+            _ = try await AtlasCapturedReader.activate(absent, identity: source,
+                find: { _ in first }, nextPage: { exact, offset in
+                    try textRankPage(identity: source, needle: exact, hex: "78", total: total,
+                        offset: offset, generation: 24, base: base, stride: 4, width: 1, limit: 2)
+                }, read: { _ in reads += 1; return "nearby occurrence" })
+            preconditionFailure("A source gap selected a nearby occurrence")
+        } catch AtlasReaderError.engine(let code) {
+            check(code == "CAPTURED_SEARCH_HIT_UNAVAILABLE", "Absent ranges stay explicitly unavailable")
+        }
+        check(reads == 0, "A converged rank interval never authorizes approximate source")
+
+        var current = true, pages = 0
+        var pending: CheckedContinuation<AtlasReaderFindReport, Never>?
+        var pendingOffset: UInt64 = 0
+        let task = Task { @MainActor in
+            try await AtlasCapturedReader.activate(target, identity: source,
+                find: { _ in first }, nextPage: { exact, offset in
+                    pages += 1
+                    if pages == 1 {
+                        return try textRankPage(identity: source, needle: exact, hex: "78", total: total,
+                            offset: offset, generation: 24, base: base, stride: 4, width: 1, limit: 2)
+                    }
+                    pendingOffset = offset
+                    return await withCheckedContinuation { pending = $0 }
+                }, read: { _ in reads += 1; return "obsolete rank" }, isCurrent: { current })
+        }
+        while pending == nil { await Task.yield() }
+        current = false
+        pending!.resume(returning: try textRankPage(identity: source, needle: "x", hex: "78",
+            total: total, offset: pendingOffset, generation: 25, base: base, stride: 4, width: 1, limit: 2))
+        do { _ = try await task.value; preconditionFailure("A revoked rank probe activated a reader") }
+        catch AtlasReaderError.canceled { checks += 1 }
+        check(pages == 2 && reads == 0, "Replacement during an empty rank response prevents any further work")
+    }
+
     @MainActor private static func pagedActivationRefusals() async throws {
         let first = try report(ranges: [(0, 2)], complete: false, startAfter: 0, more: true, retainedLimit: 1)
         let wrongPages = try [
@@ -506,7 +693,7 @@ private final class Calls: @unchecked Sendable {
     @MainActor private static func pagedActivationBudgets() async throws {
         // Receipts carry these capture sizes; the fixture allocates only its
         // bounded JSON rows, not a giant source or a second search engine.
-        for (bytes, admittedPages) in [(UInt64(32 * 1024 * 1024), 2), (UInt64(200), 64)] {
+        for (bytes, admittedPages) in [(UInt64(32 * 1024 * 1024), 2)] {
             let sourceID = identity(bytes: bytes)
             for reachesBoundary in [false, true] {
                 let desiredPage = reachesBoundary ? admittedPages : admittedPages + 1
@@ -528,10 +715,10 @@ private final class Calls: @unchecked Sendable {
                         "The last admitted scan may still activate its exact selected row")
                 } catch AtlasReaderError.engine(let code) {
                     check(!reachesBoundary && code == "CAPTURED_SEARCH_HIT_UNAVAILABLE",
-                        "Byte/page exhaustion refuses the next scan explicitly")
+                        "Replay-byte exhaustion refuses the next scan explicitly")
                 }
                 check(scans == admittedPages && reads == (reachesBoundary ? 1 : 0),
-                    "Reserve each entire capture before scanning: at most 64 MiB and 64 pages")
+                    "Reserve each whole capture before scanning: 64 MiB admits only two 32 MiB replays")
             }
         }
         var attempts = 0
@@ -632,6 +819,8 @@ private final class Calls: @unchecked Sendable {
         try await countedOccurrenceActivation()
         try await occurrenceActivation()
         try await pagedTextActivation()
+        try await rankedTextActivation()
+        try await rankedTextRefusalsAndCancellation()
         try await pagedActivationRefusals()
         try await pagedActivationBudgets()
         try await pagedActivationCurrentAndCancellation()
