@@ -17,6 +17,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use fcb_core::{ArenaOwnerId, RootId};
 use fcb_source::confined::SymlinkPolicy;
+use fcb_source::ignore::IgnoreMatcher;
+use fcb_source::path::NormalizedPath;
 use fcb_source::root::RootGrant;
 use fcb_source::{
     BoundedDiscovery, CancelFlag, DiscoveryKind, DiscoveryLimits, IncompleteReason,
@@ -148,6 +150,160 @@ fn oversized_directory_is_provisional_and_never_allocates_past_batch_cap() {
     let rest = drain_all(&mut discovery, &cancel).unwrap();
     assert_eq!(first.entries().len() + rest.len(), 10);
     assert!(discovery.is_complete());
+}
+
+#[test]
+fn byte_bounded_pages_preserve_every_nested_entry_once() {
+    let dir = TempTestDir::new("byte_pages");
+    for name in ["a.rs", "midname.rs", "longer_name.rs", "nested/x", "nested/deeper/y"] {
+        write_file(dir.path(), name, b"x");
+    }
+    let limits = DiscoveryLimits::new(1, 8, 256, 32, 16, 16).unwrap();
+    let grant = RootGrant::new(test_root_id(31, 1), dir.path());
+    let mut discovery =
+        BoundedDiscovery::open(grant, SymlinkPolicy::DisallowAll, limits).unwrap();
+    let cancel = CancelFlag::new();
+    let mut names = Vec::new();
+    let mut provisional = false;
+    for _ in 0..32 {
+        let Some(batch) = discovery.next_batch(&cancel).unwrap() else { break; };
+        let bytes: usize = batch.entries().iter().map(|entry| entry.path().as_bytes().len()).sum();
+        assert!(bytes <= 16, "page exceeded its byte admission: {bytes}");
+        assert!(batch.entries().len() <= 32);
+        assert!(batch.entries().windows(2).all(|pair| pair[0].path() <= pair[1].path()));
+        provisional |= batch.publication() == PublicationState::Provisional;
+        names.extend(batch.entries().iter().map(|entry| entry.path().as_str().unwrap().to_string()));
+        if !batch.more() { break; }
+    }
+    names.sort();
+    assert_eq!(names, [
+        "a.rs", "longer_name.rs", "midname.rs", "nested",
+        "nested/deeper", "nested/deeper/y", "nested/x",
+    ]);
+    assert!(provisional, "a byte-split directory cannot publish stable child order");
+    assert!(discovery.is_complete(), "bounded pages must eventually drain");
+    assert_eq!(discovery.aggregate().files, 5);
+    assert_eq!(discovery.aggregate().directories, 2);
+    assert!(discovery.peaks().batch_bytes <= 16);
+    assert!(discovery.peaks().open_descriptors <= 1);
+    assert!(discovery.peaks().queue_entries <= 16);
+}
+
+#[test]
+fn too_small_page_retains_observations_and_retries_without_reobserving() {
+    // Workspace traversal first returns its already collected parent entry.
+    // Exact-file discovery drains its directory queue before retaining the
+    // oversized entry, so only that retained entry keeps the scan in progress.
+    for exact_file in [false, true] {
+        let dir = TempTestDir::new("byte_retry");
+        let name = if exact_file { "long_name.txt" } else { "d/long_name.txt" };
+        write_file(dir.path(), name, b"x");
+        let initial_bytes = if exact_file { name.len() as u64 } else { 4 };
+        let limits = DiscoveryLimits::new(1, 8, 256, 32, initial_bytes, 16).unwrap();
+        let grant = RootGrant::new(test_root_id(32, 1), dir.path());
+        let mut discovery = if exact_file {
+            BoundedDiscovery::open_metadata_only_for_file(
+                grant, NormalizedPath::new(name).unwrap(), limits, IgnoreMatcher::include_all(),
+            ).unwrap()
+        } else {
+            BoundedDiscovery::open_metadata_only(
+                grant, SymlinkPolicy::DisallowAll, limits, IgnoreMatcher::include_all(),
+            ).unwrap()
+        };
+        let cancel = CancelFlag::new();
+        if exact_file {
+            discovery.set_max_batch_bytes(4).unwrap();
+        } else {
+            let first = discovery.next_batch(&cancel).unwrap().expect("parent page");
+            assert_eq!(first.entries().len(), 1);
+            assert_eq!(first.entries()[0].path().as_str(), Ok("d"));
+            assert!(first.more());
+            assert_eq!(first.publication(), PublicationState::Provisional);
+        }
+        for _ in 0..3 {
+            assert_eq!(discovery.next_batch(&cancel).unwrap_err(), SourceError::PayloadTooLarge);
+            assert_eq!(discovery.status(), ScanStatus::InProgress);
+            assert_eq!(discovery.aggregate().files, 1);
+        }
+        assert_eq!(discovery.set_max_batch_bytes(0), Err(SourceError::InvalidRange));
+        assert_eq!(discovery.limits().max_batch_bytes(), 4);
+        assert!(discovery.peaks().batch_bytes <= 4);
+
+        // A retry publishes the original observation, including its length,
+        // rather than silently replacing it with a later filesystem state.
+        write_file(dir.path(), name, b"changed after observation");
+        discovery.set_max_batch_bytes(name.len() as u64).unwrap();
+        let page = discovery.next_batch(&cancel).unwrap().expect("retained entry");
+        assert_eq!(page.entries().len(), 1);
+        assert_eq!(page.entries()[0].path().as_str(), Ok(name));
+        assert_eq!(page.entries()[0].observed_len(), Some(1));
+        assert!(drain_all(&mut discovery, &cancel).unwrap().is_empty());
+        assert!(discovery.is_complete());
+        assert_eq!(discovery.aggregate().files, 1);
+        assert_eq!(discovery.aggregate().directories, if exact_file { 0 } else { 1 });
+        assert_eq!(discovery.peaks().batch_bytes, name.len() as u64);
+    }
+}
+
+#[test]
+fn retained_oversized_entry_still_obeys_cancellation_and_revocation() {
+    for revoke in [false, true] {
+        let dir = TempTestDir::new("byte_interrupt");
+        write_file(dir.path(), "long_name.txt", b"x");
+        let grant = RootGrant::new(test_root_id(33, 1), dir.path());
+        let limits = DiscoveryLimits::new(1, 8, 256, 32, 4, 16).unwrap();
+        let mut discovery = BoundedDiscovery::open_metadata_only(
+            grant.clone(), SymlinkPolicy::DisallowAll, limits, IgnoreMatcher::include_all(),
+        ).unwrap();
+        let cancel = CancelFlag::new();
+        assert_eq!(discovery.next_batch(&cancel).unwrap_err(), SourceError::PayloadTooLarge);
+        discovery.set_max_batch_bytes(64).unwrap();
+        let (error, reason) = if revoke {
+            grant.revoke();
+            (SourceError::GrantRevoked, IncompleteReason::GrantRevoked)
+        } else {
+            cancel.cancel();
+            (SourceError::Canceled, IncompleteReason::Canceled)
+        };
+        assert_eq!(discovery.next_batch(&cancel).unwrap_err(), error);
+        assert_eq!(discovery.status(), ScanStatus::Incomplete { reason });
+        assert!(!discovery.is_complete());
+        assert_eq!(discovery.aggregate().files, 1);
+        assert_eq!(discovery.peaks().batch_entries, 0);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn byte_pages_count_authoritative_raw_filename_bytes() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = TempTestDir::new("raw_byte_pages");
+    let mut expected = vec![b"\xffa.rs".to_vec(), b"\xfeb.rs".to_vec(), b"a\\b.rs".to_vec()];
+    for name in &expected {
+        fs::write(dir.path().join(OsStr::from_bytes(name)), b"x").unwrap();
+    }
+    let limits = DiscoveryLimits::new(1, 8, 256, 32, 7, 16).unwrap();
+    let grant = RootGrant::new(test_root_id(34, 1), dir.path());
+    let mut discovery = BoundedDiscovery::open_metadata_only(
+        grant, SymlinkPolicy::DisallowAll, limits, IgnoreMatcher::include_all(),
+    ).unwrap();
+    let cancel = CancelFlag::new();
+    let mut names = Vec::new();
+    for _ in 0..8 {
+        let Some(batch) = discovery.next_batch(&cancel).unwrap() else { break; };
+        assert_eq!(batch.entries().len(), 1);
+        assert!(batch.entries()[0].path().as_bytes().len() <= 7);
+        names.push(batch.entries()[0].path().as_bytes().to_vec());
+        if !batch.more() { break; }
+    }
+    names.sort();
+    expected.sort();
+    assert_eq!(names, expected);
+    assert_eq!(discovery.aggregate().files, 3);
+    assert!(discovery.is_complete());
+    assert!(discovery.peaks().batch_bytes <= 7);
 }
 
 #[test]

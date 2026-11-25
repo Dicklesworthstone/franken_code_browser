@@ -215,6 +215,9 @@ pub struct BoundedDiscovery {
     scope: DiscoveryScope,
     pending: VecDeque<PendingDir>,
     open: VecDeque<OpenDir>,
+    // At most one observed entry can await publication. Its path remains
+    // bounded by max_path_bytes, independently of the output page byte cap.
+    deferred_entry: Option<DiscoveryEntry>,
     epoch: ScanEpoch,
     next_stable_generation: u64,
     aggregate: DiscoveryAggregate,
@@ -227,6 +230,7 @@ impl fmt::Debug for BoundedDiscovery {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BoundedDiscovery").field("epoch", &self.epoch).field("status", &self.status)
             .field("pending", &self.pending.len()).field("open", &self.open.len())
+            .field("deferred_entry", &self.deferred_entry.is_some())
             .field("aggregate", &self.aggregate).field("peaks", &self.peaks).finish_non_exhaustive()
     }
 }
@@ -330,7 +334,8 @@ impl BoundedDiscovery {
         reader.canonical_root_path()?;
         let mut session = Self { reader, grant, limits, ignore,
             own_exclusions: OwnArtifactExclusion::default_product(), read_rule_files: true,
-            repository_rules: None, scope: DiscoveryScope::Workspace, pending: VecDeque::new(), open: VecDeque::new(), epoch: ScanEpoch(1),
+            repository_rules: None, scope: DiscoveryScope::Workspace, pending: VecDeque::new(), open: VecDeque::new(),
+            deferred_entry: None, epoch: ScanEpoch(1),
             next_stable_generation: 1, aggregate: DiscoveryAggregate::default(), peaks: DiscoveryPeaks::default(),
             status: ScanStatus::InProgress, queue_saturated: false, root_excluded: false };
         session.pending.push_back(PendingDir { rel: None, kind: DiscoveryKind::Directory,
@@ -348,6 +353,14 @@ impl BoundedDiscovery {
     /// The selected exact member, or None for workspace/directory discovery.
     pub fn file(&self) -> Option<&NormalizedPath> { self.scope.file() }
     pub fn limits(&self) -> DiscoveryLimits { self.limits }
+    /// Change page byte admission without restarting traversal. After
+    /// `next_batch` returns `PayloadTooLarge`, increasing this cap allows the
+    /// retained entry to be published without repeating its observation.
+    pub fn set_max_batch_bytes(&mut self, max_batch_bytes: u64) -> Result<(), SourceError> {
+        if max_batch_bytes == 0 { return Err(SourceError::InvalidRange); }
+        self.limits.max_batch_bytes = max_batch_bytes;
+        Ok(())
+    }
     pub fn scan_epoch(&self) -> ScanEpoch { self.epoch }
     pub fn status(&self) -> ScanStatus { self.status }
     pub fn aggregate(&self) -> DiscoveryAggregate { self.aggregate }
@@ -364,6 +377,9 @@ impl BoundedDiscovery {
     /// consume traversal transitions independently of output; at most four
     /// transitions per configured batch-entry slot. Rule-aware opens add at most
     /// two bounded rule reads per newly opened directory; no UI-latency claim.
+    /// Every page fits both entry and path-byte caps. An entry that cannot fit
+    /// an empty page is retained and returns `PayloadTooLarge`; the caller may
+    /// increase `set_max_batch_bytes` and retry without losing cursor progress.
     pub fn next_batch(&mut self, cancel: &CancelFlag) -> Result<Option<DiscoveryBatch>, SourceError> {
         match self.ensure_runnable(cancel) {
             Ok(()) => {},
@@ -394,27 +410,42 @@ impl BoundedDiscovery {
                 if transitions == max_transitions { any_split = true; }
                 break;
             }
-            transitions += 1;
-            if !self.open.is_empty() {
-                match self.advance_open_dir(&mut entries, &mut batch_bytes, &mut any_split) {
-                    Advance::FinishedUnsplit => complete_unsplit_dirs = complete_unsplit_dirs.saturating_add(1),
-                    Advance::Continue => {},
-                }
-                continue;
-            }
-            if self.open.len() < self.limits.max_open_descriptors as usize
-                && let Some(pending) = self.pending.pop_front() {
-                match self.open_pending(pending, cancel) {
-                    OpenResult::Opened => {},
-                    OpenResult::SkippedEntry(entry) => {
-                        batch_bytes = batch_bytes.saturating_add(entry.path.as_bytes().len() as u64);
-                        entries.push(entry);
+            let entry = if let Some(entry) = self.deferred_entry.take() {
+                Some(entry)
+            } else {
+                transitions += 1;
+                if !self.open.is_empty() {
+                    match self.advance_open_dir(&mut any_split) {
+                        Advance::Entry(entry) => Some(entry),
+                        Advance::FinishedUnsplit => {
+                            complete_unsplit_dirs = complete_unsplit_dirs.saturating_add(1);
+                            None
+                        }
+                        Advance::Continue => None,
                     }
-                    OpenResult::SkippedUnavailable => {},
+                } else if self.open.len() < self.limits.max_open_descriptors as usize
+                    && let Some(pending) = self.pending.pop_front() {
+                    match self.open_pending(pending, cancel) {
+                        OpenResult::SkippedEntry(entry) => Some(entry),
+                        OpenResult::Opened | OpenResult::SkippedUnavailable => None,
+                    }
+                } else { break; }
+            };
+            if let Some(entry) = entry {
+                let entry_bytes = entry.path.as_bytes().len() as u64;
+                if entry_bytes > self.limits.max_batch_bytes - batch_bytes {
+                    self.deferred_entry = Some(entry);
+                    if let Some(open) = self.open.front_mut() { open.split_across_batches = true; }
+                    any_split = true;
+                    // Return observations already collected before reporting a
+                    // too-small empty page on the next call. Neither retry nor
+                    // publication re-runs policy, accounting, or child enqueue.
+                    if entries.is_empty() { return Err(SourceError::PayloadTooLarge); }
+                    break;
                 }
-                continue;
+                batch_bytes += entry_bytes;
+                entries.push(entry);
             }
-            break;
         }
         if entries.is_empty() && self.queue_empty() {
             self.ensure_runnable(cancel)?;
@@ -455,7 +486,9 @@ impl BoundedDiscovery {
             _ => SourceError::GrantRevoked,
         }
     }
-    fn queue_empty(&self) -> bool { self.pending.is_empty() && self.open.is_empty() }
+    fn queue_empty(&self) -> bool {
+        self.pending.is_empty() && self.open.is_empty() && self.deferred_entry.is_none()
+    }
     fn batch_full(&self, entries: &[DiscoveryEntry], bytes: u64) -> bool {
         entries.len() >= self.limits.max_batch_entries as usize || bytes >= self.limits.max_batch_bytes
     }
@@ -611,7 +644,7 @@ impl BoundedDiscovery {
                     && directory.as_bytes().get(path.as_bytes().len()) == Some(&b'/'))
         })
     }
-    fn advance_open_dir(&mut self, entries: &mut Vec<DiscoveryEntry>, batch_bytes: &mut u64, any_split: &mut bool) -> Advance {
+    fn advance_open_dir(&mut self, any_split: &mut bool) -> Advance {
         let next = self.open.front_mut().and_then(|open| open.iter.next());
         match next {
             None => {
@@ -631,15 +664,10 @@ impl BoundedDiscovery {
                 };
                 let child_fs = snapshot.resolved.join(dirent.file_name());
                 if let Some(entry) = self.observe_dirent(&snapshot, dirent.file_name().as_os_str(), &child_fs, true) {
-                    *batch_bytes = batch_bytes.saturating_add(entry.path.as_bytes().len() as u64);
-                    entries.push(entry);
                     if let Some(open) = self.open.front_mut() {
-                        if open.children_emitted > 0 && (entries.len() >= self.limits.max_batch_entries as usize
-                            || *batch_bytes >= self.limits.max_batch_bytes) {
-                            open.split_across_batches = true; *any_split = true;
-                        }
                         open.children_emitted = open.children_emitted.saturating_add(1);
                     }
+                    return Advance::Entry(entry);
                 }
                 Advance::Continue
             }
@@ -750,7 +778,7 @@ impl BoundedDiscovery {
     }
 }
 enum OpenResult { Opened, SkippedEntry(DiscoveryEntry), SkippedUnavailable }
-enum Advance { FinishedUnsplit, Continue }
+enum Advance { Entry(DiscoveryEntry), FinishedUnsplit, Continue }
 struct OpenSnapshot { rel: Option<NormalizedPath>, depth: u32, alias_hops: u32, ancestry: Vec<DirectoryId>, resolved: PathBuf }
 fn child_relative(parent: Option<&NormalizedPath>, name: &[u8]) -> Result<NormalizedPath, SourceError> {
     match parent { None => NormalizedPath::from_dirent_name(name), Some(parent) => parent.join_segment(name) }

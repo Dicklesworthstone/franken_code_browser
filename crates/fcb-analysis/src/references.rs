@@ -69,7 +69,7 @@ impl ReferenceCandidate {
     pub const fn id(&self) -> u64 { self.id }
     pub const fn original_range(&self) -> ByteRange { self.original_range }
     pub const fn decoded_range(&self) -> DecodedUtf8Range { self.decoded_range }
-    /// One-based source line, counting LF (including CRLF) line endings.
+    /// One-based source line, counting CR, LF and CRLF line endings.
     pub const fn line(&self) -> u64 { self.line }
     pub const fn evidence_level(&self) -> &'static str { "whole-token-text-candidate" }
 }
@@ -153,7 +153,8 @@ impl<'source> CapturedReferences<'source> {
         let mut scan = ReferenceScan {
             cursor: IdentifierCursor::new(name).map_err(|_| ReferenceError::InvalidName)?,
             candidates, max_items, skip_matches, count_all_matches, counted: 0, limited: false,
-            token_raw: 0, token_decoded: 0, token_line: 1, line: 1, raw_end: 0, decoded_end: 0,
+            token_raw: 0, token_decoded: 0, token_line: 1, line: 1, previous_cr: false,
+            raw_end: 0, decoded_end: 0,
         };
         let mut decoder = StatefulChunkDecoder::new(encoding);
         for chunk in source.chunks(DECODE_WINDOW_BYTES) {
@@ -236,6 +237,7 @@ struct ReferenceScan<'name> {
     token_decoded: u64,
     token_line: u64,
     line: u64,
+    previous_cr: bool,
     raw_end: u64,
     decoded_end: u64,
 }
@@ -280,9 +282,12 @@ impl ReferenceScan<'_> {
                 self.record(raw, decoded)?;
                 if self.matching_stopped() { break; }
             }
-            if scalar == '\n' {
+            // Match the reader's physical-line policy. Keep CR state across
+            // decoder windows so a split CRLF advances exactly one line.
+            if scalar == '\r' || (scalar == '\n' && !self.previous_cr) {
                 self.line = self.line.checked_add(1).ok_or(ReferenceError::InvalidEvidence)?;
             }
+            self.previous_cr = scalar == '\r';
         }
         Ok(())
     }
@@ -456,6 +461,61 @@ mod tests {
         assert_eq!(refs.candidates()[0].original_range().start().get(), 3);
         assert_eq!(refs.candidates()[1].original_range().start().get(), 8);
         assert_eq!(refs.candidates()[1].line(), 2);
+    }
+    #[test]
+    fn mixed_physical_line_endings_preserve_occurrence_lines_and_bytes() {
+        let text = "foo\rfoo\nfoo\r\nfoo\r\rfoo\n\rfoo";
+        for encoding in [DetectedEncoding::Utf8 { has_bom: true },
+            DetectedEncoding::Utf16Le, DetectedEncoding::Utf16Be] {
+            let (bytes, expected, scale, header) = match encoding {
+                DetectedEncoding::Utf8 { .. } => {
+                    let mut bytes = vec![0xef, 0xbb, 0xbf];
+                    bytes.extend_from_slice(text.as_bytes());
+                    (bytes, b"foo".to_vec(), 1, 3)
+                }
+                _ => {
+                    let little = encoding == DetectedEncoding::Utf16Le;
+                    let encode = |value: &str| value.encode_utf16().flat_map(|unit|
+                        if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect::<Vec<_>>();
+                    (encode(&format!("\u{feff}{text}")), encode("foo"), 2, 2)
+                }
+            };
+            let refs = build(&bytes, "foo", 20);
+            assert!(refs.is_complete());
+            assert_eq!(refs.candidates().len(), 6);
+            for (candidate, (line, start)) in refs.candidates().iter()
+                .zip([(1, 0), (2, 4), (3, 8), (4, 13), (6, 18), (8, 23)]) {
+                assert_eq!(candidate.line(), line);
+                assert_eq!(candidate.original_range().start().get(), header + start * scale);
+                assert_eq!(refs.source_bytes(candidate.id()).unwrap(), expected.as_slice());
+            }
+        }
+    }
+    #[test]
+    fn crlf_and_bare_cr_across_decoder_windows_keep_later_page_lines() {
+        for little in [None, Some(true), Some(false)] {
+            for ending in ["\r", "\r\n"] {
+                let (bytes, first_start, width) = if let Some(little) = little {
+                    // The CR occupies the last code unit of the first raw window.
+                    let text = format!("\u{feff}{}{ending}foo\rfoo", " ".repeat((DECODE_WINDOW_BYTES - 4) / 2));
+                    let bytes = text.encode_utf16().flat_map(|unit|
+                        if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect::<Vec<_>>();
+                    (bytes, DECODE_WINDOW_BYTES - 2 + ending.len() * 2, 2)
+                } else {
+                    let text = format!("{}{ending}foo\rfoo", " ".repeat(DECODE_WINDOW_BYTES - 1));
+                    (text.into_bytes(), DECODE_WINDOW_BYTES - 1 + ending.len(), 1)
+                };
+                let budget = ResourceBudget::new(owner(), ByteLength::new(32 * 1024 * 1024)).unwrap();
+                let refs = CapturedReferences::build_window(&bytes,
+                    CaptureRequest::new(file(), revision()).unwrap(), generation(), "foo", None,
+                    1, 1, true, &budget, ResourceAllocationId::new(1).unwrap(), || false).unwrap();
+                assert!(refs.is_complete());
+                assert_eq!(refs.total_matches_counted(), 2);
+                assert_eq!(refs.candidates().len(), 1);
+                assert_eq!(refs.candidates()[0].line(), 3);
+                assert_eq!(refs.candidates()[0].original_range().start().get(), (first_start + 4 * width) as u64);
+            }
+        }
     }
     #[test]
     fn utf16_both_endians_preserve_surrogate_and_identifier_ranges() {
