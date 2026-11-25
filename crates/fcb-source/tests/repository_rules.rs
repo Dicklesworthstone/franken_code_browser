@@ -179,3 +179,40 @@ fn preadmission_and_cancellation_do_not_publish_pages_or_leak_rule_capacity() {
     assert_eq!(walker.repository_rules().unwrap().stats().bytes_read, 0);
     drop(walker); assert_eq!(b.accounting().reserved().get(), 0);
 }
+
+#[test]
+fn trailing_globstar_reinclusions_survive_real_paged_discovery() {
+    for page in [1, 4] {
+        let tree = Tree::new();
+        tree.file(".gitignore", b"vendor/**\n!vendor/keep.rs\n!vendor/pkg/\n!vendor/pkg/**\nclosed/\n!closed/keep.rs\n");
+        tree.file("vendor/keep.rs", b"readable source");
+        tree.file("vendor/drop.rs", b"excluded source");
+        tree.file("vendor/pruned/hidden.rs", b"not visited");
+        tree.file("vendor/pkg/.gitignore", b"hidden.rs\n");
+        tree.file("vendor/pkg/visible.rs", b"readable nested source");
+        tree.file("vendor/pkg/hidden.rs", b"excluded by nested policy");
+        tree.file("closed/keep.rs", b"a genuinely excluded parent cannot be bypassed");
+        let b = budget();
+        let mut walker = discovery(&tree, RuleLimits::default(), &b, page);
+        let entries = drain(&mut walker);
+        let kept = included(&entries);
+        for path in [b"vendor/keep.rs".as_slice(), b"vendor/pkg/visible.rs"] {
+            assert!(kept.contains(&path.to_vec()), "re-included source was lost: {path:?}");
+        }
+        for path in [b"vendor/drop.rs".as_slice(), b"vendor/pkg/hidden.rs"] {
+            assert!(entries.iter().any(|e| e.path().as_bytes() == path && e.is_excluded()),
+                "excluded source should remain an observed entry: {path:?}");
+            assert!(!kept.contains(&path.to_vec()));
+        }
+        assert!(entries.iter().any(|e| e.path().as_bytes() == b"vendor"
+            && e.kind() == DiscoveryKind::Directory && !e.is_excluded()));
+        assert!(!entries.iter().any(|e| e.path().as_bytes().starts_with(b"vendor/pruned/")));
+        assert!(!entries.iter().any(|e| e.path().as_bytes().starts_with(b"closed/")));
+        assert!(walker.is_complete());
+        assert!(walker.repository_rules().unwrap().stats().is_complete());
+        assert_eq!(walker.repository_rules().unwrap().stats().files_loaded, 2);
+        assert!(walker.peaks().open_descriptors <= 1);
+        drop(walker);
+        assert_eq!(b.accounting().reserved().get(), 0);
+    }
+}

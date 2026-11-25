@@ -158,3 +158,35 @@ fn bad_configuration_remains_partial_after_export_and_exact_restoration() {
         &b, id(12), || false).unwrap();
     assert!(report.capture_results().matches.is_empty()); assert!(!report.is_complete());
 }
+
+#[test]
+fn reintroduced_source_under_trailing_globstar_reaches_exact_workspace_search() {
+    let tree = Tree::new();
+    tree.file(".gitignore", b"docs/**\n!docs/kept.md\n");
+    tree.file("docs/omitted.md", b"needle must stay outside the manifest");
+    let mut wide = vec![0xff, 0xfe];
+    for unit in "head\r\nneedle".encode_utf16() { wide.extend_from_slice(&unit.to_le_bytes()); }
+    tree.file("docs/kept.md", &wide);
+    let b = budget();
+    let mut catalog = initial(&tree, &b, RuleLimits::default());
+    finish(&mut catalog);
+    assert!(catalog.discovery_complete());
+    assert!(catalog.entries().iter().any(|entry| entry.path().as_bytes() == b"docs/kept.md"),
+        "a complete catalog must not silently lose the re-included file");
+    assert!(catalog.entries().iter().all(|entry| entry.path().as_bytes() != b"docs/omitted.md"));
+    let retained = captures(&tree, &catalog, &b);
+    // The search still names these captured bytes if policy and source change.
+    tree.file(".gitignore", b"docs/\n");
+    tree.file("docs/kept.md", b"changed live source");
+    let input = retained.search_inputs(&b, id(4)).unwrap();
+    let index = input.index(IndexLimits::default(), &b, id(5), || false).unwrap();
+    let report = index.search(&ParsedQuery::parse("needle").unwrap(),
+        QueryOptions::new(QueryGeneration::new(owner(), 1).unwrap()), &b, id(6), || false).unwrap();
+    assert!(report.is_complete());
+    assert_eq!(report.capture_results().matches.len(), 1);
+    let hit = &report.capture_results().matches[0];
+    assert_eq!(catalog.entry(hit.file_id).unwrap().path().as_bytes(), b"docs/kept.md");
+    assert_eq!(hit.original_byte_range.start().get(), 14);
+    assert_eq!(hit.original_byte_range.end().get(), 26);
+    assert_eq!(retained.capture(hit.file_id).unwrap().bytes(), wide);
+}

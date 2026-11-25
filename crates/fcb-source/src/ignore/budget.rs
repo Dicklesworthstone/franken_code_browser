@@ -86,7 +86,14 @@ fn match_segments(pattern: &[SegPat], path: &[&[u8]], remaining: &mut u64) -> Re
     loop {
         spend(remaining, 1)?;
         if p == pattern.len() && s == path.len() { return Ok(true); }
-        if matches!(pattern.get(p), Some(SegPat::GlobStar)) { star = Some((p + 1, s)); p += 1; continue; }
+        if matches!(pattern.get(p), Some(SegPat::GlobStar)) {
+            // A trailing /** matches descendants, not the directory before
+            // the slash. Matching zero components here prunes that directory
+            // before a later !dir/keep.rs rule can restore any of its files.
+            // Interior **/ still admits zero directories (a/**/b matches a/b).
+            if p + 1 == pattern.len() { return Ok(s < path.len()); }
+            star = Some((p + 1, s)); p += 1; continue;
+        }
         if let (Some(SegPat::Atoms(atoms)), Some(segment)) = (pattern.get(p), path.get(s)) {
             if match_atoms(atoms, segment, remaining)? { p += 1; s += 1; continue; }
         }

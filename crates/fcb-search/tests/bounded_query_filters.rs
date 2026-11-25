@@ -186,8 +186,10 @@ fn path_and_language_filters_constrain_document_selection() {
 #[test]
 fn descriptive_language_filters_include_supported_filename_variants() {
     let cases: &[(&str, &[&str], &[&str])] = &[
-        ("typescript", &["src/types.ts", "src/Panel.TSX"],
-            &["src/Panel.jsx", "src/file.typescript", "src.ts/README"]),
+        ("typescript", &["src/types.ts", "src/Panel.TSX", "src/module.mts", "src/common.CTS",
+            "src/types.d.mts", "src/types.d.cts"],
+            &["src/Panel.jsx", "src/module.mjs", "src/common.cjs",
+                "src/file.typescript", "src.ts/README", "src.mts/README"]),
         ("javascript", &["src/main.js", "src/Panel.jsx", "src/module.mjs", "src/common.CJS"],
             &["src/Panel.tsx", "src/file.javascript", "src.js/README"]),
         ("csharp", &["src/State.cs", "src/Other.CS"],
@@ -215,7 +217,7 @@ fn descriptive_language_filters_include_supported_filename_variants() {
 
 #[test]
 fn extension_filters_keep_their_existing_exact_scope() {
-    let extensions = ["ts", "tsx", "js", "jsx", "mjs", "cjs", "cs", "java", "swift", "go", "custom"];
+    let extensions = ["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "cs", "java", "swift", "go", "custom"];
     for requested in extensions {
         let positive = ParsedQuery::parse(&format!("needle type:{requested}")).unwrap();
         let negative = ParsedQuery::parse(&format!("needle -lang:{requested}")).unwrap();

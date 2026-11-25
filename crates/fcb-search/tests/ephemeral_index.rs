@@ -100,21 +100,25 @@ fn indexed_and_direct_results_agree_across_modes_filters_and_result_limits() {
 #[test]
 fn language_family_scope_matches_exact_expected_files_in_direct_indexed_and_uncovered_searches() {
     let paths = ["src/types.ts", "src/Panel.tsx", "src/main.js", "src/Panel.jsx",
-        "src/module.mjs", "src/common.cjs", "src/State.cs", "src/main.rs", "src/data.custom"];
+        "src/module.mjs", "src/common.cjs", "src/State.cs", "src/main.rs", "src/data.custom",
+        "src/module.mts", "src/common.CTS", "src/types.d.mts", "src/types.d.cts"];
     let captures: Vec<_> = (1..=paths.len()).map(|file|
         capture(file as u64, 1, b"prefix needle suffix")).collect();
     let docs: Vec<_> = paths.iter().zip(&captures).map(|(path, capture)| document(path, capture)).collect();
     let cases: &[(&str, &[u64])] = &[
-        ("needle lang:typescript", &[1, 2]),
+        ("needle lang:typescript", &[1, 2, 10, 11, 12, 13]),
         ("needle -type:typescript", &[3, 4, 5, 6, 7, 8, 9]),
         ("needle lang:javascript", &[3, 4, 5, 6]),
-        ("needle -lang:javascript", &[1, 2, 7, 8, 9]),
+        ("needle -lang:javascript", &[1, 2, 7, 8, 9, 10, 11, 12, 13]),
         ("needle lang:C#", &[7]),
-        ("needle -lang:csharp", &[1, 2, 3, 4, 5, 6, 8, 9]),
+        ("needle -lang:csharp", &[1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13]),
         ("needle lang:ts", &[1]),
         ("needle lang:js", &[3]),
         ("needle type:custom", &[9]),
-        ("needle lang:typescript -lang:tsx", &[1]),
+        ("needle lang:typescript -lang:tsx", &[1, 10, 11, 12, 13]),
+        ("needle lang:typescript -lang:mts", &[1, 2, 11, 13]),
+        ("needle type:mts", &[10, 12]),
+        ("needle type:cts", &[11, 13]),
     ];
     for limits in [IndexLimits::default(),
         IndexLimits { max_source_bytes_per_file: 2, ..Default::default() }] {

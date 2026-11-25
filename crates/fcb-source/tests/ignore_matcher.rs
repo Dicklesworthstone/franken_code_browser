@@ -344,3 +344,61 @@ fn include_all_does_not_apply_product_defaults() {
             .any(|(path, _, excluded)| path == "target/foo.rs" && !*excluded)
     );
 }
+
+#[test]
+fn trailing_globstar_excludes_descendants_without_pruning_their_parent() {
+    let cases = [
+        ("src/**", "src", true, false),
+        ("src/**", "src", false, false),
+        ("src/**", "src/file.rs", false, true),
+        ("src/**", "src/deep", true, true),
+        ("src/**", "src/deep/file.rs", false, true),
+        ("src/**/**", "src", true, false),
+        ("src/**/**", "src/file.rs", false, true),
+        ("/src/**", "src", true, false),
+        ("/src/**", "nested/src/file.rs", false, false),
+        ("**/src/**", "src", true, false),
+        ("**/src/**", "nested/src", true, false),
+        ("**/src/**", "nested/src/file.rs", false, true),
+        ("src/**/keep.rs", "src/keep.rs", false, true),
+        ("src/**/keep.rs", "src/deep/keep.rs", false, true),
+        ("src/**/", "src", true, false),
+        ("src/**/", "src/deep", true, true),
+        ("src/**/", "src/file.rs", false, false),
+        ("**", "src", true, true),
+        ("/**", "src", true, true),
+        (r"src/\*\*", "src/**", false, true),
+    ];
+    for (pattern, path, directory, excluded) in cases {
+        let mut matcher = IgnoreMatcher::include_all();
+        matcher.add_rule_file(None, pattern);
+        let path = np(path);
+        assert_eq!(matcher.peek(&path, directory).is_excluded(), excluded, "{pattern} {path:?}");
+        assert_eq!(matcher.decide(&path, directory).is_excluded(), excluded, "{pattern} {path:?}");
+        let mut work = 10_000;
+        assert_eq!(matcher.decide_bounded(&path, directory, &mut work).unwrap().is_excluded(),
+            excluded, "{pattern} {path:?}");
+        assert!(work < 10_000);
+        assert_eq!(matcher.excluded_count(), if excluded { 2 } else { 0 });
+    }
+}
+
+#[test]
+fn nested_trailing_globstar_keeps_reinclusions_and_work_refusals_distinct() {
+    use fcb_source::ignore::budget::IgnoreWorkError;
+    let mut matcher = IgnoreMatcher::include_all();
+    matcher.add_rule_file(Some(&np("packages")), "/generated/**\n!/generated/keep.rs\n");
+    for (path, directory, excluded) in [
+        ("packages/generated", true, false),
+        ("packages/generated/drop.rs", false, true),
+        ("packages/generated/keep.rs", false, false),
+        ("packages/nested/generated/drop.rs", false, false),
+        ("generated/drop.rs", false, false),
+    ] {
+        assert_eq!(matcher.peek(&np(path), directory).is_excluded(), excluded, "{path}");
+    }
+    let parent = np("packages/generated");
+    let mut exhausted = 0;
+    assert_eq!(matcher.decide_bounded(&parent, true, &mut exhausted), Err(IgnoreWorkError::WorkLimit));
+    assert_eq!(matcher.excluded_count(), 0);
+}

@@ -306,7 +306,7 @@ impl ReferenceScanOracle {
             "rust" | "rs" => ext == "rs",
             "python" | "py" => ext == "py",
             "javascript" => matches!(ext, "js" | "jsx" | "mjs" | "cjs"),
-            "typescript" => matches!(ext, "ts" | "tsx"),
+            "typescript" => matches!(ext, "ts" | "tsx" | "mts" | "cts"),
             "csharp" | "c#" => ext == "cs",
             "c" => ext == "c" || ext == "h",
             "cpp" | "cxx" | "cc" => ext == "cpp" || ext == "cxx" || ext == "cc" || ext == "hpp",
