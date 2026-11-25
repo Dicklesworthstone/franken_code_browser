@@ -318,6 +318,58 @@ import Foundation
         }
     }
 
+    private static func cargoDependencyWire(_ index: AtlasPreparedIndex) throws {
+        for basis in ["rust-path-dependency-file-candidate", "rust-path-dependency-prefix-candidate"] {
+            var value = ProjectLinksFixture.importPage(owner: index.basis.owner,
+                generation: 1, command: "imports-page")
+            // Repeated captured target manifests count toward the aggregate
+            // parse budget, beyond the former one-manifest-per-source bound.
+            value["parsed_module_bytes"] = "196608"
+            var rows = value["links"] as! [[String: Any]]
+            for i in rows.indices {
+                rows[i]["language"] = "rust"; rows[i]["lexical_import_kind"] = "rust-use"
+                rows[i]["destination"] = "dep_alias::model::Thing"
+                rows[i]["resolution_basis"] = basis
+                rows[i]["source_path"] = ProjectLinksFixture.path("app/src/main.rs")
+                rows[i]["target_path"] = ProjectLinksFixture.path("dep/src/model.rs")
+            }
+            value["links"] = rows
+            let page = try decode(value, index: index)
+            precondition(page.links[0].canOpenTarget
+                && page.links[0].label.contains("Cargo path dependency")
+                && page.links[0].label.contains("compiler resolution is not evaluated"))
+            for (key, wrong) in [("language", "go"), ("lexical_import_kind", "rust-module"),
+                ("resolution", "external"), ("resolution_basis", "rust-dependency-context-unavailable")] {
+                var bad = value, changed = rows
+                changed[0][key] = wrong; bad["links"] = changed; refuse(bad, index: index)
+            }
+            var old = value; old["resolver"] = "fcb-closed-catalog-imports-v12"; refuse(old, index: index)
+            for resolution in ["unavailable", "uncaptured", "outside-capture-scope"] {
+                var withheld = value, changed = rows
+                for i in changed.indices {
+                    changed[i]["resolution"] = resolution
+                    for key in ["target_revision", "target_sha256", "target_bytes"] { changed[i][key] = NSNull() }
+                }
+                withheld["links"] = changed
+                let unavailable = try decode(withheld, index: index)
+                precondition(!unavailable.links[0].canOpenTarget)
+            }
+            var unresolved = value, changed = rows
+            for i in changed.indices {
+                changed[i]["resolution"] = "unresolved"
+                changed[i]["resolution_basis"] = "rust-dependency-context-unavailable"
+                for key in ["target_file_id", "target_path", "target_revision", "target_sha256", "target_bytes"] {
+                    changed[i][key] = NSNull()
+                }
+            }
+            unresolved["links"] = changed
+            let edge = try decode(unresolved, index: index).links[0]
+            precondition(!edge.canOpenTarget && edge.label.contains("Cargo path dependency context"))
+            changed[0]["target_file_id"] = "4"; changed[0]["target_path"] = ProjectLinksFixture.path("dep/src/model.rs")
+            unresolved["links"] = changed; refuse(unresolved, index: index)
+        }
+    }
+
     private static func goWire(_ index: AtlasPreparedIndex) throws {
         var value = ProjectLinksFixture.importPage(owner: index.basis.owner,
             generation: 1, command: "imports-page")
@@ -340,7 +392,7 @@ import Foundation
             var bad = value, changed = rows
             changed[0][key] = wrong; bad["links"] = changed; refuse(bad, index: index)
         }
-        for bytes in ["131073", "33554432", "18446744073709551615"] {
+        for bytes in ["4718593", "33554432", "18446744073709551615"] {
             var bad = value; bad["parsed_module_bytes"] = bytes; refuse(bad, index: index)
         }
         for (basis, label) in [("go-module-context-unavailable", "go.mod context"),
@@ -802,6 +854,7 @@ import Foundation
         try pythonWire(index)
         try cppWire(index)
         try goWire(index)
+        try cargoDependencyWire(index)
         try javaWire(index)
         try javascriptLoadWire(index)
         try typescriptSourceWire(index)

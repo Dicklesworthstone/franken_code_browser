@@ -195,7 +195,7 @@ fn unresolved_imports_are_readable_evidence_and_occupied_receivers_preserve_thei
         assert_eq!(readers.execute(reader, ReaderCommand::Info, || false).err(), Some(reader_sessions::AccessError::NotOpen));
     }
     let receipt = table.open_import_reader(handle, &readers, reader, 1, 2, AtlasImportSide::Evidence, || false).unwrap();
-    assert!(receipt.as_str().contains("\"resolution_basis\":\"unresolved-rust-use\""));
+    assert!(receipt.as_str().contains("\"resolution_basis\":\"rust-dependency-context-unavailable\""));
     assert_eq!(table.open_import_reader(handle, &readers, reader, 1, 1, AtlasImportSide::Target, || false).err(),
         Some(AccessError::Reader(reader_sessions::AccessError::AlreadyOpen)));
     let retained = readers.execute(reader, ReaderCommand::CopyRange { start: 0, end: source.len() as u64 }, || false).unwrap();

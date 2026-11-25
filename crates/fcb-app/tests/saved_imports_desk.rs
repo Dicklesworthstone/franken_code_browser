@@ -171,3 +171,63 @@ fn corrupt_target_cannot_replace_the_exact_retained_import_evidence() {
     assert_eq!(saved.import_generation(), Some(1));
 }
 
+
+#[test]
+fn rust_path_dependency_candidates_keep_original_utf16_evidence_and_detached_desk_history() {
+    for big in [false, true] {
+        let raw = utf16("// \u{1f600}\r\nuse worker_alias::task::Task;\r\n", big);
+        let expected = utf16("use worker_alias::task::Task;", big);
+        let importer_manifest = b"[package]\nname = \"app\"\nversion = \"0.1.0\"\n\
+[dependencies]\nworker_alias = { path = \"../worker\", package = \"worker-package\" }\n";
+        let target_manifest = b"[package]\nname = \"worker-package\"\nversion = \"0.1.0\"\n";
+        let target = b"pub struct Task;\n";
+        let f = Fixture::new(&[
+            entry(b"app/Cargo.toml", importer_manifest),
+            entry(b"app/src/main.rs", &raw),
+            entry(b"worker/Cargo.toml", target_manifest),
+            entry(b"worker/src/lib.rs", b"pub mod task;\n"),
+            entry(b"worker/src/task.rs", target),
+        ], true);
+        let mut saved = f.open(57510 + u64::from(big));
+        let mut d = desk();
+        prepare(&mut saved);
+
+        let evidence = saved.open_import_desk(
+            &mut d, 0, 1, 1, 1, Side::Evidence, || false,
+        ).unwrap();
+        let pane = evidence.imported.change.active.unwrap();
+        assert_eq!(evidence.member(), 1);
+        assert_eq!(evidence.selection().unwrap().start().get(), 16);
+        assert_eq!(d.model().selected_bytes(pane, 1).unwrap(), &expected[2..]);
+        assert_eq!(d.model().source(pane, 1).unwrap().bytes(), raw);
+
+        let opened = saved.open_import_desk(
+            &mut d, 1, 2, 1, 1, Side::Target, || false,
+        ).unwrap();
+        assert_eq!(opened.member(), 4);
+        assert_eq!(opened.selection(), None);
+        assert_eq!(
+            d.model().source(opened.imported.change.active.unwrap(), 2).unwrap().bytes(),
+            target,
+        );
+        let receipt = json(&saved.desk_open_response(&d, &opened).unwrap());
+        assert_eq!(receipt.get("import_side").text(), "target");
+        assert!(!receipt.get("live_source_reopened").flag());
+
+        saved.clear_imports(2, || false).unwrap();
+        drop(saved);
+        fs::rename(&f.path, f.root.join("retired.fcbs")).unwrap();
+        d.apply(2, 3, DeskCommand::Back, || false).unwrap();
+        assert_eq!(
+            d.model().selected_bytes(d.model().active().unwrap(), 3).unwrap(),
+            &expected[2..],
+        );
+        d.apply(3, 4, DeskCommand::Forward, || false).unwrap();
+        assert_eq!(
+            d.model().source(d.model().active().unwrap(), 4).unwrap().bytes(),
+            target,
+        );
+        assert_eq!(d.model().retained_source_count(), 2);
+        assert!(!f.root.join("worker/src/task.rs").exists());
+    }
+}

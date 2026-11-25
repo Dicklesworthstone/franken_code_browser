@@ -1851,12 +1851,39 @@ delimiters. Malformed/unbalanced scopes or exhausted context limits preserve
 lexical evidence without granting a guessed target. These rules serve Project
 Imports, Saved Repository Imports and the saved-import Reading Desk commands.
 
-Root inference uses the nearest conventional `lib.rs` or `main.rs`, with bounded
-ancestor and path-component traversal. It stops at automatic-target boundaries
-such as `src/bin`, `tests`, `examples` and `benches`. Bare/external imports,
-unknown roots, unsupported module spellings and exhausted limits retain readable
-evidence without a guessed target. Custom Cargo layouts, conditional compilation,
-and re-exports require stronger evidence than this policy provides.
+Qualified local-path root inference uses the nearest conventional `lib.rs` or `main.rs`,
+with bounded ancestor and path-component traversal. It stops at automatic-target
+boundaries such as `src/bin`, `tests`, `examples` and `benches`. Unknown roots,
+unsupported module spellings and exhausted limits retain readable evidence
+without a guessed target.
+
+Rust imports can also cross an explicitly captured path dependency. For example,
+`use worker_alias::task::Task;` can navigate from an application to the
+unique captured `task.rs` or `task/mod.rs` in its dependency when the importing
+package's `Cargo.toml` contains:
+
+```toml
+[dependencies]
+worker_alias = { path = "../worker", package = "worker-package" }
+```
+
+The policy reads the nearest catalogued importer manifest and the dependency's
+exact `Cargo.toml` from retained bytes. It checks the declared package and
+library names, then uses the conventional `src/lib.rs` or an explicit `[lib] path`.
+Ordinary `[dependencies.alias]` tables are admitted too. Module files and
+containing-module prefixes have separate candidate labels; a root-item import
+can point to the library source without claiming the item's definition.
+Competing module files remain ambiguous. An uncaptured or unusable nested
+manifest does not fall through to an ancestor package.
+
+Include `Cargo.toml` at both ends in custom capture scopes. Each manifest is
+limited to 64 KiB of UTF-8 source and bounded nesting/path traversal, with
+at most 256 dependency aliases considered. Unsupported TOML spellings, workspace inheritance,
+registry/git dependencies, conditional/dev/build dependency selection and
+compiler bindings remain outside this finite policy. Missing metadata and
+exhausted budgets keep the original statement readable with no guessed target.
+This applies to Project Imports, Saved Repository Imports, incoming links and
+Reading Desk activation, with the same retained UTF-8/UTF-16 source evidence.
 
 A single top-level `#[path = "platform/custom.rs"] mod child;` now offers an
 explicit source-file candidate, including `pub` and `pub(crate/self/super)`
@@ -1927,8 +1954,8 @@ policy does not interpret `go.work`, `replace`, vendor trees, module caches or
 escaped path spellings, and does not run Go or fetch dependencies. Include
 `go.mod` in a custom capture scope to enable module-local destinations.
 
-Module metadata is capped at 64 KiB per lookup and shares the 32 MiB aggregate
-work allowance. Project receipts report `parsed_module_bytes` separately from
+Go and Cargo metadata are capped at 64 KiB per manifest and share the 32 MiB
+aggregate work allowance. Project receipts report `parsed_module_bytes` separately from
 `parsed_source_bytes`; both count against the parse limit. Saved-archive reads
 verify the metadata digest, count it in `member_bytes_read`, and keep combined
 source and metadata payloads within **1 MiB**. A source already using that

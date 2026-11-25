@@ -361,6 +361,16 @@ Ambiguous roots, unsupported scopes and exhausted bounds remain explicit.
 See [project import navigation](native/macos/README.md#project-import-navigation)
 for the qualified subset. Executable and physical-Mac verification remain pending.
 
+**Rust imports can cross captured path dependencies.** An explicit Cargo
+`[dependencies]` path entry connects a dependency alias to its retained
+library and module candidates. Project Imports, Saved Repository Imports and
+Reading Desk navigation use captured importer/target manifests, preserve exact
+UTF-8/UTF-16 statement evidence and keep activated sources after detachment.
+Missing metadata, competing module files and unsupported dependency selection
+remain explicit. This bounded policy does not run Cargo or claim compiler
+resolution. See [project import navigation](native/macos/README.md#project-import-navigation)
+for the supported manifest subset. Independent executable verification is pending.
+
 **TypeScript imports can navigate from emitted extensions to captured source.**
 In TypeScript and TSX files, a relative import such as `./worker.js` can open a
 unique captured `worker.ts`, `worker.tsx`, or `worker.d.ts` when the exact written

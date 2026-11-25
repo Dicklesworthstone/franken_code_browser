@@ -5,9 +5,10 @@
 //! This independent projection does not alter Markdown relationships. No step,
 //! page or activation opens working-tree source or evaluates project tooling.
 
-use fcb::search::imports::{CapturedGoModule, CapturedImports, ImportError, ImportLanguage, ImportKind,
-    ImportResolutionKind, find_go_module, go_package_source, resolve_go_import, resolve_import,
-    MAX_GO_MODULE_SOURCE_BYTES, MAX_IMPORT_SOURCE_BYTES, MAX_IMPORT_ITEMS, IMPORT_EXTRACTOR, IMPORT_POLICY};
+use fcb::search::imports::{CapturedCargoManifest, CapturedGoModule, CapturedImports, ImportError, ImportLanguage, ImportKind,
+    ImportResolutionKind, find_cargo_manifest, find_go_module, go_package_source, is_rust_dependency_import,
+    resolve_go_import, resolve_import, resolve_rust_dependency_import,
+    MAX_CARGO_MANIFEST_SOURCE_BYTES, MAX_GO_MODULE_SOURCE_BYTES, MAX_IMPORT_SOURCE_BYTES, MAX_IMPORT_ITEMS, IMPORT_EXTRACTOR, IMPORT_POLICY};
 use fcb::store::Sha256Digest;
 use super::*;
 
@@ -77,6 +78,7 @@ pub(crate) struct ImportsSnapshot {
 }
 pub(crate) struct ImportsWork {
     snapshot: ImportsSnapshot, parser_id: ResourceAllocationId, module_parser_id: ResourceAllocationId,
+    dependency_parser_id: ResourceAllocationId,
 }
 impl From<ImportError> for AtlasSearchError {
     fn from(error: ImportError) -> Self {
@@ -101,7 +103,8 @@ impl RetainedAtlasSearch {
             return Err(AtlasSearchError::InvalidLimits);
         }
         check(&mut canceled)?;
-        let [state_id, parser_id, module_parser_id] = [self.next_id()?, self.next_id()?, self.next_id()?];
+        let [state_id, parser_id, module_parser_id, dependency_parser_id] =
+            [self.next_id()?, self.next_id()?, self.next_id()?, self.next_id()?];
         let index = self.index.as_ref().ok_or(AtlasSearchError::MissingIndex)?;
         if index.generation != index_generation { return Err(AtlasSearchError::StaleIndex); }
         let capacity = index.engine.captured_files();
@@ -134,7 +137,7 @@ impl RetainedAtlasSearch {
         }
         self.validate(atlas)?; check(&mut canceled)?;
         let response = self.import_response(atlas, &snapshot, "imports-begin", &mut canceled)?;
-        self.imports_pending = Some(ImportsWork { snapshot, parser_id, module_parser_id });
+        self.imports_pending = Some(ImportsWork { snapshot, parser_id, module_parser_id, dependency_parser_id });
         Ok(response)
     }
 
@@ -311,12 +314,26 @@ impl RetainedAtlasSearch {
                 }
             } else { None }
         } else { None };
+        let cargo = if imports.facts().iter().any(is_rust_dependency_import) {
+            if let Some(location) = find_cargo_manifest(path, |candidate| find_file(atlas, candidate)) {
+                cargo_manifest(atlas, index, snapshot, location.path(), location.target,
+                    &self.budget, work.module_parser_id, canceled)?
+            } else { None }
+        } else { None };
         snapshot.scanned += 1;
         snapshot.diagnostics = snapshot.diagnostics.checked_add(imports.diagnostics() as u64).ok_or(AtlasSearchError::IdentityExhausted)?;
         snapshot.links_seen = snapshot.links_seen.checked_add(imports.links_seen()).ok_or(AtlasSearchError::IdentityExhausted)?;
         snapshot.truncated |= imports.truncated();
         for fact in imports.facts() {
             check(canceled)?;
+            let dependency = if is_rust_dependency_import(fact) {
+                if let Some(location) = cargo.as_ref().and_then(|manifest| manifest.dependency(path, fact)) {
+                    if let Some(file) = find_file(atlas, location.path()) {
+                        cargo_manifest(atlas, index, snapshot, location.path(), file,
+                            &self.budget, work.dependency_parser_id, canceled)?
+                    } else { None }
+                } else { None }
+            } else { None };
             let mut lookup_canceled = false;
             let resolved = if language == ImportLanguage::Go {
                 resolve_go_import(path, fact, module.as_ref(), |candidate| find_file(atlas, candidate).is_some(),
@@ -331,6 +348,9 @@ impl RetainedAtlasSearch {
                         }
                         None
                     })
+            } else if is_rust_dependency_import(fact) {
+                resolve_rust_dependency_import(path, fact, cargo.as_ref(), dependency.as_ref(),
+                    |candidate| find_file(atlas, candidate))
             } else { resolve_import(path, fact, |candidate| find_file(atlas, candidate)) };
             if lookup_canceled { return Err(AtlasSearchError::Canceled); }
             let (resolution, target_file) = match resolved.kind {
@@ -360,6 +380,25 @@ impl RetainedAtlasSearch {
         Ok(())
     }
 }
+#[allow(clippy::too_many_arguments)]
+fn cargo_manifest(atlas: &AtlasSession, index: &RetainedIndex, snapshot: &mut ImportsSnapshot,
+    path: &[u8], file: FileId, budget: &ResourceBudget, allocation: ResourceAllocationId,
+    canceled: &mut impl FnMut() -> bool) -> Result<Option<CapturedCargoManifest>, AtlasSearchError> {
+    check(canceled)?;
+    let Some(metadata) = index.engine.capture(file).filter(|capture|
+        capture.bytes().len() <= MAX_CARGO_MANIFEST_SOURCE_BYTES
+            && capture.bytes().len() as u64 <= snapshot.max_parse_bytes
+                .saturating_sub(snapshot.parsed_bytes + snapshot.module_bytes)) else { return Ok(None); };
+    snapshot.module_bytes += metadata.bytes().len() as u64;
+    match CapturedCargoManifest::build(path, metadata.bytes(), *metadata.request(), budget, allocation,
+        || canceled() || atlas.validate_active().is_err()) {
+        Ok(manifest) => Ok(Some(manifest)),
+        Err(ImportError::UnsupportedEncoding | ImportError::UnsupportedLexicalContext
+            | ImportError::InvalidEvidence | ImportError::SourceLimit) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn proof(snapshot: &mut ImportsSnapshot, index: &RetainedIndex, file: FileId,
     canceled: &mut impl FnMut() -> bool) -> Result<SourceProof, AtlasSearchError> {
     let position = match snapshot.proofs.binary_search_by_key(&file, |proof| proof.file) {

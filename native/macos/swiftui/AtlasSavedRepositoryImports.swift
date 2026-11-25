@@ -22,7 +22,7 @@ enum AtlasSavedImportWire {
               w.resolution_domain == "declared-catalog-candidates",
               w.extractor == "franken-markdown-d6fbd1d5/import-statements-v10",
               w.extraction_policy == "rust-inline-modules-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v10",
-              w.resolver == "fcb-closed-catalog-imports-v12",
+              w.resolver == "fcb-closed-catalog-imports-v13",
               !w.compiler_resolved, !w.semantic_complete else { throw AtlasSavedError.invalidResponse }
     }
 
@@ -82,6 +82,7 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
         }
     }
     var resolutionLabel: String {
+        if resolutionBasis == "rust-dependency-context-unavailable" { return "Captured Cargo path dependency context is unavailable or unsupported" }
         if resolutionBasis == "go-module-context-unavailable" { return "Captured go.mod context is unavailable or unsupported" }
         if resolutionBasis == "go-nested-module-boundary" { return "Import crosses a nested Go module; no target selected" }
         if resolutionBasis == "unresolved-java-wildcard" { return "Java on-demand import; no individual source target selected" }
@@ -98,6 +99,12 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
         if resolutionBasis == "go-module-package-file-candidate" {
             let availability = canOpenTarget ? "Captured representative Go package file" : "Representative Go package file has no captured bytes"
             return availability + "; build constraints are not evaluated"
+        }
+        if ["rust-path-dependency-file-candidate", "rust-path-dependency-prefix-candidate"].contains(resolutionBasis) {
+            let candidate = resolutionBasis == "rust-path-dependency-prefix-candidate"
+                ? "Containing module in Cargo path dependency" : "Cargo path dependency source candidate"
+            return candidate + (canOpenTarget ? " captured" : " recorded without source bytes")
+                + "; compiler resolution is not evaluated"
         }
         let modulePrefix = resolutionBasis == "rust-use-module-prefix-candidate"
         switch resolution {
@@ -156,6 +163,7 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
               ["captured", "unavailable", "missing", "ambiguous", "external", "unresolved"].contains(resolution),
               ["exact-relative-path", "unique-relative-module-candidate", "typescript-source-extension-candidate", "rust-path-attribute-candidate", "rust-include-file-candidate", "rust-module-file-candidate",
                "rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "rust-use-inline-module-candidate", "ambiguous-rust-crate-root",
+               "rust-path-dependency-file-candidate", "rust-path-dependency-prefix-candidate", "rust-dependency-context-unavailable",
                "python-relative-module-candidate", "python-absolute-module-candidate", "cpp-source-relative-include-candidate",
                "go-module-package-file-candidate", "go-module-context-unavailable", "go-nested-module-boundary",
                "java-source-file-candidate", "java-enclosing-type-candidate", "unresolved-java-wildcard",
@@ -174,7 +182,8 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
         if kind == "rust-path-module" && !["rust-path-attribute-candidate", "no-catalog-target", "unsupported-specifier"].contains(resolutionBasis) {
             throw AtlasSavedError.invalidResponse
         }
-        if ["rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "rust-use-inline-module-candidate", "ambiguous-rust-crate-root"]
+        if ["rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "rust-use-inline-module-candidate", "ambiguous-rust-crate-root",
+            "rust-path-dependency-file-candidate", "rust-path-dependency-prefix-candidate", "rust-dependency-context-unavailable"]
             .contains(resolutionBasis) && (language != "rust" || kind != "rust-use") {
             throw AtlasSavedError.invalidResponse
         }
@@ -222,13 +231,14 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
         switch resolution {
         case "captured", "unavailable": acceptedBases = ["exact-relative-path", "unique-relative-module-candidate", "typescript-source-extension-candidate",
             "rust-path-attribute-candidate", "rust-include-file-candidate", "rust-module-file-candidate", "rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "rust-use-inline-module-candidate",
+            "rust-path-dependency-file-candidate", "rust-path-dependency-prefix-candidate",
             "python-relative-module-candidate", "python-absolute-module-candidate",
             "cpp-source-relative-include-candidate", "go-module-package-file-candidate",
             "java-source-file-candidate", "java-enclosing-type-candidate"]
         case "missing": acceptedBases = ["no-catalog-target"]
         case "ambiguous": acceptedBases = ["ambiguous-catalog-target", "ambiguous-rust-crate-root"]
         case "external": acceptedBases = ["external-specifier"]
-        default: acceptedBases = ["unsupported-specifier", "unresolved-rust-use", "unresolved-cpp-include",
+        default: acceptedBases = ["unsupported-specifier", "unresolved-rust-use", "unresolved-cpp-include", "rust-dependency-context-unavailable",
             "go-module-context-unavailable", "go-nested-module-boundary", "unresolved-java-wildcard"]
         }
         guard acceptedBases.contains(resolutionBasis) else { throw AtlasSavedError.invalidResponse }
@@ -326,8 +336,10 @@ struct AtlasSavedImports: Sendable {
                   w.matching_links.value <= w.retained_links.value, w.retained_source_payload_bytes.value == 0,
                   w.member_bytes_read.value <= w.max_source_bytes.value,
                   w.peak_source_bytes.value <= min(w.member_bytes_read.value, AtlasSavedImportWire.maximumMemberBytes),
-                  // Each scanned Go source may verify one captured go.mod as well.
-                  w.member_read_calls.value <= (2 * scanned + unsupported) * AtlasSavedImportWire.maximumMemberReadCalls,
+                  // Each scanned source may verify its module manifest; each
+                  // retained Rust use may additionally verify one dependency manifest.
+                  w.member_read_calls.value <= (2 * scanned + w.retained_links.value + unsupported)
+                    * AtlasSavedImportWire.maximumMemberReadCalls,
                   w.imports_complete == (identity.discoveryComplete && scanned == sources && diagnostic == 0 && !w.truncated),
                   start <= w.matching_links.value,
                   UInt64(w.links.count) <= min(limit, w.matching_links.value - start),

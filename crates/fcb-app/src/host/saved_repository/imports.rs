@@ -9,9 +9,10 @@
 
 use std::mem::size_of;
 use fcb::ByteRange;
-use fcb::search::{CaptureRequest, imports::{CapturedGoModule, CapturedImports, ImportError, ImportKind,
-    ImportLanguage, ImportResolutionKind, find_go_module, go_package_source, resolve_go_import, resolve_import,
-    IMPORT_EXTRACTOR, IMPORT_POLICY, MAX_GO_MODULE_SOURCE_BYTES, MAX_IMPORT_ITEMS, MAX_IMPORT_SOURCE_BYTES}};
+use fcb::search::{CaptureRequest, imports::{CapturedCargoManifest, CapturedGoModule, CapturedImports, ImportError, ImportKind,
+    ImportLanguage, ImportResolutionKind, find_cargo_manifest, find_go_module, go_package_source, is_rust_dependency_import,
+    resolve_go_import, resolve_import, resolve_rust_dependency_import,
+    IMPORT_EXTRACTOR, IMPORT_POLICY, MAX_CARGO_MANIFEST_SOURCE_BYTES, MAX_GO_MODULE_SOURCE_BYTES, MAX_IMPORT_ITEMS, MAX_IMPORT_SOURCE_BYTES}};
 use super::{ArenaOwnerId, AppError, ByteLength, FileId, HostResponse, Output, OutputError,
     PagedCapture, PagedMemberData, PagedSearchError, QueryGeneration, RawPath,
     ReaderSession, ReaderSessionError, ResourceLease, SavedRepositoryError,
@@ -200,6 +201,14 @@ impl SavedRepositorySession {
                     Err(error) => return Err(error.into()),
                 }
             } else { None };
+            let cargo_location = if imports.facts().iter().any(is_rust_dependency_import) {
+                let path = self.archive.directory().member(ordinal).ok_or(SavedImportError::MissingImport)?.path;
+                find_cargo_manifest(path, |candidate| self.archive.directory().find_path(candidate))
+            } else { None };
+            let cargo = if let Some(location) = &cargo_location {
+                self.cargo_import_manifest(location.path(), location.target, length,
+                    &mut admitted_bytes, &mut candidate, &mut canceled)?
+            } else { None };
             candidate.scanned += 1;
             if imports.diagnostics() > 0 { candidate.diagnostic_sources += 1; }
             candidate.diagnostics = candidate.diagnostics.checked_add(imports.diagnostics() as u64)
@@ -209,6 +218,17 @@ impl SavedRepositorySession {
             candidate.truncated |= imports.truncated();
             for fact in imports.facts() {
                 check(&mut canceled)?;
+                let dependency_location = if is_rust_dependency_import(fact) {
+                    let path = self.archive.directory().member(ordinal).ok_or(SavedImportError::MissingImport)?.path;
+                    cargo.as_ref().and_then(|manifest| manifest.dependency(path, fact))
+                } else { None };
+                let dependency = if let Some(location) = &dependency_location {
+                    if let Some(member) = self.archive.directory().find_path(location.path()) {
+                        let retained_bytes = length + cargo.as_ref().map_or(0, CapturedCargoManifest::source_len);
+                        self.cargo_import_manifest(location.path(), member, retained_bytes,
+                            &mut admitted_bytes, &mut candidate, &mut canceled)?
+                    } else { None }
+                } else { None };
                 let [text_id] = self.allocations()?;
                 let text_charge = fact.destination().len().checked_add(128).ok_or(AppError::Admission)?;
                 let text_lease = self.budget.try_reserve_managed(owner, text_id, ByteLength::new(text_charge as u64))
@@ -232,6 +252,9 @@ impl SavedRepositorySession {
                             }
                             None
                         })
+                } else if is_rust_dependency_import(fact) {
+                    resolve_rust_dependency_import(path, fact, cargo.as_ref(), dependency.as_ref(),
+                        |candidate| self.archive.directory().find_path(candidate))
                 } else { resolve_import(path, fact, |candidate| self.archive.directory().find_path(candidate)) };
                 if lookup_canceled { return Err(ImportError::Canceled.into()); }
                 let (resolution, target_member, target) = match resolved.kind {
@@ -264,6 +287,36 @@ impl SavedRepositorySession {
         let response = self.finish(out, !candidate.complete, &mut canceled)?;
         self.imports = Some(candidate);
         Ok(response)
+    }
+
+    /// Verify only captured Cargo metadata. The parsed manifest owns its bounded
+    /// bytes, so its temporary archive pages can be released before loading a
+    /// dependency manifest; both retained manifests still hold budget leases.
+    fn cargo_import_manifest(&mut self, path: &[u8], ordinal: usize, retained_source_bytes: usize,
+        admitted_bytes: &mut u64, index: &mut AcceptedImports, canceled: &mut impl FnMut() -> bool)
+        -> Result<Option<CapturedCargoManifest>, SavedImportError> {
+        check(canceled)?;
+        let member = self.archive.directory().member(ordinal).ok_or(SavedImportError::MissingImport)?;
+        if member.path != path { return Err(SavedImportError::MissingImport); }
+        let PagedMemberData::Captured { byte_length, digest, .. } = member.data else { return Ok(None); };
+        if byte_length > MAX_CARGO_MANIFEST_SOURCE_BYTES
+            || byte_length > MAX_IMPORT_SOURCE_BYTES.saturating_sub(retained_source_bytes)
+            || byte_length as u64 > index.max_source_bytes.saturating_sub(*admitted_bytes) {
+            return Ok(None);
+        }
+        let proof = source_proof(self.owner(), ordinal, digest, byte_length as u64)?;
+        let [load_id, pin_id, parser_id] = self.allocations()?;
+        *admitted_bytes += byte_length as u64;
+        let metadata = PagedCapture::load(&mut self.archive, ordinal, proof.file, proof.revision,
+            &self.budget, [load_id, pin_id], &mut *canceled)?;
+        index.peak_source_bytes = index.peak_source_bytes.max((retained_source_bytes + byte_length) as u64);
+        let request = CaptureRequest::new(proof.file, proof.revision).map_err(|_| AppError::InvalidRange)?;
+        match CapturedCargoManifest::build(path, metadata.bytes(), request, &self.budget, parser_id, &mut *canceled) {
+            Ok(manifest) => Ok(Some(manifest)),
+            Err(ImportError::UnsupportedEncoding | ImportError::UnsupportedLexicalContext
+                | ImportError::InvalidEvidence | ImportError::SourceLimit) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Metadata-only filtering and pagination. Occurrence IDs do not change
@@ -467,7 +520,7 @@ impl SavedRepositorySession {
 fn contract(out: &mut Output) -> Result<(), SavedImportError> {
     out.literal(",\"projection\":\"lexical-source-imports\",\"relationship_kind\":\"lexical-import\",\"evidence_precision\":\"exact-import-source-range\",\"resolution_domain\":\"declared-catalog-candidates\",\"compiler_resolved\":false,\"semantic_complete\":false,\"extractor\":")?;
     out.quoted(IMPORT_EXTRACTOR)?;
-    out.literal(",\"resolver\":\"fcb-closed-catalog-imports-v12\",\"extraction_policy\":")?; out.quoted(IMPORT_POLICY)?;
+    out.literal(",\"resolver\":\"fcb-closed-catalog-imports-v13\",\"extraction_policy\":")?; out.quoted(IMPORT_POLICY)?;
     Ok(())
 }
 fn import_attempt(last: &mut u64, next: u64) -> Result<(), SavedImportError> {

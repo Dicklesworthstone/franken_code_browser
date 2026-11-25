@@ -64,7 +64,7 @@ fn c_imports_open_exact_statement_and_target_from_frozen_captures() {
     assert_eq!(incoming.matches("\"link_id\":").count(), 1);
     assert!(incoming.contains("\"lexical_import_kind\":\"rust-use\""), "{incoming}");
     assert!(incoming.contains("\"resolution_basis\":\"rust-use-module-prefix-candidate\""));
-    assert!(incoming.contains("\"resolver\":\"fcb-closed-catalog-imports-v12\""));
+    assert!(incoming.contains("\"resolver\":\"fcb-closed-catalog-imports-v13\""));
     assert!(incoming.contains("\"source_bytes_read\":\"0\""));
     let id = number(&incoming, "link_id");
     fs::write(root.join("src/lib.rs"), b"mod changed;\n").unwrap();

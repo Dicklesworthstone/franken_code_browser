@@ -143,7 +143,7 @@ struct AtlasProjectImportEvidence: Equatable, Sendable {
               try w.text("relationship_kind") == "lexical-import",
               try w.text("evidence_precision") == "exact-import-source-range",
               try w.text("extractor") == "franken-markdown-d6fbd1d5/import-statements-v10",
-              try w.text("resolver") == "fcb-closed-catalog-imports-v12",
+              try w.text("resolver") == "fcb-closed-catalog-imports-v13",
               try w.text("extraction_policy") == "rust-inline-modules-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v10",
               try !w.flag("compiler_resolved"), try !w.flag("semantic_complete") else {
             throw AtlasProjectLinksError.invalidResponse
@@ -166,6 +166,7 @@ struct AtlasProjectImportEvidence: Equatable, Sendable {
         guard kinds.contains(kind),
               ["exact-relative-path", "unique-relative-module-candidate", "typescript-source-extension-candidate", "rust-path-attribute-candidate", "rust-include-file-candidate", "rust-module-file-candidate",
                "rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "rust-use-inline-module-candidate", "ambiguous-rust-crate-root",
+               "rust-path-dependency-file-candidate", "rust-path-dependency-prefix-candidate", "rust-dependency-context-unavailable",
                "python-relative-module-candidate", "python-absolute-module-candidate", "cpp-source-relative-include-candidate",
                "go-module-package-file-candidate", "go-module-context-unavailable", "go-nested-module-boundary",
                "java-source-file-candidate", "java-enclosing-type-candidate", "unresolved-java-wildcard",
@@ -184,7 +185,8 @@ struct AtlasProjectImportEvidence: Equatable, Sendable {
         if kind == "rust-path-module" && !["rust-path-attribute-candidate", "no-catalog-target", "unsupported-specifier"].contains(resolutionBasis) {
             throw AtlasProjectLinksError.invalidResponse
         }
-        if ["rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "rust-use-inline-module-candidate", "ambiguous-rust-crate-root"]
+        if ["rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "rust-use-inline-module-candidate", "ambiguous-rust-crate-root",
+            "rust-path-dependency-file-candidate", "rust-path-dependency-prefix-candidate", "rust-dependency-context-unavailable"]
             .contains(resolutionBasis) && (language != "rust" || kind != "rust-use") {
             throw AtlasProjectLinksError.invalidResponse
         }
@@ -271,12 +273,14 @@ struct AtlasProjectLink: Identifiable, Sendable, Equatable, Decodable {
     var label: String {
         let status: String
         if let basis = importEvidence?.resolutionBasis {
+            if basis == "rust-dependency-context-unavailable" { return "Captured Cargo path dependency context is unavailable or unsupported" }
             if basis == "go-module-context-unavailable" { return "Captured go.mod context is unavailable or unsupported" }
             if basis == "go-nested-module-boundary" { return "Import crosses a nested Go module; no target selected" }
             if basis == "unresolved-java-wildcard" { return "Java on-demand import; no individual source target selected" }
             if basis == "rust-use-inline-module-candidate" { return "Captured source containing the inline module; module position is not identified" }
         }
         let modulePrefix = importEvidence?.resolutionBasis == "rust-use-module-prefix-candidate"
+            || importEvidence?.resolutionBasis == "rust-path-dependency-prefix-candidate"
         switch resolution {
         case "captured": status = modulePrefix ? "Captured containing-module candidate"
             : (projection == .imports ? "Captured catalog target candidate" : "Exact target capture available")
@@ -291,6 +295,10 @@ struct AtlasProjectLink: Identifiable, Sendable, Equatable, Decodable {
             : "Several catalog targets are possible; no target was selected"
         case "external": status = projection == .imports ? "External specifier; no package resolution or network content" : "External destination; no network content was fetched"
         default: status = projection == .imports ? "No supported catalog target was established" : "Destination could not be resolved within the project"
+        }
+        if let basis = importEvidence?.resolutionBasis,
+           ["rust-path-dependency-file-candidate", "rust-path-dependency-prefix-candidate"].contains(basis) {
+            return status + " · captured Cargo path dependency; compiler resolution is not evaluated"
         }
         if importEvidence?.resolutionBasis == "go-module-package-file-candidate" {
             return status + " · representative Go package file; build constraints are not evaluated"
@@ -380,14 +388,15 @@ struct AtlasProjectLink: Identifiable, Sendable, Equatable, Decodable {
             switch resolution {
             case "captured", "unavailable", "uncaptured", "outside-capture-scope":
                 allowed = ["exact-relative-path", "unique-relative-module-candidate", "typescript-source-extension-candidate", "rust-path-attribute-candidate", "rust-include-file-candidate", "rust-module-file-candidate",
-                    "rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "rust-use-inline-module-candidate", "python-relative-module-candidate",
+                    "rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "rust-use-inline-module-candidate",
+                    "rust-path-dependency-file-candidate", "rust-path-dependency-prefix-candidate", "python-relative-module-candidate",
                     "python-absolute-module-candidate",
                     "cpp-source-relative-include-candidate", "go-module-package-file-candidate",
                     "java-source-file-candidate", "java-enclosing-type-candidate"]
             case "missing": allowed = ["no-catalog-target"]
             case "ambiguous": allowed = ["ambiguous-catalog-target", "ambiguous-rust-crate-root"]
             case "external": allowed = ["external-specifier"]
-            default: allowed = ["unresolved-rust-use", "unresolved-cpp-include", "unsupported-specifier",
+            default: allowed = ["unresolved-rust-use", "unresolved-cpp-include", "unsupported-specifier", "rust-dependency-context-unavailable",
                 "go-module-context-unavailable", "go-nested-module-boundary", "unresolved-java-wildcard"]
             }
             guard allowed.contains(importEvidence.resolutionBasis) else { throw AtlasProjectLinksError.invalidResponse }
@@ -465,7 +474,9 @@ struct AtlasProjectLinksCoverage: Equatable, Sendable {
               examined == scanned + unsupported + sourceLimited, captured == examined + pending,
               retained <= 4096, retained <= linksSeen, steps <= 4097, lastStepFiles <= 1,
               moduleBytes <= 32 * 1024 * 1024, parseBytes <= 32 * 1024 * 1024 - moduleBytes,
-              moduleBytes <= UInt64(scanned) * 65_536,
+              // One importer manifest per source and one dependency manifest per
+              // observed use; the global 32 MiB cap bounds repeated metadata work.
+              moduleBytes <= (UInt64(scanned) + min(linksSeen, 4096)) * 65_536,
               parseBytes <= basis.sourceBytes, hashedBytes <= basis.sourceBytes,
               captureRegionComplete == (basis.captureScope.visibleMissingFiles == 0),
               discoveryComplete == basis.discoveryComplete, building == (stop == nil),

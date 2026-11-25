@@ -64,7 +64,7 @@ private final class SavedImportFixture: @unchecked Sendable {
          "evidence_precision": "exact-import-source-range", "resolution_domain": "declared-catalog-candidates",
          "compiler_resolved": false, "semantic_complete": false,
          "extractor": "franken-markdown-d6fbd1d5/import-statements-v10",
-         "extraction_policy": "rust-inline-modules-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v10", "resolver": "fcb-closed-catalog-imports-v12"]
+         "extraction_policy": "rust-inline-modules-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v10", "resolver": "fcb-closed-catalog-imports-v13"]
     }
     func link(_ id: UInt64) -> [String: Any] {
         let target = base.members[id == 1 ? 3 : 4]
@@ -407,6 +407,53 @@ private final class SavedImportFixture: @unchecked Sendable {
         }
     }
 
+    private static func cargoDependencyWire(_ f: SavedImportFixture, identity: AtlasSavedIdentity) throws {
+        let decode: ([String: Any]) throws -> AtlasSavedImports = {
+            try AtlasSavedImports.decode(f.base.encode($0), identity: identity, generation: 1,
+                direction: .all, member: nil, start: 0, limit: 64)
+        }
+        for basis in ["rust-path-dependency-file-candidate", "rust-path-dependency-prefix-candidate"] {
+            var value = f.page(identity.owner, generation: 1)
+            // The verified source, importer and per-use target manifests can
+            // require more reads than the former source + go.mod ceiling.
+            value["member_read_calls"] = String(3 * AtlasSavedImportWire.maximumMemberReadCalls)
+            var rows = value["links"] as! [[String: Any]]
+            for i in rows.indices {
+                rows[i]["language"] = "rust"; rows[i]["lexical_import_kind"] = "rust-use"
+                rows[i]["destination"] = "dep_alias::model::Thing"; rows[i]["resolution_basis"] = basis
+                rows[i]["source_path"] = f.base.path(Array("app/src/main.rs".utf8), "app/src/main.rs")
+                rows[i]["target_path"] = f.base.path(Array("dep/src/model.rs".utf8), "dep/src/model.rs")
+            }
+            value["links"] = rows
+            let page = try decode(value)
+            precondition(page.links[0].canOpenTarget && !page.links[1].canOpenTarget
+                && page.links[0].resolutionLabel.contains("Cargo path dependency")
+                && page.links[0].resolutionLabel.contains("compiler resolution is not evaluated"))
+            for (key, wrong) in [("language", "go"), ("lexical_import_kind", "rust-module"),
+                ("resolution", "external"), ("resolution_basis", "rust-dependency-context-unavailable")] {
+                var bad = value, changed = rows
+                changed[0][key] = wrong; bad["links"] = changed; reject { _ = try decode(bad) }
+            }
+            var old = value; old["resolver"] = "fcb-closed-catalog-imports-v12"; reject { _ = try decode(old) }
+            var excess = value
+            excess["member_read_calls"] = String(4 * AtlasSavedImportWire.maximumMemberReadCalls + 1)
+            reject { _ = try decode(excess) }
+            var unresolved = value, changed = rows
+            for i in changed.indices {
+                changed[i]["resolution"] = "unresolved"; changed[i]["resolution_basis"] = "rust-dependency-context-unavailable"
+                for key in ["target_member", "target_file_id", "target_revision", "target_digest", "target_path", "target_bytes"] {
+                    changed[i][key] = NSNull()
+                }
+            }
+            unresolved["links"] = changed
+            let edge = try decode(unresolved).links[0]
+            precondition(!edge.canOpenTarget && edge.resolutionLabel.contains("Cargo path dependency context"))
+            changed[0]["target_member"] = "3"; changed[0]["target_file_id"] = "4"
+            changed[0]["target_path"] = f.base.path(Array("dep/src/model.rs".utf8), "dep/src/model.rs")
+            unresolved["links"] = changed; reject { _ = try decode(unresolved) }
+        }
+    }
+
     private static func goWire(_ f: SavedImportFixture, identity: AtlasSavedIdentity) throws {
         let decode: ([String: Any]) throws -> AtlasSavedImports = {
             try AtlasSavedImports.decode(f.base.encode($0), identity: identity, generation: 1,
@@ -736,6 +783,7 @@ private final class SavedImportFixture: @unchecked Sendable {
         try typescriptSourceWire(f, identity: identity)
         try rustPathModuleWire(f, identity: identity)
         try goWire(f, identity: identity)
+        try cargoDependencyWire(f, identity: identity)
         try javaWire(f, identity: identity)
         try pythonAbsoluteWire(f, identity: identity)
         try javascriptLoadWire(f, identity: identity)

@@ -1306,8 +1306,8 @@ Use these commands with the returned token and import generation:
 | `saved-import-target TOKEN IMPORT_GEN LINK_ID` | Import a captured target at byte zero. |
 | `saved-imports-clear TOKEN NEW_IMPORT_GEN` | Discard the projection while retaining activated Desk sources. |
 
-The projection reuses the shared Rust, JavaScript/TypeScript/JSX/TSX and Python
-extractor and closed-manifest resolver. Each occurrence retains its original
+The projection reuses the shared Rust, JavaScript/TypeScript/JSX/TSX, Python,
+C/C++, Go and Java extractors and the closed-catalog resolver. Each occurrence retains its original
 statement and specifier byte ranges, source digest, language, extraction policy
 and explicit resolution outcome. Python relative imports consider the finite
 `.py` and `/__init__.py` candidates. Absolute imports check those filenames under
@@ -1319,6 +1319,24 @@ not Python runtime binding or imported-member resolution.
 These are lexical relationships with `compiler_resolved: false` and
 `semantic_complete: false`. They do not inspect a runtime import path, execute
 project code, install dependencies, or fetch external packages.
+
+Rust path dependencies participate in these same commands when the archive
+contains the importing package's and target package's `Cargo.toml` captures.
+Ordinary explicit `[dependencies]` path entries and `[dependencies.alias]`
+tables can map dependency aliases to a library's `src/lib.rs` or declared
+`[lib] path`. The resolver checks package/library names and only admits a
+unique catalogued module file or containing-module candidate. A statement such
+as `use worker_alias::task::Task;` can therefore open the captured dependency's
+`task.rs`, and the activated reader survives closing the archive.
+
+Each Cargo manifest is bounded to 64 KiB of UTF-8, with at most 256 dependency
+aliases considered. Source and metadata work share the aggregate parse allowance;
+saved source and simultaneously retained metadata share the 1 MiB payload
+allowance. The nearest uncaptured, invalid or over-budget manifest leaves
+explicit unresolved evidence. Workspace-inherited, conditional, dev/build,
+registry and git dependencies are not inferred. These candidates do not
+establish compiler binding or an imported item's definition. Import pages
+continue to read only retained result metadata.
 
 Preparation verifies at most one eligible source at a time. `MAX_LINKS` is
 1..4096, aggregate source allowance is 0..33554432 bytes, and a source larger
@@ -1753,9 +1771,9 @@ path; saved activation re-verifies the opened archive member and never opens
 the corresponding live path.
 
 The 4,096-fact cap, 1,024-byte destination cap, 32 MiB aggregate parse allowance
-and caller resource budgets still apply. Go module metadata remains limited
-to 64 KiB; a saved source plus its simultaneously loaded module must fit the
-1 MiB combined payload allowance. Limits, unavailable captures, diagnostics
+and caller resource budgets still apply. Go and Cargo metadata remain limited
+to 64 KiB per manifest; a saved source plus its simultaneously retained metadata
+must fit the 1 MiB combined payload allowance. Limits, unavailable captures, diagnostics
 and unresolved targets remain explicit in coverage receipts. These lexical
 relationships do not establish compiler resolution.
 

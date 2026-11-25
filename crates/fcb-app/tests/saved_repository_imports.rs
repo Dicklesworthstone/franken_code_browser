@@ -44,6 +44,109 @@ fn utf16(text: &str, big: bool) -> Vec<u8> {
 }
 
 
+
+#[test]
+fn saved_cargo_dependencies_keep_utf16_evidence_raw_paths_and_independent_readers() {
+    let manifest = b"[package]\nname = \"app\"\n[dependencies.dep_alias]\npackage = \"real-dep\"\npath = \"../dep\"\n";
+    let dependency = b"[package]\nname = \"real-dep\"\n[lib]\npath = \"code/root.rs\"\n";
+    let statement = "use dep_alias::model::Thing;";
+    let target = b"pub struct Thing;\n";
+    let root = b"pub struct Root;\n";
+    for big in [false, true] {
+        let source = utf16(&format!("// \u{1f980} saved dependency\r\nuse dep_alias::model;\r\n{statement}\r\n"), big);
+        let f = Fixture::new(&[entry(b"workspace/\xff/app/Cargo.toml", manifest),
+            entry(b"workspace/\xff/app/src/main.rs", &source), entry(b"workspace/\xff/dep/Cargo.toml", dependency),
+            entry(b"workspace/\xff/dep/code/root.rs", root), entry(b"workspace/\xff/dep/code/model.rs", target)], true);
+        let mut saved = f.open(58240 + u64::from(big) * 10);
+        let page = prepare(&mut saved, 1);
+        assert!(page.get("imports_complete").flag());
+        assert_eq!(page.get("member_bytes_read").number(),
+            (source.len() + manifest.len() + 2 * dependency.len() + root.len() + target.len()) as u64);
+        assert_eq!(page.get("peak_source_bytes").number(), (source.len() + manifest.len() + dependency.len()) as u64);
+        let row = link(&page, b"workspace/\xff/app/src/main.rs", "dep_alias::model::Thing");
+        assert_eq!(row.get("resolution").text(), "captured");
+        assert_eq!(row.get("resolution_basis").text(), "rust-path-dependency-prefix-candidate");
+        assert_eq!(row.get("target_path").get("hex").text(), hex(b"workspace/\xff/dep/code/model.rs"));
+        assert_eq!(range(&source, row.get("evidence_range")), &utf16(statement, big)[2..]);
+        assert_eq!(range(&source, row.get("specifier_range")), &utf16("dep_alias::model::Thing", big)[2..]);
+        assert_eq!(link(&page, b"workspace/\xff/app/src/main.rs", "dep_alias::model").get("resolution_basis").text(),
+            "rust-path-dependency-file-candidate");
+        let before = reads(&mut saved);
+        let incoming = json(&saved.import_page(1, Some(row.get("target_member").number().try_into().unwrap()),
+            Direction::Incoming, 0, 64, || false).unwrap());
+        assert_eq!(incoming.get("matching_links").number(), 2);
+        assert_eq!(reads(&mut saved), before);
+        let id = row.get("link_id").number();
+        let (mut evidence, receipt) = saved.open_import_reader(owner(58241 + u64::from(big) * 10),
+            1, id, Side::Evidence, || false).unwrap();
+        assert_eq!(json(&receipt).get("selection"), row.get("evidence_range"));
+        let (mut reader, receipt) = saved.open_import_reader(owner(58242 + u64::from(big) * 10),
+            1, id, Side::Target, || false).unwrap();
+        assert_eq!(json(&receipt).get("source_digest").text(), Sha256::digest(target).to_hex());
+        assert!(!json(&receipt).get("live_source_reopened").flag());
+        saved.clear_imports(2, || false).unwrap(); drop(saved);
+        fs::rename(&f.path, f.root.join("moved-cargo.fcbs")).unwrap();
+        assert_eq!(copy_all(&mut evidence).get("original_hex").text(), hex(&source));
+        assert_eq!(copy_all(&mut reader).get("original_hex").text(), hex(target));
+    }
+}
+
+#[test]
+fn saved_cargo_metadata_limits_and_corruption_preserve_accepted_imports() {
+    let source = b"use dep_alias::Root;\n";
+    let manifest = b"[package]\nname = \"app\"\n[dependencies]\ndep_alias = { package = \"real-dep\", path = \"../dep\" }\n";
+    let dependency = b"[package]\nname = \"real-dep\"\n";
+    let target = b"pub struct Root;\n";
+    let f = Fixture::new(&[entry(b"app/Cargo.toml", manifest), entry(b"app/src/main.rs", source),
+        entry(b"dep/Cargo.toml", dependency), entry(b"dep/src/lib.rs", target)], true);
+    let mut saved = f.open(58260);
+    let capped = json(&saved.prepare_imports(1, 64, (source.len() + manifest.len()) as u64, || false).unwrap());
+    assert_eq!(capped.get("member_bytes_read").number(), (source.len() + manifest.len()) as u64);
+    assert_eq!(capped.get("source_limited_members").number(), 1);
+    let unresolved = link(&capped, b"app/src/main.rs", "dep_alias::Root");
+    assert_eq!(unresolved.get("resolution_basis").text(), "rust-dependency-context-unavailable");
+    assert_eq!(unresolved.get("target_member"), &Json::Null);
+    let exact = json(&saved.prepare_imports(2, 64,
+        (source.len() + manifest.len() + dependency.len() + target.len()) as u64, || false).unwrap());
+    assert!(exact.get("imports_complete").flag());
+    let row = link(&exact, b"app/src/main.rs", "dep_alias::Root");
+    assert_eq!(row.get("resolution").text(), "captured");
+    let (mut retained, _) = saved.open_import_reader(owner(58261), 2, row.get("link_id").number(), Side::Target, || false).unwrap();
+    let accepted = json(&saved.import_page(2, None, Direction::All, 0, 64, || false).unwrap());
+    let at = f.bytes.windows(dependency.len()).position(|bytes| bytes == dependency).unwrap();
+    let mut writer = OpenOptions::new().write(true).open(&f.path).unwrap();
+    writer.seek(SeekFrom::Start(at as u64)).unwrap(); writer.write_all(b"X").unwrap(); writer.flush().unwrap();
+    assert!(saved.prepare_imports(3, 64, 1024, || false).is_err());
+    assert_eq!(saved.import_generation(), Some(2));
+    assert_eq!(json(&saved.import_page(2, None, Direction::All, 0, 64, || false).unwrap()), accepted);
+    assert_eq!(copy_all(&mut retained).get("original_hex").text(), hex(target));
+}
+
+#[test]
+fn saved_cargo_ambiguous_unavailable_and_missing_metadata_never_grant_target_readers() {
+    let source = b"use dep::model;\nuse absent_meta::Root;\nuse unavailable::Root;\n";
+    let manifest = b"[package]\nname = \"app\"\n[dependencies]\ndep = { path = \"../dep\" }\nabsent_meta = { path = \"../absent_meta\" }\nunavailable = { path = \"../unavailable\" }\n";
+    let f = Fixture::new(&[entry(b"app/Cargo.toml", manifest), entry(b"app/src/main.rs", source),
+        entry(b"dep/Cargo.toml", b"[package]\nname = \"dep\"\n"), entry(b"dep/src/lib.rs", b"pub struct Root;\n"),
+        entry(b"dep/src/model.rs", b"pub struct Thing;\n"), entry(b"dep/src/model/mod.rs", b"pub struct Thing;\n"),
+        SnapshotEntry { path: b"absent_meta/Cargo.toml", observed_bytes: 64, data: SnapshotData::Unavailable("READ_DENIED") },
+        entry(b"absent_meta/src/lib.rs", b"pub struct Root;\n"),
+        entry(b"unavailable/Cargo.toml", b"[package]\nname = \"unavailable\"\n"),
+        SnapshotEntry { path: b"unavailable/src/lib.rs", observed_bytes: 64, data: SnapshotData::Unavailable("READ_DENIED") }], true);
+    let mut saved = f.open(58270);
+    let page = prepare(&mut saved, 1);
+    for (destination, resolution, basis) in [
+        ("dep::model", "ambiguous", "ambiguous-catalog-target"),
+        ("absent_meta::Root", "unresolved", "rust-dependency-context-unavailable"),
+        ("unavailable::Root", "unavailable", "rust-path-dependency-prefix-candidate"),
+    ] {
+        let row = link(&page, b"app/src/main.rs", destination);
+        assert_eq!(row.get("resolution").text(), resolution);
+        assert_eq!(row.get("resolution_basis").text(), basis);
+        assert!(saved.open_import_reader(owner(58271), 1, row.get("link_id").number(), Side::Target, || false).is_err());
+    }
+}
+
 #[test]
 fn saved_inline_rust_modules_keep_exact_nested_evidence_and_offline_targets() {
     let statement = "mod outer { mod child; use self::child::Thing; mod inner { use super::child::Thing; } }";
@@ -56,7 +159,7 @@ fn saved_inline_rust_modules_keep_exact_nested_evidence_and_offline_targets() {
     assert!(page.get("imports_complete").flag());
     assert_eq!(page.get("links_seen").number(), 3);
     assert_eq!(page.get("extractor").text(), "franken-markdown-d6fbd1d5/import-statements-v10");
-    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v12");
+    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v13");
     for (destination, statement, kind, basis) in [
         ("child", "mod child;", "rust-module", "rust-module-file-candidate"),
         ("self::child::Thing", "use self::child::Thing;", "rust-use", "rust-use-module-prefix-candidate"),
@@ -424,7 +527,7 @@ fn saved_rust_use_tree_pages_preserve_leaf_identity_and_original_utf16_evidence(
         let result = prepare(&mut saved, 1);
         assert!(result.get("imports_complete").flag());
         assert_eq!(result.get("links_seen").number(), 5);
-        assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v12");
+        assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v13");
         let rows = result.get("links").array();
         for (index, (destination, spelling)) in [
             ("crate::shared", "self"), ("crate::shared::Thing", "Thing"),
@@ -507,7 +610,7 @@ fn shared_language_extractors_publish_exact_occurrences_and_metadata_only_revers
     assert_eq!(result.get("import_generation").number(), 7);
     assert_eq!(result.get("projection").text(), "lexical-source-imports");
     assert_eq!(result.get("evidence_precision").text(), "exact-import-source-range");
-    assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v12");
+    assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v13");
     assert_eq!(result.get("extraction_policy").text(), "rust-inline-modules-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v10");
     assert_eq!(result.get("completeness_scope").text(), "parsed-source-imports-in-saved-manifest");
     assert!(!result.get("compiler_resolved").flag());
@@ -585,7 +688,7 @@ fn saved_rust_root_and_module_ambiguity_keep_evidence_without_target_authority()
     let cases: &[(&[u8], &[u8], &str, &str, &str)] = &[
         (b"src/lib.rs", root, "crate::choice::Item", "ambiguous", "ambiguous-catalog-target"),
         (b"src/lib.rs", root, "crate::missing", "missing", "no-catalog-target"),
-        (b"src/lib.rs", root, "external::Thing", "unresolved", "unresolved-rust-use"),
+        (b"src/lib.rs", root, "external::Thing", "unresolved", "rust-dependency-context-unavailable"),
         (b"src/consumer.rs", consumer, "crate::choice", "ambiguous", "ambiguous-rust-crate-root"),
         (b"src/nested.rs", nested, "super::choice", "ambiguous", "ambiguous-rust-crate-root"),
         (b"src/conditional.rs", conditional, "super::choice", "unresolved", "unresolved-rust-use"),
