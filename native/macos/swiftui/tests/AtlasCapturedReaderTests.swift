@@ -15,14 +15,16 @@ private final class Calls: @unchecked Sendable {
     }
     private static func selected(path: String = "src.rs", root: String = "/repo", needle: String = "x",
                                  start: UInt64 = 10, end: UInt64 = 12, bytes: UInt64 = 20,
-                                 mode: AtlasSearchMode = .text, caseSensitive: Bool = true) -> AtlasSearchCapturedHit {
+                                 mode: AtlasSearchMode = .text, caseSensitive: Bool = true,
+                                 rawPath: [UInt8]? = nil) -> AtlasSearchCapturedHit {
         .init(root: root, path: path, needle: needle, start: start, end: end, capturedBytes: bytes,
-            openReader: { _ in "captured-info" }, mode: mode, caseSensitive: caseSensitive)
+            openReader: { _ in "captured-info" }, mode: mode, caseSensitive: caseSensitive, rawPath: rawPath)
     }
     private static func identity(owner: UInt64 = 100, revision: UInt64 = 1, bytes: UInt64 = 20,
-                                 path: String = "src.rs", encoding: String = "utf16le") -> AtlasReaderIdentity {
+                                 path: String = "src.rs", encoding: String = "utf16le",
+                                 rawPath: [UInt8]? = nil) -> AtlasReaderIdentity {
         .init(owner: owner, file: 1, revision: revision, capturedBytes: bytes,
-              pathBytes: Array(path.utf8), encoding: encoding, displayPath: "escaped label")
+              pathBytes: rawPath ?? Array(path.utf8), encoding: encoding, displayPath: "escaped label")
     }
     private static func report(identity: AtlasReaderIdentity = identity(), needle: String = "x",
                                ranges: [(UInt64, UInt64)] = [(2, 4), (10, 12)],
@@ -588,7 +590,45 @@ private final class Calls: @unchecked Sendable {
         check(reads == 0, "Late successful continuation cannot revive a canceled activation")
     }
 
+    @MainActor private static func rawPathActivation() async throws {
+        let raw: [UInt8] = [115, 114, 99, 47, 255, 46, 114, 115]
+        let label = "src/\\xff.rs"
+        let source = identity(rawPath: raw)
+        for mode in [AtlasSearchMode.text, .expression] {
+            let target = selected(path: label, mode: mode, rawPath: raw)
+            let input = try AtlasReaderInput(captured: target)
+            check(input.fullPath == label && input.capturedPathBytes == raw && target.livePath == nil,
+                "Capture dispatch keeps its label separate from exact native path evidence")
+            let opened = try await AtlasCapturedReader.activate(target, identity: source,
+                find: { _ in try report(identity: source) }, read: { $0 })
+            check(opened.target.start == 10 && opened.target.end == 12,
+                "Text and expression hits rebind to the exact raw-name source occurrence")
+        }
+        for mode in [AtlasSearchMode.headings, .symbols] {
+            let target = selected(path: label, mode: mode, rawPath: raw)
+            let request = try AtlasCapturedReader.structuralRequest(target, identity: source)
+            if case .window(let offset, _) = request { check(offset == 10, "Raw-name structural evidence keeps its range") }
+            else { preconditionFailure("Structural target lost its source window") }
+        }
+        let referenceSource = identity(encoding: "utf8", rawPath: raw)
+        let occurrence = selected(path: label, needle: "foo", start: 2, end: 5, mode: .occurrences, rawPath: raw)
+        let references = referencePage(identity: referenceSource, ranges: [(2, 5)])
+        let result = try await AtlasCapturedReader.activateOccurrence(occurrence, identity: referenceSource,
+            prepare: { _ in references }, nextPage: { _ in references }, read: { $0 })
+        check(result.target.occurrence.range.start == 2 && result.target.occurrence.range.end == 5,
+            "Whole-token activation preserves a raw filename without substring fallback")
+
+        var scans = 0
+        do {
+            _ = try await AtlasCapturedReader.activate(selected(path: label, rawPath: raw),
+                identity: identity(path: label), find: { _ in scans += 1; return try report() }, read: { $0 })
+            preconditionFailure("Escaped path substituted for raw capture identity")
+        } catch AtlasReaderError.invalidResponse { checks += 1 }
+        check(scans == 0, "Wrong native path is rejected before query or source operations")
+    }
+
     @MainActor static func main() async throws {
+        try await rawPathActivation()
         try await countedOccurrenceActivation()
         try await occurrenceActivation()
         try await pagedTextActivation()

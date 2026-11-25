@@ -47,6 +47,21 @@ struct SearchHit: Identifiable, Hashable, Sendable {
     /// Bounded presentation from this hit's retained capture. Navigation still
     /// uses the occurrence identity and original range, never this preview.
     var excerpt: AtlasSearchExcerpt? = nil
+    /// Exact Unix identity from the engine, retained even when UTF-8 decoding
+    /// fails. The escaped display path never becomes a live-open destination.
+    var rawPath: [UInt8]? = nil
+    var pathBytes: [UInt8]? {
+        guard let bytes = rawPath ?? sourcePath.map({ Array($0.utf8) }),
+              Self.validPath(bytes),
+              sourcePath.map({ bytes.elementsEqual($0.utf8) }) ?? true else { return nil }
+        return bytes
+    }
+    static func validPath(_ bytes: [UInt8]) -> Bool {
+        !bytes.isEmpty && bytes.count <= 16_384 && bytes.first != 47 && !bytes.contains(0)
+            && !bytes.split(separator: 47, omittingEmptySubsequences: false).contains(where: {
+                $0.isEmpty || $0.elementsEqual([46]) || $0.elementsEqual([46, 46])
+            })
+    }
     var fileName: String { (path as NSString).lastPathComponent }
     var folder: String { (path as NSString).deletingLastPathComponent }
 }
@@ -1220,10 +1235,13 @@ struct AtlasSearchPresentation: Sendable {
     private let context: AtlasSearchContext
     private let hits: [SearchHit.ID: SearchHit]
     private let verifiedHitIDs: Set<SearchHit.ID>
+    private let allowsRawPaths: Bool
 
-    init(context: AtlasSearchContext, hits: [SearchHit], verifiedHitIDs: Set<SearchHit.ID>, id: UUID = UUID()) {
+    init(context: AtlasSearchContext, hits: [SearchHit], verifiedHitIDs: Set<SearchHit.ID>, id: UUID = UUID(),
+         allowsRawPaths: Bool = false) {
         self.id = id
         self.context = context
+        self.allowsRawPaths = allowsRawPaths
         // The decoder emits unique indices. Fail closed rather than trapping
         // or choosing one witness if another producer supplies duplicate IDs.
         self.hits = Dictionary(grouping: hits, by: \.id).compactMapValues {
@@ -1241,7 +1259,7 @@ struct AtlasSearchPresentation: Sendable {
     func availability(for row: AtlasSearchRowID, in current: AtlasSearchContext) -> AtlasSearchHitAvailability {
         guard row.report == id, isCurrent(in: current) else { return .stale }
         guard let hit = hits[row.hit] else { return .unavailable }
-        guard hit.sourcePath != nil else { return .unsupportedPath }
+        guard hit.sourcePath != nil || (allowsRawPaths && hit.pathBytes != nil) else { return .unsupportedPath }
         guard captureCandidate(for: row, in: current) != nil else { return .unavailable }
         return verifiedHitIDs.contains(hit.id) ? .ready : .requiresVerification
     }
@@ -1280,7 +1298,8 @@ struct AtlasSearchPresentation: Sendable {
     }
 
     private func capturedHit(_ hitID: SearchHit.ID) -> SearchHit? {
-        guard let hit = hits[hitID], hit.sourcePath != nil, let digest = hit.captureSHA256,
+        guard let hit = hits[hitID], hit.pathBytes != nil,
+              hit.sourcePath != nil || allowsRawPaths, let digest = hit.captureSHA256,
               digest.utf8.count == 64,
               digest.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
               let count = hit.captureByteLength, hit.start < hit.end, hit.end <= count else { return nil }
@@ -1335,6 +1354,11 @@ struct AtlasSearchCapturedHit: Sendable {
     let openReader: @Sendable (UInt64) throws -> String
     var mode: AtlasSearchMode = .text
     var caseSensitive: Bool = true
+    /// Independent of the display label. Nil preserves legacy UTF-8 callers.
+    var rawPath: [UInt8]? = nil
+    var pathBytes: [UInt8] { rawPath ?? Array(path.utf8) }
+    /// Only this exact UTF-8 spelling may authorize a later explicit disk read.
+    var livePath: String? { String(bytes: pathBytes, encoding: .utf8) }
 }
 struct AtlasSearchCapture: Sendable {
     let retainAccess: @Sendable (AtlasSearchAccessLease) -> Void

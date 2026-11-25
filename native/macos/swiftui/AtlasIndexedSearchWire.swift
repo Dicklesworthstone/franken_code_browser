@@ -201,7 +201,7 @@ struct AtlasIndexedHit: Decodable, Sendable, Equatable {
                 capturedBytes: bytes, actualText: actualText)
         hit = SearchHit(id: Int(ordinal - 1), path: display, sourcePath: String(bytes: raw, encoding: .utf8),
             start: start, end: end, captureSHA256: digest, captureByteLength: bytes,
-            structure: structure, actualText: actualText, excerpt: excerpt)
+            structure: structure, actualText: actualText, excerpt: excerpt, rawPath: raw)
     }
     static func == (a: Self, b: Self) -> Bool {
         a.sameWitness(as: b) && a.hit.excerpt == b.hit.excerpt
@@ -220,7 +220,8 @@ struct AtlasIndexedHit: Decodable, Sendable, Equatable {
     func matches(_ other: SearchHit) -> Bool {
         hit.id == other.id && hit.start == other.start && hit.end == other.end
             && hit.captureSHA256 == other.captureSHA256 && hit.captureByteLength == other.captureByteLength
-            && hit.sourcePath?.utf8.elementsEqual(other.sourcePath?.utf8 ?? "".utf8) == true
+            && other.pathBytes == rawPathBytes
+            && hit.path.utf8.elementsEqual(other.path.utf8)
             && hit.structure == other.structure
             && AtlasSearchText.sameActualText(hit.actualText, other.actualText)
     }

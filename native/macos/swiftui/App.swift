@@ -1019,7 +1019,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             // missing atlas geometry must not disable on-demand navigation.
             guard searchIsCurrent,
                   let hit = searchPresentation?.captureCandidate(for: selected, in: searchContext),
-                  let path = hit.sourcePath else {
+                  let path = hit.sourcePath ?? (searchReport?.capture != nil ? hit.path : nil) else {
                 selectedHit = nil
                 selectedMatch = nil
                 selectedReaderSelection = nil
@@ -1385,7 +1385,9 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                             let row = presentation.rowID(for: hit.id)
                             let availability = presentation.availability(for: row, in: searchContext)
                             let canOpenFile = presentation.filePath(for: row, in: searchContext) != nil
-                            HitRow(hit: hit, isSameFile: selectedPath == hit.sourcePath,
+                            HitRow(hit: hit, isSameFile: usesPagedReader
+                                ? (readerHistory.current?.relativePath != nil && readerHistory.current?.relativePath == hit.pathBytes)
+                                : (selectedPath != nil && selectedPath == hit.sourcePath),
                                 availability: availability,
                                 openFile: canOpenFile ? { openSearchFile(row) } : nil)
                                 .tag(row)
@@ -2468,10 +2470,11 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         // Keep explicit range-reading recovery available when the first file
         // cannot be captured completely. Never relabel an accepted reader.
         if readerHistory.current == nil, selectedSource == nil {
-            selectedPath = path
+            selectedPath = captured == nil ? path : captured?.livePath
         }
         if captured == nil { selectedHit = nil }
-        readerHistory.open(root: root, path: path, accessLease: accessLease, initialLine: initialLine) {
+        readerHistory.open(root: root, path: path, accessLease: accessLease, initialLine: initialLine,
+            captured: captured) {
             AtlasPagedReaderModel(transport: .native, search: .native, outline: .native,
                 document: .native, captured: captured, supplied: supplied)
         }
@@ -2486,7 +2489,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         selectedMatch = selectedHit.flatMap { row in
             guard searchIsCurrent,
                   let hit = searchPresentation?.captureCandidate(for: row, in: searchContext),
-                  hit.sourcePath?.utf8.elementsEqual(capture.relativePath) == true else { return nil }
+                  hit.pathBytes == capture.relativePath else { return nil }
             return resolvedMatches[hit.id]
         }
         selectedReaderSelection = nil
@@ -3465,7 +3468,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         resolvedMatches = matches; searchRows = rows
         overlayContentRevision = atlasResidency.contentRevision
         searchPresentation = AtlasSearchPresentation(context: context, hits: report.hits,
-            verifiedHitIDs: Set(matches.keys), id: report.streamID ?? retainingReportID ?? UUID())
+            verifiedHitIDs: Set(matches.keys), id: report.streamID ?? retainingReportID ?? UUID(),
+            allowsRawPaths: report.capture != nil)
         searchPaths = Set(report.hits.compactMap(\.sourcePath))
         overlayLimited = limited
     }
@@ -3689,7 +3693,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         guard searchIsCurrent, let presentation = searchPresentation,
               let row = presentation.adjacentRow(in: hits.map(\.id), after: selectedHit,
                   backwards: backwards, context: searchContext),
-              let path = presentation.captureCandidate(for: row, in: searchContext)?.sourcePath else {
+              let hit = presentation.captureCandidate(for: row, in: searchContext),
+              let path = hit.sourcePath ?? (searchReport?.capture != nil ? hit.path : nil) else {
             status = "No navigable matches in the current search and file filter."
             return
         }
@@ -3747,12 +3752,14 @@ private struct AtlasPreparedProjectRefresh: Sendable {
 
     private func acceptsSource(_ path: String, searchRow: AtlasSearchRowID?, exactMatch: Bool) -> Bool {
         guard let row = searchRow else { return true }
-        guard searchIsCurrent,
-              let presentation = searchPresentation,
-              let sourcePath = presentation.filePath(for: row, in: searchContext),
-              sourcePath.utf8.elementsEqual(path.utf8) else { return false }
-        return !exactMatch || (selectedHit == row
-            && presentation.captureCandidate(for: row, in: searchContext) != nil)
+        guard searchIsCurrent, let presentation = searchPresentation else { return false }
+        if exactMatch {
+            guard selectedHit == row,
+                  let hit = presentation.captureCandidate(for: row, in: searchContext),
+                  let sourcePath = hit.sourcePath ?? (searchReport?.capture != nil ? hit.path : nil) else { return false }
+            return sourcePath.utf8.elementsEqual(path.utf8)
+        }
+        return presentation.filePath(for: row, in: searchContext)?.utf8.elementsEqual(path.utf8) == true
     }
 
     private func openFile(_ path: String, searchRow: AtlasSearchRowID? = nil,

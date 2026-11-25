@@ -60,6 +60,9 @@ enum AtlasReaderError: Error, Sendable {
 /// This validates a lexical join, not a symlink-confinement or atomic-read claim.
 struct AtlasReaderInput: Sendable {
     let fullPath: String
+    /// A capture-only transport uses a display label for dispatch, but the
+    /// returned reader must prove these original bytes before it is accepted.
+    var capturedPathBytes: [UInt8]? = nil
 
     init(root: String, path: String) throws {
         guard !root.isEmpty, !root.utf8.contains(0), root.utf8.count <= 16_384,

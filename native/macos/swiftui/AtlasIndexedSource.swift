@@ -15,7 +15,8 @@ enum AtlasIndexedSource {
                   mode != .expression || candidate.actualText != nil,
                   !mode.isTextual || AtlasSearchText.accepts(actualText: candidate.actualText, needle: needle,
                     caseSensitive: caseSensitive),
-                  let path = candidate.sourcePath, let bytes = candidate.captureByteLength else { return nil }
+                  let rawPath = candidate.pathBytes, let bytes = candidate.captureByteLength else { return nil }
+            let path = candidate.sourcePath ?? candidate.path
             let row = hits[candidate.id]
             return AtlasSearchCapturedHit(root: root, path: path, needle: candidate.actualText ?? needle,
                 start: candidate.start, end: candidate.end, capturedBytes: bytes, openReader: { reader in
@@ -25,7 +26,7 @@ enum AtlasIndexedSource {
                         let json = try importReader(handle, reader, basis.index, row.file, row.revision)
                         return try validate(json, reader: reader, basis: basis, row: row)
                     }
-                }, mode: mode, caseSensitive: caseSensitive)
+                }, mode: mode, caseSensitive: caseSensitive, rawPath: rawPath)
         })
     }
     static func validate(_ json: String?, reader: UInt64, basis: AtlasIndexedBasis, row: AtlasIndexedHit) throws -> String {

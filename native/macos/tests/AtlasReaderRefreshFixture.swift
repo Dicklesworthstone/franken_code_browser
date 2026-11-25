@@ -10,6 +10,7 @@ final class AtlasReaderRefreshFixture: @unchecked Sendable {
         let text: String
         let path: String
         let failure: Failure
+        var rawPath: [UInt8]? = nil
     }
     struct State {
         var nextHandle: UInt64 = 1
@@ -20,6 +21,7 @@ final class AtlasReaderRefreshFixture: @unchecked Sendable {
         var captures: [UInt64: Capture] = [:]
         var queries: [UInt64: (UInt64, String)] = [:]
         var opens: [UInt64] = []
+        var imports: [UInt64] = []
         var windows: [UInt64] = []
         var hits: [UInt64] = []
         var canceled: [UInt64] = []
@@ -90,6 +92,21 @@ final class AtlasReaderRefreshFixture: @unchecked Sendable {
             return Self.json(wire)
         })
     }
+    /// A separate injected retained-source boundary. It records no live open;
+    /// the production decoder must accept the raw filename from this receipt.
+    func importCapture(_ handle: UInt64, rawPath: [UInt8], label: String) -> String? {
+        let (capture, gate): (Capture, Gate?) = change { state in
+            let capture = Capture(text: state.text, path: label, failure: state.failure, rawPath: rawPath)
+            state.captures[handle] = capture; state.imports.append(handle)
+            let gate = state.gate; state.gate = nil
+            return (capture, gate)
+        }
+        gate?.wait()
+        if capture.failure == .open { return nil }
+        var wire = header(handle, capture: capture, command: "info")
+        wire["capture_origin"] = "host-supplied"
+        return Self.json(wire)
+    }
     private func open(_ handle: UInt64, path: String) -> String? {
         let (capture, gate): (Capture, Gate?) = change { state in
             let capture = Capture(text: state.text, path: path, failure: state.failure)
@@ -130,7 +147,7 @@ final class AtlasReaderRefreshFixture: @unchecked Sendable {
          "owner": String(handle), "file_id": "1", "source_revision": "1",
          "captured_bytes": String(capture.text.utf8.count), "encoding": "utf8",
          "additional_source_bytes_read": "0", "native_presented": false,
-         "path": ["encoding": "unix-bytes", "hex": Self.hex(capture.path.utf8), "display": capture.path]]
+         "path": ["encoding": "unix-bytes", "hex": Self.hex(capture.rawPath ?? Array(capture.path.utf8)), "display": capture.path]]
     }
     private static func range(_ start: UInt64, _ end: UInt64) -> [String: String] {
         ["start": String(start), "end": String(end)]

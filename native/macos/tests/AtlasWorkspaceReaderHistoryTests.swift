@@ -245,6 +245,68 @@ import Foundation
         history.close()
     }
 
+    static func rawSearchCapturesKeepIdentityWithoutLiveReopening() async throws {
+        let fixture = AtlasReaderRefreshFixture(), history = AtlasWorkspaceReaderHistory()
+        let first = try await open(history, fixture, path: "first.rs")
+        let raw: [UInt8] = [115, 114, 99, 47, 255, 46, 114, 115]
+        let label = "src/\\xff.rs"
+        let target = AtlasSearchCapturedHit(root: "/project", path: label, needle: "old",
+            start: 0, end: 3, capturedBytes: UInt64("old capture\n".utf8.count),
+            openReader: { handle in
+                guard let json = fixture.importCapture(handle, rawPath: raw, label: label) else {
+                    throw AtlasReaderError.unavailable
+                }
+                return json
+            }, rawPath: raw)
+        history.open(root: "/project", path: label, accessLease: nil, captured: target) {
+            AtlasPagedReaderModel(transport: fixture.transport, search: fixture.search, captured: target)
+        }
+        try await wait { !history.busy }
+        guard let native = history.current else { fatalError("raw search capture was not accepted") }
+        require(native !== first && native.relativePath == raw && native.path == nil
+                && native.reader.page?.identity.pathBytes == raw,
+                "history and the reader preserve native bytes instead of the escaped label")
+        require(native.reader.selectedHitIndex == 0 && native.reader.findIsCurrent
+                && native.reader.page?.text == "old capture\n",
+                "the exact search occurrence is selected in the independently retained reader")
+        require(!native.reader.canRefresh && fixture.snapshot.opens.count == 1
+                && fixture.snapshot.imports.count == 1,
+                "a raw search transfer neither opens nor authorizes refreshing an escaped pathname")
+        native.reader.refreshFromDisk()
+        require(fixture.snapshot.opens.count == 1 && !native.reader.busy,
+                "Refresh from disk remains unavailable without an exact UTF-8 destination")
+        let windows = fixture.snapshot.windows
+        history.back(); history.forward()
+        require(history.current === native && fixture.snapshot.windows == windows
+                && fixture.snapshot.opens.count == 1,
+                "Back/Forward restores the same raw-name reader without new I/O")
+
+        var wrongTarget = target
+        wrongTarget.rawPath = Array(label.utf8)
+        let mismatched = wrongTarget
+        history.open(root: "/project", path: label, accessLease: nil, captured: mismatched) {
+            AtlasPagedReaderModel(transport: fixture.transport, search: fixture.search, captured: mismatched)
+        }
+        try await wait { !history.busy }
+        require(history.current === native && history.count == 2 && fixture.snapshot.windows == windows,
+                "a display-label identity cannot accept the original raw-name receipt or issue a source window")
+
+        let gate = AtlasReaderRefreshFixture.Gate()
+        fixture.change { $0.gate = gate }
+        history.open(root: "/project", path: label, accessLease: nil, captured: target) {
+            AtlasPagedReaderModel(transport: fixture.transport, search: fixture.search, captured: target)
+        }
+        try await wait { gate.didEnter }
+        history.close()
+        require(history.current == nil && native.reader.page == nil && history.busy,
+                "closing the root revokes raw search history while entered transfer drains")
+        gate.release()
+        try await wait { !history.busy }
+        require(history.current == nil && fixture.snapshot.opens.count == 1,
+                "a late raw-name transfer cannot revive a closed root or fall back to disk")
+        try await wait { fixture.snapshot.closed.count == 4 }
+    }
+
     static func main() async throws {
         try await backAndForwardKeepExactReaderAndFindState()
         try await failedDestinationPreservesCurrentAndForward()
@@ -253,6 +315,7 @@ import Foundation
         try await acceptedHistoryIsBoundedAndPreparedOwnersTransferOnce()
         try await queuedPreparedSourcesRetireOnReplacementAndClose()
         try await initialLineIsPreparedOnlyOnce()
-        print("7 workspace source history regression cases passed")
+        try await rawSearchCapturesKeepIdentityWithoutLiveReopening()
+        print("8 workspace source history regression cases passed")
     }
 }

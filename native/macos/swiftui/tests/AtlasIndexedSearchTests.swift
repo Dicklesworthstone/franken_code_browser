@@ -1139,7 +1139,18 @@ import Dispatch
             let f = IndexedFixture(), w = AtlasIndexedSearch(transport: f.transport)
             f.configure { $0.pathHex = "ff2e7273" }
             let r = try run(w)
-            check(r.hits[0].sourcePath == nil && r.capture?.target(r.hits[0]) == nil, "Non-UTF-8 path stays visible without fabricated native opener")
+            let target = r.capture?.target(r.hits[0])
+            check(r.hits[0].sourcePath == nil && r.hits[0].pathBytes == [255, 46, 114, 115]
+                && target?.pathBytes == [255, 46, 114, 115] && target?.livePath == nil,
+                "Non-UTF-8 index hits retain a capture-only opener and exact native identity")
+            let info = try target!.openReader(100)
+            let wire = try JSONSerialization.jsonObject(with: Data(info.utf8)) as! [String: Any]
+            check((wire["path"] as? [String: Any])?["hex"] as? String == "ff2e7273"
+                && f.count("source:") == 1 && f.count("build-begin:") == 1,
+                "Raw-name activation imports the existing index source without a new capture")
+            var alias = r.hits[0]; alias.rawPath = Array(alias.path.utf8)
+            check(r.capture?.target(alias) == nil,
+                "An escaped label cannot impersonate the indexed raw filename")
         }
         do {
             let f = IndexedFixture(), w = AtlasIndexedSearch(transport: f.transport)
@@ -1411,8 +1422,10 @@ import Dispatch
             f.configure { $0.pathHex = "7372632fff2e7273" }
             let w = AtlasIndexedSearch(transport: f.transport)
             let raw = try scoped(w, scope: .all, pathScope: directory)
-            check(raw.hits.count == 2 && raw.hits[0].sourcePath == nil && raw.capture?.target(raw.hits[0]) == nil,
-                "A non-UTF8 directory descendant retains searchable bytes without a fabricated opener")
+            check(raw.hits.count == 2 && raw.hits[0].sourcePath == nil
+                && raw.capture?.target(raw.hits[0])?.pathBytes == [115, 114, 99, 47, 255, 46, 114, 115]
+                && raw.capture?.target(raw.hits[0])?.livePath == nil,
+                "A non-UTF8 directory descendant opens retained source within its exact search scope")
         }
         do {
             let f = IndexedFixture()

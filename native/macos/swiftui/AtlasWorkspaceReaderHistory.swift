@@ -86,17 +86,26 @@ import Observation
     }
 
     func open(root: String, path: String, accessLease: AnyObject?, initialLine: UInt64? = nil,
+              captured: AtlasSearchCapturedHit? = nil,
               makeReader: @escaping @MainActor () -> AtlasPagedReaderModel) {
         bind(root: root, accessIdentity: accessLease.map(ObjectIdentifier.init))
         guard history.bound else { return }
         // Bound waiting metadata before retaining the closure and its source.
-        guard (try? AtlasReaderInput(root: root, path: path)) != nil else { return }
+        let relativePath: [UInt8]
+        if let captured {
+            guard captured.root.utf8.elementsEqual(root.utf8), captured.path.utf8.elementsEqual(path.utf8),
+                  (try? AtlasReaderInput(captured: captured)) != nil else { return }
+            relativePath = captured.pathBytes
+        } else {
+            guard (try? AtlasReaderInput(root: root, path: path)) != nil else { return }
+            relativePath = Array(path.utf8)
+        }
         submit(Request(label: path, open: {
             let reader = makeReader()
             do {
                 try await reader.prepareOpen(root: root, path: path, accessLease: accessLease, initialLine: initialLine)
                 try Task.checkCancellation()
-                return try AtlasWorkspaceReaderCapture(root: root, relativePath: Array(path.utf8),
+                return try AtlasWorkspaceReaderCapture(root: root, relativePath: relativePath,
                     label: path, reader: reader)
             } catch {
                 reader.close()

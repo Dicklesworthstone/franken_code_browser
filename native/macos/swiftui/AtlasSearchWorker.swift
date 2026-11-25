@@ -422,7 +422,8 @@ private struct SearchStream {
                       wire.capture_byte_length == previous.capture_byte_length else { throw invalid() }
             }
             let charge = wire.path.hex.utf8.count + 2 * wire.path.display.utf8.count
-                + (hit.sourcePath?.utf8.count ?? 0) + 2 * (hit.actualText?.utf8.count ?? 0) + 512
+                + (hit.sourcePath?.utf8.count ?? 0) + (hit.rawPath?.count ?? 0)
+                + 2 * (hit.actualText?.utf8.count ?? 0) + 512
             guard charge <= AtlasSearchRetention.witnessBytes - retainedTextBytes else { throw invalid() }
             retainedTextBytes += charge
             if let excerpt = hit.excerpt {
@@ -651,7 +652,7 @@ private struct SearchStream {
             excerpt: try wire.excerpt?.validated(hitStart: start, hitEnd: end,
                 capturedBytes: length, actualText: mode.isTextual
                     ? (wire.matched_text ?? state?.expression?.primaryNeedle ?? query)
-                    : (mode == .occurrences ? query : nil)))
+                    : (mode == .occurrences ? query : nil)), rawPath: raw)
     }
     private func invalid() -> AtlasSearchError { .invalidResponse }
     private func number(_ text: String) throws -> UInt64 {

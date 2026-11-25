@@ -55,6 +55,24 @@ import Foundation
         let unicode = AtlasSearchPresentation(context: context("é"), hits: [hit(0)], verifiedHitIDs: [])
         precondition(unicode.adjacentRow(in: [0], after: nil, backwards: false, context: context("e\u{301}")) == nil)
         precondition(unicode.adjacentRow(in: [0], after: nil, backwards: false, context: context("é")) == unicode.rowID(for: 0))
-        print("PASS: 17 AtlasSearch visible-order/capture/context navigation assertions")
+        let rawPath: [UInt8] = [115, 114, 99, 47, 255, 46, 114, 115]
+        var nativeHit = hit(0, path: nil)
+        nativeHit.rawPath = rawPath
+        let transferable = AtlasSearchPresentation(context: current, hits: [nativeHit],
+            verifiedHitIDs: [], allowsRawPaths: true)
+        let nativeRow = transferable.rowID(for: 0)
+        precondition(transferable.availability(for: nativeRow, in: current).allowsActivation)
+        precondition(transferable.captureCandidate(for: nativeRow, in: current)?.pathBytes == rawPath)
+        precondition(transferable.adjacentRow(in: [0], after: nil, backwards: false, context: current) == nativeRow)
+        precondition(transferable.filePath(for: nativeRow, in: current) == nil,
+            "Retained source navigation must not authorize a live open of an escaped filename")
+        let legacy = AtlasSearchPresentation(context: current, hits: [nativeHit], verifiedHitIDs: [])
+        precondition(!legacy.availability(for: legacy.rowID(for: 0), in: current).allowsActivation,
+            "A legacy result with no capture transfer cannot reopen a raw filename")
+        nativeHit.rawPath = Array("../escape.rs".utf8)
+        let invalid = AtlasSearchPresentation(context: current, hits: [nativeHit],
+            verifiedHitIDs: [], allowsRawPaths: true)
+        precondition(invalid.captureCandidate(for: invalid.rowID(for: 0), in: current) == nil)
+        print("PASS: AtlasSearch visible-order/raw-path/capture/context navigation assertions")
     }
 }

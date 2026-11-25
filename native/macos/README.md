@@ -1482,6 +1482,15 @@ preserves its original bytes. Workspace queries remain limited to 1024 UTF-8
 bytes; the retained reader accepts up to 4096 bytes so that a short lowercase
 query can activate a longer original Unicode spelling.
 
+Sidebar results from live and captured-index search also preserve filenames
+containing non-UTF-8 bytes. Text, Expression, Symbols, Headings and Occurrences
+carry the original filename bytes through retained-source transfer and exact
+activation; the escaped row label is only presentation. Source Back/Forward
+retain the accepted reader. Current-file Open and Refresh from disk remain
+unavailable when there is no exact UTF-8 pathname. Regression sources cover raw
+identity validation, transfer, history and interrupted activation; executable
+and native qualification remain pending.
+
 Search rows also show bounded source context from the same retained capture,
 with the exact matched span emphasized. This applies to live and captured-index
 text search and to symbol and Markdown-heading results. Compact rows mark line

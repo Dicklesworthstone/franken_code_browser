@@ -583,7 +583,7 @@ private final class AtlasReaderSession: @unchecked Sendable {
             let result = try await io.perform(cancellation: flag, keepingAlive: [next]) {
                 let info = try AtlasReaderInfo.decode(
                     next.transport.open(next.handle, input.fullPath, AtlasReaderLimits.captureBytes),
-                    handle: next.handle, path: input.fullPath)
+                    handle: next.handle, pathBytes: input.capturedPathBytes ?? Array(input.fullPath.utf8))
                 guard !flag.isCanceled else { throw AtlasReaderError.canceled }
                 let request = AtlasReaderRequest.firstPage
                 let page = try AtlasReaderPage.decode(

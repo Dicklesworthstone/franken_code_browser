@@ -118,6 +118,32 @@ private final class Access: @unchecked Sendable {
         check(refusedCreates.get("create") == 128, "Failed creation releases its reserved admission")
         do {
             let spellingOwner = try AtlasSearchCaptureOwner(create: { 42 }, close: { _ in true }, retirementFailed: {})
+            let raw: [UInt8] = [115, 114, 99, 47, 255, 46, 114, 115]
+            let nativeHit = SearchHit(id: 0, path: "src/\\xff.rs", sourcePath: nil, start: 2, end: 6,
+                captureSHA256: hit.captureSHA256, captureByteLength: 20, rawPath: raw)
+            let nativeWitness = AtlasSearchCaptureWitness(hit: nativeHit, file: 6, revision: 7,
+                pathHex: "7372632fff2e7273")
+            var nativeEnvelope = envelope()
+            let nativePath: [String: Any] = ["encoding": "unix-bytes", "hex": nativeWitness.pathHex,
+                "display": nativeHit.path]
+            nativeEnvelope["path"] = nativePath
+            var nativeReader = nativeEnvelope["reader"] as! [String: Any]
+            nativeReader["path"] = nativePath; nativeEnvelope["reader"] = nativeReader
+            let nativeJSON = try json(nativeEnvelope)
+            let nativeCapture = AtlasSearchCaptureFactory.make(owner: spellingOwner, identity: identity,
+                root: "/repo", needle: "x", witnesses: [nativeWitness],
+                importReader: { _, _, _, _ in nativeJSON })
+            let nativeTarget = nativeCapture.target(nativeHit)
+            check(nativeTarget?.pathBytes == raw && nativeTarget?.livePath == nil,
+                "A retained search hit preserves non-UTF-8 identity without a live pathname")
+            let rawReader = try nativeTarget!.openReader(100)
+            let rawInfo = try JSONSerialization.jsonObject(with: Data(rawReader.utf8)) as! [String: Any]
+            check((rawInfo["path"] as? [String: Any])?["hex"] as? String == nativeWitness.pathHex,
+                "The original native filename survives the reader transfer")
+            var alias = nativeHit; alias.rawPath = Array(nativeHit.path.utf8)
+            check(nativeCapture.target(alias) == nil, "An escaped display label cannot borrow a raw filename's capture")
+            alias = nativeHit; alias.rawPath = [115, 114, 99, 47, 254, 46, 114, 115]
+            check(nativeCapture.target(alias) == nil, "Equal display labels cannot alias distinct native filenames")
             var spellingHit = hit; spellingHit.actualText = "é"
             let spellingWitness = AtlasSearchCaptureWitness(hit: spellingHit, file: 6, revision: 7, pathHex: witness.pathHex)
             let spellingCapture = AtlasSearchCaptureFactory.make(owner: spellingOwner, identity: identity,

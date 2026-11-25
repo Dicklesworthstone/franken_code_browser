@@ -656,7 +656,10 @@ import Observation
         if let initialLine {
             guard initialLine > 0, capturedTarget == nil else { throw AtlasReaderError.invalidInput }
         }
-        let liveInput = try AtlasReaderInput(root: root, path: path)
+        let livePath: String?
+        if let capturedTarget { livePath = capturedTarget.livePath }
+        else { livePath = path }
+        let liveInput = try livePath.map { try AtlasReaderInput(root: root, path: $0) }
         if let target = capturedTarget {
             guard target.root.utf8.elementsEqual(root.utf8), target.path.utf8.elementsEqual(path.utf8),
                   !target.mode.isTextual || coordinator.supportsFind,
@@ -670,12 +673,13 @@ import Observation
             guard liveTransport.openBytes != nil else { throw AtlasReaderError.unavailable }
             input = supplied.input
         } else {
+            guard let liveInput else { throw AtlasReaderError.invalidInput }
             input = liveInput
         }
         // Remember only the explicitly opened project/path and its current
         // lease. Captured metadata alone never grants a refresh destination.
         refreshInput = liveInput
-        refreshImageSource = try? AtlasDocumentImageSource(root: root, relativePath: path)
+        refreshImageSource = livePath.flatMap { try? AtlasDocumentImageSource(root: root, relativePath: $0) }
         refreshAccessLease = accessLease
         let imageSource = refreshImageSource
         if let initialLine { lineInput = String(initialLine) }

@@ -5,8 +5,13 @@ extension AtlasReaderInput {
     /// Only pair with the capture-only transport below. Root/path validation
     /// still precedes admission, but no live source is opened by this route.
     init(captured target: AtlasSearchCapturedHit) throws {
-        _ = try AtlasReaderInput(root: target.root, path: target.path)
+        guard !target.root.isEmpty, target.root.utf8.count <= 16_384,
+              !target.root.utf8.contains(0), !target.path.isEmpty, target.path.utf8.count <= 65_536,
+              !target.path.utf8.contains(0), SearchHit.validPath(target.pathBytes) else {
+            throw AtlasReaderError.invalidInput
+        }
         fullPath = target.path
+        capturedPathBytes = target.pathBytes
     }
 }
 
@@ -48,7 +53,7 @@ enum AtlasCapturedReader {
     static func structuralRequest(_ selected: AtlasSearchCapturedHit,
                                   identity: AtlasReaderIdentity) throws -> AtlasReaderRequest {
         guard selected.mode.supportsNameMatching, identity.capturedBytes == selected.capturedBytes,
-              identity.pathBytes.elementsEqual(selected.path.utf8),
+              identity.pathBytes == selected.pathBytes,
               selected.start < selected.end, selected.end <= selected.capturedBytes,
               selected.end - selected.start <= AtlasReaderLimits.maximumPageBytes else {
             throw AtlasReaderError.invalidResponse
@@ -76,7 +81,7 @@ enum AtlasCapturedReader {
         }
         try checkCurrent()
         guard selected.mode.isTextual, identity.capturedBytes == selected.capturedBytes,
-              identity.pathBytes.elementsEqual(selected.path.utf8),
+              identity.pathBytes == selected.pathBytes,
               selected.start < selected.end, selected.end <= selected.capturedBytes else {
             throw AtlasReaderError.invalidResponse
         }
@@ -158,7 +163,7 @@ enum AtlasCapturedReader {
         guard selected.mode == .occurrences, selected.caseSensitive,
               identity.capturedBytes == selected.capturedBytes,
               identity.capturedBytes <= AtlasReferencePage.sourceLimit,
-              identity.pathBytes.elementsEqual(selected.path.utf8),
+              identity.pathBytes == selected.pathBytes,
               selected.start < selected.end, selected.end <= selected.capturedBytes else {
             throw AtlasReaderError.invalidResponse
         }

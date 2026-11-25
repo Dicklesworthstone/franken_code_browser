@@ -154,13 +154,15 @@ enum AtlasSearchCaptureFactory {
             let witness = witnesses[hit.id]
             // Compare raw bytes, not Swift's canonically equivalent strings.
             guard witness.hit.id == hit.id,
-                  witness.hit.sourcePath?.utf8.elementsEqual(hit.sourcePath?.utf8 ?? "".utf8) == true,
+                  let rawPath = hit.pathBytes, witness.hit.pathBytes == rawPath,
+                  witness.hit.path.utf8.elementsEqual(hit.path.utf8),
                   witness.hit.start == hit.start, witness.hit.end == hit.end,
                   witness.hit.captureSHA256 == hit.captureSHA256,
                   witness.hit.captureByteLength == hit.captureByteLength,
                   witness.hit.structure == hit.structure,
                   AtlasSearchText.sameActualText(witness.hit.actualText, hit.actualText),
-                  let path = hit.sourcePath, hit.start < hit.end else { return nil }
+                  hit.start < hit.end else { return nil }
+            let path = hit.sourcePath ?? hit.path
             let mode = requestedMode ?? witness.hit.structure?.mode ?? .text
             guard (mode.isTextual ? witness.hit.structure == nil : witness.hit.structure?.mode == mode),
                   mode != .expression || hit.actualText != nil,
@@ -185,7 +187,7 @@ enum AtlasSearchCaptureFactory {
                         let json = try importReader(handle, reader, identity.generation, UInt64(hit.id + 1))
                         return try validatedReader(json, receiver: reader, identity: identity, witness: witness)
                     }
-                }, mode: mode, caseSensitive: caseSensitive)
+                }, mode: mode, caseSensitive: caseSensitive, rawPath: rawPath)
         })
     }
 
