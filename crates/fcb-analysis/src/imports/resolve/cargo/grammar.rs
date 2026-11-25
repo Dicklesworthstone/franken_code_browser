@@ -3,12 +3,19 @@
 //! Finite Cargo metadata grammar over the pinned TOML lexical terminals.
 //! Unsupported source never authorizes a partial path-dependency binding.
 
-use super::{CapturedCargoManifest, Dependency, ImportError, MAX_DEPENDENCIES,
-    Terminal, TextRange, Tok, check, package_name};
+use super::{CapturedCargoManifest, Dependency, DependencyScope, ImportError, MAX_DEPENDENCIES,
+    MAX_WORKSPACE_PATTERNS, Terminal, TextRange, Tok, check, package_name};
 
 const MAX_KEYS: usize = 8;
 const MAX_DEPTH: usize = 32;
 const MAX_INLINE_FIELDS: usize = 32;
+const PATH: u16 = 1;
+const PACKAGE: u16 = 2;
+const WORKSPACE: u16 = 4;
+pub(super) const VERSION: u16 = 8;
+pub(super) const OPTIONAL: u16 = 16;
+const FEATURES: u16 = 32;
+const DEFAULT_FEATURES: u16 = 64;
 
 #[derive(Clone, Copy)]
 struct Keys { parts: [TextRange; MAX_KEYS], len: usize }
@@ -16,7 +23,7 @@ impl Keys {
     fn name<'a>(&self, index: usize, text: &'a str) -> &'a str { self.parts[index].text(text) }
 }
 #[derive(Clone, Copy)]
-enum Table { Other, Package, Library, Dependencies(bool), Dependency(usize) }
+enum Table { Other, Package, Library, Workspace, Dependencies(DependencyScope), Dependency(usize) }
 struct Grammar<'a> { text: &'a str, tokens: &'a [Terminal] }
 impl<'a> Grammar<'a> {
     fn word(&self, at: usize) -> &'a str {
@@ -116,6 +123,7 @@ pub(super) fn parse(text: &str, tokens: &[Terminal], manifest: &mut CapturedCarg
     let grammar = Grammar { text, tokens };
     let mut table = Table::Other;
     let (mut package_seen, mut library_seen, mut dependencies_seen) = (false, false, false);
+    let (mut workspace_seen, mut workspace_dependencies_seen) = (false, false);
     let mut at = 0;
     while at < tokens.len() {
         check(canceled)?;
@@ -135,10 +143,11 @@ pub(super) fn parse(text: &str, tokens: &[Terminal], manifest: &mut CapturedCarg
             let first = keys.name(0, text);
             let last = keys.name(keys.len - 1, text);
             let group = |name: &str| matches!(name, "dependencies" | "dev-dependencies" | "build-dependencies");
-            if array && (matches!(first, "package" | "lib") || group(last)
+            if array && (matches!(first, "package" | "lib") || first == "workspace" && keys.len == 1 || group(last)
                 || keys.len >= 2 && group(keys.name(keys.len - 2, text))) {
                 return Err(ImportError::InvalidEvidence);
             }
+            if first == "workspace" { manifest.workspace = true; }
             table = if array { Table::Other }
                 else if keys.len == 1 && first == "package" {
                     if package_seen { return Err(ImportError::InvalidEvidence); }
@@ -146,15 +155,28 @@ pub(super) fn parse(text: &str, tokens: &[Terminal], manifest: &mut CapturedCarg
                 } else if keys.len == 1 && first == "lib" {
                     if library_seen { return Err(ImportError::InvalidEvidence); }
                     library_seen = true; manifest.library_declared = true; Table::Library
+                } else if keys.len == 1 && first == "workspace" {
+                    if workspace_seen { return Err(ImportError::InvalidEvidence); }
+                    workspace_seen = true; Table::Workspace
+                } else if keys.len == 2 && first == "workspace" && last == "dependencies" {
+                    if workspace_dependencies_seen { return Err(ImportError::InvalidEvidence); }
+                    workspace_dependencies_seen = true; Table::Dependencies(DependencyScope::Workspace)
+                } else if keys.len == 3 && first == "workspace" && keys.name(1, text) == "dependencies" {
+                    let index = add_dependency(manifest, keys.parts[2],
+                        grammar.range(start, at)?, DependencyScope::Workspace, text)?;
+                    manifest.dependencies[index].sealed = true;
+                    Table::Dependency(index)
                 } else if first != "workspace" && group(last) {
                     let normal = keys.len == 1 && first == "dependencies";
                     if normal && dependencies_seen { return Err(ImportError::InvalidEvidence); }
                     dependencies_seen |= normal;
-                    Table::Dependencies(normal)
+                    Table::Dependencies(if normal { DependencyScope::Normal } else { DependencyScope::Other })
                 } else if first != "workspace" && keys.len >= 2 && group(keys.name(keys.len - 2, text)) {
-                    let normal = keys.len == 2 && first == "dependencies";
+                    let scope = if keys.len == 2 && first == "dependencies" { DependencyScope::Normal }
+                        else { DependencyScope::Other };
                     let index = add_dependency(manifest, keys.parts[keys.len - 1],
-                        grammar.range(start, at)?, normal, text)?;
+                        grammar.range(start, at)?, scope, text)?;
+                    manifest.dependencies[index].sealed = true;
                     Table::Dependency(index)
                 } else { Table::Other };
             continue;
@@ -169,10 +191,12 @@ pub(super) fn parse(text: &str, tokens: &[Terminal], manifest: &mut CapturedCarg
         let key = keys.name(0, text);
         let evidence = grammar.range(start, end)?;
         match table {
-            Table::Package if matches!(key, "name" | "autolib") => {
+            Table::Package if matches!(key, "name" | "autolib" | "workspace") => {
                 if keys.len != 1 { return Err(ImportError::UnsupportedLexicalContext); }
                 if key == "name" {
                     set_string(&mut manifest.package, grammar.string(value, end)?)?;
+                } else if key == "workspace" {
+                    set_string(&mut manifest.package_workspace, grammar.string(value, end)?)?;
                 } else {
                     if manifest.autolib.is_some() || end != value + 1 { return Err(ImportError::InvalidEvidence); }
                     manifest.autolib = Some(match grammar.word(value) {
@@ -190,12 +214,38 @@ pub(super) fn parse(text: &str, tokens: &[Terminal], manifest: &mut CapturedCarg
                     set_string(destination, grammar.string(value, end)?)?;
                 }
             }
-            Table::Dependencies(normal) => {
+            Table::Workspace if matches!(key, "members" | "exclude") => {
                 if keys.len != 1 { return Err(ImportError::UnsupportedLexicalContext); }
-                let index = add_dependency(manifest, keys.parts[0], evidence, normal, text)?;
-                if grammar.word(value) == "{" {
-                    inline_dependency(&grammar, value, end, &mut manifest.dependencies[index], canceled)?;
-                } else { manifest.dependencies[index].unsupported = true; }
+                let (declared, patterns) = if key == "members" {
+                    (&mut manifest.members_declared, &mut manifest.workspace_members)
+                } else {
+                    (&mut manifest.excludes_declared, &mut manifest.workspace_excludes)
+                };
+                if *declared { return Err(ImportError::InvalidEvidence); }
+                *declared = true;
+                string_array(&grammar, value, end, |range| {
+                    if patterns.len() == MAX_WORKSPACE_PATTERNS { return Err(ImportError::SourceLimit); }
+                    patterns.push(range); Ok(())
+                })?;
+            }
+            Table::Dependencies(scope) => {
+                if keys.len == 1 {
+                    let index = add_dependency(manifest, keys.parts[0], evidence, scope, text)?;
+                    manifest.dependencies[index].sealed = true;
+                    if grammar.word(value) == "{" {
+                        inline_dependency(&grammar, value, end, &mut manifest.dependencies[index], canceled)?;
+                    } else { manifest.dependencies[index].unsupported = true; }
+                } else if keys.len == 2 {
+                    let name = keys.name(0, text);
+                    let index = match manifest.dependencies.iter().position(|d|
+                        d.scope == scope && d.name.text(text) == name) {
+                        Some(index) if !manifest.dependencies[index].sealed => index,
+                        Some(_) => return Err(ImportError::InvalidEvidence),
+                        None => add_dependency(manifest, keys.parts[0], evidence, scope, text)?,
+                    };
+                    dependency_field(&grammar, keys.name(1, text), value, end, &mut manifest.dependencies[index])?;
+                    manifest.dependencies[index].evidence.end = evidence.end;
+                } else { return Err(ImportError::UnsupportedLexicalContext); }
             }
             Table::Dependency(index) => {
                 if keys.len != 1 { return Err(ImportError::UnsupportedLexicalContext); }
@@ -214,18 +264,26 @@ fn set_string(target: &mut Option<TextRange>, value: TextRange) -> Result<(), Im
     *target = Some(value); Ok(())
 }
 fn add_dependency(manifest: &mut CapturedCargoManifest, name: TextRange, evidence: TextRange,
-    normal: bool, text: &str) -> Result<usize, ImportError> {
+    scope: DependencyScope, text: &str) -> Result<usize, ImportError> {
     if manifest.dependencies.len() == MAX_DEPENDENCIES { return Err(ImportError::SourceLimit); }
     if !package_name(name.text(text)) { return Err(ImportError::InvalidEvidence); }
-    if manifest.dependencies.iter().any(|d| d.normal == normal && d.name.text(text) == name.text(text)) {
+    if manifest.dependencies.iter().any(|d| d.scope == scope && d.name.text(text) == name.text(text)) {
         return Err(ImportError::InvalidEvidence);
     }
     let index = manifest.dependencies.len();
-    manifest.dependencies.push(Dependency { name, path: None, package: None, evidence, normal, unsupported: false });
+    manifest.dependencies.push(Dependency { name, path: None, package: None, evidence, scope, unsupported: false,
+        inherited: false, sealed: false, fields: 0 });
     Ok(index)
 }
 fn dependency_field(grammar: &Grammar<'_>, key: &str, first: usize, end: usize, dependency: &mut Dependency)
     -> Result<(), ImportError> {
+    let field = match key {
+        "path" => PATH, "package" => PACKAGE, "workspace" => WORKSPACE, "version" => VERSION,
+        "optional" => OPTIONAL, "features" => FEATURES, "default-features" | "default_features" => DEFAULT_FEATURES,
+        _ => { dependency.unsupported = true; return Ok(()); }
+    };
+    if dependency.fields & field != 0 { return Err(ImportError::InvalidEvidence); }
+    dependency.fields |= field;
     match key {
         "path" => set_string(&mut dependency.path, grammar.string(first, end)?)?,
         "package" => {
@@ -233,7 +291,13 @@ fn dependency_field(grammar: &Grammar<'_>, key: &str, first: usize, end: usize, 
             if !package_name(name.text(grammar.text)) { return Err(ImportError::InvalidEvidence); }
             set_string(&mut dependency.package, name)?;
         }
-        "workspace" | "git" | "registry" => dependency.unsupported = true,
+        "workspace" => {
+            dependency.inherited = boolean(grammar, first, end)?;
+            if !dependency.inherited { dependency.unsupported = true; }
+        }
+        "version" => { grammar.string(first, end)?; }
+        "optional" | "default-features" | "default_features" => { boolean(grammar, first, end)?; }
+        "features" => string_array(grammar, first, end, |_| Ok(()))?,
         _ => {}
     }
     Ok(())
@@ -256,6 +320,30 @@ fn inline_dependency(grammar: &Grammar<'_>, first: usize, end: usize, dependency
         dependency_field(grammar, name.text(grammar.text), value, next, dependency)?;
         if grammar.word(next) == "}" { break; }
         at = next + 1;
+    }
+    Ok(())
+}
+
+fn boolean(grammar: &Grammar<'_>, first: usize, end: usize) -> Result<bool, ImportError> {
+    if end != first + 1 { return Err(ImportError::InvalidEvidence); }
+    match grammar.word(first) {
+        "true" => Ok(true), "false" => Ok(false), _ => Err(ImportError::InvalidEvidence),
+    }
+}
+
+fn string_array(grammar: &Grammar<'_>, first: usize, end: usize,
+    mut accept: impl FnMut(TextRange) -> Result<(), ImportError>) -> Result<(), ImportError> {
+    if grammar.word(first) != "[" || end < first + 2 || grammar.word(end - 1) != "]" {
+        return Err(ImportError::InvalidEvidence);
+    }
+    let mut at = first + 1;
+    while at < end - 1 {
+        accept(grammar.string(at, at + 1)?)?;
+        at += 1;
+        if at < end - 1 {
+            if grammar.word(at) != "," { return Err(ImportError::InvalidEvidence); }
+            at += 1;
+        }
     }
     Ok(())
 }

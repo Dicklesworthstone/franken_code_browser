@@ -370,6 +370,54 @@ import Foundation
         }
     }
 
+    private static func cargoWorkspaceMetadataWire(_ index: AtlasPreparedIndex) throws {
+        var legacy = ProjectLinksFixture.importPage(owner: index.basis.owner,
+            generation: 1, command: "imports-page")
+        // Two scanned sources and 70 retained uses admit 72 manifests in v13.
+        // Workspace inheritance adds at most one root manifest per source.
+        legacy["parsed_module_bytes"] = String(72 * 65_536)
+        let oldPage = try decode(legacy, index: index)
+        precondition(oldPage.coverage.scanned == 2 && oldPage.coverage.linksSeen == 70
+            && oldPage.coverage.moduleBytes == 72 * 65_536)
+        var excessLegacy = legacy
+        excessLegacy["parsed_module_bytes"] = String(72 * 65_536 + 1)
+        refuse(excessLegacy, index: index)
+
+        var workspace = excessLegacy
+        workspace["resolver"] = "fcb-closed-catalog-imports-v14"
+        var rows = workspace["links"] as! [[String: Any]]
+        for i in rows.indices {
+            rows[i]["language"] = "rust"; rows[i]["lexical_import_kind"] = "rust-use"
+            rows[i]["destination"] = "dep_alias::Thing"
+            rows[i]["resolution_basis"] = "rust-path-dependency-prefix-candidate"
+            rows[i]["source_path"] = ProjectLinksFixture.path("crates/app/src/main.rs")
+            rows[i]["target_path"] = ProjectLinksFixture.path("crates/dep/src/lib.rs")
+        }
+        workspace["links"] = rows
+        let inherited = try decode(workspace, index: index)
+        precondition(inherited.links[0].canOpenTarget
+            && inherited.links[0].label.contains("Cargo path dependency"))
+        workspace["parsed_module_bytes"] = String(74 * 65_536)
+        let fullAllowance = try decode(workspace, index: index)
+        precondition(fullAllowance.coverage.moduleBytes == 74 * 65_536)
+        var excess = workspace
+        excess["parsed_module_bytes"] = String(74 * 65_536 + 1)
+        refuse(excess, index: index)
+        var unknown = workspace; unknown["resolver"] = "fcb-closed-catalog-imports-v15"
+        refuse(unknown, index: index)
+
+        // Enough retained uses make the per-manifest allowance exceed 32 MiB;
+        // source and manifest parsing must still share the original total cap.
+        var aggregate = workspace
+        for key in ["links_seen", "retained_links", "matching_links"] { aggregate[key] = "4096" }
+        let parseBytes = UInt64(aggregate["parsed_source_bytes"] as! String)!
+        aggregate["parsed_module_bytes"] = String(33_554_432 - parseBytes)
+        let bounded = try decode(aggregate, index: index)
+        precondition(bounded.coverage.parseBytes + bounded.coverage.moduleBytes == 33_554_432)
+        aggregate["parsed_module_bytes"] = String(33_554_433 - parseBytes)
+        refuse(aggregate, index: index)
+    }
+
     private static func goWire(_ index: AtlasPreparedIndex) throws {
         var value = ProjectLinksFixture.importPage(owner: index.basis.owner,
             generation: 1, command: "imports-page")
@@ -855,6 +903,7 @@ import Foundation
         try cppWire(index)
         try goWire(index)
         try cargoDependencyWire(index)
+        try cargoWorkspaceMetadataWire(index)
         try javaWire(index)
         try javascriptLoadWire(index)
         try typescriptSourceWire(index)

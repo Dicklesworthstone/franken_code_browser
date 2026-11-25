@@ -22,7 +22,7 @@ enum AtlasSavedImportWire {
               w.resolution_domain == "declared-catalog-candidates",
               w.extractor == "franken-markdown-d6fbd1d5/import-statements-v10",
               w.extraction_policy == "rust-inline-modules-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v10",
-              w.resolver == "fcb-closed-catalog-imports-v13",
+              ["fcb-closed-catalog-imports-v13", "fcb-closed-catalog-imports-v14"].contains(w.resolver),
               !w.compiler_resolved, !w.semantic_complete else { throw AtlasSavedError.invalidResponse }
     }
 
@@ -319,6 +319,7 @@ struct AtlasSavedImports: Sendable {
             let sources = w.source_members.value, scanned = w.scanned_source_members.value
             let unavailable = w.unavailable_source_members.value, unsupported = w.unsupported_source_members.value
             let limited = w.source_limited_members.value, diagnostic = w.diagnostic_source_members.value
+            let readsPerSource: UInt64 = w.resolver == "fcb-closed-catalog-imports-v14" ? 3 : 2
             guard generation > 0, w.import_generation.value == generation, w.direction == direction.rawValue,
                   w.completeness_scope == "parsed-source-imports-in-saved-manifest",
                   w.source_observation == "verified-saved-members",
@@ -336,9 +337,9 @@ struct AtlasSavedImports: Sendable {
                   w.matching_links.value <= w.retained_links.value, w.retained_source_payload_bytes.value == 0,
                   w.member_bytes_read.value <= w.max_source_bytes.value,
                   w.peak_source_bytes.value <= min(w.member_bytes_read.value, AtlasSavedImportWire.maximumMemberBytes),
-                  // Each scanned source may verify its module manifest; each
-                  // retained Rust use may additionally verify one dependency manifest.
-                  w.member_read_calls.value <= (2 * scanned + w.retained_links.value + unsupported)
+                  // v14 also admits one captured workspace manifest per source.
+                  // Legacy v13 responses keep their original read-count envelope.
+                  w.member_read_calls.value <= (readsPerSource * scanned + w.retained_links.value + unsupported)
                     * AtlasSavedImportWire.maximumMemberReadCalls,
                   w.imports_complete == (identity.discoveryComplete && scanned == sources && diagnostic == 0 && !w.truncated),
                   start <= w.matching_links.value,
@@ -368,7 +369,7 @@ struct AtlasSavedImports: Sendable {
     }
     private struct Wire: Decodable {
         let import_generation, offset, limit, matching_links: AtlasSavedNumber
-        let direction, completeness_scope, source_observation: String
+        let direction, completeness_scope, source_observation, resolver: String
         let filter_member, next_offset: AtlasSavedNumber?
         let imports_complete, truncated: Bool
         let source_members, scanned_source_members, unavailable_source_members, unsupported_source_members: AtlasSavedNumber

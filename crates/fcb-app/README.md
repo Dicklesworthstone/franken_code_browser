@@ -1329,14 +1329,28 @@ unique catalogued module file or containing-module candidate. A statement such
 as `use worker_alias::task::Task;` can therefore open the captured dependency's
 `task.rs`, and the activated reader survives closing the archive.
 
+Workspace-inherited path dependencies also participate when the captured
+workspace root declares the member and its `[workspace.dependencies]` entry.
+Member declarations support `alias.workspace = true`,
+`alias = { workspace = true }` and `[dependencies.alias]` subtables. Paths
+and package renames come from the workspace declaration; the path is relative
+to that captured workspace root. Root packages and virtual workspaces are
+admitted. Membership and exclusions support literal paths and patterns such as
+`crates/*`, where `*` matches one complete directory component. Other glob patterns
+and implicit workspace membership remain unresolved.
+
 Each Cargo manifest is bounded to 64 KiB of UTF-8, with at most 256 dependency
 aliases considered. Source and metadata work share the aggregate parse allowance;
-saved source and simultaneously retained metadata share the 1 MiB payload
-allowance. The nearest uncaptured, invalid or over-budget manifest leaves
-explicit unresolved evidence. Workspace-inherited, conditional, dev/build,
-registry and git dependencies are not inferred. These candidates do not
-establish compiler binding or an imported item's definition. Import pages
-continue to read only retained result metadata.
+saved source and simultaneously retained importer, workspace and target metadata
+share the 1 MiB payload allowance. At most one nearest ancestor manifest is
+consulted, and an uncaptured, invalid, non-workspace or over-budget boundary
+leaves explicit unresolved evidence. Conditional, dev/build, registry, git and
+path-base dependencies are not inferred. These candidates do not establish
+compiler binding or an imported item's definition. Import pages continue to
+read only retained result metadata. Resolver receipts use
+`fcb-closed-catalog-imports-v14`; native consumers retain the original limits
+when reading v13 receipts. Workspace-inheritance execution remains pending in
+the independent batch verification lane.
 
 Preparation verifies at most one eligible source at a time. `MAX_LINKS` is
 1..4096, aggregate source allowance is 0..33554432 bytes, and a source larger

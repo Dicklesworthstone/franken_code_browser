@@ -1893,12 +1893,35 @@ can point to the library source without claiming the item's definition.
 Competing module files remain ambiguous. An uncaptured or unusable nested
 manifest does not fall through to an ancestor package.
 
-Include `Cargo.toml` at both ends in custom capture scopes. Each manifest is
-limited to 64 KiB of UTF-8 source and bounded nesting/path traversal, with
-at most 256 dependency aliases considered. Unsupported TOML spellings, workspace inheritance,
-registry/git dependencies, conditional/dev/build dependency selection and
-compiler bindings remain outside this finite policy. Missing metadata and
-exhausted budgets keep the original statement readable with no guessed target.
+Workspace-inherited path dependencies use the same navigation. For example, a
+captured workspace root can declare:
+
+```toml
+[workspace]
+members = ["crates/app", "crates/worker"]
+
+[workspace.dependencies]
+worker_alias = { package = "worker-core", path = "crates/worker" }
+```
+
+A member can inherit it with `worker_alias.workspace = true`, an inline
+`worker_alias = { workspace = true }`, or a `[dependencies.worker_alias]`
+table containing `workspace = true`. The dependency path is resolved from the
+captured workspace root. Root packages and virtual workspace manifests are
+supported; member admission uses explicit members and exclusions with literal
+paths or patterns such as `crates/*`, where `*` matches one complete directory
+component. Unsupported patterns, implicit workspace membership and conflicting metadata keep the import unresolved.
+
+Include the importer, workspace root and target `Cargo.toml` files in custom
+capture scopes. The resolver consults at most one nearest ancestor manifest;
+an unavailable or non-workspace boundary never falls through to an outer
+workspace. Each manifest is limited to 64 KiB of UTF-8 source and bounded
+nesting/path traversal, with at most 256 dependency aliases considered.
+Unsupported TOML spellings, path-base configuration, registry/git dependencies,
+conditional/dev/build dependency selection and compiler bindings remain outside
+this finite policy. Missing metadata and exhausted budgets keep the original
+statement readable with no guessed target. Navigation uses captured manifest evidence even after the live files change. This source addition awaits independent
+executable and physical-Mac verification.
 This applies to Project Imports, Saved Repository Imports, incoming links and
 Reading Desk activation, with the same retained UTF-8/UTF-16 source evidence.
 

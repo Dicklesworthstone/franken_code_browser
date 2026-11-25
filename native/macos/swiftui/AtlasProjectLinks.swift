@@ -143,7 +143,7 @@ struct AtlasProjectImportEvidence: Equatable, Sendable {
               try w.text("relationship_kind") == "lexical-import",
               try w.text("evidence_precision") == "exact-import-source-range",
               try w.text("extractor") == "franken-markdown-d6fbd1d5/import-statements-v10",
-              try w.text("resolver") == "fcb-closed-catalog-imports-v13",
+              try ["fcb-closed-catalog-imports-v13", "fcb-closed-catalog-imports-v14"].contains(w.text("resolver")),
               try w.text("extraction_policy") == "rust-inline-modules-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v10",
               try !w.flag("compiler_resolved"), try !w.flag("semantic_complete") else {
             throw AtlasProjectLinksError.invalidResponse
@@ -457,6 +457,7 @@ struct AtlasProjectLinksCoverage: Equatable, Sendable {
         captureRegionComplete = try w.flag("capture_region_complete")
         discoveryComplete = try w.flag("discovery_complete"); truncated = try w.flag("truncated")
         stop = try w.optionalText("stop_reason")
+        var metadataManifestsPerSource: UInt64 = 1
         if projection == .documentation {
             guard try w.text("evidence_precision") == "whole-captured-markdown-document",
                   try w.text("relationship_kind") == "parsed-markdown-link",
@@ -464,6 +465,7 @@ struct AtlasProjectLinksCoverage: Equatable, Sendable {
                   try w.number("max_markdown_source_bytes") == 262_144 else { throw AtlasProjectLinksError.invalidResponse }
         } else {
             try AtlasProjectImportEvidence.validateRoot(w)
+            if try w.text("resolver") == "fcb-closed-catalog-imports-v14" { metadataManifestsPerSource = 2 }
             guard try w.number("max_source_bytes") == AtlasProjectImportEvidence.sourceLimit else { throw AtlasProjectLinksError.invalidResponse }
         }
         guard try w.text("source_observation") == "retained-index-captures",
@@ -474,9 +476,9 @@ struct AtlasProjectLinksCoverage: Equatable, Sendable {
               examined == scanned + unsupported + sourceLimited, captured == examined + pending,
               retained <= 4096, retained <= linksSeen, steps <= 4097, lastStepFiles <= 1,
               moduleBytes <= 32 * 1024 * 1024, parseBytes <= 32 * 1024 * 1024 - moduleBytes,
-              // One importer manifest per source and one dependency manifest per
-              // observed use; the global 32 MiB cap bounds repeated metadata work.
-              moduleBytes <= (UInt64(scanned) + min(linksSeen, 4096)) * 65_536,
+              // v14 may additionally inspect one workspace manifest per source.
+              // Keep the original v13 bound and the independent global byte cap.
+              moduleBytes <= (metadataManifestsPerSource * UInt64(scanned) + min(linksSeen, 4096)) * 65_536,
               parseBytes <= basis.sourceBytes, hashedBytes <= basis.sourceBytes,
               captureRegionComplete == (basis.captureScope.visibleMissingFiles == 0),
               discoveryComplete == basis.discoveryComplete, building == (stop == nil),

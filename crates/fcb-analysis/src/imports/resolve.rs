@@ -15,7 +15,8 @@ pub use go::{CapturedGoModule, GoModuleLocation, find_go_module, go_package_sour
     resolve_go_import, MAX_GO_MODULE_SOURCE_BYTES};
 
 pub use cargo::{CapturedCargoManifest, CargoManifestLocation, CargoDependencyLocation,
-    find_cargo_manifest, is_rust_dependency_import, resolve_rust_dependency_import,
+    find_cargo_manifest, find_cargo_workspace_manifest, is_rust_dependency_import,
+    resolve_rust_dependency_import, resolve_rust_dependency_import_with_workspace,
     MAX_CARGO_MANIFEST_SOURCE_BYTES};
 
 pub const MAX_IMPORT_RESOLUTION_PATH_BYTES: usize = 16 * 1024;

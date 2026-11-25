@@ -6,8 +6,8 @@
 //! page or activation opens working-tree source or evaluates project tooling.
 
 use fcb::search::imports::{CapturedCargoManifest, CapturedGoModule, CapturedImports, ImportError, ImportLanguage, ImportKind,
-    ImportResolutionKind, find_cargo_manifest, find_go_module, go_package_source, is_rust_dependency_import,
-    resolve_go_import, resolve_import, resolve_rust_dependency_import,
+    ImportResolutionKind, find_cargo_manifest, find_cargo_workspace_manifest, find_go_module, go_package_source, is_rust_dependency_import,
+    resolve_go_import, resolve_import, resolve_rust_dependency_import_with_workspace,
     MAX_CARGO_MANIFEST_SOURCE_BYTES, MAX_GO_MODULE_SOURCE_BYTES, MAX_IMPORT_SOURCE_BYTES, MAX_IMPORT_ITEMS, IMPORT_EXTRACTOR, IMPORT_POLICY};
 use fcb::store::Sha256Digest;
 use super::*;
@@ -78,7 +78,7 @@ pub(crate) struct ImportsSnapshot {
 }
 pub(crate) struct ImportsWork {
     snapshot: ImportsSnapshot, parser_id: ResourceAllocationId, module_parser_id: ResourceAllocationId,
-    dependency_parser_id: ResourceAllocationId,
+    dependency_parser_id: ResourceAllocationId, workspace_parser_id: ResourceAllocationId,
 }
 impl From<ImportError> for AtlasSearchError {
     fn from(error: ImportError) -> Self {
@@ -103,8 +103,8 @@ impl RetainedAtlasSearch {
             return Err(AtlasSearchError::InvalidLimits);
         }
         check(&mut canceled)?;
-        let [state_id, parser_id, module_parser_id, dependency_parser_id] =
-            [self.next_id()?, self.next_id()?, self.next_id()?, self.next_id()?];
+        let [state_id, parser_id, module_parser_id, dependency_parser_id, workspace_parser_id] =
+            [self.next_id()?, self.next_id()?, self.next_id()?, self.next_id()?, self.next_id()?];
         let index = self.index.as_ref().ok_or(AtlasSearchError::MissingIndex)?;
         if index.generation != index_generation { return Err(AtlasSearchError::StaleIndex); }
         let capacity = index.engine.captured_files();
@@ -137,7 +137,7 @@ impl RetainedAtlasSearch {
         }
         self.validate(atlas)?; check(&mut canceled)?;
         let response = self.import_response(atlas, &snapshot, "imports-begin", &mut canceled)?;
-        self.imports_pending = Some(ImportsWork { snapshot, parser_id, module_parser_id, dependency_parser_id });
+        self.imports_pending = Some(ImportsWork { snapshot, parser_id, module_parser_id, dependency_parser_id, workspace_parser_id });
         Ok(response)
     }
 
@@ -320,6 +320,14 @@ impl RetainedAtlasSearch {
                     &self.budget, work.module_parser_id, canceled)?
             } else { None }
         } else { None };
+        // Inheritance may consult one additional captured ancestor, never a
+        // live pathname or an outer fallback after an unavailable boundary.
+        // Root packages use their already-held manifest without another parse.
+        let workspace = if let Some(location) = cargo.as_ref().and_then(|manifest|
+            find_cargo_workspace_manifest(manifest, |candidate| find_file(atlas, candidate))) {
+            cargo_manifest(atlas, index, snapshot, location.path(), location.target,
+                &self.budget, work.workspace_parser_id, canceled)?
+        } else { None };
         snapshot.scanned += 1;
         snapshot.diagnostics = snapshot.diagnostics.checked_add(imports.diagnostics() as u64).ok_or(AtlasSearchError::IdentityExhausted)?;
         snapshot.links_seen = snapshot.links_seen.checked_add(imports.links_seen()).ok_or(AtlasSearchError::IdentityExhausted)?;
@@ -327,7 +335,7 @@ impl RetainedAtlasSearch {
         for fact in imports.facts() {
             check(canceled)?;
             let dependency = if is_rust_dependency_import(fact) {
-                if let Some(location) = cargo.as_ref().and_then(|manifest| manifest.dependency(path, fact)) {
+                if let Some(location) = cargo.as_ref().and_then(|manifest| manifest.dependency_with_workspace(path, fact, workspace.as_ref())) {
                     if let Some(file) = find_file(atlas, location.path()) {
                         cargo_manifest(atlas, index, snapshot, location.path(), file,
                             &self.budget, work.dependency_parser_id, canceled)?
@@ -349,8 +357,8 @@ impl RetainedAtlasSearch {
                         None
                     })
             } else if is_rust_dependency_import(fact) {
-                resolve_rust_dependency_import(path, fact, cargo.as_ref(), dependency.as_ref(),
-                    |candidate| find_file(atlas, candidate))
+                resolve_rust_dependency_import_with_workspace(path, fact, cargo.as_ref(), workspace.as_ref(),
+                    dependency.as_ref(), |candidate| find_file(atlas, candidate))
             } else { resolve_import(path, fact, |candidate| find_file(atlas, candidate)) };
             if lookup_canceled { return Err(AtlasSearchError::Canceled); }
             let (resolution, target_file) = match resolved.kind {

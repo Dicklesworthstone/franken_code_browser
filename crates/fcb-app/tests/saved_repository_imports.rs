@@ -45,6 +45,98 @@ fn utf16(text: &str, big: bool) -> Vec<u8> {
 
 
 
+
+#[test]
+fn saved_workspace_dependencies_keep_utf16_evidence_and_offline_raw_paths() {
+    let workspace = b"[workspace]\nmembers = [\"app\", \"dep\"]\n[workspace.dependencies]\ndep_alias = { package = \"real-dep\", path = \"dep\" }\n";
+    let manifest = b"[package]\nname = \"app\"\n[dependencies.dep_alias]\nworkspace = true\n";
+    let dependency = b"[package]\nname = \"real-dep\"\n[lib]\npath = \"code/root.rs\"\n";
+    let statement = "use dep_alias::model::Thing;";
+    let target = b"pub struct Thing;\n";
+    let root = b"pub struct Root;\n";
+    for big in [false, true] {
+        let source = utf16(&format!("// saved workspace\r\n{statement}\r\n"), big);
+        let f = Fixture::new(&[entry(b"workspace/\xff/Cargo.toml", workspace),
+            entry(b"workspace/\xff/app/Cargo.toml", manifest),
+            entry(b"workspace/\xff/app/src/main.rs", &source),
+            entry(b"workspace/\xff/dep/Cargo.toml", dependency),
+            entry(b"workspace/\xff/dep/code/root.rs", root),
+            entry(b"workspace/\xff/dep/code/model.rs", target)], true);
+        let mut saved = f.open(58340 + u64::from(big) * 10);
+        let page = prepare(&mut saved, 1);
+        assert!(page.get("imports_complete").flag());
+        assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v14");
+        assert_eq!(page.get("member_bytes_read").number(),
+            (source.len() + manifest.len() + workspace.len() + dependency.len() + root.len() + target.len()) as u64);
+        assert_eq!(page.get("peak_source_bytes").number(),
+            (source.len() + manifest.len() + workspace.len() + dependency.len()) as u64);
+        let row = link(&page, b"workspace/\xff/app/src/main.rs", "dep_alias::model::Thing");
+        assert_eq!(row.get("resolution").text(), "captured");
+        assert_eq!(row.get("resolution_basis").text(), "rust-path-dependency-prefix-candidate");
+        assert_eq!(row.get("target_path").get("hex").text(), hex(b"workspace/\xff/dep/code/model.rs"));
+        assert_eq!(range(&source, row.get("evidence_range")), &utf16(statement, big)[2..]);
+        let before = reads(&mut saved);
+        let incoming = json(&saved.import_page(1, Some(row.get("target_member").number().try_into().unwrap()),
+            Direction::Incoming, 0, 64, || false).unwrap());
+        assert_eq!(incoming.get("matching_links").number(), 1);
+        assert_eq!(reads(&mut saved), before);
+        let (mut reader, receipt) = saved.open_import_reader(owner(58341 + u64::from(big) * 10),
+            1, row.get("link_id").number(), Side::Target, || false).unwrap();
+        assert!(!json(&receipt).get("live_source_reopened").flag());
+        saved.clear_imports(2, || false).unwrap(); drop(saved);
+        fs::rename(&f.path, f.root.join("moved-workspace.fcbs")).unwrap();
+        assert_eq!(copy_all(&mut reader).get("original_hex").text(), hex(target));
+    }
+}
+
+#[test]
+fn saved_missing_workspace_evidence_cannot_authorize_an_inherited_target() {
+    let source = b"use dep::Root;\n";
+    let manifest = b"[package]\nname = \"app\"\n[dependencies]\ndep.workspace = true\n";
+    let f = Fixture::new(&[
+        SnapshotEntry { path: b"Cargo.toml", observed_bytes: 64, data: SnapshotData::Unavailable("READ_DENIED") },
+        entry(b"app/Cargo.toml", manifest), entry(b"app/src/main.rs", source),
+        entry(b"dep/Cargo.toml", b"[package]\nname = \"dep\"\n"),
+        entry(b"dep/src/lib.rs", b"pub struct Root;\n")], true);
+    let mut saved = f.open(58360);
+    let page = prepare(&mut saved, 1);
+    let row = link(&page, b"app/src/main.rs", "dep::Root");
+    assert_eq!(row.get("resolution_basis").text(), "rust-dependency-context-unavailable");
+    assert_eq!(row.get("target_member"), &Json::Null);
+    assert!(saved.open_import_reader(owner(58361), 1, row.get("link_id").number(),
+        Side::Target, || false).is_err());
+}
+
+#[test]
+fn saved_workspace_budget_and_corruption_preserve_previous_import_inventory() {
+    let workspace = b"[workspace]\nmembers = [\"app\", \"dep\"]\n[workspace.dependencies]\ndep = { path = \"dep\" }\n";
+    let manifest = b"[package]\nname = \"app\"\n[dependencies]\ndep.workspace = true\n";
+    let dependency = b"[package]\nname = \"dep\"\n";
+    let source = b"use dep::Root;\n";
+    let target = b"pub struct Root;\n";
+    let f = Fixture::new(&[entry(b"Cargo.toml", workspace), entry(b"app/Cargo.toml", manifest),
+        entry(b"app/src/main.rs", source), entry(b"dep/Cargo.toml", dependency),
+        entry(b"dep/src/lib.rs", target)], true);
+    let mut saved = f.open(58370);
+    let capped = json(&saved.prepare_imports(1, 64, (source.len() + manifest.len()) as u64, || false).unwrap());
+    assert_eq!(capped.get("member_bytes_read").number(), (source.len() + manifest.len()) as u64);
+    assert_eq!(link(&capped, b"app/src/main.rs", "dep::Root").get("target_member"), &Json::Null);
+    let complete = json(&saved.prepare_imports(2, 64,
+        (source.len() + manifest.len() + workspace.len() + dependency.len() + target.len()) as u64, || false).unwrap());
+    assert!(complete.get("imports_complete").flag());
+    let row = link(&complete, b"app/src/main.rs", "dep::Root");
+    let (mut retained, _) = saved.open_import_reader(owner(58371), 2,
+        row.get("link_id").number(), Side::Target, || false).unwrap();
+    let accepted = json(&saved.import_page(2, None, Direction::All, 0, 64, || false).unwrap());
+    let at = f.bytes.windows(workspace.len()).position(|bytes| bytes == workspace).unwrap();
+    let mut writer = OpenOptions::new().write(true).open(&f.path).unwrap();
+    writer.seek(SeekFrom::Start(at as u64)).unwrap(); writer.write_all(b"X").unwrap(); writer.flush().unwrap();
+    assert!(saved.prepare_imports(3, 64, 1024 * 1024, || false).is_err());
+    assert_eq!(saved.import_generation(), Some(2));
+    assert_eq!(json(&saved.import_page(2, None, Direction::All, 0, 64, || false).unwrap()), accepted);
+    assert_eq!(copy_all(&mut retained).get("original_hex").text(), hex(target));
+}
+
 #[test]
 fn saved_cargo_dependencies_keep_utf16_evidence_raw_paths_and_independent_readers() {
     let manifest = b"[package]\nname = \"app\"\n[dependencies.dep_alias]\npackage = \"real-dep\"\npath = \"../dep\"\n";
@@ -159,7 +251,7 @@ fn saved_inline_rust_modules_keep_exact_nested_evidence_and_offline_targets() {
     assert!(page.get("imports_complete").flag());
     assert_eq!(page.get("links_seen").number(), 3);
     assert_eq!(page.get("extractor").text(), "franken-markdown-d6fbd1d5/import-statements-v10");
-    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v13");
+    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v14");
     for (destination, statement, kind, basis) in [
         ("child", "mod child;", "rust-module", "rust-module-file-candidate"),
         ("self::child::Thing", "use self::child::Thing;", "rust-use", "rust-use-module-prefix-candidate"),
@@ -527,7 +619,7 @@ fn saved_rust_use_tree_pages_preserve_leaf_identity_and_original_utf16_evidence(
         let result = prepare(&mut saved, 1);
         assert!(result.get("imports_complete").flag());
         assert_eq!(result.get("links_seen").number(), 5);
-        assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v13");
+        assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v14");
         let rows = result.get("links").array();
         for (index, (destination, spelling)) in [
             ("crate::shared", "self"), ("crate::shared::Thing", "Thing"),
@@ -610,7 +702,7 @@ fn shared_language_extractors_publish_exact_occurrences_and_metadata_only_revers
     assert_eq!(result.get("import_generation").number(), 7);
     assert_eq!(result.get("projection").text(), "lexical-source-imports");
     assert_eq!(result.get("evidence_precision").text(), "exact-import-source-range");
-    assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v13");
+    assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v14");
     assert_eq!(result.get("extraction_policy").text(), "rust-inline-modules-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v10");
     assert_eq!(result.get("completeness_scope").text(), "parsed-source-imports-in-saved-manifest");
     assert!(!result.get("compiler_resolved").flag());

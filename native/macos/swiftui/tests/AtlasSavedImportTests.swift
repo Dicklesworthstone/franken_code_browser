@@ -454,6 +454,56 @@ private final class SavedImportFixture: @unchecked Sendable {
         }
     }
 
+    private static func cargoWorkspaceMetadataWire(_ f: SavedImportFixture, identity: AtlasSavedIdentity) throws {
+        let decode: ([String: Any]) throws -> AtlasSavedImports = {
+            try AtlasSavedImports.decode(f.base.encode($0), identity: identity, generation: 1,
+                direction: .all, member: nil, start: 0, limit: 64)
+        }
+        var legacy = f.page(identity.owner, generation: 1)
+        // One source, its importing manifest and two target manifests admit
+        // four bounded reads. V14 additionally admits one workspace manifest.
+        legacy["member_read_calls"] = String(4 * AtlasSavedImportWire.maximumMemberReadCalls)
+        let oldPage = try decode(legacy)
+        precondition(oldPage.scanned == 1 && oldPage.retained == 2
+            && oldPage.readCalls == 4 * AtlasSavedImportWire.maximumMemberReadCalls)
+        var excessLegacy = legacy
+        excessLegacy["member_read_calls"] = String(4 * AtlasSavedImportWire.maximumMemberReadCalls + 1)
+        reject { _ = try decode(excessLegacy) }
+
+        var workspace = excessLegacy
+        workspace["resolver"] = "fcb-closed-catalog-imports-v14"
+        var rows = workspace["links"] as! [[String: Any]]
+        for i in rows.indices {
+            rows[i]["language"] = "rust"; rows[i]["lexical_import_kind"] = "rust-use"
+            rows[i]["destination"] = "dep_alias::Thing"
+            rows[i]["resolution_basis"] = "rust-path-dependency-prefix-candidate"
+            rows[i]["source_path"] = f.base.path(Array("crates/app/src/main.rs".utf8), "crates/app/src/main.rs")
+            rows[i]["target_path"] = f.base.path(Array("crates/dep/src/lib.rs".utf8), "crates/dep/src/lib.rs")
+        }
+        workspace["links"] = rows
+        let inherited = try decode(workspace)
+        precondition(inherited.links[0].canOpenTarget && !inherited.links[1].canOpenTarget
+            && inherited.links[0].resolutionLabel.contains("Cargo path dependency"))
+        workspace["member_read_calls"] = String(5 * AtlasSavedImportWire.maximumMemberReadCalls)
+        let fullAllowance = try decode(workspace)
+        precondition(fullAllowance.readCalls == 5 * AtlasSavedImportWire.maximumMemberReadCalls)
+        var excess = workspace
+        excess["member_read_calls"] = String(5 * AtlasSavedImportWire.maximumMemberReadCalls + 1)
+        reject { _ = try decode(excess) }
+        var unknown = workspace; unknown["resolver"] = "fcb-closed-catalog-imports-v15"
+        reject { _ = try decode(unknown) }
+
+        // Workspace metadata does not enlarge archive I/O or peak residency.
+        var aggregate = workspace
+        aggregate["member_bytes_read"] = "33554432"; aggregate["peak_source_bytes"] = "1048576"
+        let bounded = try decode(aggregate)
+        precondition(bounded.sourceBytes == 33_554_432 && bounded.peakSourceBytes == 1_048_576)
+        var excessBytes = aggregate; excessBytes["member_bytes_read"] = "33554433"
+        reject { _ = try decode(excessBytes) }
+        var excessPeak = aggregate; excessPeak["peak_source_bytes"] = "1048577"
+        reject { _ = try decode(excessPeak) }
+    }
+
     private static func goWire(_ f: SavedImportFixture, identity: AtlasSavedIdentity) throws {
         let decode: ([String: Any]) throws -> AtlasSavedImports = {
             try AtlasSavedImports.decode(f.base.encode($0), identity: identity, generation: 1,
@@ -784,6 +834,7 @@ private final class SavedImportFixture: @unchecked Sendable {
         try rustPathModuleWire(f, identity: identity)
         try goWire(f, identity: identity)
         try cargoDependencyWire(f, identity: identity)
+        try cargoWorkspaceMetadataWire(f, identity: identity)
         try javaWire(f, identity: identity)
         try pythonAbsoluteWire(f, identity: identity)
         try javascriptLoadWire(f, identity: identity)
