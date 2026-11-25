@@ -80,8 +80,124 @@ import Foundation
         }
     }
 
+
+    @MainActor private static func atlasFileNavigation() throws {
+        func member(_ index: Int, path: [UInt8]? = nil, width: Double = 32) -> AtlasProjectCatalog.Entry {
+            let raw = path ?? Array("file-\(index).rs".utf8)
+            return AtlasProjectCatalog.Entry(id: UInt64(index + 1), rawPath: raw, displayPath: "untrusted label",
+                sourcePath: String(bytes: raw, encoding: .utf8), observedBytes: 17,
+                x: Double(index), y: 0, width: width, height: 16)
+        }
+        let frame = AtlasCatalogNavigation.Frame(layout: UUID(), content: UUID())
+        let members = (0..<65).map { member($0) }
+        var navigation = AtlasCatalogNavigation()
+        check(navigation.install(members, frame: frame), "Install shares an admitted catalog")
+        navigation.setActive(true)
+        let first = navigation.rows[0].id
+        check(navigation.rows.count == 32 && navigation.focusedRow == nil,
+              "Accessibility starts with at most 32 rows and independent focus")
+        check(!navigation.focus(first, expected: frame)
+              && navigation.entry(for: first, expected: frame, action: .read) == nil,
+              "A pending layout cannot lend metadata to a native action")
+        let wrongContent = AtlasCatalogNavigation.Frame(layout: frame.layout, content: UUID())
+        check(!navigation.acknowledge(wrongContent) && navigation.acknowledge(frame),
+              "Only the exact presented content opens the action boundary")
+        check(navigation.focus(first, expected: frame)
+              && navigation.entry(for: first, expected: frame, action: .read)?.rawPath == members[0].rawPath,
+              "An acknowledged row opens its exact native path")
+        check(navigation.rows[0].label == "file-0.rs", "Labels are escaped from raw paths, never authority")
+        check(navigation.movePage(1, expected: frame) && navigation.pageOffset == 32
+              && navigation.rows.count == 32 && navigation.focusedOrdinal == 32,
+              "Next page advances a bounded window")
+        check(navigation.movePage(1, expected: frame) && navigation.pageOffset == 64
+              && navigation.rows.count == 1 && !navigation.movePage(1, expected: frame),
+              "Final partial page is retained without phantom rows")
+        let last = navigation.focusedRow!.id
+        check(navigation.entry(for: last, expected: frame, action: .read)?.id == 65,
+              "Later windows retain exact response identities")
+        check(navigation.moveFocus(1, expected: frame) && navigation.focusedOrdinal == 0
+              && navigation.pageOffset == 0 && !navigation.movePage(-1, expected: frame),
+              "Keyboard traversal wraps without scanning or skipping entries")
+        check(navigation.moveFocus(-1, expected: frame) && navigation.focusedOrdinal == 64,
+              "Reverse keyboard traversal reaches the final window")
+        check(!navigation.moveFocus(0, expected: frame) && !navigation.movePage(Int.max, expected: frame),
+              "Invalid navigation directions never overflow")
+
+        check(navigation.request(wrongContent) && navigation.focusedRow?.id == last
+              && navigation.pageOffset == 64 && !navigation.accepts(frame),
+              "Source replacement preserves focus and page while fencing actions")
+        check(navigation.entry(for: last, expected: frame, action: .read) == nil
+              && navigation.entry(for: last, expected: wrongContent, action: .read) == nil
+              && !navigation.acknowledge(frame),
+              "Old and unpresented replacement receipts are both refused")
+        check(navigation.acknowledge(wrongContent)
+              && navigation.entry(for: last, expected: wrongContent, action: .read)?.id == 65,
+              "The same file becomes actionable after its new content is presented")
+        navigation.setActive(false)
+        check(!navigation.acknowledge(wrongContent) && !navigation.moveFocus(1, expected: wrongContent)
+              && navigation.entry(for: last, expected: wrongContent, action: .read) == nil,
+              "Hidden, canceled, or detached navigation cannot activate sources")
+        navigation.setActive(true)
+        check(!navigation.accepts(wrongContent) && navigation.acknowledge(wrongContent),
+              "Returning requires a compatible presentation receipt")
+
+        let replacement = AtlasCatalogNavigation.Frame(layout: UUID(), content: UUID())
+        check(navigation.install([member(64, path: Array("different.rs".utf8))], frame: replacement)
+              && navigation.acknowledge(replacement) && navigation.focusedRow == nil,
+              "Scope/filter replacement resets page and focus")
+        check(navigation.entry(for: last, expected: replacement, action: .read) == nil,
+              "A reused response ID cannot activate a replacement layout")
+        let accepted = navigation.rows[0].id
+        let forgedPath = AtlasCatalogNavigation.Identity(layout: replacement.layout, ordinal: 0,
+            file: accepted.file, rawPath: Array("other.rs".utf8))
+        let forgedID = AtlasCatalogNavigation.Identity(layout: replacement.layout, ordinal: 0,
+            file: accepted.file + 1, rawPath: accepted.rawPath)
+        check(navigation.entry(for: forgedPath, expected: replacement, action: .read) == nil
+              && navigation.entry(for: forgedID, expected: replacement, action: .reveal) == nil,
+              "Ordinal alone never authorizes a different path or file ID")
+
+        let special = [
+            member(0, path: Array("é.rs".utf8)), member(1, path: Array("e\u{301}.rs".utf8)),
+            member(2, path: [255, 46, 114, 115]), member(3, path: Array("a\nb.rs".utf8)),
+            member(4, path: Array("../outside.rs".utf8)), member(5, width: .nan)
+        ]
+        check(navigation.install(special, frame: frame) && navigation.acknowledge(frame),
+              "An admitted catalog keeps unusual or unavailable rows visible")
+        let rows = navigation.rows
+        check(rows[0].id != rows[1].id
+              && navigation.entry(for: rows[0].id, expected: frame, action: .read)?.rawPath == special[0].rawPath
+              && navigation.entry(for: rows[1].id, expected: frame, action: .read)?.rawPath == special[1].rawPath,
+              "Canonically equivalent Unicode names retain distinct exact identities")
+        check(rows[2].canReveal && !rows[2].canRead && rows[2].limitation != nil
+              && navigation.entry(for: rows[2].id, expected: frame, action: .reveal) != nil
+              && navigation.entry(for: rows[2].id, expected: frame, action: .read) == nil,
+              "Non-UTF-8 rows can be revealed without inventing an openable path")
+        check(rows[3].label == "a\\u{a}b.rs" && !rows[3].label.contains("\n")
+              && navigation.entry(for: rows[3].id, expected: frame, action: .read)?.rawPath.contains(10) == true,
+              "Control characters are escaped only for display; original identity survives")
+        for row in rows.suffix(2) {
+            check(!row.canReveal && !row.canRead && row.limitation != nil
+                  && navigation.entry(for: row.id, expected: frame, action: .reveal) == nil,
+                  "Malformed paths and geometry have explicit non-activating rows")
+        }
+        check(navigation.install([], frame: replacement) && navigation.acknowledge(replacement)
+              && navigation.rows.isEmpty && !navigation.moveFocus(1, expected: replacement)
+              && !navigation.movePage(1, expected: replacement),
+              "Empty/filtered-out catalogs are usable without fabricated targets")
+        let maximum = (0..<AtlasProjectCatalog.maximumFiles).map { member($0) }
+        check(navigation.install(maximum, frame: frame) && navigation.acknowledge(frame)
+              && navigation.moveFocus(-1, expected: frame)
+              && navigation.focusedOrdinal == maximum.count - 1 && navigation.rows.count <= 32,
+              "The full atlas bound remains reachable through one bounded window")
+        check(!navigation.install(Array(repeating: member(0), count: AtlasProjectCatalog.maximumFiles + 1),
+                                  frame: replacement)
+              && navigation.frame == nil && navigation.rows.isEmpty && !navigation.accepts(frame),
+              "Oversized replacement cannot keep an older actionable frame")
+    }
+
     @MainActor static func main() throws {
         try exactFileScope()
+        try atlasFileNavigation()
         let r = try decode(wire())
         check(r.entries.count == 1 && r.entries[0].sourcePath == "a.rs", "Native path comes from reversible bytes, not label")
         check(r.entries[0].displayPath == "label only" && r.entries[0].observedBytes == 17, "Metadata labels and exact sizes retained")

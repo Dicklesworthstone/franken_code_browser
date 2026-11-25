@@ -4080,6 +4080,10 @@ struct AtlasCanvas: View {
     @State private var viewport: CGSize = .zero
     @State private var initialFitPending = true
     @State private var presentedFrame = AtlasPresentedFrame()
+    @State private var fileNavigation = AtlasCatalogNavigation()
+    @State private var showsFileNavigation = false
+    @FocusState private var fileNavigationListFocused: Bool
+    @FocusState private var fileNavigationButtonFocused: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -4095,6 +4099,8 @@ struct AtlasCanvas: View {
                               camera.acceptsNavigation(revision: revision) else { return }
                         presentedFrame.record(revision: revision, scale: scale, offset: offset,
                             contentRevision: contentRevision)
+                        prepareFileNavigation()
+                        acknowledgeFileNavigation()
                         requestVisibleSource(in: size)
                     })
                 .onChange(of: timeline.date) { _, _ in
@@ -4153,9 +4159,22 @@ struct AtlasCanvas: View {
             }
             .onAppear {
                 camera.reducedMotion = reduceMotion
+                prepareFileNavigation()
+                fileNavigation.setActive(active)
+                acknowledgeFileNavigation()
+            }
+            .onDisappear { fileNavigation.setActive(false) }
+            .onChange(of: contentRevision) { _, _ in
+                prepareFileNavigation()
+                acknowledgeFileNavigation()
+            }
+            .onChange(of: showsFileNavigation) { _, shown in
+                fileNavigationListFocused = shown && active
+                if !shown && active { fileNavigationButtonFocused = true }
             }
             .onChange(of: reduceMotion) { _, value in camera.reducedMotion = value }
             .onChange(of: revision, initial: true) { _, value in
+                prepareFileNavigation()
                 guard active, camera.acceptsNavigation(revision: value) else { return }
                 initialFitPending = !preservesNavigation && !camera.fit(bounds: contentBounds, viewport: size)
             }
@@ -4177,13 +4196,28 @@ struct AtlasCanvas: View {
                 }
             }
             .onChange(of: active) { _, value in
+                fileNavigation.setActive(value)
+                if value { acknowledgeFileNavigation() }
+                else { fileNavigationListFocused = false }
                 guard value, camera.acceptsNavigation(revision: revision) else { return }
                 camera.updateViewport(size)
                 if initialFitPending && !preservesNavigation { initialFitPending = !camera.fit(bounds: contentBounds, viewport: size) }
                 requestVisibleSource(in: size)
             }
+            .overlay(alignment: .topLeading) {
+                if active && showsFileNavigation { fileNavigator }
+            }
             .overlay(alignment: .bottomLeading) {
                 HStack(spacing: 8) {
+                    Button {
+                        guard active else { return }
+                        showsFileNavigation.toggle()
+                    } label: {
+                        Label("Atlas files", systemImage: "list.bullet")
+                    }
+                    .focused($fileNavigationButtonFocused)
+                    .accessibilityLabel("Browse files in the 2D atlas")
+                    .help("Browse known atlas files with the keyboard or a screen reader. Focus, reveal, and read are separate actions.")
                     Button {
                         camera.goBack(viewport: viewport, revision: revision)
                     } label: {
@@ -4244,6 +4278,154 @@ struct AtlasCanvas: View {
                 .padding(10)
             }
         }
+    }
+
+
+    /// The native list materializes one bounded metadata window. It is a
+    /// conventional keyboard/VoiceOver route through the displayed atlas, not
+    /// a second filesystem browser or a source-capture authority.
+    @ViewBuilder private var fileNavigator: some View {
+        if let frame = fileNavigation.frame {
+            let rows = fileNavigation.rows
+            let ready = fileNavigationReady(frame)
+            let focused = fileNavigation.focusedRow
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("Atlas files").font(.headline)
+                    Spacer()
+                    Button("Close") { showsFileNavigation = false }
+                        .accessibilityLabel("Close atlas file navigator")
+                }
+                Text(rows.isEmpty ? "No files in this atlas."
+                    : "Files \(fileNavigation.pageOffset + 1)–\(fileNavigation.pageOffset + rows.count) of \(fileNavigation.count) known in this atlas")
+                    .font(.caption).foregroundStyle(.secondary)
+                if !rows.isEmpty {
+                    ScrollViewReader { scroll in
+                        List(selection: Binding<AtlasCatalogNavigation.Identity?>(
+                            get: { fileNavigation.focusedRow?.id },
+                            set: { identity in
+                                guard let identity, fileNavigationReady(frame) else { return }
+                                fileNavigation.focus(identity, expected: frame)
+                            })) {
+                            ForEach(rows) { row in
+                                Text(verbatim: row.label)
+                                    .font(.system(size: 12, design: .monospaced))
+                                    .lineLimit(1).truncationMode(.middle)
+                                    .tag(row.id).id(row.id)
+                                    .help(row.label)
+                                    .accessibilityHint(row.limitation
+                                        ?? "Select to focus this file. Reveal moves the map; Read source opens its reader.")
+                            }
+                        }
+                        .listStyle(.plain)
+                        .focusable()
+                        .focused($fileNavigationListFocused)
+                        .accessibilityLabel("Files in the displayed 2D atlas")
+                        .onKeyPress(.upArrow) {
+                            guard fileNavigationReady(frame) else { return .ignored }
+                            fileNavigation.moveFocus(-1, expected: frame)
+                            return .handled
+                        }
+                        .onKeyPress(.downArrow) {
+                            guard fileNavigationReady(frame) else { return .ignored }
+                            fileNavigation.moveFocus(1, expected: frame)
+                            return .handled
+                        }
+                        .onKeyPress(.return) {
+                            if let row = fileNavigation.focusedRow {
+                                readNavigationFile(row.id, expected: frame)
+                            }
+                            return .handled
+                        }
+                        .onKeyPress(.escape) {
+                            showsFileNavigation = false
+                            return .handled
+                        }
+                        .onChange(of: fileNavigation.focusedRow?.id) { _, identity in
+                            if let identity { scroll.scrollTo(identity, anchor: .center) }
+                        }
+                        .disabled(!ready)
+                    }
+                    .frame(height: min(240, max(44, viewport.height - 220)))
+                }
+                if !ready {
+                    Text("Waiting for this atlas view to be displayed…").font(.caption).foregroundStyle(.secondary)
+                } else if let limitation = focused?.limitation {
+                    Text(limitation).font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Text("Arrow keys focus files · Return reads · Escape closes")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                HStack {
+                    Button("Previous files") {
+                        guard fileNavigationReady(frame) else { return }
+                        fileNavigation.movePage(-1, expected: frame)
+                    }.disabled(!ready || !fileNavigation.hasPreviousPage)
+                    Button("Next files") {
+                        guard fileNavigationReady(frame) else { return }
+                        fileNavigation.movePage(1, expected: frame)
+                    }.disabled(!ready || !fileNavigation.hasNextPage)
+                    Spacer(minLength: 0)
+                }
+                HStack {
+                    Button("Reveal in atlas") {
+                        if let focused { revealNavigationFile(focused.id, expected: frame) }
+                    }.disabled(!ready || focused?.canReveal != true)
+                    Button("Read source") {
+                        if let focused { readNavigationFile(focused.id, expected: frame) }
+                    }.disabled(!ready || focused?.canRead != true)
+                }
+            }
+            .controlSize(.small)
+            .padding(12)
+            .frame(width: min(360, max(1, viewport.width - 48)))
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+            .padding(12)
+        } else {
+            Text("Atlas file navigation is unavailable for this catalog.")
+                .font(.caption).padding(12).background(.regularMaterial)
+        }
+    }
+
+    private var navigationFrame: AtlasCatalogNavigation.Frame {
+        AtlasCatalogNavigation.Frame(layout: revision, content: contentRevision)
+    }
+    private func prepareFileNavigation() {
+        if fileNavigation.frame?.layout != revision {
+            fileNavigation.install(metadata, frame: navigationFrame)
+        } else if fileNavigation.frame != navigationFrame {
+            fileNavigation.request(navigationFrame)
+        }
+    }
+    private func acknowledgeFileNavigation() {
+        guard active, camera.acceptsNavigation(revision: revision),
+              presentedFrame.worldPoint(at: .zero, revision: revision, contentRevision: contentRevision) != nil,
+              !fileNavigation.accepts(navigationFrame) else { return }
+        // Camera-only receipts do not mutate observable navigation state or
+        // schedule an additional SwiftUI render on every presented frame.
+        fileNavigation.acknowledge(navigationFrame)
+    }
+    private func fileNavigationReady(_ expected: AtlasCatalogNavigation.Frame) -> Bool {
+        active && expected == navigationFrame && camera.acceptsNavigation(revision: revision)
+            && fileNavigation.accepts(expected)
+            && presentedFrame.worldPoint(at: .zero, revision: revision, contentRevision: contentRevision) != nil
+    }
+    private func revealNavigationFile(_ identity: AtlasCatalogNavigation.Identity,
+                                      expected: AtlasCatalogNavigation.Frame) {
+        guard fileNavigationReady(expected),
+              let entry = fileNavigation.entry(for: identity, expected: expected, action: .reveal) else { return }
+        let parcel = CGRect(x: entry.x, y: entry.y, width: entry.width, height: entry.height)
+        guard camera.navigateFocus(bounds: parcel, viewport: viewport, revision: revision) else { return }
+        fileNavigation.focus(identity, expected: expected)
+    }
+    private func readNavigationFile(_ identity: AtlasCatalogNavigation.Identity,
+                                    expected: AtlasCatalogNavigation.Frame) {
+        guard fileNavigationReady(expected),
+              let entry = fileNavigation.entry(for: identity, expected: expected, action: .read) else { return }
+        fileNavigation.focus(identity, expected: expected)
+        // The existing owner/grant/source opener alone publishes a successful
+        // reader. Focusing a row or a failed read never replaces that capture.
+        onSelect(entry)
     }
 
     /// Only the accepted display transform supplies demand. This callback

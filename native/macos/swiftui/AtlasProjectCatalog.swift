@@ -402,3 +402,141 @@ struct AtlasStartupFileRequest {
 #endif
     }
 }
+
+/// A bounded conventional navigator over an already admitted atlas catalog.
+/// It shares the immutable metadata array; installation never scans or sorts
+/// the project. Each presentation reads at most one 32-row window, and actions
+/// resolve one ordinal under the exact acknowledged layout/content receipt.
+/// Focus belongs to this navigator and does not open or replace a source reader.
+struct AtlasCatalogNavigation {
+    struct Frame: Equatable, Sendable {
+        let layout: UUID
+        let content: UUID
+    }
+    struct Identity: Hashable, Sendable {
+        let layout: UUID
+        let ordinal: Int
+        let file: UInt64
+        let rawPath: [UInt8]
+    }
+    struct Row: Identifiable, Sendable {
+        let id: Identity
+        let label: String
+        let canReveal: Bool
+        let canRead: Bool
+        let limitation: String?
+    }
+    enum Action { case reveal, read }
+    static let pageSize = 32
+
+    private var entries: [AtlasProjectCatalog.Entry] = []
+    private var presented: Frame?
+    private var active = false
+    private(set) var frame: Frame?
+    private(set) var pageOffset = 0
+    private(set) var focusedOrdinal: Int?
+
+    var count: Int { entries.count }
+    var hasPreviousPage: Bool { pageOffset > 0 }
+    var hasNextPage: Bool { pageOffset + Self.pageSize < entries.count }
+    var rows: [Row] {
+        (pageOffset..<min(entries.count, pageOffset + Self.pageSize)).compactMap { row(at: $0) }
+    }
+    var focusedRow: Row? { focusedOrdinal.flatMap { row(at: $0) } }
+
+    @discardableResult mutating func install(_ entries: [AtlasProjectCatalog.Entry], frame: Frame) -> Bool {
+        self.entries = []
+        self.frame = nil; presented = nil; pageOffset = 0; focusedOrdinal = nil
+        guard entries.count <= AtlasProjectCatalog.maximumFiles else { return false }
+        self.entries = entries; self.frame = frame
+        return true
+    }
+
+    /// Source residency changes retire action receipts without changing file
+    /// identity, the current page, or keyboard focus within the same layout.
+    @discardableResult mutating func request(_ frame: Frame) -> Bool {
+        guard self.frame?.layout == frame.layout else { return false }
+        if self.frame != frame { self.frame = frame; presented = nil }
+        return true
+    }
+
+    mutating func setActive(_ active: Bool) {
+        self.active = active
+        if !active { presented = nil }
+    }
+    @discardableResult mutating func acknowledge(_ frame: Frame) -> Bool {
+        guard active, self.frame == frame else { return false }
+        presented = frame
+        return true
+    }
+    func accepts(_ expected: Frame) -> Bool {
+        active && frame == expected && presented == expected
+    }
+
+    @discardableResult mutating func focus(_ identity: Identity, expected: Frame) -> Bool {
+        guard accepts(expected), matches(identity) else { return false }
+        focusedOrdinal = identity.ordinal
+        pageOffset = identity.ordinal / Self.pageSize * Self.pageSize
+        return true
+    }
+    @discardableResult mutating func moveFocus(_ direction: Int, expected: Frame) -> Bool {
+        guard accepts(expected), direction == -1 || direction == 1, !entries.isEmpty else { return false }
+        let ordinal: Int
+        if let focusedOrdinal {
+            ordinal = (focusedOrdinal + (direction < 0 ? entries.count - 1 : 1)) % entries.count
+        } else {
+            ordinal = direction < 0 ? entries.count - 1 : 0
+        }
+        guard let row = row(at: ordinal) else { return false }
+        return focus(row.id, expected: expected)
+    }
+    @discardableResult mutating func movePage(_ direction: Int, expected: Frame) -> Bool {
+        guard accepts(expected), direction == -1 || direction == 1 else { return false }
+        if direction < 0 {
+            guard hasPreviousPage else { return false }
+            pageOffset -= Self.pageSize
+        } else {
+            guard hasNextPage else { return false }
+            pageOffset += Self.pageSize
+        }
+        focusedOrdinal = pageOffset
+        return true
+    }
+
+    /// Labels and Swift's canonical String equality never grant file access.
+    /// A stale row, reused response ID, changed raw spelling, or pending frame
+    /// cannot borrow a replacement catalog's geometry or source-opening action.
+    func entry(for identity: Identity, expected: Frame, action: Action) -> AtlasProjectCatalog.Entry? {
+        guard accepts(expected), matches(identity), let row = row(at: identity.ordinal) else { return nil }
+        switch action {
+        case .reveal: guard row.canReveal else { return nil }
+        case .read: guard row.canRead else { return nil }
+        }
+        return entries[identity.ordinal]
+    }
+
+    private func matches(_ identity: Identity) -> Bool {
+        guard identity.layout == frame?.layout, entries.indices.contains(identity.ordinal) else { return false }
+        let entry = entries[identity.ordinal]
+        return entry.id == identity.file && entry.rawPath == identity.rawPath
+    }
+
+    private func row(at ordinal: Int) -> Row? {
+        guard let frame, entries.indices.contains(ordinal) else { return nil }
+        let entry = entries[ordinal], raw = entry.rawPath
+        let pathValid = !raw.isEmpty && raw.count <= 16_384 && AtlasDirectoryFocus.isRelativePath(raw)
+        let geometryValid = entry.id > 0 && entry.width > 0 && entry.height > 0
+            && [entry.x, entry.y, entry.width, entry.height, entry.x + entry.width, entry.y + entry.height]
+                .allSatisfy { $0.isFinite && abs($0) <= 1e12 }
+        let canReveal = pathValid && geometryValid
+        let canRead = canReveal && (entry.sourcePath.map { $0.utf8.elementsEqual(raw) } == true)
+        let limitation: String?
+        if !pathValid { limitation = "Invalid native path; this atlas row cannot be activated." }
+        else if !geometryValid { limitation = "Atlas geometry is unavailable; this row cannot be activated." }
+        else if !canRead { limitation = "This filename can be revealed in the atlas, but this reader requires a UTF-8 filename." }
+        else { limitation = nil }
+        return Row(id: Identity(layout: frame.layout, ordinal: ordinal, file: entry.id, rawPath: raw),
+            label: pathValid ? AtlasDirectoryFocus.display(rawPath: raw) : "Invalid file path",
+            canReveal: canReveal, canRead: canRead, limitation: limitation)
+    }
+}

@@ -163,6 +163,33 @@ The production regression sources are in `AtlasFolderNavigationTests.swift`,
 verification remain pending. Automatic precision-triggered focus islands and
 complete multi-pane workspace restoration remain separate work.
 
+## Browse the 2D atlas with the keyboard
+
+Choose **Atlas files** in the map's lower-left controls to open its native file
+list. Tab reaches the navigator and its buttons. Up and Down focus files;
+**Reveal in atlas** moves the camera to the focused file, while **Read source**
+or Return opens it through the existing project reader. Escape or **Close**
+returns keyboard focus to the Atlas files button. Focusing a row by itself
+does not replace the source you are reading.
+
+The navigator shows at most 32 rows at once. **Previous files** and **Next files**
+move through the known atlas catalog, and arrow navigation crosses page
+boundaries. The count describes the current scope and filter; it does not claim
+that undiscovered or filtered-out files are present. No source read or new
+project discovery is needed to browse this list.
+
+A replacement layout resets the page and focus. Source-preview replacement
+keeps them while disabling file actions until the matching atlas content has
+been displayed. Actions retain the original file ID and path bytes, so a stale
+row or escaped display label cannot select a replacement file. Non-UTF-8 names
+remain visible and can be revealed; this atlas reader still requires a UTF-8
+filename to open source.
+
+This supplies a conventional native list for keyboard and screen-reader use.
+The catalog regression harness covers bounded pages, focus, replacement
+receipts and raw path identity. Executable keyboard/VoiceOver and physical-Mac
+qualification remain pending; this is not a full accessibility qualification.
+
 ## City view
 
 After preparing a text atlas, choose **City** in the toolbar. The City uses the
