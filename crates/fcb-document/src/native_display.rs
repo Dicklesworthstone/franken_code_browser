@@ -16,7 +16,7 @@ use franken_markdown::fonts::BundledFlowFonts;
 use franken_markdown::text::{Direction, FontId};
 use crate::reader::{DocumentReadError, DocumentReader, DocumentSourceEncoding};
 
-pub const MAX_DISPLAY_SOURCE_BYTES: usize = 64 * 1024;
+pub const MAX_DISPLAY_SOURCE_BYTES: usize = 128 * 1024;
 pub const MAX_DISPLAY_ITEMS: usize = 8192;
 pub const MAX_DISPLAY_GLYPHS: usize = 131_072;
 pub const MAX_DISPLAY_RUN_GLYPHS: usize = 4096;
@@ -108,13 +108,22 @@ impl NativeDocumentDisplay {
         // Includes simultaneous AST/projection/layout candidates, retained runs,
         // source pin and the upstream immutable bundled-font registry envelope.
         // It is managed admission, not a process-footprint or cache-eviction claim.
-        let charge = parse_charge.checked_add(MAX_DISPLAY_GLYPHS * 256)
-            .and_then(|n| n.checked_add(MAX_DISPLAY_ITEMS * 512))
-            .and_then(|n| n.checked_add(24 * 1024 * 1024 + source.len()))
+        let retained_charge = (24 * 1024 * 1024_usize).checked_add(source.len())
             .and_then(|n| n.checked_add(document.source_encoding().retained_charge()))
             .ok_or(NativeDisplayError::ResourceDenied)?;
+        let charge = parse_charge.checked_add(MAX_DISPLAY_GLYPHS * 256)
+            .and_then(|n| n.checked_add(MAX_DISPLAY_ITEMS * 512))
+            .and_then(|n| n.checked_add(retained_charge))
+            .ok_or(NativeDisplayError::ResourceDenied)?;
+        // Qualification owns its separate full-AST/slice scratch reservation.
+        // No display parser, font registry or glyph output exists during that
+        // audit, so reserve only the retained envelope before entering it.
+        // This includes its returned span vector (at most 8192 SourceSpans),
+        // source/encoding pins and the eventual immutable-font allowance.
+        // Stacking both phases' peak reservations would reject useful documents
+        // even though their allocations never coexist.
         let lease = budget.try_reserve_managed(capture.request().file().owner(), allocations[0],
-            ByteLength::new(charge as u64)).map_err(|_| NativeDisplayError::ResourceDenied)?;
+            ByteLength::new(retained_charge as u64)).map_err(|_| NativeDisplayError::ResourceDenied)?;
         let qualified_spans = match document.qualified_source_spans(
             budget, allocations[1], &mut canceled) {
             Ok(spans) => Some(spans),
@@ -125,6 +134,13 @@ impl NativeDocumentDisplay {
             Err(DocumentReadError::ResourceDenied) => return Err(NativeDisplayError::ResourceDenied),
             Err(_) => return Err(NativeDisplayError::EngineLimit),
         };
+        check(&mut canceled)?;
+        // The audit's scratch lease has now retired. Admit the unchanged full
+        // parse/shaping/output envelope BEFORE constructing any display state.
+        // Failed growth drops only this private candidate; accepted previews
+        // and their independently charged allocations remain untouched.
+        lease.reconcile(ByteLength::new(charge as u64))
+            .map_err(|_| NativeDisplayError::ResourceDenied)?;
         let limits = FlowDisplayLimits {
             max_source_bytes: MAX_DISPLAY_SOURCE_BYTES, max_source_lines: 32_768,
             max_ast_nodes: 32_768, max_nesting_depth: 64, max_output_blocks: 4096,

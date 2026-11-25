@@ -2679,7 +2679,7 @@ and physical-Mac visual, wheel and frame-cadence qualification.
 Open a retained source file and choose **Markdown**, or **Split preview** to keep
 the source alongside the document. The native reader prepares a **Styled**
 view by default when the host supplies the rich-display capability and the
-capture fits its 64 KiB source and decoded-input limits. **Text** keeps the selectable
+capture fits its 128 KiB source and decoded-input limits. **Text** keeps the selectable
 logical preview available for UTF-8 and BOM-marked UTF-16 captures up to **256 KiB**
 in each of those domains. Larger supported
 documents automatically use Text with an explanation; choosing Styled keeps
@@ -2737,21 +2737,36 @@ Logical preparation uses the existing public 256 KiB source bound with at most
 original-byte anchors, rendered-text copy and enclosing-Markdown copy. Files
 above 256 KiB remain available in the source reader.
 
-Styled preparation retains its 64 KiB source bound, at most 8,192 display
+Styled preparation admits up to 128 KiB in each source domain, at most 8,192 display
 elements, 131,072 glyphs, and 8 MiB of bundled font resources. It does not queue
 typography, font or image work for a document above that source bound. A page admits at most 128
 elements and 16,384 glyphs. Source, generation, layout and page identities are
 checked before accepting asynchronous results or enabling source actions.
 Cancellation, capture replacement and failed reflow cannot reactivate stale
 pages. Each logical generation retains one rich width; reflow creates a fresh
-generation.
+generation. These are admission ceilings: parser complexity, layout, glyph and
+managed-memory limits can still require Text or source fallback for a smaller
+capture, including UTF-16 whose decoded form needs more workspace.
+
+The host retires temporary source-qualification scratch before admitting the
+full rich-display parser, shaping and output envelope. This allows larger
+styled documents within the existing 256 MiB managed budget. Heading jumps,
+source following and both copy domains reuse that completed qualification only
+while the logical and styled layouts name the same immutable capture and
+generation. Successful reflow or clear retires the proof; an unqualified or
+failed display cannot authorize source actions.
 
 `tests/test-large-document-preview.sh` covers the native size boundaries,
-fallback, late source anchors, copy domains, reflow and cancellation. The Rust
-host regression `crates/fcb-app/tests/retained_reader_large_document.rs`
-exercises actual larger Markdown parsing and original BOM/CRLF offsets, including
-the exact 256 KiB boundary. These code-first additions await independent
-execution; they do not qualify native drawing or raise the styled-rendering limit.
+fallback, late source anchors, copy domains, reflow and cancellation.
+`crates/fcb-document/tests/native_display.rs` adds exact 128 KiB styled
+pagination, bounded admission and cancellation/recovery regressions.
+`crates/fcb-app/tests/retained_reader_document_display.rs` exercises larger
+styled documents through the host, including heading/source navigation and
+exact copies after display preparation.
+`crates/fcb-app/tests/retained_reader_large_document.rs` covers Text fallback
+above the styled limit and the exact 256 KiB logical boundary with original
+BOM/CRLF offsets. These code-first additions await independent executable
+and physical-Mac qualification.
 
 `tests/test-document-preview.sh` and the selected-file reader cases in
 `tests/test-native-open.sh` include authored source-follow coalescing, worker

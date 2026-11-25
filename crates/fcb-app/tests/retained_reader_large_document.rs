@@ -27,7 +27,7 @@ fn options() -> ReaderDocumentOptions {
 #[test]
 fn large_logical_preview_keeps_bom_crlf_tail_anchors_and_copy_after_rich_display_refuses() {
     let mut bytes = b"\xef\xbb\xbf# Large document\r\n\r\n".to_vec();
-    while bytes.len() < 96 * 1024 { bytes.extend_from_slice(PARAGRAPH); }
+    while bytes.len() < 136 * 1024 { bytes.extend_from_slice(PARAGRAPH); }
     let heading_at = bytes.len();
     bytes.extend_from_slice(b"## Tail target\r\n\r\n");
     let paragraph_at = bytes.len();

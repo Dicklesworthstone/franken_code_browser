@@ -170,7 +170,7 @@ struct AtlasMarkdownPreviewPreference {
     private var styledSourceLimitReason: String? {
         guard richSupported, let identity,
               identity.capturedBytes > AtlasReaderDocumentLimits.styledSourceBytes else { return nil }
-        return "This document uses Text preview because Styled preview is limited to 64 KiB. Headings, links, and source navigation remain available."
+        return "This document uses Text preview because Styled preview is limited to 128 KiB of original source and decoded UTF-8. Headings, links, and source navigation remain available."
     }
     var canPrepare: Bool { unavailableReason == nil }
     var canNavigate: Bool { authorized && page != nil && !busy }
@@ -980,9 +980,15 @@ struct AtlasMarkdownPreviewPreference {
                 self.notice = (error as? AtlasReaderError)?.message ?? AtlasReaderError.unavailable.message
                 if case .prepareDisplay = request {
                     self.showsStyled = false
-                    if let readerError = error as? AtlasReaderError, case .engine(let code) = readerError,
-                       code == "DOCUMENT_DISPLAY_SHAPING_UNSUPPORTED" {
-                        self.notice = "Bundled typography does not support all the text in this document. Text preview and the exact source remain available."
+                    if let readerError = error as? AtlasReaderError, case .engine(let code) = readerError {
+                        switch code {
+                        case "DOCUMENT_DISPLAY_SHAPING_UNSUPPORTED":
+                            self.notice = "Bundled typography does not support all the text in this document. Text preview and the exact source remain available."
+                        case "DOCUMENT_DISPLAY_SOURCE_LIMIT":
+                            self.notice = "Styled preview admits up to 128 KiB of original source and decoded UTF-8. This capture exceeds a source limit; Text preview and source navigation remain available."
+                        default:
+                            self.notice += " Text preview remains available."
+                        }
                     } else {
                         self.notice += " Text preview remains available."
                     }

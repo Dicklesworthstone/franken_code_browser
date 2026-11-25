@@ -600,7 +600,7 @@ import AppKit
                     preparePreview()
                 }
                 .disabled(model.page == nil || model.busy || showsSplitPreview)
-                .help("Preview the same retained capture with headings and source mapping; Text up to 256 KiB, Styled up to 64 KiB of UTF-8")
+                .help("Preview the same retained capture with headings and source mapping; Text up to 256 KiB, Styled up to 128 KiB of original source and decoded UTF-8")
                 Button(showsSplitPreview ? "Hide preview" : "Split preview") {
                     showsSplitPreview.toggle()
                     if showsSplitPreview { preparePreview() }

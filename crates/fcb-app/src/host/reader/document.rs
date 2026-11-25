@@ -235,12 +235,22 @@ impl ReaderSession {
         self.last_document_attempt = generation;
         Ok(())
     }
-    /// Explicit source-coordinate actions, never rendering/page requests, pay
-    /// for bounded provenance qualification on the existing host worker. Keep
-    /// the retained preview, source, query and generation unchanged on refusal.
+    /// Explicit source-coordinate actions require the complete logical-layout
+    /// provenance audit. A qualified retained display already performed that
+    /// same audit for this immutable document; reuse it without another parser
+    /// workspace. Keep the preview, source, query and generation on refusal.
     pub(super) fn qualify_document_source_actions(&mut self, generation: u64,
         canceled: &mut impl FnMut() -> bool) -> Result<(), ReaderSessionError> {
+        check(canceled)?;
         self.document_snapshot(generation)?;
+        if let Some(display) = &self.document_display {
+            display.validate_delivery(&self.capture, generation)?;
+            // NativeDocumentDisplay::prepare qualifies this document's complete
+            // heading catalog, source-map elements and logical-row associations
+            // before granting source authority. Reflow/clear retires the display
+            // together with that proof; an unqualified display grants none.
+            if display.source_ranges_qualified() { return Ok(()); }
+        }
         let [qualification_id] = self.allocations()?;
         self.document_snapshot(generation)?.qualify_heading_source_ranges(
             &self.budget, qualification_id, canceled)?;

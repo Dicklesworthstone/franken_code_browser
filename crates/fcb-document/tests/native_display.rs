@@ -6,8 +6,8 @@ use fcb_core::{ArenaOwnerId, ByteLength, DocumentGeneration, DocumentId, FileId,
 use fcb_source::{CaptureRequest, CompleteCapture};
 use fcb_document::{DisplayItem, NativeVectorShape};
 use fcb_document::native_display::{NativeDocumentDisplay, NativeDisplayError,
-    MAX_DISPLAY_PAGE_GLYPHS, MAX_DISPLAY_PAGE_ITEMS};
-use fcb_document::reader::{DocumentReader, DocumentReadOptions};
+    MAX_DISPLAY_PAGE_GLYPHS, MAX_DISPLAY_PAGE_ITEMS, MAX_DISPLAY_SOURCE_BYTES};
+use fcb_document::reader::{DocumentReadError, DocumentReader, DocumentReadOptions};
 use franken_markdown::text::FontId;
 
 fn owner() -> ArenaOwnerId { ArenaOwnerId::new(813).unwrap() }
@@ -262,7 +262,7 @@ fn utf16_styled_display_retains_exact_mapping_after_the_logical_reader_retires()
 #[test]
 fn utf16_styled_source_limit_also_applies_to_decoded_parser_input() {
     // It fits the original-byte display cap but exceeds its decoded UTF-8 cap.
-    let bytes: Vec<u8> = "\u{feff}".encode_utf16().chain("界".repeat(22_000).encode_utf16())
+    let bytes: Vec<u8> = "\u{feff}".encode_utf16().chain("界".repeat(44_000).encode_utf16())
         .flat_map(u16::to_le_bytes).collect();
     let source = capture(&bytes); let budget = budget();
     let reader = DocumentReader::prepare(&source, DocumentId::new(owner(), 1).unwrap(),
@@ -272,4 +272,160 @@ fn utf16_styled_source_limit_also_applies_to_decoded_parser_input() {
         &budget, allocation(1), || false).unwrap();
     assert_eq!(NativeDocumentDisplay::prepare(&reader, 640, &budget,
         [allocation(2), allocation(3)], || false).err(), Some(NativeDisplayError::SourceLimit));
+}
+
+fn large_styled_source() -> String {
+    let mut text = String::from("# Large document\n\n");
+    let paragraph = "Ordinary text in a retained document remains readable with exact source navigation.\n\n";
+    let tail = "\n\n## Final target\n\nA **bold** final paragraph.\n";
+    while text.len() + paragraph.len() + tail.len() <= MAX_DISPLAY_SOURCE_BYTES {
+        text.push_str(paragraph);
+    }
+    text.push_str(&"x".repeat(MAX_DISPLAY_SOURCE_BYTES - text.len() - tail.len()));
+    text.push_str(tail);
+    text
+}
+
+#[test]
+fn exact_rich_source_limit_preserves_qualified_tail_and_bounded_pages_under_256_mib() {
+    let text = large_styled_source();
+    assert!(text.len() > 100 * 1024);
+    assert_eq!(text.len(), MAX_DISPLAY_SOURCE_BYTES);
+    let source = capture(text.as_bytes()); let budget = budget();
+    let reader = DocumentReader::prepare(&source, DocumentId::new(owner(), 1).unwrap(),
+        DocumentGeneration::new(owner(), 1).unwrap(),
+        DocumentReadOptions { max_source_bytes: MAX_DISPLAY_SOURCE_BYTES, ..Default::default() },
+        &budget, allocation(1), || false).unwrap();
+    let baseline = budget.accounting();
+    let display = display(&reader, &budget, 640);
+    assert!(display.source_ranges_qualified());
+    assert!(display.glyph_count() > 0 && display.font_count() >= 2);
+    assert_eq!(budget.accounting().active_allocations(), baseline.active_allocations() + 1);
+    assert!(budget.accounting().peak_reserved().get() <= 256 * 1024 * 1024);
+
+    // Negative control: these full envelopes cannot coexist in the host's
+    // real capacity. Successful preparation above requires the audit scratch
+    // to retire before the display parser/shaper/output envelope is admitted.
+    let accepted_charge = budget.accounting().reserved();
+    assert_eq!(reader.qualify_heading_source_ranges(&budget, allocation(4), || false),
+        Err(DocumentReadError::ResourceDenied));
+    assert_eq!(budget.accounting().reserved(), accepted_charge);
+
+    let tail = text.find("A **bold** final").unwrap() as u64;
+    let item = display.first_item_at_source(tail, || false).unwrap();
+    assert!(item > MAX_DISPLAY_PAGE_ITEMS);
+    let range = display.original_range(item).unwrap().unwrap();
+    assert_eq!(range.start().get(), tail);
+    assert!(range.end().get() <= source.bytes().len() as u64);
+    let (start, end) = range.as_usize_bounds().unwrap();
+    assert!(source.bytes()[start..end].starts_with(b"A **bold** final"));
+    let mut first = 0;
+    let mut paged_glyphs = 0;
+    while first < display.display().items().len() {
+        let end = display.page_end(first, MAX_DISPLAY_PAGE_ITEMS).unwrap();
+        assert!(end > first && end - first <= MAX_DISPLAY_PAGE_ITEMS);
+        let glyphs: usize = display.display().items()[first..end].iter().map(|item| match item {
+            DisplayItem::Text(text) => text.font_run.as_ref().unwrap().glyphs.len(), _ => 0,
+        }).sum();
+        assert!(glyphs <= MAX_DISPLAY_PAGE_GLYPHS);
+        paged_glyphs += glyphs;
+        first = end;
+    }
+    assert_eq!(paged_glyphs, display.glyph_count());
+    assert_eq!(display.first_item_at_source(source.bytes().len() as u64, || false).unwrap(), first);
+    assert_eq!(display.page_end(first, 1).unwrap(), first);
+    display.validate_delivery(&source, 1).unwrap();
+    drop(display);
+    assert_eq!(budget.accounting().reserved(), baseline.reserved());
+    assert_eq!(budget.accounting().active_allocations(), baseline.active_allocations());
+}
+
+#[test]
+fn one_byte_above_rich_limit_keeps_the_larger_logical_preview_and_all_reservations() {
+    let mut text = large_styled_source(); text.push('\n');
+    let source = capture(text.as_bytes()); let budget = budget();
+    let reader = DocumentReader::prepare(&source, DocumentId::new(owner(), 1).unwrap(),
+        DocumentGeneration::new(owner(), 1).unwrap(),
+        DocumentReadOptions { max_source_bytes: 256 * 1024, ..Default::default() },
+        &budget, allocation(1), || false).unwrap();
+    let before = budget.accounting();
+    assert_eq!(NativeDocumentDisplay::prepare(&reader, 640, &budget,
+        [allocation(2), allocation(3)], || false).err(), Some(NativeDisplayError::SourceLimit));
+    assert_eq!(budget.accounting().reserved(), before.reserved());
+    assert_eq!(budget.accounting().active_allocations(), before.active_allocations());
+    assert!(reader.rendered_text().contains("final paragraph."));
+    assert_eq!(reader.capture().bytes(), text.as_bytes());
+}
+
+#[test]
+fn cancellation_after_provenance_audit_retires_the_unpublished_display_envelope() {
+    let source = capture(b"# Stable\n\nA retained paragraph.\n");
+    let budget = budget(); let reader = read(&source, &budget);
+    let before = budget.accounting();
+    let mut saw_audit = false;
+    let mut stopped_after_audit = false;
+    let result = NativeDocumentDisplay::prepare(&reader, 640, &budget,
+        [allocation(2), allocation(3)], || {
+            let active = budget.accounting().active_allocations();
+            if active == before.active_allocations() + 2 { saw_audit = true; }
+            if saw_audit && active == before.active_allocations() + 1 {
+                stopped_after_audit = true;
+                return true;
+            }
+            false
+        });
+    assert!(saw_audit && stopped_after_audit, "cancel between audit retirement and display admission");
+    assert_eq!(result.err(), Some(NativeDisplayError::Canceled));
+    assert_eq!(budget.accounting().reserved(), before.reserved());
+    assert_eq!(budget.accounting().active_allocations(), before.active_allocations());
+    assert!(reader.rendered_text().contains("retained paragraph"));
+    assert!(display(&reader, &budget, 640).source_ranges_qualified(),
+        "the canceled attempt must release both allocation identities");
+}
+
+#[test]
+fn denied_display_growth_preserves_prior_capture_geometry_fonts_and_resource_charges() {
+    let source = capture(b"# Stable\n\nA retained paragraph.\n");
+    let budget = budget(); let reader = read(&source, &budget);
+    let accepted = display(&reader, &budget, 640);
+    let accepted_items = accepted.display().items().len();
+    let accepted_glyphs = accepted.glyph_count();
+    let accepted_font = accepted.font_chunk(0, 0, 32).unwrap().to_vec();
+    let source_offset = source.bytes().windows(b"A retained".len())
+        .position(|bytes| bytes == b"A retained").unwrap() as u64;
+    let accepted_item = accepted.first_item_at_source(source_offset, || false).unwrap();
+    let accepted_range = accepted.original_range(accepted_item).unwrap();
+
+    // Forty MiB admits the retained envelope and this small provenance audit,
+    // but cannot admit the full display parser/glyph/output envelope.
+    let available = budget.accounting().available().get();
+    assert!(available > 40 * 1024 * 1024);
+    let pressure = budget.try_reserve_managed(owner(), allocation(8),
+        ByteLength::new(available - 40 * 1024 * 1024)).unwrap();
+    let before = budget.accounting();
+    let mut saw_audit = false;
+    let mut audit_retired = false;
+    let result = NativeDocumentDisplay::prepare(&reader, 320, &budget,
+        [allocation(4), allocation(5)], || {
+            let active = budget.accounting().active_allocations();
+            if active == before.active_allocations() + 2 { saw_audit = true; }
+            if saw_audit && active == before.active_allocations() + 1 { audit_retired = true; }
+            false
+        });
+    assert!(saw_audit && audit_retired, "refusal must occur on growth after a successful audit");
+    assert_eq!(result.err(), Some(NativeDisplayError::ResourceDenied));
+    assert_eq!(budget.accounting().reserved(), before.reserved());
+    assert_eq!(budget.accounting().active_allocations(), before.active_allocations());
+    accepted.validate_delivery(&source, 1).unwrap();
+    assert_eq!(accepted.width_points(), 640);
+    assert_eq!(accepted.display().items().len(), accepted_items);
+    assert_eq!(accepted.glyph_count(), accepted_glyphs);
+    assert_eq!(accepted.font_chunk(0, 0, 32).unwrap(), accepted_font.as_slice());
+    assert_eq!(accepted.original_range(accepted_item).unwrap(), accepted_range);
+    assert_eq!(accepted.first_item_at_source(source_offset, || false).unwrap(), accepted_item);
+    assert!(reader.rendered_text().contains("retained paragraph"));
+    drop(pressure);
+    assert!(NativeDocumentDisplay::prepare(&reader, 320, &budget,
+        [allocation(4), allocation(5)], || false).is_ok(),
+        "a denied growth must release both candidate allocation identities");
 }

@@ -77,7 +77,7 @@ enum AtlasReaderDocumentLimits {
     // default bounded flow/metadata quotas. NativeDocumentDisplay has its own
     // smaller source allowance; a larger document still has logical navigation.
     static let sourceBytes: UInt64 = 256 * 1024
-    static let styledSourceBytes: UInt64 = 64 * 1024
+    static let styledSourceBytes: UInt64 = 128 * 1024
     static let flowLines: UInt64 = 8192
     static let flowItems: UInt64 = 8192
     static let blocks: UInt64 = 4096
