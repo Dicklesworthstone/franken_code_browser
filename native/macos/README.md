@@ -400,7 +400,8 @@ history bounds and scoped refresh. This is a **fcb-mhpb** code-first checkpoint;
 batch verification and physical-Mac interaction checks remain pending.
 The **fcb-g50a.2** folder-row slice adds host, C ABI and native regressions for
 folder-only pages, mixed retention limits, raw-path drilling, stale actions and
-the visible depth boundary. Its executable verification is also pending.
+the visible depth boundary. Focused portable Rust diagnostics pass; C ABI and
+native execution and independent batch qualification remain pending.
 
 ### Reading large files from Project Files
 
@@ -677,6 +678,26 @@ UTF-8 or UTF-16 spelling even when the query matches a lowercase expansion.
 The source reader remains independently usable after the archive closes.
 Case/mode, byte-witness, index-bypass, cancellation and native ABI regressions
 are included; executable verification remains pending.
+
+Literal and expression queries stream each selected archive member through
+bounded buffers; a search step does not load a whole member before it can yield.
+Expression predicates share the existing decoder pass. Per-step byte and
+read-call allowances cover both matching and digest verification, including
+short or interrupted reads.
+
+A member's results and counts become publishable only after its complete
+observed byte stream matches the saved SHA-256 digest. Reaching a match limit
+or expression work limit still verifies the unread suffix in bounded steps;
+it does not silently accept an unverified prefix. Cancellation stops this work
+and preserves the prior accepted query and its readers. Search I/O counters
+include verification bytes, while scanned-byte counters measure matcher work
+and peak-source counters measure occupied input buffers. Opening **Read source**
+continues to verify and retain the complete selected capture explicitly.
+
+The **fcb-g50a.1** saved-query streaming slice includes low-memory large-member,
+per-step I/O, corrupt-tail, cancellation, expression and retained-reader
+regressions. Focused portable Rust diagnostics pass; pinned-toolchain, independent
+batch and native qualification remain pending for this checkpoint.
 
 ### Saved result windows
 

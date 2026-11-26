@@ -176,7 +176,11 @@ fn expansion_spans_and_count_only_work_limits_keep_original_source_semantics() {
             .expression_search_matching(1, "i required", 2, 10000, false, true, || false)
             .unwrap(),
     );
-    assert_eq!(result.get("matches_seen").number(), 2);
+    // Both dotted-I scalars and the ASCII I in REQUIRED match the primary.
+    // The predicate also being present does not remove its primary occurrence.
+    assert_eq!(result.get("matches_seen").number(), 3);
+    assert_eq!(result.get("retained_hits").number(), 2);
+    assert!(result.get("matches_seen_exact").flag());
     let (_, opened) = saved
         .open_expression_hit_reader(owner(66702), 1, 1, || false)
         .unwrap();
@@ -190,7 +194,7 @@ fn expansion_spans_and_count_only_work_limits_keep_original_source_semantics() {
             .expression_search_matching(2, "i required", 0, 10000, false, true, || false)
             .unwrap(),
     );
-    assert_eq!(complete.get("matches_seen").number(), 2);
+    assert_eq!(complete.get("matches_seen").number(), 3);
     assert!(complete.get("matches_seen_exact").flag());
     assert!(complete.get("hits").array().is_empty());
     let partial = json(

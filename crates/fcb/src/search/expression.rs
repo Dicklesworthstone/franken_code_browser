@@ -2,17 +2,18 @@
 
 //! Multi-term saved-source queries over the existing parser, metadata filters,
 //! decoder and streaming matcher. Predicates are document-wide, not line-local.
-//! Each step evaluates one metadata record or one bounded matcher quantum. A
-//! member's verified buffer feeds all predicates and the primary matcher in one
-//! decoding pass. No runtime, source grant, or filesystem path is inferred.
+//! Each step evaluates one metadata record or one bounded source/matcher quantum.
+//! One observed member stream feeds every predicate and the primary matcher in
+//! one decoding pass. Results remain private until that entire stream matches its
+//! saved digest. No runtime, source grant, or filesystem path is inferred.
 
-use std::{io::{Cursor, Read, Seek}, mem::size_of};
+use std::{io::{Read, Seek}, mem::size_of};
 use fcb_core::{ArenaOwnerId, ByteLength, ByteRange, FileId, QueryGeneration,
     ResourceAllocationId, ResourceBudget, ResourceLease, SourceRevision};
 use super::{CaptureRequest, ParsedQuery, QueryError, ReferenceScanOracle, RawPath,
-    ReaderSearch, StreamingNeedle, StreamReadError, StreamReadOptions, StreamReadState, StreamReadStep};
-use super::paged_snapshot::{PagedSnapshot, PagedMemberData, VerifiedMember, PagedCapture,
-    PagedSearchError, Sha256Digest};
+    StreamingNeedle, StreamReadError, StreamReadOptions, StreamReadState, StreamReadStep};
+use super::paged_snapshot::{PagedSnapshot, PagedMemberData, PagedCapture,
+    PagedSearchError, Sha256Digest, SnapshotDirectory, SnapshotReadSession, MemberSearch};
 use super::snapshot_index::{SnapshotIndex, IndexDecision};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -120,9 +121,15 @@ pub struct ExpressionStats {
     pub scope_files: usize,
     pub metadata_excluded: usize,
     pub unavailable_files: usize,
+    /// Members whose complete observed stream passed saved-digest verification.
     pub members_loaded: usize,
+    /// Actual source I/O, including bounded integrity drains after match/work limits.
     pub loaded_bytes: u64,
+    pub read_calls: u64,
+    /// Peak occupied source buffer length, not the full member or reserved capacity.
     pub peak_member_bytes: usize,
+    pub last_step_loaded_bytes: usize,
+    pub last_step_read_calls: usize,
     /// Predicate cursors evaluated inside the shared source passes, not
     /// additional reads or decoder passes.
     pub predicate_scans: usize,
@@ -170,14 +177,15 @@ impl ExpressionHit {
 /// selected sources remain visible even when a subsequent result limit stops the
 /// scan. No per-repository candidate vector or capture collection is allocated.
 pub struct ExpressionQuery<'archive, 'plan, R: Read + Seek> {
-    archive: &'archive mut PagedSnapshot<R>,
+    directory: &'archive SnapshotDirectory,
+    source: Option<SnapshotReadSession<'archive, R>>,
     plan: &'plan ExpressionPlan,
     index: Option<&'plan SnapshotIndex>,
     options: ExpressionOptions,
     allocations: [ResourceAllocationId; 3],
     scope_at: usize,
     next: usize,
-    active: Option<ReaderSearch<'plan, Cursor<VerifiedMember>>>,
+    active: Option<MemberSearch<'archive, 'plan, R>>,
     hits: Vec<ExpressionHit>,
     seen: u64,
     matching_files: usize,
@@ -188,7 +196,7 @@ pub struct ExpressionQuery<'archive, 'plan, R: Read + Seek> {
     _lease: ResourceLease,
 }
 impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
-    /// allocations = [result/metadata scratch, one member, one active matcher].
+    /// allocations = [result/metadata scratch, bounded source scratch, one active matcher].
     /// The query owns no backing handle beyond its borrowed archive.
     pub fn new(archive: &'archive mut PagedSnapshot<R>, plan: &'plan ExpressionPlan,
         options: ExpressionOptions, budget: &ResourceBudget, allocations: [ResourceAllocationId; 3])
@@ -218,7 +226,9 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
             .map_err(|_| ExpressionError::ResourceDenied)?;
         let mut hits = Vec::new(); hits.try_reserve_exact(options.max_matches).map_err(|_| ExpressionError::ResourceDenied)?;
         if hits.capacity() > options.max_matches { return Err(ExpressionError::ResourceDenied); }
-        Ok(Self { archive, plan, index: None, options, allocations, scope_at: 0, next: 0,
+        let source = archive.read_session();
+        let directory = source.directory();
+        Ok(Self { directory, source: Some(source), plan, index: None, options, allocations, scope_at: 0, next: 0,
             active: None, hits, seen: 0, matching_files: 0, count_all_matches, skip_matches,
             state: ExpressionState::Pending, stats: ExpressionStats::default(), _lease: lease })
     }
@@ -256,23 +266,29 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
     }
     pub const fn state(&self) -> ExpressionState { self.state }
     pub const fn stats(&self) -> ExpressionStats { self.stats }
-    pub fn cancel(&mut self) { self.active = None; self.state = ExpressionState::Canceled; }
+    pub fn cancel(&mut self) { self.active = None; self.source = None; self.state = ExpressionState::Canceled; }
     pub fn step(&mut self, step: StreamReadStep, generation: QueryGeneration, budget: &ResourceBudget,
         mut canceled: impl FnMut() -> bool) -> Result<ExpressionState, ExpressionError> {
         self.stats.last_step_scanned_bytes = 0;
+        self.stats.last_step_loaded_bytes = 0; self.stats.last_step_read_calls = 0;
         if generation != self.options.generation { self.cancel(); return Err(ExpressionError::StaleQuery); }
         if canceled() { self.cancel(); return Err(ExpressionError::Canceled); }
         if self.state != ExpressionState::Pending { return Ok(self.state); }
         if step.max_bytes == 0 || step.max_calls == 0 || step.max_hits == 0 { return Ok(self.state); }
         let result = self.advance(step, budget, &mut canceled);
         if canceled() { self.cancel(); return Err(ExpressionError::Canceled); }
-        if let Err(error) = result { self.active = None; self.state = ExpressionState::Failed(error); return Err(error); }
+        if let Err(error) = result {
+            self.active = None; self.source = None;
+            self.state = if error == ExpressionError::Canceled { ExpressionState::Canceled }
+                else { ExpressionState::Failed(error) };
+            return Err(error);
+        }
         Ok(self.state)
     }
     fn advance(&mut self, step: StreamReadStep, budget: &ResourceBudget,
         canceled: &mut impl FnMut() -> bool) -> Result<(), ExpressionError> {
-        if self.scope_at < self.archive.directory().len() {
-            let member = self.archive.directory().member(self.scope_at).ok_or(PagedSearchError::InvalidHit)?;
+        if self.scope_at < self.directory.len() {
+            let member = self.directory.member(self.scope_at).ok_or(PagedSearchError::InvalidHit)?;
             self.scope_at += 1; self.stats.metadata_examined += 1;
             if self.plan.admits(member.path) {
                 self.stats.scope_files += 1;
@@ -281,9 +297,9 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
             return Ok(());
         }
         if self.active.is_none() {
-            if self.next == self.archive.directory().len() { self.state = ExpressionState::Complete; return Ok(()); }
+            if self.next == self.directory.len() { self.state = ExpressionState::Complete; return Ok(()); }
             let ordinal = self.next; self.next += 1;
-            let member = self.archive.directory().member(ordinal).ok_or(PagedSearchError::InvalidHit)?;
+            let member = self.directory.member(ordinal).ok_or(PagedSearchError::InvalidHit)?;
             if !self.plan.admits(member.path) || matches!(member.data, PagedMemberData::Unavailable(_)) { return Ok(()); }
             if let Some(index) = self.index {
                 // The saved index certifies absence of exact UTF-8 grams only.
@@ -299,24 +315,31 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
             if member.observed_bytes > 0 && self.stats.scanned_bytes == self.options.max_scan_bytes {
                 self.state = ExpressionState::WorkLimit; return Ok(());
             }
-            let verified = self.archive.load(ordinal, budget, self.allocations[1], &mut *canceled)
-                .map_err(PagedSearchError::from)?;
-            self.stats.members_loaded += 1;
-            self.stats.loaded_bytes += verified.bytes().len() as u64;
-            self.stats.peak_member_bytes = self.stats.peak_member_bytes.max(verified.bytes().len());
-            self.start(verified, budget)?;
-            // Member validation is distinct worker work. Do not hide a matcher
-            // quantum behind this load.
+            self.start(ordinal, budget)?;
+            // Admission is distinct from source I/O. The next step starts one
+            // bounded source/matcher quantum, with no whole-member allocation.
             return Ok(());
         }
         let scan = self.active.as_mut().ok_or(ExpressionError::Pending)?;
-        let before = scan.stats().scanned_bytes;
-        let state = scan.step(step, self.options.generation, &mut *canceled)?;
-        let used = scan.stats().scanned_bytes - before;
-        self.stats.scanned_bytes += used; self.stats.last_step_scanned_bytes = used;
-        if state == StreamReadState::Pending { return Ok(()); }
-        let (cursor, report) = self.active.take().ok_or(ExpressionError::Pending)?.finish()?;
-        let verified = cursor.into_inner();
+        let before = scan.stats();
+        let result = scan.step(step, self.options.generation, &mut *canceled);
+        let after = scan.stats();
+        self.stats.scanned_bytes += after.scanned_bytes - before.scanned_bytes;
+        self.stats.loaded_bytes += after.io.bytes_read - before.io.bytes_read;
+        self.stats.read_calls += after.io.read_calls - before.io.read_calls;
+        self.stats.peak_member_bytes = self.stats.peak_member_bytes.max(after.peak_source_bytes);
+        self.stats.last_step_scanned_bytes = after.last_step_scanned_bytes;
+        self.stats.last_step_loaded_bytes = after.last_step_loaded_bytes;
+        self.stats.last_step_read_calls = after.last_step_read_calls;
+        let complete = result.map_err(|error| match error {
+            PagedSearchError::Canceled => ExpressionError::Canceled,
+            _ => ExpressionError::Search(error),
+        })?;
+        if !complete { return Ok(()); }
+        let (session, verified, report) = self.active.take().ok_or(ExpressionError::Pending)?.finish()?;
+        self.source = Some(session);
+        self.stats.members_loaded += 1;
+        let report = report.ok_or(ExpressionError::Pending)?;
         match report.state() {
             StreamReadState::UnsupportedText => { self.stats.unsupported_files += 1; return Ok(()); }
             StreamReadState::Canceled => return Err(ExpressionError::Canceled),
@@ -348,20 +371,22 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
         else if !self.count_all_matches && report.has_more_matches() { self.state = ExpressionState::Truncated; }
         Ok(())
     }
-    fn start(&mut self, verified: VerifiedMember, budget: &ResourceBudget) -> Result<(), ExpressionError> {
-        let ordinal = verified.ordinal() as u64;
+    fn start(&mut self, ordinal: usize, budget: &ResourceBudget) -> Result<(), ExpressionError> {
         let owner = self.options.generation.owner();
-        let file = FileId::new(owner, self.options.first_file.get() + ordinal).map_err(|_| ExpressionError::IdentityExhausted)?;
-        let revision = SourceRevision::new(owner, self.options.first_revision.get() + ordinal).map_err(|_| ExpressionError::IdentityExhausted)?;
+        let file = FileId::new(owner, self.options.first_file.get() + ordinal as u64).map_err(|_| ExpressionError::IdentityExhausted)?;
+        let revision = SourceRevision::new(owner, self.options.first_revision.get() + ordinal as u64).map_err(|_| ExpressionError::IdentityExhausted)?;
         let request = CaptureRequest::new(file, revision).map_err(|_| PagedSearchError::InvalidHit)?;
-        let length = verified.bytes().len() as u64;
+        let member = self.directory.member(ordinal).ok_or(PagedSearchError::InvalidHit)?;
+        let PagedMemberData::Captured { byte_length, .. } = member.data else { return Err(PagedSearchError::InvalidHit.into()); };
+        let length = byte_length as u64;
         let mut options = StreamReadOptions::new(self.options.generation);
         options.max_matches = self.options.max_matches - self.hits.len();
         options.max_bytes = length.min(self.options.max_scan_bytes.saturating_sub(self.stats.scanned_bytes));
         options.max_read_calls = fcb_store::paged_snapshot::MAX_SNAPSHOT_READ_CALLS;
-        let scan = ReaderSearch::new_page(Cursor::new(verified), request, ByteLength::new(length),
-            &self.plan.pattern, options, self.skip_matches.saturating_sub(self.seen),
-            self.count_all_matches, budget, self.allocations[2])?;
+        let session = self.source.take().ok_or(ExpressionError::Pending)?;
+        let scan = MemberSearch::new(session, ordinal, request, &self.plan.pattern, options,
+            self.skip_matches.saturating_sub(self.seen), self.count_all_matches, false,
+            budget, [self.allocations[1], self.allocations[2]])?;
         self.stats.primary_scans += 1;
         self.stats.predicate_scans += self.plan.predicate_count();
         self.active = Some(scan); Ok(())
@@ -372,8 +397,8 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
             ExpressionState::Canceled => return Err(ExpressionError::Canceled),
             ExpressionState::Failed(error) => return Err(error), _ => {},
         }
-        Ok(ExpressionReport { archive: self.archive.directory().digest(), generation: self.options.generation,
-            discovery_complete: self.archive.directory().discovery_complete(), state: self.state,
+        Ok(ExpressionReport { archive: self.directory.digest(), generation: self.options.generation,
+            discovery_complete: self.directory.discovery_complete(), state: self.state,
             hits: self.hits, seen: self.seen, matching_files: self.matching_files,
             case_sensitive: self.plan.case_sensitive, count_all_matches: self.count_all_matches,
             skip_matches: self.skip_matches,
