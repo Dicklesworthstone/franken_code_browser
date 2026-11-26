@@ -219,12 +219,15 @@ fn identifiers_cross_scan_boundaries_and_include_textual_comments_and_strings() 
     for (hit, offset) in page.get("hits").array().iter().zip(expected) {
         assert_eq!(bounds(hit), ((prefix + offset) as u64, (prefix + offset + 3) as u64));
     }
-    assert!(matches!(s.search_with_options(1, pane, 2, "foo", 8, bytes.len() as u64,
-        DeskFindOptions { case_sensitive: false, ..options(DeskFindMode::Identifier, false, 0) }, || false),
-        Err(DeskSessionError::Desk(DeskError::InvalidLimits))));
+    let lowercase = s.search_with_options(1, pane, 2, "FOO", 8, bytes.len() as u64,
+        DeskFindOptions { case_sensitive: false, ..options(DeskFindMode::Identifier, false, 0) },
+        || false).unwrap();
+    assert_eq!(json(&lowercase).get("matches_seen").number(), expected.len() as u64);
+    assert!(!json(&lowercase).get("case_sensitive").flag());
     assert!(matches!(s.search_with_options(1, pane, 3, "foo bar", 8, bytes.len() as u64,
-        options(DeskFindMode::Identifier, false, 0), || false), Err(DeskSessionError::Stream(_))));
-    assert_eq!(s.accepted_query(), Some(1));
+        DeskFindOptions { case_sensitive: false, ..options(DeskFindMode::Identifier, false, 0) },
+        || false), Err(DeskSessionError::Stream(_))));
+    assert_eq!(s.accepted_query(), Some(2));
 }
 
 #[test]
@@ -263,4 +266,76 @@ fn restored_captures_support_the_same_modes_without_live_paths_or_losing_notes()
     assert_eq!(json(&restored.copy_selection(2, pane, || false).unwrap()).get("original_hex").text(), hex(b"anchor"));
     assert_eq!(restored.model().bookmarks()[0].body(), "saved explanation");
     assert_eq!(json(&restored.state(|| false).unwrap()).get("initial_source_bytes_read").number(), 0);
+}
+
+#[test]
+fn lowercase_identifier_windows_keep_whole_tokens_original_encodings_and_activation() {
+    let prefix = " ".repeat(fcb::search::streaming::STREAM_BUFFER_BYTES - 5);
+    let text = format!("{prefix}k K K kx _K 1K\nİ i\u{307} I\u{307} i I ß ẞ ss SS ΟΣ οσ ος É é e\u{301}");
+    for encoding in 0..4 {
+        let bytes = encode(&text, encoding);
+        let mut s = session(); let pane = adopt(&mut s, &bytes);
+        let lower = DeskFindOptions { case_sensitive: false, ..options(DeskFindMode::Identifier, true, 1) };
+        let response = s.search_with_options(1, pane, 1, "K", 2, bytes.len() as u64, lower, || false).unwrap();
+        assert_eq!(response.exit_code(), EXIT_PARTIAL);
+        let page = json(&response);
+        assert_eq!(page.get("mode").text(), "whole-token-text-candidate");
+        assert!(!page.get("case_sensitive").flag());
+        assert!(page.get("search_complete").flag()); assert!(page.get("match_count_complete").flag());
+        assert_eq!(page.get("matches_seen").number(), 3);
+        assert_eq!(page.get("skipped_matches").number(), 1);
+        assert_eq!(page.get("hits").array().len(), 2);
+        assert!(!page.get("has_more_matches").flag());
+        let kelvin = &page.get("hits").array()[1];
+        assert_eq!(kelvin.get("hit").number(), 1); assert_eq!(kelvin.get("occurrence_id").number(), 3);
+        let start = text.find('K').unwrap();
+        assert_eq!(bounds(kelvin), (encode(&text[..start], encoding).len() as u64,
+            encode(&text[..start + 'K'.len_utf8()], encoding).len() as u64));
+        s.activate_hit(1, 2, pane, 1, 1, || false).unwrap();
+        let (start, end) = bounds(kelvin);
+        assert_eq!(json(&s.copy_selection(2, pane, || false).unwrap()).get("original_hex").text(),
+            hex(&bytes[start as usize..end as usize]));
+
+        for (generation, query, expected) in [(2, "i", vec!["i", "I"]),
+            (3, "i\u{307}", vec!["İ", "i\u{307}", "I\u{307}"]),
+            (4, "ß", vec!["ß", "ẞ"]), (5, "ss", vec!["ss", "SS"]),
+            (6, "οσ", vec!["ΟΣ", "οσ"]), (7, "ος", vec!["ος"]),
+            (8, "é", vec!["É", "é"])] {
+            let response = s.search_with_options(2, pane, generation, query, 16, bytes.len() as u64,
+                DeskFindOptions { start_after: 0, ..lower }, || false).unwrap();
+            assert_eq!(response.exit_code(), EXIT_OK);
+            let report = json(&response);
+            assert_eq!(report.get("matches_seen").number(), expected.len() as u64);
+            for (hit, spelling) in report.get("hits").array().iter().zip(expected) {
+                let (start, end) = bounds(hit);
+                let original = encode(spelling, encoding);
+                assert_eq!(&bytes[start as usize..end as usize], &original[encode("", encoding).len()..]);
+            }
+        }
+        let beyond = json(&s.search_with_options(2, pane, 9, "K", 1, bytes.len() as u64,
+            DeskFindOptions { start_after: u64::MAX, ..lower }, || false).unwrap());
+        assert_eq!(beyond.get("matches_seen").number(), 3);
+        assert_eq!(beyond.get("skipped_matches").number(), 3);
+        assert!(beyond.get("hits").array().is_empty()); assert!(beyond.get("match_count_complete").flag());
+    }
+}
+
+#[test]
+fn lowercase_identifier_witness_can_exceed_query_limit_and_survive_failed_replacement() {
+    let name = "K".repeat(1024); let spelling = "K".repeat(1024);
+    let text = format!("{spelling} {name}");
+    let mut s = session(); let pane = adopt(&mut s, text.as_bytes());
+    let lower = DeskFindOptions { case_sensitive: false, ..options(DeskFindMode::Identifier, true, 0) };
+    let page = json(&s.search_with_options(1, pane, 1, &name, 1, text.len() as u64, lower, || false).unwrap());
+    assert_eq!(page.get("matches_seen").number(), 2);
+    assert_eq!(bounds(&page.get("hits").array()[0]), (0, spelling.len() as u64));
+    assert!(s.search_with_options(1, pane, 2, &name, 1, text.len() as u64,
+        DeskFindOptions { case_sensitive: true, ..lower }, || true).err().unwrap().is_canceled());
+    assert_eq!(s.accepted_query(), Some(1));
+    s.activate_hit(1, 2, pane, 1, 0, || false).unwrap();
+    assert_eq!(json(&s.copy_selection(2, pane, || false).unwrap()).get("original_hex").text(),
+        hex(spelling.as_bytes()));
+    let count = json(&s.search_with_options(2, pane, 3, &name, 0, text.len() as u64, lower, || false).unwrap());
+    assert_eq!(count.get("matches_seen").number(), 2);
+    assert!(count.get("hits").array().is_empty()); assert!(count.get("match_count_complete").flag());
 }

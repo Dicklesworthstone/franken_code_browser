@@ -149,7 +149,7 @@ mod native {
             "0\topen\t{}\n\
              1\tfind\t1\t1\t10\t100\tfirst\n\
              1\tfind-page\t1\t2\texpression\tsensitive\tbounded\t0\t10\t100\tsecond path:source.rs\n\
-             1\tfind-page\t1\t3\tidentifier\tunicode-lowercase\tbounded\t0\t10\t100\tsecond\n\
+             1\tfind-page\t1\t3\tidentifier\tunicode-lowercase\tbounded\t0\t10\t100\tsecond::other\n\
              1\tfind-page-text-hex\t1\t4\tliteral\tsensitive\tbounded\t0\t10\t100\tff\n\
              1\tfind-page\t1\t4\tliteral\tsensitive\tbounded\t0\t10\t100\tsecond\n\
              1\thit\t1\t1\t0\n\
@@ -159,7 +159,7 @@ mod native {
         let (exit, rows) = invoke(&script);
         assert_eq!(exit, EXIT_ERROR); assert_eq!(rows.len(), 10);
         assert_eq!(rows[2].get("error").get("code").text(), "DESK_EXPRESSION_SCOPE_UNSUPPORTED");
-        assert_eq!(rows[3].get("error").get("code").text(), "DESK_INVALID_LIMITS");
+        assert_eq!(rows[3].get("error").get("code").text(), "STREAM_READ_INVALID_IDENTIFIER");
         assert_eq!(rows[4].get("error").get("code").text(), "DESK_INVALID_TEXT");
         for row in &rows[1..5] { assert_eq!(row.get("accepted_query_generation").number(), 1); }
         assert_eq!(rows[5].get("accepted_query_generation").number(), 4);
@@ -179,5 +179,51 @@ mod native {
              3\tquit\n", source.display(), hex(b"a\tb\nc")));
         assert_eq!(exit, EXIT_OK);
         assert_eq!(rows[3].get("result").get("original_hex").text(), hex(b"a\tb\nc"));
+    }
+
+    #[test]
+    fn lowercase_identifier_pages_activate_original_tokens_and_keep_counting_independent() {
+        for encoding in 0..3 {
+            let root = fixture(); let source = root.join("source.txt");
+            let text = "k K K Kx _K 1K\nİ i\u{307} I\u{307} i I";
+            let bytes = match encoding {
+                0 => text.as_bytes().to_vec(),
+                1 => format!("\u{feff}{text}").encode_utf16().flat_map(u16::to_le_bytes).collect(),
+                _ => format!("\u{feff}{text}").encode_utf16().flat_map(u16::to_be_bytes).collect(),
+            };
+            fs::write(&source, &bytes).unwrap();
+            let expanded = hex("i\u{307}".as_bytes());
+            let script = format!(
+                "0\topen\t{}\n\
+                 1\tfind-page\t1\t1\tidentifier\tunicode-lowercase\tcount-all\t2\t1\t10000\tK\n\
+                 1\thit\t1\t1\t0\n\
+                 3\tcopy\t1\n\
+                 3\tfind-page\t1\t2\tidentifier\tunicode-lowercase\tcount-all\t0\t0\t10000\tK\n\
+                 3\tfind-page-text-hex\t1\t3\tidentifier\tunicode-lowercase\tcount-all\t0\t10\t10000\t{expanded}\n\
+                 3\tfind-page\t1\t4\tidentifier\tunicode-lowercase\tcount-all\t0\t10\t10000\ti\n\
+                 3\tfind-page\t1\t5\tidentifier\tsensitive\tcount-all\t0\t10\t10000\tK\n\
+                 3\tquit\n", source.display());
+            let (exit, rows) = invoke(&script);
+            assert_eq!(exit, EXIT_PARTIAL); assert_eq!(rows.len(), 9);
+            let page = rows[1].get("result");
+            assert!(!page.get("case_sensitive").flag());
+            assert_eq!(page.get("mode").text(), "whole-token-text-candidate");
+            assert_eq!(page.get("matches_seen").number(), 3);
+            assert_eq!(page.get("skipped_matches").number(), 2);
+            assert!(page.get("match_count_complete").flag()); assert!(!page.get("has_more_matches").flag());
+            assert_eq!(page.get("hits").array()[0].get("occurrence_id").number(), 3);
+            let expected = match encoding { 0 => "e284aa", 1 => "2a21", _ => "212a" };
+            assert_eq!(rows[3].get("result").get("original_hex").text(), expected);
+            let count = rows[4].get("result");
+            assert_eq!(count.get("matches_seen").number(), 3); assert!(count.get("hits").array().is_empty());
+            assert!(count.get("match_count_complete").flag());
+            assert_eq!(rows[5].get("result").get("matches_seen").number(), 3);
+            assert_eq!(rows[6].get("result").get("matches_seen").number(), 2);
+            assert_eq!(rows[7].get("result").get("matches_seen").number(), 1);
+            assert!(rows[7].get("result").get("case_sensitive").flag());
+            for row in rows {
+                assert_eq!(row.get("result").get("additional_source_bytes_read").number(), 0);
+            }
+        }
     }
 }

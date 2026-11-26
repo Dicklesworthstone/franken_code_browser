@@ -74,8 +74,8 @@ Later operations use retained bytes even after a live file changes.\n\
 UTF-8/BOM UTF-16 windows and Find use the shared reader. find remains exact literal.\n\
 find-page MODE: literal | expression | identifier. CASE: sensitive | unicode-lowercase.\n\
 COUNT: bounded | count-all. Unicode lowercase is not full case folding/normalization.\n\
-Identifiers require sensitive case and find textual tokens, including comments and\n\
-strings; they do not establish compiler references. Expressions support phrases,\n\
+Identifiers honor CASE while matching complete textual tokens, including comments\n\
+and strings; they do not establish compiler references. Expressions support phrases,\n\
 required terms and exclusions within the same capture. They always scan to EOF\n\
 before qualifying hits; partial expressions expose no tentative rows or count.\n\
 Pane labels do not authorize path/type/lang filters; those expressions are refused.\n\

@@ -24,8 +24,8 @@ pub enum DeskFindMode {
     /// Bounded phrases, required terms and exclusions within the same capture.
     /// Path/language filters require repository metadata and are refused here.
     Expression,
-    /// Exact whole-token textual candidates, including comments and strings.
-    /// This is not compiler name resolution; case must remain sensitive.
+    /// Whole-token textual candidates, including comments and strings.
+    /// Optional scalar lowercase matching never implies compiler name resolution.
     Identifier,
 }
 
@@ -92,8 +92,7 @@ impl DeskSession {
             return Err(DeskSessionError::StaleQuery);
         }
         if needle.is_empty() || needle.len() > MAX_DESK_NEEDLE_BYTES
-            || max_matches > MAX_DESK_MATCHES
-            || (options.mode == DeskFindMode::Identifier && !options.case_sensitive) {
+            || max_matches > MAX_DESK_MATCHES {
             return Err(DeskError::InvalidLimits.into());
         }
         self.last_query_attempt = generation;
@@ -110,8 +109,8 @@ impl DeskSession {
             DeskFindMode::Expression => StreamingNeedle::expression(self.desk.owner(),
                 &expression.as_ref().ok_or(QueryError::SyntaxError)?.parsed,
                 options.case_sensitive, &self.budget, pattern_id)?,
-            DeskFindMode::Identifier => StreamingNeedle::identifier(self.desk.owner(),
-                needle, &self.budget, pattern_id)?,
+            DeskFindMode::Identifier => StreamingNeedle::identifier_matching(self.desk.owner(),
+                needle, options.case_sensitive, &self.budget, pattern_id)?,
         };
         // The old accepted page and this private replacement can overlap.
         // Admit replacement storage before doing any scan or discarding rows.
