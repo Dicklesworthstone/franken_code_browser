@@ -222,10 +222,15 @@ enum AtlasSavedResultWindowTests {
 
     @MainActor private static func literalWindowsKeepPoliciesAndExactReaders() async throws {
         let f = SavedResultWindowFixture(), model = await opened(f)
+        let pin = String(repeating: "a", count: 64)
+        model.attachIndex(path: "/saved/index.fcbd", pin: pin, accessLease: nil)
+        await wait("window fixture index did not attach") { !model.busy }
+        precondition(model.index?.generation == 1)
         model.searchInput = "ANA"; model.searchCaseSensitive = false; model.countAllMatches = true
         model.search(); await wait("first literal window did not finish") { !model.busy }
         let first = model.searchPage!
         precondition(first.generation == 1 && first.retained == 4096 && first.hits.count == 64)
+        precondition(!first.caseSensitive && first.indexGeneration == 1 && first.indexPin == pin)
         precondition(first.window.offset == 0 && first.window.next == 4096 && first.window.earlier == nil)
         let scans = f.calls.count
         model.searchInput = "edited"; model.loadSearchWindow(offset: 4096, from: first)
@@ -240,6 +245,7 @@ enum AtlasSavedResultWindowTests {
         await wait("first-window metadata page did not finish") { !model.busy }
         let metadata = model.searchPage!
         precondition(metadata.start == 64 && metadata.window == first.window && f.calls.count == scans)
+        precondition(metadata.indexGeneration == 1 && metadata.indexPin == pin)
         precondition(f.metadataCalls == ["literal:1:64"])
         model.loadSearchWindow(offset: 4096, from: first)
         precondition(!model.busy && f.calls.count == scans, "An older metadata-page action remained current")
@@ -249,6 +255,7 @@ enum AtlasSavedResultWindowTests {
         precondition(later.generation == 2 && later.window.offset == 4096 && later.window.skipped == 4096)
         precondition(later.retained == 4 && later.seen == 4100 && later.window.next == nil && later.window.earlier == 0)
         precondition(later.truncated && !later.window.hasMore && !later.complete)
+        precondition(!later.caseSensitive && later.indexGeneration == 1 && later.indexPin == pin)
         precondition(submitted.query == "ANA" && !submitted.matching && submitted.counting
             && submitted.maximum == 4096 && submitted.offset == 4096)
         let reader = try await model.openHit(later.hits[3], from: later, readerTransport: f.base.readerTransport())
@@ -264,6 +271,7 @@ enum AtlasSavedResultWindowTests {
         model.loadSearchWindow(offset: 0, from: model.searchPage!)
         await wait("first-window return did not finish") { !model.busy }
         precondition(model.queryGeneration == 3 && model.searchPage?.window.offset == 0)
+        precondition(model.searchPage?.indexGeneration == 1 && model.searchPage?.indexPin == pin)
         await refused("A replaced later window authorized its former row") {
             _ = try await model.openHit(later.hits[3], from: later, readerTransport: f.base.readerTransport())
         }

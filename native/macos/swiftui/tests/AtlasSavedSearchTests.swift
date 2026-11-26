@@ -108,6 +108,27 @@ import Dispatch
         indexed["index_generation"] = "1"; indexed["index_pin"] = String(repeating: "a", count: 64)
         indexed["index_used"] = true; indexed["index_policy"] = "exact-compatible-postings"
         rejected("lowercase query claimed incompatible exact postings") { _ = try decode(indexed) }
+        indexed = f.searchPage(40, generation: 1, index: 1, pin: String(repeating: "a", count: 64),
+            countAllMatches: true, caseSensitive: false)
+        let accelerated = try decode(indexed)
+        precondition(!accelerated.caseSensitive && accelerated.indexGeneration == 1
+            && accelerated.indexPin == String(repeating: "a", count: 64))
+        precondition(accelerated.indexEliminatedFiles == 1 && accelerated.fallbackFiles == 2
+            && accelerated.postingEntriesVisited == 3 && !accelerated.hasSameSummary(as: accepted))
+        for field in ["case_sensitive", "index_used", "index_policy"] {
+            var bad = indexed; bad.removeValue(forKey: field)
+            rejected("indexed lowercase page accepted a missing \(field)") { _ = try decode(bad) }
+        }
+        for policy in ["direct-verified-member-scan", "exact-compatible-postings", "ascii-case-variants"] {
+            var bad = indexed; bad["index_policy"] = policy
+            rejected("indexed lowercase page accepted incompatible postings policy") { _ = try decode(bad) }
+        }
+        var mislabeledExact = indexed
+        mislabeledExact["case_sensitive"] = true; mislabeledExact["mode"] = "exact-decoded-literal"
+        rejected("exact query accepted a lowercase index-policy receipt") {
+            _ = try AtlasSavedSearchPage.decode(f.encode(mislabeledExact), identity: identity, generation: 1,
+                needle: "ana", start: 0, limit: 64, countAllMatches: true, caseSensitive: true)
+        }
         var legacy = exactObject
         for field in ["case_sensitive", "index_used", "index_policy"] { legacy.removeValue(forKey: field) }
         let previous = try AtlasSavedSearchPage.decode(f.encode(legacy), identity: identity, generation: 1,
@@ -139,7 +160,7 @@ import Dispatch
         await wait("lowercase search did not finish") { !model.busy }
         let accepted = model.searchPage!
         precondition(!accepted.caseSensitive && accepted.needle == "ANA" && accepted.hits.count == 4)
-        precondition(accepted.indexGeneration == nil && accepted.indexPin == nil && model.index?.generation == 1)
+        precondition(accepted.indexGeneration == 1 && accepted.indexPin == pin && model.index?.generation == 1)
         precondition(held != nil && model.searchIsCurrent && accepted.counting.all)
         let utf8 = try await model.openHit(accepted.hits[0], from: accepted, readerTransport: f.readerTransport())
         let utf16 = try await model.openHit(accepted.hits[3], from: accepted, readerTransport: f.readerTransport())
@@ -154,11 +175,19 @@ import Dispatch
         f.corruptNext("case-policy"); model.loadSearchResults(start: 2, from: accepted)
         await wait("forged matching policy did not drain") { !model.busy }
         precondition(model.searchPage?.start == 0 && model.searchPage?.caseSensitive == false)
+        model.loadSearchResults(start: 2, from: accepted)
+        await wait("indexed lowercase metadata page did not finish") { !model.busy }
+        precondition(model.searchPage?.start == 2 && model.searchPage?.indexGeneration == 1
+            && model.searchPage?.indexPin == pin && model.searchIsCurrent)
+        f.corruptNext("index-query-pin"); model.loadSearchResults(start: 0, from: model.searchPage!)
+        await wait("forged lowercase index pin did not drain") { !model.busy }
+        precondition(model.searchPage?.start == 2 && model.searchPage?.indexPin == pin)
         f.corruptNext("search-lost"); model.search()
         await wait("lost lowercase reply did not reconcile") { !model.busy }
         precondition(model.queryGeneration == 3 && model.searchPage?.caseSensitive == false && model.searchIsCurrent)
         precondition(f.calls.filter { $0 == "search:40:3:ANA" }.count == 1)
-        precondition(model.searchPage?.indexGeneration == nil && model.index?.generation == 1 && held != nil)
+        precondition(model.searchPage?.indexGeneration == 1 && model.searchPage?.indexPin == pin
+            && model.index?.generation == 1 && held != nil)
         model.searchCaseSensitive = true; model.searchInput = "ana"; model.search()
         await wait("exact replacement did not finish") { !model.busy }
         precondition(model.searchPage?.caseSensitive == true && model.searchPage?.indexGeneration == 1)

@@ -309,7 +309,8 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             "index_generation": index.map(String.init) as Any? ?? NSNull(), "index_pin": pin as Any? ?? NSNull(),
             "mode": caseSensitive ? "exact-decoded-literal" : "unicode-lowercase-literal",
             "case_sensitive": caseSensitive, "index_used": index != nil,
-            "index_policy": index == nil ? "direct-verified-member-scan" : "exact-compatible-postings",
+            "index_policy": index == nil ? "direct-verified-member-scan"
+                : caseSensitive ? "exact-compatible-postings" : "ascii-case-variants-with-source-fallback",
             "search_complete": false, "truncated": false, "retained_hits": String(hits.count),
             "matches_seen": String(hits.count), "unavailable_files": "1", "unsupported_files": "0",
             "member_bytes_read": String(sourceBytes), "member_read_calls": "4",
@@ -810,8 +811,8 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                     }
                     session.queryGeneration = generation; session.needle = needle
                     session.caseSensitive = caseSensitive; session.countAllMatches = countAllMatches
-                    session.queryIndexGeneration = caseSensitive ? session.indexGeneration : nil
-                    session.queryIndexPin = caseSensitive ? session.indexPin : nil
+                    session.queryIndexGeneration = session.indexGeneration
+                    session.queryIndexPin = session.indexPin
                     session.readBytes += UInt64(members.compactMap(\.bytes).reduce(0) { $0 + $1.count }); session.readCalls += 4
                     sessions[handle] = session
                     if fault == "search-lost" { fault = nil; return nil }

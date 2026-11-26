@@ -1363,8 +1363,8 @@ private final class AtlasSavedSession: @unchecked Sendable {
                     identity: info.identity, generation: generation, needle: needle, start: 0, limit: 64,
                     searching: true, countAllMatches: counting, caseSensitive: caseSensitive)
                 guard page.counting.maximum == 4096, page.window.offset == 0,
-                      page.indexGeneration == (caseSensitive ? info.index?.generation : nil),
-                      page.indexPin == (caseSensitive ? info.index?.pin : nil) else {
+                      page.indexGeneration == info.index?.generation,
+                      page.indexPin == info.index?.pin else {
                     throw AtlasSavedError.invalidResponse
                 }
                 guard model.session === lease, !model.closed else { throw AtlasSavedError.canceled }
@@ -1419,8 +1419,8 @@ private final class AtlasSavedSession: @unchecked Sendable {
                     searching: true, countAllMatches: page.counting.all, caseSensitive: page.caseSensitive,
                     resultOffset: offset)
                 guard next.counting.maximum == page.counting.maximum,
-                      next.indexGeneration == (page.caseSensitive ? info.index?.generation : nil),
-                      next.indexPin == (page.caseSensitive ? info.index?.pin : nil) else {
+                      next.indexGeneration == info.index?.generation,
+                      next.indexPin == info.index?.pin else {
                     throw AtlasSavedError.invalidResponse
                 }
                 guard model.session === lease, !model.closed else { throw AtlasSavedError.canceled }

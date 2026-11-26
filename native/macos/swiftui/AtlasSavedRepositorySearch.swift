@@ -714,9 +714,10 @@ struct AtlasSavedSearchPage: Sendable {
             // Older exact receipts omit these additive fields. A matching-policy
             // receipt is accepted only as a complete, internally consistent set.
             if w.case_sensitive != nil || w.index_used != nil || w.index_policy != nil {
+                let indexPolicy = indexGeneration == nil ? "direct-verified-member-scan"
+                    : caseSensitive ? "exact-compatible-postings" : "ascii-case-variants-with-source-fallback"
                 guard w.case_sensitive == caseSensitive, w.index_used == (indexGeneration != nil),
-                      w.index_policy == (indexGeneration == nil ? "direct-verified-member-scan" : "exact-compatible-postings"),
-                      caseSensitive || indexGeneration == nil else { throw AtlasSavedError.invalidResponse }
+                      w.index_policy == indexPolicy else { throw AtlasSavedError.invalidResponse }
             }
             let counting = try AtlasSavedSearchCount.admit(all: w.count_all_matches, exact: w.matches_seen_exact,
                 matchingFiles: w.matching_files?.value, retainedFiles: w.retained_matching_files?.value,

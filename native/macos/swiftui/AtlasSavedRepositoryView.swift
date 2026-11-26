@@ -669,7 +669,7 @@ private final class AtlasSavedTrailArchiveAccess {
                     Button("Reload index status") { panelNotice = ""; model.reloadIndex() }
                         .disabled(!model.canOperate)
                 }.controlSize(.small)
-                Text("Use the digest from a trusted index build receipt, not a whole-file checksum. Posting pages are checked when read; exact source verification and direct scans cover candidates, uncovered members and short literals. Unicode lowercase and expression searches scan source directly.")
+                Text("Use the digest from a trusted index build receipt, not a whole-file checksum. Posting pages are checked when read; source verification and direct scans cover candidates, uncovered members and short literals. Unicode lowercase searches use compatible ASCII case-variant postings with source fallback; expression searches scan source directly.")
                     .font(.caption2).foregroundStyle(.secondary)
             }.padding(.top, 5)
         }.font(.callout)
