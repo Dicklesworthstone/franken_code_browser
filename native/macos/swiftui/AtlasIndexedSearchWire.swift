@@ -352,6 +352,12 @@ struct AtlasIndexedQueryState: Equatable {
     let resultWindow: AtlasIndexedResultWindow?
 }
 struct AtlasIndexedQueryPage {
+    // Query steps no longer correspond one-to-one with files. Allow two
+    // metadata/finalization calls for each of 4096 admitted members, the 512
+    // full 64 KiB verification slices in the 32 MiB source allowance, and an
+    // empty-scope terminal call. Capture/verification bytes remain separately
+    // checked; larger expression work budgets cannot create additional source.
+    private static let maximumSteps = 2 * 4096 + (32 * 1024 * 1024) / (64 * 1024) + 1
     let state: AtlasIndexedQueryState
     let hits: [AtlasIndexedHit]
     let next: UInt64?
@@ -404,7 +410,7 @@ struct AtlasIndexedQueryPage {
         let unavailable = try w.count("unavailable_files", upTo: eligible)
         let pending = try w.count("pending_files", upTo: eligible)
         let retained = try w.count("retained_hits", upTo: 1000)
-        let step = try w.count("step_count", upTo: 4097)
+        let step = try w.count("step_count", upTo: Self.maximumSteps)
         let skipped = try w.count("skipped_by_index", upTo: captured)
         let fallback = try w.count("fallback_files", upTo: scanned)
         let matches = try w.number("matches_seen"), verification = try w.number("verification_source_bytes")

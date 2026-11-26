@@ -570,7 +570,47 @@ private final class Reports: @unchecked Sendable {
         #endif
     }
 
+
+    @MainActor private static func slicedLiveMemberReceipts() throws {
+        // The C boundary supplies multiple observations of one unfinished
+        // member. This tests the actual native worker and JSON admission,
+        // independently of the Rust fixtures that establish the byte bound.
+        for defect in ["none", "premature-scan", "missing-step"] {
+            resetFixture()
+            try install(0, openReceipt())
+            try install(1, page("begin", step: 0, catalogued: 1))
+            for step in 1...2 {
+                var partial = page("step", step: step, catalogued: 1)
+                partial["examined_files"] = "0"; partial["scanned_files"] = "0"
+                partial["pending_files"] = "1"
+                if step == 1 && defect == "premature-scan" { partial["scanned_files"] = "1" }
+                if step == 2 && defect == "missing-step" { partial["step_count"] = "3" }
+                try install(2, partial, index: UInt32(step - 1))
+            }
+            try install(2, page("step", step: 3, total: 1, running: false,
+                complete: true, catalogued: 1), index: 2)
+            let reports = Reports()
+            do {
+                var report: AtlasSearchReport? = try AtlasNativeSearch.runProgressive(
+                    root: "/project", query: "x", cancellation: AtlasSearchCancellation(),
+                    progress: reports.append)
+                guard defect == "none" else { preconditionFailure("Invalid live slice accepted: " + defect) }
+                check(report!.complete && report!.hits.count == 1 && fixtureCount(3) == 3,
+                    "Several zero-finalized-file replies lead to one exact completed member")
+                check(reports.values.allSatisfy { !$0.complete || $0.hits.count == 1 },
+                    "An unfinished member cannot become a complete search report")
+                report = nil
+            } catch AtlasSearchError.invalidResponse {
+                check(defect != "none", "Valid sliced live receipts were rejected")
+            }
+            reports.clear()
+            retired()
+            check(fixtureCount(6) == fixtureCount(7), "Every sliced-search C response is released")
+        }
+    }
+
     @MainActor static func main() throws {
+        try slicedLiveMemberReceipts()
         resetFixture()
         let windowInput = try AtlasSearchInput(root: "/project", query: "x")
         let windowSource = AtlasSearchResultWindowSource(index: UUID(), input: windowInput, countAllMatches: true)

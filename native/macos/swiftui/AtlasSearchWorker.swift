@@ -325,6 +325,12 @@ private struct SearchWirePath: Decodable, Equatable { let encoding, hex, display
 /// Exactly one canonical all-files row order is admitted. Raw paths are never
 /// reconstructed from display labels, including non-UTF-8 Unix filenames.
 private struct SearchStream {
+    // Query steps no longer correspond one-to-one with files. Allow two
+    // metadata/finalization calls for each of 4096 admitted members, the 512
+    // full 64 KiB verification slices in the 32 MiB source allowance, and an
+    // empty-scope terminal call. Capture/verification bytes remain separately
+    // checked; larger expression work budgets cannot create additional source.
+    private static let maximumSteps = 2 * 4096 + (32 * 1024 * 1024) / (64 * 1024) + 1
     let query: String
     let scope: AtlasSearchFileScope
     let pathScope: AtlasSearchPathScope
@@ -365,7 +371,7 @@ private struct SearchStream {
         let next = try validated(page)
         if let previous = state {
             guard page.command == "step", previous.running,
-                  next.steps == previous.steps + 1, next.steps <= 4097,
+                  next.steps == previous.steps + 1, next.steps <= Self.maximumSteps,
                   next.catalogued == previous.catalogued, next.eligible == previous.eligible,
                   next.visibleMissing == previous.visibleMissing,
                   next.discovery == previous.discovery,
@@ -504,7 +510,7 @@ private struct SearchStream {
         let pending = try count(page.pending_files, max: eligible)
         let retained = try count(page.retained_hits, max: 1000)
         let matches = try number(page.matches_seen)
-        let steps = try count(page.step_count, max: 4097)
+        let steps = try count(page.step_count, max: Self.maximumSteps)
         guard (page.count_all_matches ?? false) == countAllMatches,
               !countAllMatches || page.match_count_complete != nil,
               (page.match_count_complete ?? page.search_complete) == page.search_complete,

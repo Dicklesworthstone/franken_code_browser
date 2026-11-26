@@ -145,6 +145,9 @@ impl OwnedEphemeralIndex {
     }
 }
 impl QuerySource for OwnedEphemeralIndex {
+    // A suspended verifier owns an Arc capture even if the host drops this
+    // index between steps. Keep its source allocation charged until it retires.
+    fn source_lease(&self) -> Option<ResourceLease> { Some(self._source_lease.clone()) }
     fn id(&self) -> SearchManifestId { self.id }
     fn membership(&self) -> MembershipState { self.membership }
     fn count(&self) -> usize { self.documents.len() }

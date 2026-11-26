@@ -15,6 +15,7 @@
 
 mod capture;
 mod expression;
+mod progressive_capture;
 pub mod identifier;
 pub mod normalized;
 pub mod index;
@@ -31,6 +32,7 @@ pub use index::{
 };
 pub use indexed_query::{IndexedQuery, IndexedQueryState, IndexedSearchReport};
 pub use expression::CaptureQueryScanner;
+pub use progressive_capture::{CaptureQueryScan, MAX_CAPTURE_QUERY_STEP_BYTES};
 pub use oracle::{OracleMismatchError, ReferenceScanOracle, SearchDocument};
 pub use query::{LangFilterKind, ParsedQuery, PathFilterKind, MAX_QUERY_LEN, MAX_QUERY_TOKENS};
 

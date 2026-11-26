@@ -856,7 +856,86 @@ import Dispatch
         }
     }
 
+
+    /// Exercise the production wire decoder and monotonic accumulator with
+    /// several worker replies for one retained capture. Scripted receipts do
+    /// not qualify Rust verification or native presentation.
+    @MainActor private static func slicedVerificationReceipts() throws {
+        let fixture = IndexedFixture()
+        fixture.configure { $0.files = 1; $0.captureBytes = 3 * 65536; $0.hitCount = 0; $0.fallback = true }
+        let transport = fixture.transport
+        let worker = AtlasIndexedSearch(transport: transport)
+        let prepared = try worker.prepare(root: "/repo", cancellation: AtlasSearchCancellation(),
+            access: AtlasSearchAccessLease(nil), progress: { _ in })
+        let began = try prepared.owner.call { try transport.queryBegin($0, 2, prepared.basis.index, "x") }
+        let completed = try prepared.owner.call { try transport.queryStep($0, 2, AtlasSearchCancellation()) }
+        guard let completed, let data = completed.data(using: .utf8),
+              let terminal = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            preconditionFailure("Invalid scripted terminal receipt")
+        }
+        func decode(_ fields: [String: Any]) throws -> AtlasIndexedQueryPage {
+            let data = try JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys])
+            return try AtlasIndexedQueryPage(String(decoding: data, as: UTF8.self),
+                basis: prepared.basis, generation: 2, needle: "x", command: "step")
+        }
+        func slice(_ step: Int, finished: Bool, bytes: Int) -> [String: Any] {
+            var fields = terminal
+            fields["step_count"] = String(step)
+            fields["examined_files"] = finished ? "1" : "0"
+            fields["scanned_files"] = finished ? "1" : "0"
+            fields["verified_files"] = finished ? "1" : "0"
+            fields["fallback_files"] = finished ? "1" : "0"
+            fields["pending_files"] = finished ? "0" : "1"
+            fields["verification_source_bytes"] = String(bytes)
+            fields["search_in_progress"] = !finished
+            fields["search_complete"] = finished
+            if fields["match_count_complete"] != nil { fields["match_count_complete"] = finished }
+            fields["stop_reason"] = finished ? "all-files-examined" : NSNull()
+            return fields
+        }
+        let first = try AtlasIndexedQueryPage(began, basis: prepared.basis,
+            generation: 2, needle: "x", command: "begin-indexed")
+        var accumulator = AtlasIndexedAccumulator()
+        try accumulator.head(first, basis: prepared.basis)
+        for step in 1...3 {
+            let page = try decode(slice(step, finished: step == 3, bytes: step * 65536))
+            try accumulator.head(page, basis: prepared.basis)
+            check(accumulator.hits.isEmpty, "Sliced verification does not invent retained hits")
+            check(page.state.examined == (step == 3 ? 1 : 0)
+                && page.state.scanned == (step == 3 ? 1 : 0)
+                && page.state.verificationBytes == UInt64(step * 65536),
+                "Source work advances while finalized-member counts stay private")
+        }
+        let late = try decode(slice(4098, finished: true, bytes: 3 * 65536))
+        check(late.state.step == 4098, "Multi-slice campaigns may exceed the old one-step-per-file bound")
+        for defect in ["excessive-steps", "byte-overflow", "premature-scan"] {
+            var fields = slice(1, finished: false, bytes: 65536)
+            if defect == "excessive-steps" { fields["step_count"] = "8706" }
+            if defect == "byte-overflow" { fields["verification_source_bytes"] = String(3 * 65536 + 1) }
+            if defect == "premature-scan" {
+                fields["scanned_files"] = "1"; fields["verified_files"] = "1"; fields["fallback_files"] = "1"
+            }
+            do { _ = try decode(fields); preconditionFailure("Invalid slice receipt accepted: " + defect) }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
+        }
+        var ordered = AtlasIndexedAccumulator()
+        try ordered.head(first, basis: prepared.basis)
+        try ordered.head(decode(slice(1, finished: false, bytes: 65536)), basis: prepared.basis)
+        do {
+            try ordered.head(decode(slice(3, finished: false, bytes: 2 * 65536)), basis: prepared.basis)
+            preconditionFailure("A missing verification receipt was accepted")
+        } catch AtlasSearchError.invalidResponse { checks += 1 }
+        var monotonic = AtlasIndexedAccumulator()
+        try monotonic.head(first, basis: prepared.basis)
+        try monotonic.head(decode(slice(1, finished: false, bytes: 65536)), basis: prepared.basis)
+        do {
+            try monotonic.head(decode(slice(2, finished: false, bytes: 65535)), basis: prepared.basis)
+            preconditionFailure("Verification bytes moved backwards")
+        } catch AtlasSearchError.invalidResponse { checks += 1 }
+    }
+
     @MainActor static func main() throws {
+        try slicedVerificationReceipts()
         try directoryCatalogs()
         try exactFileCatalogs()
         try discoveryPolicyOwnership()

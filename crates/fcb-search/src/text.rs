@@ -4,7 +4,7 @@
 //! fcb-source; this adapter retains only a decoding window and the mapping spans
 //! needed by a needle that crosses windows. It never stitches a whole capture.
 
-use std::collections::VecDeque;
+use std::{borrow::Cow, collections::VecDeque};
 
 use fcb_core::{ByteOffset, ByteRange, DecodedUtf8Offset, DecodedUtf8Range, FileId, SourceRevision};
 use fcb_source::{CaptureEncodingMap, DetectedEncoding, MappingSpan, SpanKind, detect_encoding};
@@ -68,8 +68,8 @@ fn scan_text_chunks_inner<'a, 'query>(
     let mut scan = TextScan {
         cursor: ByteSearchCursor::new(query.as_bytes())?,
         normalized: NormalizedCursor::new(query, options.mode)?,
-        query,
-        options,
+        query: Cow::Borrowed(query),
+        options: Cow::Borrowed(options),
         count_all_matches,
         skip_matches,
         predicates,
@@ -148,8 +148,8 @@ fn scan_text_chunks_inner<'a, 'query>(
 struct TextScan<'a> {
     cursor: ByteSearchCursor<'a>,
     normalized: Option<NormalizedCursor>,
-    query: &'a str,
-    options: &'a QueryOptions,
+    query: Cow<'a, str>,
+    options: Cow<'a, QueryOptions>,
     count_all_matches: bool,
     skip_matches: u64,
     predicates: Option<Predicates<'a>>,
@@ -275,7 +275,7 @@ impl TextScan<'_> {
                         ).map_err(|_| QueryError::InvalidRange)?),
                         original_byte_range: ByteRange::new(ByteOffset::new(start), ByteOffset::new(end))
                             .map_err(|_| QueryError::InvalidRange)?,
-                        matched_text: self.query.to_owned(),
+                        matched_text: self.query.as_ref().to_owned(),
                         multiplicity: 1,
                     });
                 }
@@ -402,6 +402,92 @@ impl TextScan<'_> {
             if self.chunk_ends[mid] <= start { low = mid + 1; } else { high = mid; }
         }
         self.chunk_ends.get(low).is_some_and(|boundary| *boundary < end)
+    }
+}
+
+/// The same decoder/provenance state as the synchronous adapters, with owned
+/// bounded query state so an indexed worker can yield inside one source file.
+pub(crate) struct CapturedTextScan {
+    scan: TextScan<'static>,
+    staging: Vec<u8>,
+    terminal: bool,
+}
+impl CapturedTextScan {
+    pub(crate) fn new(file_id: FileId, revision: SourceRevision, query: &str,
+        options: &QueryOptions, count_all_matches: bool, skip_matches: u64,
+        predicates: Option<Predicates<'static>>) -> Result<Self, QueryError> {
+        let mut staging = Vec::new();
+        staging.try_reserve_exact(WINDOW_BYTES).map_err(|_| QueryError::LimitExceeded)?;
+        let scan = TextScan {
+            cursor: ByteSearchCursor::new_owned(query.as_bytes())?,
+            normalized: NormalizedCursor::new(query, options.mode)?,
+            query: Cow::Owned(query.to_owned()), options: Cow::Owned(options.clone()),
+            count_all_matches, skip_matches, predicates, primary_limited: false,
+            file_id, revision, encoding: options.declared_encoding,
+            raw_offset: 0, decoded_offset: 0, utf16_offset: 0, scalar_offset: 0,
+            spans: VecDeque::new(), chunk_ends: VecDeque::new(),
+            result: SearchResult::empty(SearchCoverage::Exhaustive),
+        };
+        Ok(Self { scan, staging, terminal: false })
+    }
+
+    pub(crate) fn is_terminal(&self) -> bool { self.terminal }
+    pub(crate) fn result(&self) -> &SearchResult { &self.scan.result }
+    pub(crate) fn into_result(self) -> SearchResult { self.scan.result }
+
+    fn finish(&mut self, complete_source: bool) {
+        if let Some(predicates) = &self.scan.predicates {
+            predicates.finish(&mut self.scan.result, complete_source, self.scan.primary_limited,
+                self.scan.options.max_matches);
+        }
+        self.terminal = true;
+    }
+
+    pub(crate) fn step(&mut self, bytes: &[u8], max_bytes: usize,
+        canceled: &mut impl FnMut() -> bool) -> Result<usize, QueryError> {
+        if self.terminal { return Ok(0); }
+        let before = self.scan.result.scanned_bytes;
+        if canceled() {
+            self.scan.result.coverage = SearchCoverage::CanceledEarly;
+            self.finish(false);
+            return Ok(0);
+        }
+        if max_bytes == 0 { return Ok(0); }
+        if !self.scan.count_all_matches && self.scan.options.max_matches == 0 && !bytes.is_empty() {
+            self.scan.result.coverage = SearchCoverage::TruncatedAtLimit { max_matches: 0 };
+            self.finish(false);
+            return Ok(0);
+        }
+        let total = bytes.len() as u64;
+        let admitted = self.scan.options.max_bytes_scanned.unwrap_or(total).min(total);
+        let end = before.saturating_add(max_bytes as u64).min(admitted);
+        while self.scan.result.scanned_bytes < end {
+            if canceled() {
+                self.scan.result.coverage = SearchCoverage::CanceledEarly;
+                self.finish(false);
+                return Ok((self.scan.result.scanned_bytes - before) as usize);
+            }
+            let offset = self.scan.result.scanned_bytes as usize;
+            let take = (end - self.scan.result.scanned_bytes).min(
+                (WINDOW_BYTES - self.staging.len()) as u64) as usize;
+            self.staging.extend_from_slice(&bytes[offset..offset + take]);
+            self.scan.result.scanned_bytes += take as u64;
+            if self.staging.len() == WINDOW_BYTES
+                && self.scan.process(&mut self.staging, false, canceled)? {
+                self.finish(false);
+                return Ok((self.scan.result.scanned_bytes - before) as usize);
+            }
+        }
+        if self.scan.result.scanned_bytes == total {
+            self.scan.process(&mut self.staging, true, canceled)?;
+            self.finish(self.scan.raw_offset == total);
+        } else if self.scan.result.scanned_bytes == admitted {
+            if !self.scan.process(&mut self.staging, false, canceled)? {
+                self.scan.result.coverage = SearchCoverage::BudgetExhausted { bytes_scanned: admitted };
+            }
+            self.finish(false);
+        }
+        Ok((self.scan.result.scanned_bytes - before) as usize)
     }
 }
 

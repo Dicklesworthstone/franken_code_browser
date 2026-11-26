@@ -164,6 +164,25 @@ impl<'query> Predicates<'query> {
         Ok(Self { terms })
     }
 
+    /// Independently movable predicates for a resumable capture. Exact cursors
+    /// own their bounded needles; normalized cursors already own their tables.
+    pub(crate) fn new_owned(query: &ParsedQuery, options: &QueryOptions)
+        -> Result<Predicates<'static>, QueryError> {
+        let count = query.conjunction_terms.len() + query.exclusion_terms.len();
+        let mut terms = Vec::new();
+        terms.try_reserve_exact(count).map_err(|_| QueryError::LimitExceeded)?;
+        if terms.capacity() > count { return Err(QueryError::LimitExceeded); }
+        for (text, excluded) in query.conjunction_terms.iter().map(|term| (term, false))
+            .chain(query.exclusion_terms.iter().map(|term| (term, true))) {
+            let cursor = match NormalizedCursor::new(text, options.mode)? {
+                Some(cursor) => Cursor::Normalized(cursor),
+                None => Cursor::Exact(ByteSearchCursor::new_owned(text.as_bytes())?),
+            };
+            terms.push(Predicate { excluded, seen: false, cursor });
+        }
+        Ok(Predicates { terms })
+    }
+
     pub(crate) fn rejected(&self) -> bool {
         self.terms.iter().any(|term| term.excluded && term.seen)
     }

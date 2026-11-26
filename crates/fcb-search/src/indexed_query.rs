@@ -2,14 +2,15 @@
 
 //! Progressive exact verification over immutable prepared source universes.
 //! Borrowed and independently movable queries share the same execution state
-//! machine. A step admits bounded documents, not a fixed-duration UI callback.
+//! machine. A step admits bounded documents and original source bytes, yielding
+//! inside large captures. This is worker work, not a fixed-duration UI callback.
 //! No filesystem calls, runtime, or per-step candidate-universe allocation occurs.
 
 use std::{borrow::Cow, mem::size_of, sync::Arc};
 use fcb_core::{ByteLength, FileId, QueryGeneration, ResourceAllocationId, ResourceBudget, ResourceLease};
 use crate::index::{EphemeralIndex, IndexError, MembershipState, SearchManifestId};
 use crate::index::export::OwnedEphemeralIndex;
-use crate::{CaptureQueryScanner, LangFilterKind, ParsedQuery, PathFilterKind, QueryOptions, ReferenceScanOracle,
+use crate::{CaptureQueryScan, MAX_CAPTURE_QUERY_STEP_BYTES, LangFilterKind, ParsedQuery, PathFilterKind, QueryOptions, ReferenceScanOracle,
     SearchCoverage, SearchDocument, SearchMatch, SearchResult};
 
 pub const MAX_QUERY_STEP_DOCUMENTS: usize = 256;
@@ -39,6 +40,7 @@ pub struct IndexedSearchReport<'source> {
     state: IndexedQueryState,
     failure: Option<IndexError>,
     results: SearchResult,
+    output_bytes: u64,
     _lease: ResourceLease,
 }
 impl IndexedSearchReport<'_> {
@@ -79,7 +81,11 @@ impl IndexedSearchReport<'_> {
         if manifest != self.manifest || generation != self.generation { return Err(IndexError::StaleQuery); }
         Ok(())
     }
-    pub fn reserved_output_bytes(&self) -> u64 { self._lease.info().bytes().get() }
+    pub const fn reserved_output_bytes(&self) -> u64 { self.output_bytes }
+    /// Temporary matcher/decoder reservation held only while a file is active.
+    pub fn reserved_scan_bytes(&self) -> u64 {
+        self._lease.info().bytes().get().saturating_sub(self.output_bytes)
+    }
 }
 
 /// Internal access to two OWNERSHIP forms of the same prepared index. No
@@ -88,6 +94,7 @@ pub(crate) trait QuerySource {
     fn id(&self) -> SearchManifestId;
     fn membership(&self) -> MembershipState;
     fn count(&self) -> usize;
+    fn source_lease(&self) -> Option<ResourceLease> { None }
     fn document(&self, ordinal: usize) -> SearchDocument<'_>;
     fn may_match(&self, ordinal: usize, query: &ParsedQuery, options: &QueryOptions) -> Result<bool, IndexError>;
     fn fallback(&self, ordinal: usize, options: &QueryOptions, needle: &[u8]) -> bool;
@@ -113,6 +120,10 @@ struct Execution<'source> {
     /// precedes gram selection, verification work, occurrence and byte quotas.
     selected_documents: Option<Vec<usize>>,
     next_document: usize,
+    active: Option<CaptureQueryScan>,
+    active_source_lease: Option<ResourceLease>,
+    active_fallback: bool,
+    scanner_bytes: u64,
     count_all_matches: bool,
     hit_capacity: usize,
     text_capacity_per_hit: usize,
@@ -158,9 +169,9 @@ impl<'source> Execution<'source> {
             Cow::Owned(ids) => ids.capacity().checked_mul(size_of::<FileId>()).ok_or(IndexError::LimitExceeded)?,
             Cow::Borrowed(_) => 0,
         };
-        let predicate_bytes = CaptureQueryScanner::predicate_scratch_bytes(query, &options)?;
+        let scanner_bytes = u64::try_from(CaptureQueryScan::scratch_bytes(query, &options)?)
+            .map_err(|_| IndexError::LimitExceeded)?;
         let reserved = retained.checked_mul(3).and_then(|n| n.checked_add(unavailable_bytes as u64))
-            .and_then(|n| n.checked_add(predicate_bytes as u64))
             .ok_or(IndexError::LimitExceeded)?;
         let lease = budget.try_reserve_managed(index.id().owner(), allocation, ByteLength::new(reserved))
             .map_err(|_| IndexError::ResourceDenied)?;
@@ -172,45 +183,66 @@ impl<'source> Execution<'source> {
         }
         if canceled() { return Err(IndexError::Canceled); }
         let known_files = document_count.checked_add(unavailable.len()).ok_or(IndexError::LimitExceeded)?;
-        Ok(Self { options: options.clone(), selected_documents, next_document: 0, count_all_matches,
+        Ok(Self { options: options.clone(), selected_documents, next_document: 0, active: None, active_source_lease: None, active_fallback: false, scanner_bytes, count_all_matches,
             hit_capacity, text_capacity_per_hit,
             report: IndexedSearchReport { manifest: index.id(), generation: options.generation, result_offset,
                 membership: index.membership(), unavailable, known_files, examined_files: 0,
                 skipped_by_index: 0, excluded_by_path: 0, scan_attempts: 0, fallback_attempts: 0,
-                state: IndexedQueryState::Running, failure: None, results, _lease: lease } })
+                state: IndexedQueryState::Running, failure: None, results, output_bytes: reserved, _lease: lease } })
     }
     fn cancel(&mut self) {
         if self.report.state == IndexedQueryState::Running {
             self.report.state = IndexedQueryState::Canceled;
             self.report.results.coverage = SearchCoverage::CanceledEarly;
+            self.release_scan();
         }
+    }
+    fn release_scan(&mut self) {
+        self.active = None;
+        self.active_source_lease = None;
+        // Shrinking a live reservation cannot require additional capacity.
+        let released = self.report._lease.reconcile(ByteLength::new(self.report.output_bytes));
+        debug_assert!(released.is_ok());
+    }
+    fn into_report(mut self) -> IndexedSearchReport<'source> {
+        self.release_scan();
+        self.report
     }
     fn document_count(&self, index: &impl QuerySource) -> usize {
         self.selected_documents.as_ref().map_or(index.count(), Vec::len)
     }
     fn step(&mut self, index: &impl QuerySource, query: &ParsedQuery, document_budget: usize,
-        active_generation: QueryGeneration, mut canceled: impl FnMut() -> bool) -> Result<(), IndexError> {
+        active_generation: QueryGeneration, canceled: impl FnMut() -> bool) -> Result<(), IndexError> {
+        self.step_bounded(index, query, document_budget, MAX_CAPTURE_QUERY_STEP_BYTES,
+            active_generation, canceled)
+    }
+    fn step_bounded(&mut self, index: &impl QuerySource, query: &ParsedQuery, document_budget: usize,
+        byte_budget: usize, active_generation: QueryGeneration, mut canceled: impl FnMut() -> bool)
+        -> Result<(), IndexError> {
         if active_generation != self.options.generation { self.cancel(); return Err(IndexError::StaleQuery); }
         if canceled() { self.cancel(); }
-        if self.report.is_terminal() || document_budget == 0 { return Ok(()); }
+        if self.report.is_terminal() || document_budget == 0 || byte_budget == 0 { return Ok(()); }
+        let mut remaining_bytes = byte_budget.min(MAX_CAPTURE_QUERY_STEP_BYTES);
         let document_count = self.document_count(index);
         let end = self.next_document.saturating_add(document_budget.min(MAX_QUERY_STEP_DOCUMENTS)).min(document_count);
         while self.next_document < end {
             if canceled() { self.cancel(); break; }
             let ordinal = self.selected_documents.as_ref()
                 .map_or(self.next_document, |ordinals| ordinals[self.next_document]);
-            // A panic during a child verifier must not leave a partially consumed
-            // candidate resumable. Ordinary success explicitly restores Running.
+            // A panicking verifier/cancellation callback cannot leave partially
+            // consumed candidate state resumable.
             self.report.state = IndexedQueryState::Failed;
-            let outcome = self.visit(index, query, ordinal, &mut canceled);
-            if let Err(error) = outcome {
-                self.report.failure = Some(error);
-                return Err(error);
-            }
+            let outcome = self.visit(index, query, ordinal, &mut remaining_bytes, &mut canceled);
+            let finished = match outcome {
+                Ok(finished) => finished,
+                Err(error) => { self.report.failure = Some(error); return Err(error); }
+            };
             if self.report.state == IndexedQueryState::Failed { self.report.state = IndexedQueryState::Running; }
-            self.next_document += 1;
-            self.report.examined_files += 1;
-            if self.report.is_terminal() { break; }
+            if finished {
+                self.next_document += 1;
+                self.report.examined_files += 1;
+            }
+            if !finished || self.report.is_terminal() || remaining_bytes == 0 { break; }
         }
         if canceled() { self.cancel(); }
         if self.report.state == IndexedQueryState::Running && self.next_document == document_count {
@@ -219,31 +251,51 @@ impl<'source> Execution<'source> {
         Ok(())
     }
     fn visit(&mut self, index: &impl QuerySource, query: &ParsedQuery, ordinal: usize,
-        canceled: &mut impl FnMut() -> bool) -> Result<(), IndexError> {
-        let doc = index.document(ordinal);
-        if !ReferenceScanOracle::matches_path_filters(doc.path, &query.path_filters)
-            || !ReferenceScanOracle::matches_lang_filters(doc.path, &query.lang_filters) {
-            self.report.excluded_by_path += 1; return Ok(());
-        }
-        if (self.count_all_matches || self.options.max_matches > 0)
-            && !index.may_match(ordinal, query, &self.options)? {
-            self.report.skipped_by_index += 1; return Ok(());
-        }
-        if index.fallback(ordinal, &self.options, query.primary_needle.as_bytes()) { self.report.fallback_attempts += 1; }
-        self.report.scan_attempts += 1;
+        byte_budget: &mut usize, canceled: &mut impl FnMut() -> bool) -> Result<bool, IndexError> {
         let retained = self.report.results.matches.len();
         let remaining = self.options.max_matches.saturating_sub(retained);
-        let mut options = self.options.clone();
-        options.max_matches = if self.count_all_matches {
-            remaining
-        } else if self.options.max_matches == 0 { 0 } else { remaining.max(1) };
-        options.max_bytes_scanned = self.options.max_bytes_scanned
-            .map(|limit| limit.saturating_sub(self.report.results.scanned_bytes));
         let skip = self.report.result_offset.saturating_sub(self.report.results.total_matches_counted as u64);
-        let child = CaptureQueryScanner::scan_document_window_with_cancel(&doc, query, &options,
-            skip, self.count_all_matches, canceled)?;
-        let scanned = self.report.results.scanned_bytes.checked_add(child.scanned_bytes).ok_or(IndexError::LimitExceeded)?;
-        if self.options.max_bytes_scanned.is_some_and(|limit| scanned > limit) { return Err(IndexError::LimitExceeded); }
+        if self.active.is_none() {
+            let doc = index.document(ordinal);
+            if !ReferenceScanOracle::matches_path_filters(doc.path, &query.path_filters)
+                || !ReferenceScanOracle::matches_lang_filters(doc.path, &query.lang_filters) {
+                self.report.excluded_by_path += 1; return Ok(true);
+            }
+            if (self.count_all_matches || self.options.max_matches > 0)
+                && !index.may_match(ordinal, query, &self.options)? {
+                self.report.skipped_by_index += 1; return Ok(true);
+            }
+            self.active_fallback = index.fallback(ordinal, &self.options, query.primary_needle.as_bytes());
+            let mut options = self.options.clone();
+            options.max_matches = if self.count_all_matches { remaining }
+                else if self.options.max_matches == 0 { 0 } else { remaining.max(1) };
+            options.max_bytes_scanned = self.options.max_bytes_scanned
+                .map(|limit| limit.saturating_sub(self.report.results.scanned_bytes));
+            // The output reservation remains small. Expand this same lease
+            // before allocating a file's retained decoder/matcher state, then
+            // release the scratch portion when that verifier retires.
+            let bytes = self.report.output_bytes.checked_add(self.scanner_bytes).ok_or(IndexError::LimitExceeded)?;
+            self.report._lease.reconcile(ByteLength::new(bytes)).map_err(|_| IndexError::ResourceDenied)?;
+            self.active_source_lease = index.source_lease();
+            match CaptureQueryScan::new(&doc, query, &options, skip, self.count_all_matches) {
+                Ok(scan) => self.active = Some(scan),
+                Err(error) => { self.release_scan(); return Err(error.into()); }
+            }
+        }
+        let scan = self.active.as_mut().ok_or(IndexError::InvalidManifest)?;
+        let consumed = scan.step(*byte_budget, canceled)?;
+        *byte_budget = byte_budget.checked_sub(consumed).ok_or(IndexError::LimitExceeded)?;
+        let scanned = self.report.results.scanned_bytes.checked_add(consumed as u64)
+            .ok_or(IndexError::LimitExceeded)?;
+        if self.options.max_bytes_scanned.is_some_and(|limit| scanned > limit) {
+            return Err(IndexError::LimitExceeded);
+        }
+        self.report.results.scanned_bytes = scanned;
+        if !scan.is_terminal() { return Ok(false); }
+        let child = self.active.take().ok_or(IndexError::InvalidManifest)?.into_result()?;
+        self.report.scan_attempts += 1;
+        if self.active_fallback { self.report.fallback_attempts += 1; }
+        self.release_scan();
         // Child counts include skipped qualified occurrences. A full window
         // from a prior file admits only one global lookahead even though the
         // child verifier needs a nonzero row allowance to inspect that file.
@@ -276,7 +328,7 @@ impl<'source> Execution<'source> {
             self.report.results.coverage = SearchCoverage::BudgetExhausted { bytes_scanned: scanned };
             self.report.state = IndexedQueryState::Finished;
         }
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -317,6 +369,15 @@ impl<'index, 'source, 'query> IndexedQuery<'index, 'source, 'query> {
         self.execution.step(self.index, self.query, document_budget, active_generation, canceled)?;
         Ok(self.report())
     }
+    /// Advance an explicit source-byte quantum shared across all visited files.
+    /// Matcher state survives pauses within a file; the hard 64 KiB cap still applies.
+    pub fn step_with_budget(&mut self, document_budget: usize, byte_budget: usize,
+        active_generation: QueryGeneration, canceled: impl FnMut() -> bool)
+        -> Result<&IndexedSearchReport<'source>, IndexError> {
+        self.execution.step_bounded(self.index, self.query, document_budget, byte_budget,
+            active_generation, canceled)?;
+        Ok(self.report())
+    }
     pub fn run_to_completion(&mut self, mut canceled: impl FnMut() -> bool)
         -> Result<&IndexedSearchReport<'source>, IndexError> {
         while !self.report().is_terminal() {
@@ -324,7 +385,7 @@ impl<'index, 'source, 'query> IndexedQuery<'index, 'source, 'query> {
         }
         Ok(self.report())
     }
-    pub fn into_report(self) -> IndexedSearchReport<'source> { self.execution.report }
+    pub fn into_report(self) -> IndexedSearchReport<'source> { self.execution.into_report() }
 }
 
 /// A movable query cursor bound to one actual owned-index instance, not merely
@@ -438,7 +499,14 @@ impl OwnedIndexedQuery {
         self.execution.step(index, &self.query, document_budget, generation, canceled)?;
         Ok(self.report())
     }
-    pub fn into_report(self) -> IndexedSearchReport<'static> { self.execution.report }
+    pub fn step_with_budget(&mut self, index: &OwnedEphemeralIndex, document_budget: usize,
+        byte_budget: usize, generation: QueryGeneration, canceled: impl FnMut() -> bool)
+        -> Result<&IndexedSearchReport<'static>, IndexError> {
+        if !Arc::ptr_eq(&self.identity, index.query_identity()) { return Err(IndexError::InvalidManifest); }
+        self.execution.step_bounded(index, &self.query, document_budget, byte_budget, generation, canceled)?;
+        Ok(self.report())
+    }
+    pub fn into_report(self) -> IndexedSearchReport<'static> { self.execution.into_report() }
 }
 impl<'source> EphemeralIndex<'source> {
     pub fn search(&self, query: &ParsedQuery, options: QueryOptions, budget: &ResourceBudget,

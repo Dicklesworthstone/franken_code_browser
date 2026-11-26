@@ -229,7 +229,7 @@ fn indexed_excluded_documents_keep_verification_budget_failure() {
             let index = EphemeralIndex::build(manifest, IndexLimits {
                 max_source_bytes_per_file, ..IndexLimits::default()
             }, &index_budget, allocation(1), || false).unwrap();
-            let output_budget = budget(128 * 1024);
+            let output_budget = budget(8 * 1024 * 1024 + 128 * 1024);
             let mut opts = options().with_max_matches(1);
             opts.max_bytes_scanned = Some(16_384);
             for counted in [false, true] {
@@ -352,7 +352,7 @@ fn indexed_and_fallback_verification_share_the_single_pass_allowance() {
         let index_budget = budget(8 * 1024 * 1024);
         let index = EphemeralIndex::build(manifest, IndexLimits { max_source_bytes_per_file,
             ..IndexLimits::default() }, &index_budget, allocation(1), || false).unwrap();
-        let output_budget = budget(128 * 1024);
+        let output_budget = budget(8 * 1024 * 1024 + 128 * 1024);
         let mut opts = options(); opts.max_bytes_scanned = Some(source.bytes().len() as u64);
         let report = index.search(&query, opts, &output_budget, allocation(2), || false).unwrap();
         assert!(report.is_complete());
@@ -369,7 +369,7 @@ fn simultaneous_predicate_capacity_is_admitted_before_index_execution() {
     let manifest = SearchManifest::new(SearchManifestId::new(owner(), 1).unwrap(), &documents, &[],
         MembershipState::Closed, ManifestLimits::default()).unwrap();
     let index_budget = budget(8 * 1024 * 1024);
-    let index = EphemeralIndex::build(manifest, IndexLimits::default(), &index_budget, allocation(1), || false).unwrap();
+    let index = EphemeralIndex::build(manifest, IndexLimits { max_source_bytes_per_file: 0, ..IndexLimits::default() }, &index_budget, allocation(1), || false).unwrap();
     // Public ASTs permit longer individual terms than the textual parser, up
     // to the shared needle limit. Charge their simultaneous cursor storage.
     let mut query = ParsedQuery::parse("needle required").unwrap();
@@ -378,8 +378,15 @@ fn simultaneous_predicate_capacity_is_admitted_before_index_execution() {
         case_sensitive: false, normalization: UnicodeNormalization::Exact });
     let scratch = CaptureQueryScanner::predicate_scratch_bytes(&query, &opts).unwrap();
     assert!(scratch > 64 * 1024);
-    assert_eq!(IndexedQuery::new(&index, &query, opts, &budget(64 * 1024), allocation(2)).err(),
-        Some(IndexError::ResourceDenied));
+    let output_budget = budget(64 * 1024);
+    let mut cursor = IndexedQuery::new(&index, &query, opts, &output_budget, allocation(2)).unwrap();
+    // Descriptor/result admission is independent; a candidate's simultaneous
+    // matcher capacity must be admitted before its first source byte is read.
+    assert_eq!(cursor.step(1, options().generation, || false).err(), Some(IndexError::ResourceDenied));
+    assert_eq!(cursor.report().capture_results().scanned_bytes, 0);
+    assert!(cursor.report().capture_results().matches.is_empty());
+    drop(cursor);
+    assert_eq!(output_budget.accounting().reserved().get(), 0);
     query.conjunction_terms[0].clear();
     assert_eq!(CaptureQueryScanner::scan_document(&documents[0], &query, &options()).err(), Some(QueryError::EmptyNeedle));
 }

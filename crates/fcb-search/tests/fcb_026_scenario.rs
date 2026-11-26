@@ -190,7 +190,9 @@ fn scenario_unicode_normalization_and_expansion_multiplicity(context: &ScenarioC
         };
     }
 
-    // 2. German 'ß' expansion to 'ss' (multiplicity 1) and 's' (multiplicity 2)
+    // 2. Each normalized occurrence has its own identity. German 'ß'
+    // contributes one 'ss' occurrence or two distinct 's' occurrences at the
+    // same original range; the initial 'S' is a third case-folded 's' hit.
     let fold_options = QueryOptions::new(generation).with_mode(SearchMode::DecodedText {
         case_sensitive: false,
         normalization: UnicodeNormalization::CaseFold,
@@ -204,9 +206,14 @@ fn scenario_unicode_normalization_and_expansion_multiplicity(context: &ScenarioC
     }
 
     let s_res = DirectSourceScanner::scan_complete_capture(&strasse_cap, "s", &fold_options).unwrap();
-    if s_res.match_count() != 2 || s_res.matches[1].multiplicity != 2 {
+    let witnesses: Vec<_> = s_res.matches.iter().map(|hit| (
+        hit.original_byte_range.start().get(), hit.original_byte_range.end().get(),
+        hit.matched_text.as_str(), hit.multiplicity, hit.occurrence_id,
+    )).collect();
+    if !s_res.is_complete() || s_res.match_count() != 3
+        || witnesses != [(0, 1, "S", 1, 1), (4, 6, "ß", 1, 2), (4, 6, "ß", 1, 3)] {
         return BodyResult::Fail {
-            reason: format!("Straße 's' multiplicity error: {:?}", s_res),
+            reason: format!("Straße 's' occurrence identity or provenance error: {:?}", s_res),
         };
     }
 
