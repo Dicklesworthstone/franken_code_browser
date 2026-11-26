@@ -17,7 +17,8 @@ fn identity(out: &mut Output, snapshot: &ImportsSnapshot) -> Result<(), AtlasSea
 fn contract(out: &mut Output) -> Result<(), AtlasSearchError> {
     out.literal(",\"projection\":\"lexical-source-imports\",\"relationship_kind\":\"lexical-import\",\"evidence_precision\":\"exact-import-source-range\",\"resolution_domain\":\"declared-catalog-candidates\",\"compiler_resolved\":false,\"semantic_complete\":false,\"extractor\":")?;
     out.quoted(IMPORT_EXTRACTOR)?;
-    out.literal(",\"resolver\":\"fcb-closed-catalog-imports-v14\",\"extraction_policy\":")?; out.quoted(IMPORT_POLICY)?;
+    out.literal(",\"resolver\":\"fcb-closed-catalog-imports-v15\",\"extraction_policy\":")?; out.quoted(IMPORT_POLICY)?;
+    out.literal(",\"cpp_angle_include_policy\":\"project-root-and-include-exact-candidates-v1\"")?;
     Ok(())
 }
 fn summary(out: &mut Output, atlas: &AtlasSession, index: &RetainedIndex, snapshot: &ImportsSnapshot)

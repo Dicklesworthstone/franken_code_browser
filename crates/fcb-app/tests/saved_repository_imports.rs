@@ -65,7 +65,7 @@ fn saved_workspace_dependencies_keep_utf16_evidence_and_offline_raw_paths() {
         let mut saved = f.open(58340 + u64::from(big) * 10);
         let page = prepare(&mut saved, 1);
         assert!(page.get("imports_complete").flag());
-        assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v14");
+        assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v15");
         assert_eq!(page.get("member_bytes_read").number(),
             (source.len() + manifest.len() + workspace.len() + dependency.len() + root.len() + target.len()) as u64);
         assert_eq!(page.get("peak_source_bytes").number(),
@@ -251,7 +251,7 @@ fn saved_inline_rust_modules_keep_exact_nested_evidence_and_offline_targets() {
     assert!(page.get("imports_complete").flag());
     assert_eq!(page.get("links_seen").number(), 3);
     assert_eq!(page.get("extractor").text(), "franken-markdown-d6fbd1d5/import-statements-v10");
-    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v14");
+    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v15");
     for (destination, statement, kind, basis) in [
         ("child", "mod child;", "rust-module", "rust-module-file-candidate"),
         ("self::child::Thing", "use self::child::Thing;", "rust-use", "rust-use-module-prefix-candidate"),
@@ -542,6 +542,101 @@ fn corrupt_go_module_cannot_replace_accepted_archive_imports() {
 }
 
 #[test]
+fn saved_cpp_angle_candidates_keep_exact_utf16_evidence_and_offline_target_readers() {
+    let statement = "# include <project/café.hpp>";
+    let header = b"#pragma once\nstruct Saved {};\n";
+    let root_header = b"#pragma once\nstruct Root {};\n";
+    for big in [false, true] {
+        let source = utf16(&format!("// saved \u{1f980}\r\n{statement}\r\n#include <root.h>\r\n"), big);
+        let f = Fixture::new(&[entry("include/project/café.hpp".as_bytes(), header),
+            entry(b"root.h", root_header), entry(b"src/\xff/main.cpp", &source)], true);
+        let mut saved = f.open(58400 + u64::from(big) * 10);
+        let page = prepare(&mut saved, 1);
+        assert!(page.get("imports_complete").flag());
+        assert_eq!(page.get("links_seen").number(), 2);
+        assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v15");
+        assert_eq!(page.get("cpp_angle_include_policy").text(), "project-root-and-include-exact-candidates-v1");
+        assert!(!page.get("compiler_resolved").flag());
+        let row = link(&page, b"src/\xff/main.cpp", "project/café.hpp");
+        let id = row.get("link_id").number();
+        assert_eq!(row.get("resolution").text(), "captured");
+        assert_eq!(row.get("lexical_import_kind").text(), "cpp-angle-include");
+        assert_eq!(row.get("resolution_basis").text(), "cpp-project-include-candidate");
+        assert_eq!(row.get("target_path").get("hex").text(), hex("include/project/café.hpp".as_bytes()));
+        assert_eq!(row.get("target_digest").text(), Sha256::digest(header).to_hex());
+        assert_eq!(range(&source, row.get("evidence_range")), &utf16(statement, big)[2..]);
+        assert_eq!(range(&source, row.get("specifier_range")), &utf16("project/café.hpp", big)[2..]);
+        let root = link(&page, b"src/\xff/main.cpp", "root.h");
+        assert_eq!(root.get("resolution").text(), "captured");
+        assert_eq!(root.get("target_path").get("hex").text(), hex(b"root.h"));
+        let before = reads(&mut saved);
+        let incoming = json(&saved.import_page(1, Some(row.get("target_member").number().try_into().unwrap()),
+            Direction::Incoming, 0, 64, || false).unwrap());
+        assert_eq!(incoming.get("matching_links").number(), 1);
+        assert_eq!(&incoming.get("links").array()[0], row);
+        assert_eq!(reads(&mut saved), before);
+        let (mut evidence, receipt) = saved.open_import_reader(owner(58401 + u64::from(big) * 10),
+            1, id, Side::Evidence, || false).unwrap();
+        assert_eq!(json(&receipt).get("selection"), row.get("evidence_range"));
+        let (mut target, receipt) = saved.open_import_reader(owner(58402 + u64::from(big) * 10),
+            1, id, Side::Target, || false).unwrap();
+        let receipt = json(&receipt);
+        assert_eq!(receipt.get("resolver").text(), "fcb-closed-catalog-imports-v15");
+        assert_eq!(receipt.get("cpp_angle_include_policy").text(), "project-root-and-include-exact-candidates-v1");
+        assert_eq!(receipt.get("source_digest").text(), Sha256::digest(header).to_hex());
+        assert!(!receipt.get("live_source_reopened").flag());
+        assert!(!receipt.get("compiler_resolved").flag());
+        saved.clear_imports(2, || false).unwrap(); drop(saved);
+        fs::rename(&f.path, f.root.join("moved-cpp-angle.fcbs")).unwrap();
+        assert_eq!(copy_all(&mut evidence).get("original_hex").text(), hex(&source));
+        assert_eq!(copy_all(&mut target).get("original_hex").text(), hex(header));
+        assert!(!f.root.join("include").exists(), "saved navigation cannot materialize project files");
+    }
+}
+
+#[test]
+fn saved_cpp_angle_candidates_distinguish_ambiguity_unavailable_and_external_targets() {
+    let source = b"#include <conflict.h>\n#include <blocked.h>\n#include <missing.h>\n#include <vector>\n#include <./escape.h>\n";
+    let f = Fixture::new(&[entry(b"conflict.h", b""), entry(b"include/conflict.h", b""),
+        SnapshotEntry { path: b"include/blocked.h", observed_bytes: 77, data: SnapshotData::Unavailable("READ_DENIED") },
+        entry(b"main.cpp", source), entry(b"vector", b"")], true);
+    let mut saved = f.open(58420);
+    let page = prepare(&mut saved, 1);
+    assert!(!page.get("imports_complete").flag());
+    assert_eq!(page.get("unavailable_source_members").number(), 1);
+    assert_eq!(page.get("links_seen").number(), 5);
+    for (destination, resolution, basis) in [
+        ("conflict.h", "ambiguous", "ambiguous-catalog-target"),
+        ("blocked.h", "unavailable", "cpp-project-include-candidate"),
+        ("missing.h", "external", "external-specifier"),
+        ("vector", "external", "external-specifier"),
+        ("./escape.h", "unresolved", "unsupported-specifier"),
+    ] {
+        let row = link(&page, b"main.cpp", destination);
+        assert_eq!(row.get("resolution").text(), resolution);
+        assert_eq!(row.get("resolution_basis").text(), basis);
+        let before = reads(&mut saved);
+        let expected = if resolution == "unavailable" { Error::TargetUnavailable } else { Error::UnresolvedTarget };
+        assert_eq!(saved.open_import_reader(owner(58421), 1, row.get("link_id").number(), Side::Target, || false).err(),
+            Some(expected));
+        assert_eq!(reads(&mut saved), before);
+        if resolution != "unavailable" {
+            assert_eq!(row.get("target_member"), &Json::Null);
+            assert_eq!(row.get("target_path"), &Json::Null);
+        }
+    }
+    let blocked = link(&page, b"main.cpp", "blocked.h");
+    assert_eq!(blocked.get("target_path").get("hex").text(), hex(b"include/blocked.h"));
+    assert_eq!(blocked.get("target_digest"), &Json::Null);
+    let before = reads(&mut saved);
+    let incoming = json(&saved.import_page(1, Some(blocked.get("target_member").number().try_into().unwrap()),
+        Direction::Incoming, 0, 64, || false).unwrap());
+    assert_eq!(incoming.get("matching_links").number(), 1);
+    assert_eq!(&incoming.get("links").array()[0], blocked);
+    assert_eq!(reads(&mut saved), before);
+}
+
+#[test]
 fn saved_cpp_includes_preserve_utf16_evidence_and_independent_offline_readers() {
     let prefix = "// \u{1f980} saved source\r\n";
     let statement = "# include \"detail/café.h\"";
@@ -619,7 +714,7 @@ fn saved_rust_use_tree_pages_preserve_leaf_identity_and_original_utf16_evidence(
         let result = prepare(&mut saved, 1);
         assert!(result.get("imports_complete").flag());
         assert_eq!(result.get("links_seen").number(), 5);
-        assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v14");
+        assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v15");
         let rows = result.get("links").array();
         for (index, (destination, spelling)) in [
             ("crate::shared", "self"), ("crate::shared::Thing", "Thing"),
@@ -702,7 +797,7 @@ fn shared_language_extractors_publish_exact_occurrences_and_metadata_only_revers
     assert_eq!(result.get("import_generation").number(), 7);
     assert_eq!(result.get("projection").text(), "lexical-source-imports");
     assert_eq!(result.get("evidence_precision").text(), "exact-import-source-range");
-    assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v14");
+    assert_eq!(result.get("resolver").text(), "fcb-closed-catalog-imports-v15");
     assert_eq!(result.get("extraction_policy").text(), "rust-inline-modules-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v10");
     assert_eq!(result.get("completeness_scope").text(), "parsed-source-imports-in-saved-manifest");
     assert!(!result.get("compiler_resolved").flag());
@@ -1001,12 +1096,18 @@ fn explicit_javascript_targets_preserve_binary_bytes_and_opened_archive_identity
 fn unavailable_unsupported_and_source_limited_members_partition_coverage_without_payload_retention() {
     let source = b"from .b import Value\n";
     let oversized = vec![b' '; MAX_IMPORT_SOURCE_BYTES + 1];
+    let limits = SnapshotLimits { max_file_bytes: 2 * 1024 * 1024, ..SnapshotLimits::default() };
     let f = Fixture::with_limits(&[entry(b"a.py", source), entry(b"b.py", b""), entry(b"c.py", &[0xff, 0, 1]),
         entry(b"d.py", &oversized),
         SnapshotEntry { path: b"e.py", observed_bytes: 50, data: SnapshotData::Unavailable("READ_DENIED") },
-        entry(b"f.PYI", b""), entry(b"g.txt", b"import not_python")], true,
-        SnapshotLimits { max_file_bytes: 2 * 1024 * 1024, ..SnapshotLimits::default() });
-    let mut saved = f.open(57451);
+        entry(b"f.PYI", b""), entry(b"g.txt", b"import not_python")], true, limits);
+    // The ordinary archive limit still refuses this member. Open with the same
+    // explicit archive bounds used to encode it so the smaller import-source
+    // limit, rather than archive admission, is the behavior under examination.
+    assert_eq!(SavedRepositorySession::open(owner(57450), &f.path, SnapshotLimits::default(), || false).err(),
+        Some(fcb_app::host::saved_repository::SavedRepositoryError::Archive(
+            fcb::search::paged_snapshot::PagedSnapshotError::Limits)));
+    let mut saved = SavedRepositorySession::open(owner(57451), &f.path, limits, || false).unwrap();
     let response = saved.prepare_imports(1, 20, 1024 * 1024, || false).unwrap();
     assert_eq!(response.exit_code(), EXIT_PARTIAL);
     let result = json(&response);

@@ -11,10 +11,42 @@ enum AtlasSavedImportWire {
     static let maximumMemberReadCalls: UInt64 = 1_048_576
 
     static func validateContract(_ data: Data) throws {
+        struct ResolverClaim: Decodable {
+            let lexical_import_kind, resolution_basis: String
+            var requiresProjectIncludeResolver: Bool {
+                resolution_basis == "cpp-project-include-candidate"
+                    || (lexical_import_kind == "cpp-angle-include" && resolution_basis == "ambiguous-catalog-target")
+            }
+        }
         struct Contract: Decodable {
             let projection, relationship_kind, evidence_precision, resolution_domain: String
             let extractor, extraction_policy, resolver: String
             let compiler_resolved, semantic_complete: Bool
+            let links: [ResolverClaim]?
+            let relationship: ResolverClaim?
+            let cpp_angle_include_policy: String?
+            let hasAngleIncludePolicy: Bool
+            enum CodingKeys: CodingKey {
+                case projection, relationship_kind, evidence_precision, resolution_domain,
+                     extractor, extraction_policy, resolver, compiler_resolved, semantic_complete,
+                     links, relationship, cpp_angle_include_policy
+            }
+            init(from decoder: Decoder) throws {
+                let c = try decoder.container(keyedBy: CodingKeys.self)
+                projection = try c.decode(String.self, forKey: .projection)
+                relationship_kind = try c.decode(String.self, forKey: .relationship_kind)
+                evidence_precision = try c.decode(String.self, forKey: .evidence_precision)
+                resolution_domain = try c.decode(String.self, forKey: .resolution_domain)
+                extractor = try c.decode(String.self, forKey: .extractor)
+                extraction_policy = try c.decode(String.self, forKey: .extraction_policy)
+                resolver = try c.decode(String.self, forKey: .resolver)
+                compiler_resolved = try c.decode(Bool.self, forKey: .compiler_resolved)
+                semantic_complete = try c.decode(Bool.self, forKey: .semantic_complete)
+                links = try c.decodeIfPresent([ResolverClaim].self, forKey: .links)
+                relationship = try c.decodeIfPresent(ResolverClaim.self, forKey: .relationship)
+                hasAngleIncludePolicy = c.contains(.cpp_angle_include_policy)
+                cpp_angle_include_policy = try c.decodeIfPresent(String.self, forKey: .cpp_angle_include_policy)
+            }
         }
         let w = try JSONDecoder().decode(Contract.self, from: data)
         guard w.projection == "lexical-source-imports", w.relationship_kind == "lexical-import",
@@ -22,8 +54,33 @@ enum AtlasSavedImportWire {
               w.resolution_domain == "declared-catalog-candidates",
               w.extractor == "franken-markdown-d6fbd1d5/import-statements-v10",
               w.extraction_policy == "rust-inline-modules-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v10",
-              ["fcb-closed-catalog-imports-v13", "fcb-closed-catalog-imports-v14"].contains(w.resolver),
+              ["fcb-closed-catalog-imports-v13", "fcb-closed-catalog-imports-v14", "fcb-closed-catalog-imports-v15"].contains(w.resolver),
               !w.compiler_resolved, !w.semantic_complete else { throw AtlasSavedError.invalidResponse }
+        if w.resolver == "fcb-closed-catalog-imports-v15" {
+            guard w.cpp_angle_include_policy == "project-root-and-include-exact-candidates-v1" else {
+                throw AtlasSavedError.invalidResponse
+            }
+        } else {
+            guard !w.hasAngleIncludePolicy else { throw AtlasSavedError.invalidResponse }
+            guard w.links?.contains(where: \.requiresProjectIncludeResolver) != true,
+                  w.relationship?.requiresProjectIncludeResolver != true else { throw AtlasSavedError.invalidResponse }
+        }
+    }
+
+    /// Check the declared v15 spelling; the host alone looks up catalog targets.
+    static func acceptsProjectIncludeDestination(_ destination: String) -> Bool {
+        let bytes = Array(destination.utf8)
+        guard !bytes.isEmpty, bytes.count <= 1024, bytes.first != 47,
+              !bytes.contains(where: { [34, 58, 60, 62, 92].contains($0) }),
+              !destination.unicodeScalars.contains(where: { $0.value < 32 || (127...159).contains($0.value) }),
+              !bytes.split(separator: 47, omittingEmptySubsequences: false).contains(where: {
+                  $0.isEmpty || $0.elementsEqual([46]) || $0.elementsEqual([46, 46])
+              }) else { return false }
+        if bytes.contains(47) { return true }
+        guard let dot = bytes.lastIndex(of: 46) else { return false }
+        let suffix = bytes[(dot + 1)...].map { (65...90).contains($0) ? $0 + 32 : $0 }
+        return ["h", "hh", "hpp", "hxx", "h++", "inl", "inc", "ipp", "tpp"]
+            .contains(String(decoding: suffix, as: UTF8.self))
     }
 
     static func clear(_ json: String?, identity: AtlasSavedIdentity, generation: UInt64) throws {
@@ -73,7 +130,7 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
         case "java-import": return "Java type import"
         case "java-static-import": return "Java static member import"
         case "cpp-quoted-include": return "Quoted C/C++ include"
-        case "cpp-angle-include": return "External C/C++ include"
+        case "cpp-angle-include": return "Angle C/C++ include"
         case "cpp-computed-include": return "Unresolved computed C/C++ include"
         case "javascript-export": return "Re-export statement"
         case "javascript-require": return "Bare require() candidate (binding not resolved)"
@@ -95,6 +152,10 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
         if resolutionBasis == "python-absolute-module-candidate" {
             return (canOpenTarget ? "Captured Python source-file candidate" : "Python source-file candidate recorded without source bytes")
                 + "; runtime import binding is not resolved"
+        }
+        if resolutionBasis == "cpp-project-include-candidate" {
+            return (canOpenTarget ? "Captured project header candidate" : "Project header candidate recorded without source bytes")
+                + "; project root or include/ path; compiler search paths are not resolved"
         }
         if resolutionBasis == "go-module-package-file-candidate" {
             let availability = canOpenTarget ? "Captured representative Go package file" : "Representative Go package file has no captured bytes"
@@ -164,7 +225,7 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
               ["exact-relative-path", "unique-relative-module-candidate", "typescript-source-extension-candidate", "rust-path-attribute-candidate", "rust-include-file-candidate", "rust-module-file-candidate",
                "rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "rust-use-inline-module-candidate", "ambiguous-rust-crate-root",
                "rust-path-dependency-file-candidate", "rust-path-dependency-prefix-candidate", "rust-dependency-context-unavailable",
-               "python-relative-module-candidate", "python-absolute-module-candidate", "cpp-source-relative-include-candidate",
+               "python-relative-module-candidate", "python-absolute-module-candidate", "cpp-source-relative-include-candidate", "cpp-project-include-candidate",
                "go-module-package-file-candidate", "go-module-context-unavailable", "go-nested-module-boundary",
                "java-source-file-candidate", "java-enclosing-type-candidate", "unresolved-java-wildcard",
                "unresolved-cpp-include", "unresolved-rust-use", "external-specifier",
@@ -205,13 +266,13 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
             "unsupported-specifier", "no-catalog-target", "ambiguous-catalog-target"].contains(resolutionBasis) {
             throw AtlasSavedError.invalidResponse
         }
-        if ["cpp-source-relative-include-candidate", "unresolved-cpp-include"].contains(resolutionBasis)
+        if ["cpp-source-relative-include-candidate", "cpp-project-include-candidate", "unresolved-cpp-include"].contains(resolutionBasis)
             && language != "cpp" { throw AtlasSavedError.invalidResponse }
         if language == "cpp" {
             let allowed: [String]
             switch kind {
             case "cpp-quoted-include": allowed = ["cpp-source-relative-include-candidate", "no-catalog-target", "unsupported-specifier"]
-            case "cpp-angle-include": allowed = ["external-specifier", "unsupported-specifier"]
+            case "cpp-angle-include": allowed = ["cpp-project-include-candidate", "ambiguous-catalog-target", "external-specifier", "unsupported-specifier"]
             default: allowed = ["unresolved-cpp-include"]
             }
             guard allowed.contains(resolutionBasis) else { throw AtlasSavedError.invalidResponse }
@@ -233,7 +294,7 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
             "rust-path-attribute-candidate", "rust-include-file-candidate", "rust-module-file-candidate", "rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "rust-use-inline-module-candidate",
             "rust-path-dependency-file-candidate", "rust-path-dependency-prefix-candidate",
             "python-relative-module-candidate", "python-absolute-module-candidate",
-            "cpp-source-relative-include-candidate", "go-module-package-file-candidate",
+            "cpp-source-relative-include-candidate", "cpp-project-include-candidate", "go-module-package-file-candidate",
             "java-source-file-candidate", "java-enclosing-type-candidate"]
         case "missing": acceptedBases = ["no-catalog-target"]
         case "ambiguous": acceptedBases = ["ambiguous-catalog-target", "ambiguous-rust-crate-root"]
@@ -253,6 +314,19 @@ struct AtlasSavedImport: Decodable, Sendable, Identifiable {
                   let targetBytes, targetBytes <= AtlasSavedWire.memberBytes else { throw AtlasSavedError.invalidResponse }
         } else {
             guard targetRevision == nil, targetDigest == nil, targetBytes == nil else { throw AtlasSavedError.invalidResponse }
+        }
+        if kind == "cpp-angle-include"
+            && ["cpp-project-include-candidate", "ambiguous-catalog-target"].contains(resolutionBasis) {
+            guard AtlasSavedImportWire.acceptsProjectIncludeDestination(destination) else {
+                throw AtlasSavedError.invalidResponse
+            }
+            if resolutionBasis == "cpp-project-include-candidate" {
+                let spelling = Array(destination.utf8)
+                guard let targetPath,
+                      targetPath.bytes == spelling || targetPath.bytes == Array("include/".utf8) + spelling else {
+                    throw AtlasSavedError.invalidResponse
+                }
+            }
         }
         if resolutionBasis == "rust-use-inline-module-candidate" {
             guard resolution == "captured", targetMember == sourceMember, targetFile == sourceFile,
@@ -319,7 +393,7 @@ struct AtlasSavedImports: Sendable {
             let sources = w.source_members.value, scanned = w.scanned_source_members.value
             let unavailable = w.unavailable_source_members.value, unsupported = w.unsupported_source_members.value
             let limited = w.source_limited_members.value, diagnostic = w.diagnostic_source_members.value
-            let readsPerSource: UInt64 = w.resolver == "fcb-closed-catalog-imports-v14" ? 3 : 2
+            let readsPerSource: UInt64 = w.resolver == "fcb-closed-catalog-imports-v13" ? 2 : 3
             guard generation > 0, w.import_generation.value == generation, w.direction == direction.rawValue,
                   w.completeness_scope == "parsed-source-imports-in-saved-manifest",
                   w.source_observation == "verified-saved-members",
@@ -337,7 +411,7 @@ struct AtlasSavedImports: Sendable {
                   w.matching_links.value <= w.retained_links.value, w.retained_source_payload_bytes.value == 0,
                   w.member_bytes_read.value <= w.max_source_bytes.value,
                   w.peak_source_bytes.value <= min(w.member_bytes_read.value, AtlasSavedImportWire.maximumMemberBytes),
-                  // v14 also admits one captured workspace manifest per source.
+                  // v14 and v15 also admit one captured workspace manifest per source.
                   // Legacy v13 responses keep their original read-count envelope.
                   w.member_read_calls.value <= (readsPerSource * scanned + w.retained_links.value + unsupported)
                     * AtlasSavedImportWire.maximumMemberReadCalls,

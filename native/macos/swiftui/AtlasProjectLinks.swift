@@ -138,16 +138,66 @@ struct AtlasProjectImportEvidence: Equatable, Sendable {
     static let sourceLimit: UInt64 = 1024 * 1024
     let language, kind, resolutionBasis: String
 
+    private struct ResolverClaim: Decodable {
+        let lexical_import_kind, resolution_basis: String
+        var requiresProjectIncludeResolver: Bool {
+            resolution_basis == "cpp-project-include-candidate"
+                || (lexical_import_kind == "cpp-angle-include" && resolution_basis == "ambiguous-catalog-target")
+        }
+    }
+
     static func validateRoot(_ w: AtlasIndexWire) throws {
+        let resolver = try w.text("resolver")
         guard try w.text("projection") == "lexical-source-imports",
               try w.text("relationship_kind") == "lexical-import",
               try w.text("evidence_precision") == "exact-import-source-range",
               try w.text("extractor") == "franken-markdown-d6fbd1d5/import-statements-v10",
-              try ["fcb-closed-catalog-imports-v13", "fcb-closed-catalog-imports-v14"].contains(w.text("resolver")),
+              ["fcb-closed-catalog-imports-v13", "fcb-closed-catalog-imports-v14", "fcb-closed-catalog-imports-v15"].contains(resolver),
               try w.text("extraction_policy") == "rust-inline-modules-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v10",
               try !w.flag("compiler_resolved"), try !w.flag("semantic_complete") else {
             throw AtlasProjectLinksError.invalidResponse
         }
+        if resolver == "fcb-closed-catalog-imports-v15" {
+            guard try w.text("cpp_angle_include_policy") == "project-root-and-include-exact-candidates-v1" else {
+                throw AtlasProjectLinksError.invalidResponse
+            }
+        } else if w.fields.contains(AtlasIndexWire.Key("cpp_angle_include_policy")) {
+            throw AtlasProjectLinksError.invalidResponse
+        }
+        // Check both inventory pages and repeated reader-import evidence. Older
+        // resolver receipts cannot acquire the new project-header authority.
+        if resolver != "fcb-closed-catalog-imports-v15" {
+            if w.fields.contains(AtlasIndexWire.Key("links")) {
+                let claims: [ResolverClaim] = try w.rows("links", limit: 128)
+                guard !claims.contains(where: \.requiresProjectIncludeResolver) else {
+                    throw AtlasProjectLinksError.invalidResponse
+                }
+            }
+            if w.fields.contains(AtlasIndexWire.Key("relationship")) {
+                let row = try w.object("relationship")
+                let kind = try row.text("lexical_import_kind"), basis = try row.text("resolution_basis")
+                guard basis != "cpp-project-include-candidate",
+                      !(kind == "cpp-angle-include" && basis == "ambiguous-catalog-target") else {
+                    throw AtlasProjectLinksError.invalidResponse
+                }
+            }
+        }
+    }
+
+    /// Validate the v15 claim's spelling without performing source resolution.
+    static func acceptsProjectIncludeDestination(_ destination: String) -> Bool {
+        let bytes = Array(destination.utf8)
+        guard !bytes.isEmpty, bytes.count <= 1024, bytes.first != 47,
+              !bytes.contains(where: { [34, 58, 60, 62, 92].contains($0) }),
+              !destination.unicodeScalars.contains(where: { $0.value < 32 || (127...159).contains($0.value) }),
+              !bytes.split(separator: 47, omittingEmptySubsequences: false).contains(where: {
+                  $0.isEmpty || $0.elementsEqual([46]) || $0.elementsEqual([46, 46])
+              }) else { return false }
+        if bytes.contains(47) { return true }
+        guard let dot = bytes.lastIndex(of: 46) else { return false }
+        let suffix = bytes[(dot + 1)...].map { (65...90).contains($0) ? $0 + 32 : $0 }
+        return ["h", "hh", "hpp", "hxx", "h++", "inl", "inc", "ipp", "tpp"]
+            .contains(String(decoding: suffix, as: UTF8.self))
     }
     init(_ w: AtlasIndexWire) throws {
         language = try w.text("language"); kind = try w.text("lexical_import_kind")
@@ -167,7 +217,7 @@ struct AtlasProjectImportEvidence: Equatable, Sendable {
               ["exact-relative-path", "unique-relative-module-candidate", "typescript-source-extension-candidate", "rust-path-attribute-candidate", "rust-include-file-candidate", "rust-module-file-candidate",
                "rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "rust-use-inline-module-candidate", "ambiguous-rust-crate-root",
                "rust-path-dependency-file-candidate", "rust-path-dependency-prefix-candidate", "rust-dependency-context-unavailable",
-               "python-relative-module-candidate", "python-absolute-module-candidate", "cpp-source-relative-include-candidate",
+               "python-relative-module-candidate", "python-absolute-module-candidate", "cpp-source-relative-include-candidate", "cpp-project-include-candidate",
                "go-module-package-file-candidate", "go-module-context-unavailable", "go-nested-module-boundary",
                "java-source-file-candidate", "java-enclosing-type-candidate", "unresolved-java-wildcard",
                "unresolved-cpp-include", "unresolved-rust-use", "external-specifier",
@@ -208,13 +258,13 @@ struct AtlasProjectImportEvidence: Equatable, Sendable {
             "unsupported-specifier", "no-catalog-target", "ambiguous-catalog-target"].contains(resolutionBasis) {
             throw AtlasProjectLinksError.invalidResponse
         }
-        if ["cpp-source-relative-include-candidate", "unresolved-cpp-include"].contains(resolutionBasis)
+        if ["cpp-source-relative-include-candidate", "cpp-project-include-candidate", "unresolved-cpp-include"].contains(resolutionBasis)
             && language != "cpp" { throw AtlasProjectLinksError.invalidResponse }
         if language == "cpp" {
             let allowed: [String]
             switch kind {
             case "cpp-quoted-include": allowed = ["cpp-source-relative-include-candidate", "no-catalog-target", "unsupported-specifier"]
-            case "cpp-angle-include": allowed = ["external-specifier", "unsupported-specifier"]
+            case "cpp-angle-include": allowed = ["cpp-project-include-candidate", "ambiguous-catalog-target", "external-specifier", "unsupported-specifier"]
             default: allowed = ["unresolved-cpp-include"]
             }
             guard allowed.contains(resolutionBasis) else { throw AtlasProjectLinksError.invalidResponse }
@@ -246,7 +296,7 @@ struct AtlasProjectImportEvidence: Equatable, Sendable {
         case "java-import": statement = "Java type import"
         case "java-static-import": statement = "Java static member import"
         case "cpp-quoted-include": statement = "Quoted C/C++ include"
-        case "cpp-angle-include": statement = "External C/C++ include"
+        case "cpp-angle-include": statement = "Angle C/C++ include"
         case "cpp-computed-include": statement = "Unresolved computed C/C++ include"
         case "javascript-export": statement = "Re-export statement"
         case "javascript-require": statement = "Bare require() candidate (binding not resolved)"
@@ -305,6 +355,9 @@ struct AtlasProjectLink: Identifiable, Sendable, Equatable, Decodable {
         }
         if importEvidence?.resolutionBasis == "python-absolute-module-candidate" {
             return status + " · conventional Python source path; runtime import binding is not resolved"
+        }
+        if importEvidence?.resolutionBasis == "cpp-project-include-candidate" {
+            return status + " · project root or include/ header candidate; compiler search paths are not resolved"
         }
         if importEvidence?.language == "java" {
             return status + (importEvidence?.resolutionBasis == "java-enclosing-type-candidate"
@@ -391,7 +444,7 @@ struct AtlasProjectLink: Identifiable, Sendable, Equatable, Decodable {
                     "rust-use-module-file-candidate", "rust-use-module-prefix-candidate", "rust-use-inline-module-candidate",
                     "rust-path-dependency-file-candidate", "rust-path-dependency-prefix-candidate", "python-relative-module-candidate",
                     "python-absolute-module-candidate",
-                    "cpp-source-relative-include-candidate", "go-module-package-file-candidate",
+                    "cpp-source-relative-include-candidate", "cpp-project-include-candidate", "go-module-package-file-candidate",
                     "java-source-file-candidate", "java-enclosing-type-candidate"]
             case "missing": allowed = ["no-catalog-target"]
             case "ambiguous": allowed = ["ambiguous-catalog-target", "ambiguous-rust-crate-root"]
@@ -400,6 +453,19 @@ struct AtlasProjectLink: Identifiable, Sendable, Equatable, Decodable {
                 "go-module-context-unavailable", "go-nested-module-boundary", "unresolved-java-wildcard"]
             }
             guard allowed.contains(importEvidence.resolutionBasis) else { throw AtlasProjectLinksError.invalidResponse }
+            if importEvidence.kind == "cpp-angle-include"
+                && ["cpp-project-include-candidate", "ambiguous-catalog-target"].contains(importEvidence.resolutionBasis) {
+                guard AtlasProjectImportEvidence.acceptsProjectIncludeDestination(destination) else {
+                    throw AtlasProjectLinksError.invalidResponse
+                }
+                if importEvidence.resolutionBasis == "cpp-project-include-candidate" {
+                    let spelling = Array(destination.utf8)
+                    guard let targetPath,
+                          targetPath.bytes == spelling || targetPath.bytes == Array("include/".utf8) + spelling else {
+                        throw AtlasProjectLinksError.invalidResponse
+                    }
+                }
+            }
         }
         if importEvidence?.resolutionBasis == "rust-use-inline-module-candidate" {
             guard resolution == "captured", target == source else { throw AtlasProjectLinksError.invalidResponse }
@@ -465,7 +531,9 @@ struct AtlasProjectLinksCoverage: Equatable, Sendable {
                   try w.number("max_markdown_source_bytes") == 262_144 else { throw AtlasProjectLinksError.invalidResponse }
         } else {
             try AtlasProjectImportEvidence.validateRoot(w)
-            if try w.text("resolver") == "fcb-closed-catalog-imports-v14" { metadataManifestsPerSource = 2 }
+            if try ["fcb-closed-catalog-imports-v14", "fcb-closed-catalog-imports-v15"].contains(w.text("resolver")) {
+                metadataManifestsPerSource = 2
+            }
             guard try w.number("max_source_bytes") == AtlasProjectImportEvidence.sourceLimit else { throw AtlasProjectLinksError.invalidResponse }
         }
         guard try w.text("source_observation") == "retained-index-captures",
@@ -476,7 +544,7 @@ struct AtlasProjectLinksCoverage: Equatable, Sendable {
               examined == scanned + unsupported + sourceLimited, captured == examined + pending,
               retained <= 4096, retained <= linksSeen, steps <= 4097, lastStepFiles <= 1,
               moduleBytes <= 32 * 1024 * 1024, parseBytes <= 32 * 1024 * 1024 - moduleBytes,
-              // v14 may additionally inspect one workspace manifest per source.
+              // v14 and v15 may additionally inspect one workspace manifest per source.
               // Keep the original v13 bound and the independent global byte cap.
               moduleBytes <= (metadataManifestsPerSource * UInt64(scanned) + min(linksSeen, 4096)) * 65_536,
               parseBytes <= basis.sourceBytes, hashedBytes <= basis.sourceBytes,

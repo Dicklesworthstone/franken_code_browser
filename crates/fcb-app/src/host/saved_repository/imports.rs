@@ -529,7 +529,8 @@ impl SavedRepositorySession {
 fn contract(out: &mut Output) -> Result<(), SavedImportError> {
     out.literal(",\"projection\":\"lexical-source-imports\",\"relationship_kind\":\"lexical-import\",\"evidence_precision\":\"exact-import-source-range\",\"resolution_domain\":\"declared-catalog-candidates\",\"compiler_resolved\":false,\"semantic_complete\":false,\"extractor\":")?;
     out.quoted(IMPORT_EXTRACTOR)?;
-    out.literal(",\"resolver\":\"fcb-closed-catalog-imports-v14\",\"extraction_policy\":")?; out.quoted(IMPORT_POLICY)?;
+    out.literal(",\"resolver\":\"fcb-closed-catalog-imports-v15\",\"extraction_policy\":")?; out.quoted(IMPORT_POLICY)?;
+    out.literal(",\"cpp_angle_include_policy\":\"project-root-and-include-exact-candidates-v1\"")?;
     Ok(())
 }
 fn import_attempt(last: &mut u64, next: u64) -> Result<(), SavedImportError> {

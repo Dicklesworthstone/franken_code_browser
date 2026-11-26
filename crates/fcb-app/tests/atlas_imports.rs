@@ -41,7 +41,7 @@ fn workspace_cargo_dependencies_use_captured_root_paths_and_retained_targets() {
     fs::write(f.root.join("dep/code/model.rs"), b"pub struct Replacement;\n").unwrap();
     let page = f.prepare(1, 1);
     assert!(page.get("relationships_complete").flag());
-    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v14");
+    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v15");
     assert_eq!(page.get("parsed_module_bytes").number(),
         (manifest.len() + workspace.len() + dependency.len()) as u64);
     let row = link(&page, b"app/src/main.rs", "dep_alias::model::Thing");
@@ -185,7 +185,7 @@ fn inline_rust_modules_resolve_nested_candidates_from_retained_captures() {
     assert!(page.get("relationships_complete").flag());
     assert_eq!(page.get("links_seen").number(), 3);
     assert_eq!(page.get("extractor").text(), "franken-markdown-d6fbd1d5/import-statements-v10");
-    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v14");
+    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v15");
     for (destination, statement, kind, basis) in [
         ("child", b"mod child;".as_slice(), "rust-module", "rust-module-file-candidate"),
         ("self::child::Thing", b"use self::child::Thing;", "rust-use", "rust-use-module-prefix-candidate"),
@@ -395,7 +395,7 @@ fn coverage(page: &Json) {
     assert_eq!(page.get("relationship_kind").text(), "lexical-import");
     assert_eq!(page.get("resolution_domain").text(), "declared-catalog-candidates");
     assert_eq!(page.get("extractor").text(), "franken-markdown-d6fbd1d5/import-statements-v10");
-    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v14");
+    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v15");
     assert_eq!(page.get("extraction_policy").text(), "rust-inline-modules-file-includes-use-tree-js-literal-loads-python-cpp-go-java-v10");
     assert!(!page.get("compiler_resolved").flag()); assert!(!page.get("semantic_complete").flag());
     assert_eq!(page.get("source_files").number(), page.get("captured_source_files").number()
@@ -599,6 +599,98 @@ fn direct_import_geometry_is_catalog_bound_and_keeps_reader_occurrence_identity(
         rows[1].get("link_id").number(), Side::Evidence, || false).unwrap();
     assert_eq!(json(&receipt).get("relationship"), &rows[1]);
     assert_eq!(json(&receipt).get("additional_source_bytes_read").number(), 0);
+}
+
+#[test]
+fn cpp_angle_headers_navigate_unique_catalog_candidates_and_keep_ambiguity_explicit() {
+    let source = b"# include <root.HPP>\n#include <project/api.hpp>\n#include <conflict.h>\n#include <missing.hpp>\n#include <vector>\n";
+    let root_header = b"#pragma once\nstruct Root {};\n";
+    let project_header = b"#pragma once\nstruct Project {};\n";
+    let mut f = Fixture::new(&[("src/main.cpp", source), ("root.HPP", root_header),
+        ("include/project/api.hpp", project_header), ("src/project/api.hpp", b"// not an angle candidate\n"),
+        ("conflict.h", b"// first candidate\n"), ("include/conflict.h", b"// second candidate\n"),
+        ("vector", b"// unqualified extensionless name stays external\n")]);
+    f.build(1);
+    let page = f.prepare(1, 1);
+    assert!(page.get("relationships_complete").flag());
+    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v15");
+    assert_eq!(page.get("cpp_angle_include_policy").text(), "project-root-and-include-exact-candidates-v1");
+    assert!(!page.get("compiler_resolved").flag());
+    assert_eq!(page.get("links_seen").number(), 5);
+    for (destination, path, bytes) in [("root.HPP", b"root.HPP".as_slice(), root_header.as_slice()),
+        ("project/api.hpp", b"include/project/api.hpp", project_header)] {
+        let row = link(&page, b"src/main.cpp", destination);
+        assert_eq!(row.get("resolution").text(), "captured");
+        assert_eq!(row.get("lexical_import_kind").text(), "cpp-angle-include");
+        assert_eq!(row.get("resolution_basis").text(), "cpp-project-include-candidate");
+        assert_eq!(row.get("target_path").get("hex").text(), hex(path));
+        assert_eq!(row.get("target_sha256").text(), Sha256::digest(bytes).to_hex());
+        assert_eq!(range(row.get("specifier_range"), source), destination.as_bytes());
+        let incoming = f.page(1, Direction::Incoming, Some(path), 0, 64);
+        assert_eq!(ids(&incoming), [row.get("link_id").number()]);
+        assert_eq!(&incoming.get("links").array()[0], row);
+    }
+    for (destination, resolution, basis) in [
+        ("conflict.h", "ambiguous", "ambiguous-catalog-target"),
+        ("missing.hpp", "external", "external-specifier"),
+        ("vector", "external", "external-specifier"),
+    ] {
+        let row = link(&page, b"src/main.cpp", destination);
+        assert_eq!(row.get("resolution").text(), resolution);
+        assert_eq!(row.get("resolution_basis").text(), basis);
+        assert_eq!(row.get("target_file_id"), &Json::Null);
+        assert_eq!(row.get("target_path"), &Json::Null);
+        assert_eq!(f.search.open_import_reader(&f.atlas, owner(73040), 1,
+            row.get("link_id").number(), Side::Target, || false).err(), Some(Error::ImportTargetUnavailable));
+    }
+    for path in [b"src/project/api.hpp".as_slice(), b"conflict.h", b"include/conflict.h", b"vector"] {
+        assert_eq!(f.page(1, Direction::Incoming, Some(path), 0, 64).get("matching_links").number(), 0);
+    }
+    let row = link(&page, b"src/main.cpp", "project/api.hpp");
+    let id = row.get("link_id").number();
+    fs::write(f.root.join("src/main.cpp"), b"#include <replacement.h>\n").unwrap();
+    fs::write(f.root.join("include/project/api.hpp"), b"changed header").unwrap();
+    // A newly appearing competing candidate cannot change this retained catalog.
+    fs::create_dir_all(f.root.join("project")).unwrap();
+    fs::write(f.root.join("project/api.hpp"), b"new root candidate").unwrap();
+    assert_eq!(f.page(1, Direction::Outgoing, Some(b"src/main.cpp"), 0, 64).get("links"), page.get("links"));
+    let (evidence, receipt) = f.search.open_import_reader(&f.atlas, owner(73041), 1, id, Side::Evidence, || false).unwrap();
+    assert_eq!(json(&receipt).get("relationship"), row);
+    assert_eq!(evidence.capture().bytes(), source);
+    let (target, receipt) = f.search.open_import_reader(&f.atlas, owner(73042), 1, id, Side::Target, || false).unwrap();
+    let receipt = json(&receipt);
+    assert_eq!(receipt.get("resolver").text(), "fcb-closed-catalog-imports-v15");
+    assert_eq!(receipt.get("cpp_angle_include_policy").text(), "project-root-and-include-exact-candidates-v1");
+    assert_eq!(receipt.get("source_sha256").text(), Sha256::digest(project_header).to_hex());
+    assert_eq!(receipt.get("additional_source_bytes_read").number(), 0);
+    assert!(!receipt.get("source_reopened").flag());
+    assert!(!receipt.get("compiler_resolved").flag());
+    f.search.clear_index(&f.atlas, 2, || false).unwrap();
+    assert_eq!(target.capture().bytes(), project_header);
+    assert_eq!(evidence.capture().bytes(), source);
+}
+
+#[test]
+fn cpp_angle_header_resolution_uses_the_catalog_even_when_targets_are_outside_capture_scope() {
+    let source = b"#include <api.h>\n#include <conflict.h>\n";
+    let mut f = Fixture::new(&[("main.cpp", source), ("include/api.h", b"// uncaptured candidate\n"),
+        ("conflict.h", b"// uncaptured first candidate\n"), ("include/conflict.h", b"// uncaptured second candidate\n")]);
+    f.search.prepare_index_scoped(&f.atlas, 1, AtlasSearchScope::from_csv(Some("cpp"), None).unwrap(),
+        index_options(), || false).unwrap();
+    let page = f.prepare(1, 1);
+    let unique = link(&page, b"main.cpp", "api.h");
+    assert_eq!(unique.get("resolution").text(), "outside-capture-scope");
+    assert_eq!(unique.get("resolution_basis").text(), "cpp-project-include-candidate");
+    assert_eq!(unique.get("target_path").get("hex").text(), hex(b"include/api.h"));
+    assert_eq!(unique.get("target_sha256"), &Json::Null);
+    let ambiguous = link(&page, b"main.cpp", "conflict.h");
+    assert_eq!(ambiguous.get("resolution").text(), "ambiguous");
+    assert_eq!(ambiguous.get("resolution_basis").text(), "ambiguous-catalog-target");
+    assert_eq!(ambiguous.get("target_file_id"), &Json::Null);
+    for row in [unique, ambiguous] {
+        assert_eq!(f.search.open_import_reader(&f.atlas, owner(73043), 1,
+            row.get("link_id").number(), Side::Target, || false).err(), Some(Error::ImportTargetUnavailable));
+    }
 }
 
 #[test]
@@ -848,17 +940,20 @@ fn rust_root_and_module_ambiguity_preserve_evidence_and_never_guess_a_target() {
 
 #[test]
 fn catalog_ambiguity_external_names_and_unsupported_specifiers_never_open_guessed_targets() {
-    let source = b"import './pick';\nimport './exact';\nimport './explicit.js';\nimport 'package';\nimport '../outside';\nimport './bad\\u002ejs';\nimport('./late');\nimport(computed);\n";
+    let source = b"import './pick';\nimport './exact';\nimport './explicit.js';\nimport './explicit.css';\nimport 'package';\nimport '../outside';\nimport './bad\\u002ejs';\nimport('./late');\nimport(computed);\n";
+    let typed_source = b"export const explicit = 1;\n";
     let mut f = Fixture::new(&[("main.ts", source), ("pick.ts", b""), ("pick.js", b""),
-        ("exact", b"exact captured target"), ("exact.ts", b"alternative candidate"), ("explicit.ts", b""),
+        ("exact", b"exact captured target"), ("exact.ts", b"alternative candidate"), ("explicit.ts", typed_source),
         ("late.ts", b""), ("bad.js", b""), ("lib.rs", b"use crate::missing;\n")]);
     f.build(1); let page = f.prepare(1, 1);
-    assert_eq!(page.get("retained_links").number(), 8);
+    assert_eq!(page.get("retained_links").number(), 9);
     assert_eq!(page.get("parser_diagnostics").number(), 1);
     assert!(!page.get("relationships_complete").flag());
+    // TypeScript's declared emitted-extension policy admits explicit.ts for
+    // explicit.js, but an unrelated written suffix cannot borrow that target.
     for (destination, resolution, basis) in [
         ("./pick", "ambiguous", "ambiguous-catalog-target"),
-        ("./explicit.js", "missing", "no-catalog-target"),
+        ("./explicit.css", "missing", "no-catalog-target"),
         ("package", "external", "external-specifier"),
         ("../outside", "unresolved", "unsupported-specifier"),
         ("./bad\\u002ejs", "unresolved", "unsupported-specifier"),
@@ -866,7 +961,9 @@ fn catalog_ambiguity_external_names_and_unsupported_specifiers_never_open_guesse
         let row = link(&page, b"main.ts", destination);
         assert_eq!(row.get("resolution").text(), resolution);
         assert_eq!(row.get("resolution_basis").text(), basis);
-        assert_eq!(row.get("target_file_id"), &Json::Null);
+        for field in ["target_file_id", "target_path", "target_revision", "target_sha256", "target_bytes"] {
+            assert_eq!(row.get(field), &Json::Null);
+        }
         let id = row.get("link_id").number();
         assert_eq!(f.search.open_import_reader(&f.atlas, owner(72901), 1, id, Side::Target, || false).err(),
             Some(Error::ImportTargetUnavailable));
@@ -879,6 +976,19 @@ fn catalog_ambiguity_external_names_and_unsupported_specifiers_never_open_guesse
     let exact = link(&page, b"main.ts", "./exact");
     assert_eq!(exact.get("resolution_basis").text(), "exact-relative-path");
     assert_eq!(exact.get("target_path").get("hex").text(), hex(b"exact"));
+    let emitted = link(&page, b"main.ts", "./explicit.js");
+    assert_eq!(emitted.get("resolution").text(), "captured");
+    assert_eq!(emitted.get("resolution_basis").text(), "typescript-source-extension-candidate");
+    assert_eq!(emitted.get("target_path").get("hex").text(), hex(b"explicit.ts"));
+    assert_eq!(emitted.get("target_sha256").text(), Sha256::digest(typed_source).to_hex());
+    assert_eq!(range(emitted.get("evidence_range"), source), b"import './explicit.js';");
+    assert_eq!(range(emitted.get("specifier_range"), source), b"./explicit.js");
+    let incoming = f.page(1, Direction::Incoming, Some(b"explicit.ts"), 0, 64);
+    assert_eq!(ids(&incoming), [emitted.get("link_id").number()]);
+    let (reader, receipt) = f.search.open_import_reader(&f.atlas, owner(72950), 1,
+        emitted.get("link_id").number(), Side::Target, || false).unwrap();
+    assert_eq!(reader.capture().bytes(), typed_source);
+    assert_eq!(json(&receipt).get("relationship"), emitted);
     let dynamic = link(&page, b"main.ts", "./late");
     assert_eq!(dynamic.get("lexical_import_kind").text(), "javascript-dynamic-import");
     assert_eq!(dynamic.get("resolution").text(), "captured");
@@ -958,18 +1068,33 @@ fn capture_scope_unavailable_and_uncaptured_members_have_distinct_partial_naviga
 
 #[test]
 fn source_and_parse_limits_never_turn_unexamined_members_into_proven_absence() {
-    let oversized = vec![b' '; MAX_ATLAS_IMPORT_SOURCE_BYTES + 1];
     let source = b"import './a';";
+    let mut oversized = vec![b' '; MAX_ATLAS_IMPORT_SOURCE_BYTES + 1];
+    let tail = oversized.len() - source.len();
+    oversized[tail..].copy_from_slice(source);
     let mut f = Fixture::new(&[("a.ts", b""), ("b.ts", source), ("bad.ts", b"\xff"), ("huge.ts", &oversized)]);
-    f.search.prepare_index(&f.atlas, 1, AtlasIndexOptions { max_file_bytes: 2 * 1024 * 1024,
-        ..index_options() }, || false).unwrap();
-    let page = f.prepare(1, 1);
+    // The live capture boundary is already 1 MiB. A larger requested cap is
+    // invalid; oversized members remain unavailable before import parsing.
+    assert_eq!(f.search.prepare_index(&f.atlas, 1, AtlasIndexOptions { max_file_bytes: 2 * 1024 * 1024,
+        ..index_options() }, || false).err(), Some(Error::InvalidLimits));
+    assert_eq!(f.search.index_generation(), None);
+    assert_eq!(f.search.pending_index_generation(), None);
+    assert_eq!(f.search.indexed_source_bytes(), 0);
+    f.build(2);
+    let page = f.prepare(1, 2);
     assert!(!page.get("relationships_complete").flag());
+    assert_eq!(page.get("source_files").number(), 4);
+    assert_eq!(page.get("captured_source_files").number(), 3);
+    assert_eq!(page.get("capture_unavailable_source_files").number(), 1);
+    assert_eq!(page.get("uncaptured_source_files").number(), 0);
     assert_eq!(page.get("scanned_source_files").number(), 2);
     assert_eq!(page.get("unsupported_source_files").number(), 1);
-    assert_eq!(page.get("source_limited_source_files").number(), 1);
+    assert_eq!(page.get("source_limited_source_files").number(), 0);
     assert_eq!(page.get("parsed_source_bytes").number(), source.len() as u64 + 1);
     assert_eq!(page.get("retained_links").number(), 1);
+    let hidden = f.page(1, Direction::Outgoing, Some(b"huge.ts"), 0, 64);
+    assert!(hidden.get("links").array().is_empty());
+    assert!(!hidden.get("relationships_complete").flag(), "an unparsed import is not proven absent");
     let mut budget = Fixture::new(&[("a.ts", b""), ("b.ts", source)]);
     budget.build(1); budget.begin(1, 1, 64, 0);
     let first = json(&budget.search.step_imports(&budget.atlas, 1, || false).unwrap());
@@ -1164,7 +1289,7 @@ fn python_relative_imports_share_incoming_navigation_and_exact_retained_readers(
     let page = f.prepare(1, 1);
     assert!(page.get("relationships_complete").flag(), "{page:?}");
     assert_eq!(page.get("retained_links").number(), 5);
-    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v14");
+    assert_eq!(page.get("resolver").text(), "fcb-closed-catalog-imports-v15");
 
     let row = link(&page, b"pkg/main.py", ".worker");
     assert_eq!(row.get("language").text(), "python");

@@ -26,7 +26,12 @@ impl Fixture {
             std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
         fs::create_dir(&root).unwrap();
         let budget = ResourceBudget::new(owner(55001), ByteLength::new(64 * 1024 * 1024)).unwrap();
-        let encoded = SnapshotBytes::encode(owner(55001), complete, "saved-desk-test", entries,
+        // Fixtures describe a catalog; FCBS assigns ordinals in exact raw-path
+        // order. Sorting leaves every previously valid fixture byte-identical.
+        // Duplicate and invalid paths still reach the production encoder checks.
+        let mut ordered = entries.to_vec();
+        ordered.sort_by(|left, right| left.path.cmp(right.path));
+        let encoded = SnapshotBytes::encode(owner(55001), complete, "saved-desk-test", &ordered,
             limits, &budget, id(1), || false).unwrap();
         let bytes = encoded.bytes().to_vec(); let path = root.join("repository.fcbs");
         fs::write(&path, &bytes).unwrap(); Self { root, path, bytes }

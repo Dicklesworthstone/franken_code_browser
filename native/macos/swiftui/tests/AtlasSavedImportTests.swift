@@ -490,7 +490,11 @@ private final class SavedImportFixture: @unchecked Sendable {
         var excess = workspace
         excess["member_read_calls"] = String(5 * AtlasSavedImportWire.maximumMemberReadCalls + 1)
         reject { _ = try decode(excess) }
-        var unknown = workspace; unknown["resolver"] = "fcb-closed-catalog-imports-v15"
+        var v15 = workspace; v15["resolver"] = "fcb-closed-catalog-imports-v15"
+        v15["cpp_angle_include_policy"] = "project-root-and-include-exact-candidates-v1"
+        let continuedAllowance = try decode(v15)
+        precondition(continuedAllowance.readCalls == fullAllowance.readCalls)
+        var unknown = workspace; unknown["resolver"] = "fcb-closed-catalog-imports-v16"
         reject { _ = try decode(unknown) }
 
         // Workspace metadata does not enlarge archive I/O or peak residency.
@@ -575,10 +579,10 @@ private final class SavedImportFixture: @unchecked Sendable {
         var oldPolicy = value; oldPolicy["resolver"] = "fcb-closed-catalog-imports-v3"
         reject { _ = try decode(oldPolicy) }
         for (kind, destination, resolution, basis, label) in [
-            ("cpp-angle-include", "vector", "external", "external-specifier", "External C/C++ include"),
+            ("cpp-angle-include", "vector", "external", "external-specifier", "Angle C/C++ include"),
             ("cpp-computed-include", "HEADER_NAME", "unresolved", "unresolved-cpp-include", "Unresolved computed C/C++ include"),
             ("cpp-quoted-include", "missing.h", "missing", "no-catalog-target", "Quoted C/C++ include"),
-            ("cpp-angle-include", "broken\\header", "unresolved", "unsupported-specifier", "External C/C++ include")
+            ("cpp-angle-include", "broken\\header", "unresolved", "unsupported-specifier", "Angle C/C++ include")
         ] {
             var other = value, changed = rows
             for i in changed.indices {
@@ -601,6 +605,102 @@ private final class SavedImportFixture: @unchecked Sendable {
         let page = try decode(partial)
         precondition(!page.complete && page.unsupported == 1 && page.links[0].canOpenTarget)
         partial["imports_complete"] = true; reject { _ = try decode(partial) }
+    }
+
+    private static func cppProjectIncludeWire(_ f: SavedImportFixture, identity: AtlasSavedIdentity) throws {
+        let policy = "project-root-and-include-exact-candidates-v1"
+        let decode: ([String: Any]) throws -> AtlasSavedImports = {
+            try AtlasSavedImports.decode(f.base.encode($0), identity: identity, generation: 1,
+                direction: .all, member: nil, start: 0, limit: 64)
+        }
+        let targetFields = ["target_member", "target_file_id", "target_path", "target_revision", "target_digest", "target_bytes"]
+        func vector(_ destination: String = "project/widget.hpp", prefix: String = "include/") -> [String: Any] {
+            var value = f.page(identity.owner, generation: 1), row = f.link(1)
+            row["language"] = "cpp"; row["lexical_import_kind"] = "cpp-angle-include"
+            row["destination"] = destination; row["resolution_basis"] = "cpp-project-include-candidate"
+            row["source_path"] = f.base.path(Array("src/main.cpp".utf8), "src/main.cpp")
+            row["target_path"] = f.base.path(Array((prefix + destination).utf8), prefix + destination)
+            value["resolver"] = "fcb-closed-catalog-imports-v15"; value["cpp_angle_include_policy"] = policy
+            value["links"] = [row]; value["next_offset"] = NSNull()
+            for key in ["links_seen", "retained_links", "matching_links"] { value[key] = "1" }
+            return value
+        }
+        for destination in ["project/header", "project/Value.HPP", "value.h", "value.HH", "value.hpp", "value.hxx",
+            "value.h++", "value.inl", "value.inc", "value.ipp", "value.tpp"] {
+            for prefix in ["", "include/"] {
+                let link = try decode(vector(destination, prefix: prefix)).links[0]
+                precondition(link.canOpenTarget && link.targetPath?.bytes == Array((prefix + destination).utf8))
+                precondition(link.label == "Angle C/C++ include"
+                    && link.resolutionLabel.contains("compiler search paths are not resolved"))
+                precondition(link.sourceMember == f.sourceOrdinal && link.sourceOccurrence == 1
+                    && link.evidence.start == f.evidenceStart && link.evidence.end == f.evidenceEnd)
+            }
+        }
+        let valid = vector(), row = (valid["links"] as! [[String: Any]])[0]
+        var unavailable = valid, unavailableRow = row
+        unavailableRow["resolution"] = "unavailable"
+        for key in ["target_revision", "target_digest", "target_bytes"] { unavailableRow[key] = NSNull() }
+        unavailable["links"] = [unavailableRow]
+        let withheld = try decode(unavailable).links[0]
+        precondition(!withheld.canOpenTarget && withheld.targetMember == 3 && withheld.targetFile == 4
+            && withheld.targetPath?.bytes == Array("include/project/widget.hpp".utf8))
+        for (resolution, basis, destination) in [("ambiguous", "ambiguous-catalog-target", "project/widget.hpp"),
+            ("external", "external-specifier", "vector"), ("external", "external-specifier", "absent/header.h"),
+            ("unresolved", "unsupported-specifier", "../escape.h")] {
+            var value = valid, changed = row
+            changed["resolution"] = resolution; changed["resolution_basis"] = basis; changed["destination"] = destination
+            for key in targetFields { changed[key] = NSNull() }
+            value["links"] = [changed]
+            let link = try decode(value).links[0]
+            precondition(!link.canOpenTarget && link.targetMember == nil && link.label == "Angle C/C++ include")
+            if resolution == "ambiguous" {
+                for version in ["v13", "v14"] {
+                    var old = value; old["resolver"] = "fcb-closed-catalog-imports-" + version
+                    old.removeValue(forKey: "cpp_angle_include_policy"); reject { _ = try decode(old) }
+                }
+            }
+            changed["target_member"] = "3"; changed["target_file_id"] = "4"
+            changed["target_path"] = f.base.path(Array("include/project/widget.hpp".utf8), "include/project/widget.hpp")
+            value["links"] = [changed]; reject { _ = try decode(value) }
+        }
+        for (field, wrong) in [("language", "rust"), ("lexical_import_kind", "cpp-quoted-include"),
+            ("lexical_import_kind", "cpp-computed-include"), ("resolution_basis", "cpp-source-relative-include-candidate")] {
+            var bad = valid, changed = row; changed[field] = wrong; bad["links"] = [changed]; reject { _ = try decode(bad) }
+        }
+        for resolution in ["external", "missing", "ambiguous", "unresolved"] {
+            var bad = valid, changed = row; changed["resolution"] = resolution
+            for key in targetFields { changed[key] = NSNull() }
+            bad["links"] = [changed]; reject { _ = try decode(bad) }
+        }
+        for destination in ["vector", "value.cpp", "", "/absolute.h", "./value.h", "../value.h", "a//b.h", "a/../b.h",
+            "a/", "C:value.h", "a\\value.h", "a\"value.h", "a<value.h", "a>value.h", "a\nvalue.h", "a\u{0085}value.h"] {
+            reject { _ = try decode(vector(destination, prefix: "")) }
+        }
+        for target in ["src/project/widget.hpp", "include/project/WIDGET.hpp", "elsewhere/widget.hpp"] {
+            var bad = valid, changed = row
+            changed["target_path"] = f.base.path(Array(target.utf8), "include/project/widget.hpp")
+            bad["links"] = [changed]; reject { _ = try decode(bad) }
+        }
+        for version in ["v13", "v14", "v16"] {
+            var bad = valid; bad["resolver"] = "fcb-closed-catalog-imports-" + version
+            reject { _ = try decode(bad) }
+            bad.removeValue(forKey: "cpp_angle_include_policy"); reject { _ = try decode(bad) }
+        }
+        for key in ["compiler_resolved", "semantic_complete"] {
+            var bad = valid; bad[key] = true; reject { _ = try decode(bad) }
+        }
+        for wrong in ["compiler-search-paths", NSNull()] as [Any] {
+            var bad = valid; bad["cpp_angle_include_policy"] = wrong; reject { _ = try decode(bad) }
+        }
+        var missing = valid; missing.removeValue(forKey: "cpp_angle_include_policy"); reject { _ = try decode(missing) }
+        // Reader receipts carry the same contract around a repeated row.
+        var repeated = valid; repeated.removeValue(forKey: "links"); repeated["relationship"] = row
+        try AtlasSavedImportWire.validateContract(Data(f.base.encode(repeated).utf8))
+        for version in ["v13", "v14"] {
+            var old = repeated; old["resolver"] = "fcb-closed-catalog-imports-" + version
+            old.removeValue(forKey: "cpp_angle_include_policy")
+            reject { try AtlasSavedImportWire.validateContract(Data(f.base.encode(old).utf8)) }
+        }
     }
 
 
@@ -830,6 +930,7 @@ private final class SavedImportFixture: @unchecked Sendable {
         }
         let accepted = try decode(f.page(identity.owner, generation: 1))
         try cppWire(f, identity: identity)
+        try cppProjectIncludeWire(f, identity: identity)
         try typescriptSourceWire(f, identity: identity)
         try rustPathModuleWire(f, identity: identity)
         try goWire(f, identity: identity)

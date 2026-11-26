@@ -1377,8 +1377,8 @@ leaves explicit unresolved evidence. Conditional, dev/build, registry, git and
 path-base dependencies are not inferred. These candidates do not establish
 compiler binding or an imported item's definition. Import pages continue to
 read only retained result metadata. Resolver receipts use
-`fcb-closed-catalog-imports-v14`; native consumers retain the original limits
-when reading v13 receipts. Workspace-inheritance execution remains pending in
+`fcb-closed-catalog-imports-v15`; native consumers preserve the corresponding
+v13/v14 policies and limits when reading older receipts. Workspace-inheritance execution remains pending in
 the independent batch verification lane.
 
 Preparation verifies at most one eligible source at a time. `MAX_LINKS` is
@@ -1824,6 +1824,37 @@ Regression sources cover late UTF-8/UTF-16 evidence, maximum original and
 expanded decoded sources, reverse navigation, canceled replacements and
 reader ownership after project/archive detachment. Execution and physical
 macOS qualification remain pending in the independent verification lane.
+
+## Follow C/C++ project headers
+
+Live captured-project and saved-repository Imports can follow conventional
+angle-header candidates such as `#include <project/api.hpp>`. The closed-catalog
+resolver checks exactly the written project-relative path and that path beneath
+`include/`. One matching path produces a navigable
+`cpp-project-include-candidate`; two matching paths remain ambiguous, with no
+priority between them. Incoming pages expose the corresponding captured include
+statements as backlinks.
+
+Paths preserve exact bytes and case. The spelling must contain a directory
+component or an explicit header suffix (`h`, `hh`, `hpp`, `hxx`, `h++`, `inl`,
+`inc`, `ipp`, or `tpp`); no extension is added. Absolute paths, escaping or empty
+components, unsupported spellings and capacity overflow are refused before
+catalog lookup. Bare standard-library names such as `<vector>` remain external.
+Quoted includes retain their source-relative policy, and computed includes
+remain unresolved.
+
+Resolver v15 receipts declare
+`cpp_angle_include_policy: "project-root-and-include-exact-candidates-v1"`.
+The evidence remains lexical, with `compiler_resolved: false` and
+`semantic_complete: false`. Compiler include roots, preprocessor conditions,
+macros and build flags are outside this finite navigation policy. Native
+consumers validate the version, policy, spelling and target-path relationship
+before enabling navigation.
+
+Evidence activation keeps the exact original statement range, including UTF-16
+source. Target activation uses the selected retained capture or verified archive
+member; replacing the live file cannot rebind an accepted relationship to new
+bytes. Unavailable and ambiguous targets retain their explicit outcomes.
 
 ## Larger source outlines and symbol search
 

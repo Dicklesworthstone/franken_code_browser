@@ -79,9 +79,13 @@ impl<T> ImportResolution<T> {
 /// remain ambiguous; absent candidates remain external. These are filename
 /// candidates, with no sys.path, execution, namespace-root or NFKC inference.
 /// C/C++ quoted includes admit only the exact source-relative catalog path.
-/// Angle includes remain external; computed includes remain unresolved. No
-/// include directories, compilation database, macro expansion or header suffix
-/// preference is inferred, and header-name bytes are not C-unescaped.
+/// Canonical angle-header paths admit exactly two catalog candidates: the
+/// written path at the project root and that path beneath include/. A slash or
+/// an explicit conventional header suffix qualifies the spelling; no suffix is
+/// added. Distinct matching paths are ambiguous, without include-order priority.
+/// Bare standard-library names remain external; computed includes remain
+/// unresolved. No compiler include directories, compilation database, macro
+/// expansion or header-name unescaping is inferred.
 /// Java imports admit a bounded set of conventional source roots and dotted
 /// type/enclosing-type filename candidates. Static imports navigate their type
 /// candidate, never the member. Package wildcards, classpaths and build-system
@@ -182,7 +186,7 @@ fn cpp_include<T: Copy + Eq>(source_path: &[u8], fact: &ImportFact,
         return unsupported();
     }
     if fact.kind() == ImportKind::CppAngleInclude {
-        return ImportResolution::without(ImportResolutionKind::External, "external-specifier");
+        return cpp_angle_include(destination, lookup);
     }
     if destination.starts_with('/') || destination.contains(':') || destination.ends_with('/')
         || matches!(destination.rsplit('/').next(), Some("." | "..")) { return unsupported(); }
@@ -190,6 +194,39 @@ fn cpp_include<T: Copy + Eq>(source_path: &[u8], fact: &ImportFact,
     match lookup(path.bytes()) {
         Some(target) => ImportResolution::local(target, "cpp-source-relative-include-candidate"),
         None => ImportResolution::without(ImportResolutionKind::Missing, "no-catalog-target"),
+    }
+}
+
+/// A finite source-navigation policy, not the compiler's angle-include search.
+/// Both candidate capacities are validated before either catalog lookup, and
+/// matching two paths is ambiguous even if the catalog aliases their file IDs.
+fn cpp_angle_include<T: Copy + Eq>(destination: &str,
+    lookup: &mut impl FnMut(&[u8]) -> Option<T>) -> ImportResolution<T> {
+    use ImportResolutionKind::{Ambiguous, External, Unresolved};
+    let bytes = destination.as_bytes();
+    if destination.contains(':') || !valid_source_path(bytes) {
+        return ImportResolution::without(Unresolved, "unsupported-specifier");
+    }
+    let header_suffix = destination.rsplit_once('.').is_some_and(|(_, suffix)|
+        ["h", "hh", "hpp", "hxx", "h++", "inl", "inc", "ipp", "tpp"]
+            .iter().any(|header| suffix.eq_ignore_ascii_case(header)));
+    if !destination.contains('/') && !header_suffix {
+        return ImportResolution::without(External, "external-specifier");
+    }
+    const INCLUDE: &[u8] = b"include/";
+    if bytes.len() > MAX_IMPORT_RESOLUTION_PATH_BYTES - INCLUDE.len() {
+        return ImportResolution::without(Unresolved, "unsupported-specifier");
+    }
+    let root = lookup(bytes);
+    let mut path = CatalogPath { data: [0; MAX_IMPORT_RESOLUTION_PATH_BYTES], len: INCLUDE.len() + bytes.len() };
+    path.data[..INCLUDE.len()].copy_from_slice(INCLUDE);
+    path.data[INCLUDE.len()..path.len].copy_from_slice(bytes);
+    let include = lookup(path.bytes());
+    match (root, include) {
+        (Some(_), Some(_)) => ImportResolution::without(Ambiguous, "ambiguous-catalog-target"),
+        (Some(target), None) | (None, Some(target)) =>
+            ImportResolution::local(target, "cpp-project-include-candidate"),
+        (None, None) => ImportResolution::without(External, "external-specifier"),
     }
 }
 
@@ -306,6 +343,39 @@ mod tests {
     }
     fn resolve(source: &[u8], kind: ImportKind, destination: &str, paths: &[&[u8]]) -> ImportResolution<usize> {
         resolve_import(source, &fact(kind, destination), |path| paths.iter().position(|candidate| *candidate == path))
+    }
+
+    #[test]
+    fn angle_header_candidates_validate_all_capacities_before_either_probe() {
+        let limit = MAX_IMPORT_RESOLUTION_PATH_BYTES - b"include/".len();
+        let exact = format!("{}.h", "x".repeat(limit - 2));
+        let mut calls = Vec::new();
+        let result = resolve_import(b"main.cpp", &fact(ImportKind::CppAngleInclude, &exact), |path| {
+            calls.push(path.len()); (path.len() == MAX_IMPORT_RESOLUTION_PATH_BYTES).then_some(9)
+        });
+        assert_eq!(calls, [limit, MAX_IMPORT_RESOLUTION_PATH_BYTES]);
+        assert_eq!(result.target, Some(9));
+        let too_long = format!("x{exact}");
+        let result: ImportResolution<u64> = resolve_import(b"main.cpp",
+            &fact(ImportKind::CppAngleInclude, &too_long), |_| panic!("partial probing cannot prove uniqueness"));
+        assert_eq!(result.kind, ImportResolutionKind::Unresolved);
+        assert_eq!(result.basis, "unsupported-specifier");
+        // Test the resolver's canonical-path guard independently of how the
+        // pinned lexer classifies hostile spelling (notably // comments).
+        for destination in ["./api.h", "../api.h", "/api.h", "public//api.h",
+            "public/../api.h", "public/./api.h", "public/", "C:/api.h", "public\\api.h",
+            "api\0.h", "api\n.h", "api\t.h", "api\".h", "api<.h", "api>.h"] {
+            let result: ImportResolution<u64> = resolve_import(b"main.cpp",
+                &fact(ImportKind::CppAngleInclude, destination), |_| panic!("invalid header queried"));
+            assert_eq!(result.kind, ImportResolutionKind::Unresolved);
+            assert_eq!(result.basis, "unsupported-specifier");
+            assert!(result.target.is_none());
+        }
+        let mut refused = fact(ImportKind::CppAngleInclude, "api.h");
+        refused.resolution_allowed = false;
+        let result: ImportResolution<u64> = resolve_import(b"main.cpp", &refused,
+            |_| panic!("unqualified extraction cannot authorize catalog lookup"));
+        assert_eq!(result.kind, ImportResolutionKind::Unresolved);
     }
 
     #[test]

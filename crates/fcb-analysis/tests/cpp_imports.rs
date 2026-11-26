@@ -121,6 +121,103 @@ fn quoted_headers_use_only_exact_source_relative_case_sensitive_catalog_paths() 
 }
 
 #[test]
+fn angle_headers_use_only_two_exact_project_catalog_candidates() {
+    for destination in ["public/api.hpp", "public/detail", "public/café.h", "literal%2fapi.h",
+        "api.h", "api.hh", "api.HPP", "api.hxx", "api.h++", "api.inl", "api.inc", "api.ipp", "api.tpp"] {
+        let statement = format!("# include <{destination}>");
+        let source = format!("// captured source\n{statement}\n");
+        let imports = build(source.as_bytes(), 1);
+        assert!(imports.is_complete(), "{destination}");
+        assert_eq!(names(&imports), [destination]);
+        let fact = &imports.facts()[0];
+        assert_eq!(fact.kind(), ImportKind::CppAngleInclude);
+        assert_eq!(imports.source_bytes(1).unwrap(), statement.as_bytes());
+        let (start, end) = fact.specifier_range().as_usize_bounds().unwrap();
+        assert_eq!(&source.as_bytes()[start..end], destination.as_bytes());
+        let candidates = [destination.as_bytes().to_vec(), format!("include/{destination}").into_bytes()];
+        for selected in 0..2 {
+            let mut consulted = Vec::new();
+            let result = resolve_import(b"src/\xff/main.CPP", fact, |path| {
+                consulted.push(path.to_vec()); (path == candidates[selected].as_slice()).then_some(42)
+            });
+            assert_eq!(consulted, candidates, "no source-relative, extension, basename, or compiler directory search");
+            assert_eq!(result.kind, ImportResolutionKind::Local);
+            assert_eq!(result.target, Some(42));
+            assert_eq!(result.basis, "cpp-project-include-candidate");
+        }
+    }
+}
+
+#[test]
+fn angle_header_uniqueness_is_by_path_without_include_order_or_id_aliases() {
+    let imports = build(b"#include <project/value.h>\n", 1);
+    let fact = &imports.facts()[0];
+    let mut consulted = Vec::new();
+    let ambiguous = resolve_import(b"main.c", fact, |path| {
+        consulted.push(path.to_vec()); Some(7)
+    });
+    assert_eq!(consulted, [b"project/value.h".to_vec(), b"include/project/value.h".to_vec()]);
+    assert_eq!(ambiguous.kind, ImportResolutionKind::Ambiguous);
+    assert_eq!(ambiguous.target, None, "two paths with one aliased catalog ID are still ambiguous");
+    assert_eq!(ambiguous.basis, "ambiguous-catalog-target");
+    let near_matches: &[&[u8]] = &[b"src/project/value.h", b"Project/value.h",
+        b"include/project/Value.h", b"project/value.hpp", b"vendor/project/value.h"];
+    let absent = resolve_import(b"src/main.cpp", fact,
+        |path| near_matches.iter().position(|candidate| *candidate == path));
+    assert_eq!(absent.kind, ImportResolutionKind::External);
+    assert_eq!(absent.target, None);
+    assert_eq!(absent.basis, "external-specifier");
+}
+
+#[test]
+fn angle_headers_refuse_noncanonical_paths_before_catalog_lookup() {
+    for destination in ["./api.h", "../api.h", "/api.h",
+        "public/../api.h", "public/./api.h", "public/", "C:/api.h", "public\\api.h"] {
+        let source = format!("#include <{destination}>\n");
+        let imports = build(source.as_bytes(), 1);
+        assert_eq!(names(&imports), [destination]);
+        assert_eq!(imports.facts()[0].kind(), ImportKind::CppAngleInclude);
+        assert_eq!(imports.facts()[0].resolution_allowed(), !destination.contains('\\'));
+        let result = resolve_import(b"src/main.cpp", &imports.facts()[0], |_| -> Option<u64> {
+            panic!("noncanonical angle header must not probe the catalog: {destination}")
+        });
+        assert_eq!(result.kind, ImportResolutionKind::Unresolved, "{destination}");
+        assert_eq!(result.basis, "unsupported-specifier");
+        assert!(result.target.is_none());
+    }
+    // The pinned lexer owns comment recognition. A doubled slash consumes the
+    // closing delimiter, so extraction cannot authorize an angle-header fact.
+    let imports = build(b"#include <public//api.h>\n#include <public/api.h>\n", 2);
+    assert_eq!(names(&imports), ["<public", "public/api.h"]);
+    let computed = &imports.facts()[0];
+    assert_eq!(computed.kind(), ImportKind::CppComputedInclude);
+    assert!(!computed.resolution_allowed());
+    assert_eq!(imports.source_bytes(1).unwrap(), b"#include <public");
+    let refused = resolve_import(b"src/main.cpp", computed, |_| -> Option<u64> {
+        panic!("comment-truncated computed include must not probe the catalog")
+    });
+    assert_eq!(refused.kind, ImportResolutionKind::Unresolved);
+    assert_eq!(refused.basis, "unresolved-cpp-include");
+    assert!(refused.target.is_none());
+    let canonical = &imports.facts()[1];
+    assert_eq!(canonical.kind(), ImportKind::CppAngleInclude);
+    assert!(canonical.resolution_allowed());
+    let admitted = resolve_import(b"src/main.cpp", canonical,
+        |path| (path == b"include/public/api.h").then_some(7));
+    assert_eq!(admitted.kind, ImportResolutionKind::Local);
+    assert_eq!(admitted.target, Some(7));
+    assert_eq!(admitted.basis, "cpp-project-include-candidate");
+    for destination in ["vector", "string", "custom", "module.cpp"] {
+        let source = format!("#include <{destination}>\n");
+        let imports = build(source.as_bytes(), 1);
+        let result = resolve_import(b"main.cpp", &imports.facts()[0], |_| -> Option<u64> {
+            panic!("unqualified header must not probe the catalog: {destination}")
+        });
+        assert_eq!(result.kind, ImportResolutionKind::External, "{destination}");
+    }
+}
+
+#[test]
 fn external_computed_escaped_and_escaping_headers_never_probe_the_catalog() {
     let source = br#"#include <vector>
 #include HEADER
