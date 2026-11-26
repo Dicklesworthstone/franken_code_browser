@@ -67,7 +67,8 @@ pub unsafe extern "C" fn fcb_saved_structure_search_page(handle: u64, generation
 
 /// Explicit name-case and count policy without changing the legacy ABI.
 /// Flags are exactly 0 or 1. Unicode scalar lowercase is supported for symbol
-/// and heading names; whole-token occurrences require case_sensitive=1.
+/// and heading names and whole-token occurrences. Occurrences always require
+/// exact name_mode=0; lowercase never matches only part of an original token.
 /// # Safety
 /// needle is null or readable NUL-terminated UTF-8 stable until return.
 /// Release every non-null response exactly once with fcb_free_string.
@@ -109,9 +110,6 @@ pub unsafe extern "C" fn fcb_saved_structure_search_matching_page(handle: u64, g
         let count_all_matches = match count_all_matches {
             0 => false, 1 => true, _ => return Err(AccessError::InvalidArgument),
         };
-        if mode == StructureMode::Occurrences && !case_sensitive {
-            return Err(AccessError::InvalidArgument);
-        }
         let needle = unsafe { cstr(needle) }.ok_or(AccessError::InvalidArgument)?;
         sessions.execute(handle, Command::StructureSearchMatching { generation, mode, name_mode,
             needle, max_hits: number(max_hits)?, max_source_bytes, skip_matches,

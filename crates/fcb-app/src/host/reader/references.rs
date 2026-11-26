@@ -21,6 +21,7 @@ pub const MAX_READER_REFERENCE_SOURCE_BYTES: usize = MAX_REFERENCE_SOURCE_BYTES;
 pub(super) struct AcceptedReferences {
     generation: u64,
     name: String,
+    case_sensitive: bool,
     rows: Vec<ReferenceCandidate>,
     counted: usize,
     limited: bool,
@@ -50,7 +51,7 @@ impl ReaderSession {
     /// The first page is encoded privately before replacing that inventory.
     pub fn prepare_references(&mut self, generation: u64, name: &str, max_items: usize,
         canceled: impl FnMut() -> bool) -> Result<HostResponse, ReaderSessionError> {
-        self.prepare_references_inner(generation, name, max_items, None, canceled)
+        self.prepare_references_inner(generation, name, max_items, true, None, canceled)
     }
 
     /// Retain a bounded later window from this SAME immutable source capture.
@@ -66,21 +67,33 @@ impl ReaderSession {
     pub fn prepare_references_window(&mut self, generation: u64, name: &str,
         max_items: usize, count_all_matches: bool, result_offset: u64,
         canceled: impl FnMut() -> bool) -> Result<HostResponse, ReaderSessionError> {
-        self.prepare_references_inner(generation, name, max_items,
+        self.prepare_references_matching_window(generation, name, max_items, true,
+            count_all_matches, result_offset, canceled)
+    }
+
+    /// Select exact spelling or Unicode scalar-lowercase equality for complete
+    /// tokens. Original source ranges and spelling remain authoritative.
+    /// Lowercase expansions never authorize partial-token matches.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_references_matching_window(&mut self, generation: u64, name: &str,
+        max_items: usize, case_sensitive: bool, count_all_matches: bool, result_offset: u64,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, ReaderSessionError> {
+        self.prepare_references_inner(generation, name, max_items, case_sensitive,
             Some(ReferenceResultWindow { result_offset, count_all_matches }), canceled)
     }
 
     fn prepare_references_inner(&mut self, generation: u64, name: &str, max_items: usize,
-        window: Option<ReferenceResultWindow>,
+        case_sensitive: bool, window: Option<ReferenceResultWindow>,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, ReaderSessionError> {
         self.reference_attempt(generation)?;
         check(&mut canceled)?;
         let [extract_id, rows_id] = self.allocations()?;
         let query = QueryGeneration::new(self.owner(), generation)
             .map_err(|_| ReaderSessionError::IdentityExhausted)?;
-        let extracted = CapturedReferences::build_window(self.capture.bytes(), *self.capture.request(),
+        let extracted = CapturedReferences::build_matching_window(self.capture.bytes(), *self.capture.request(),
             query, name, Some(self.encoding), max_items, window.map_or(0, |window| window.result_offset),
-            window.is_some_and(|window| window.count_all_matches), &self.budget, extract_id, &mut canceled)?;
+            window.is_some_and(|window| window.count_all_matches), case_sensitive, &self.budget,
+            extract_id, &mut canceled)?;
         let count = extracted.candidates().len();
         let charge = count.checked_mul(size_of::<ReferenceCandidate>())
             .and_then(|n| n.checked_add(size_of::<AcceptedReferences>()))
@@ -98,7 +111,7 @@ impl ReaderSession {
         owned_name.try_reserve_exact(name.len()).map_err(|_| AppError::Admission)?;
         if owned_name.capacity() > name.len() { return Err(AppError::Admission.into()); }
         owned_name.push_str(name);
-        let candidate = AcceptedReferences { generation, name: owned_name, rows,
+        let candidate = AcceptedReferences { generation, name: owned_name, case_sensitive, rows,
             counted: extracted.total_matches_counted(), limited: extracted.output_limited(),
             count_complete: extracted.is_complete(), max_items, window, _lease: lease };
         drop(extracted);
@@ -202,7 +215,9 @@ fn encode_page(out: &mut Output, references: &AcceptedReferences, start: usize, 
     if start > references.rows.len() { return Err(ReaderSessionError::InvalidRange); }
     out.literal(",\"reference_generation\":")?; out.integer(references.generation)?;
     out.literal(",\"name\":")?; out.quoted(&references.name)?;
-    out.literal(",\"selection_namespace\":\"reference\",\"evidence_level\":\"whole-token-text-candidate\",\"includes_comments_and_literals\":true,\"compiler_resolved\":false,\"semantic_complete\":false,\"name_case\":\"sensitive\",\"line_semantics\":\"LF-counted-source-lines\",\"max_source_bytes\":")?;
+    out.literal(",\"selection_namespace\":\"reference\",\"evidence_level\":\"whole-token-text-candidate\",\"includes_comments_and_literals\":true,\"compiler_resolved\":false,\"semantic_complete\":false,\"name_case\":")?;
+    out.quoted(if references.case_sensitive { "sensitive" } else { "unicode-lowercase" })?;
+    out.literal(",\"line_semantics\":\"LF-counted-source-lines\",\"max_source_bytes\":")?;
     out.integer(MAX_READER_REFERENCE_SOURCE_BYTES as u64)?;
     out.literal(",\"max_items\":")?; out.integer(references.max_items as u64)?;
     out.literal(",\"search_complete\":")?; out.boolean(references.count_complete)?;

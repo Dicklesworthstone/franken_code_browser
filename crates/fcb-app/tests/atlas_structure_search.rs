@@ -333,3 +333,29 @@ fn cpp_symbol_search_opens_the_original_capture_after_the_file_changes() {
     assert_eq!(reader.capture().bytes(), source);
     assert!(receipt.as_str().contains("\"source_reopened\":false"));
 }
+
+#[test]
+fn live_lowercase_occurrences_keep_original_names_and_retained_reader_evidence() {
+    let source = "k K K kx _K 1K".as_bytes();
+    let fixture = Fixture::new(&[("source.txt", source)]);
+    let atlas = fixture.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
+    let mut settings = options(AtlasStructureMode::Occurrences);
+    settings.name_mode = SymbolNameMode::Exact;
+    let scope = AtlasSearchScope::all().with_case_sensitive(false);
+    search.begin_structure(&atlas, 1, "K", scope, settings, || false).unwrap();
+    let page = finish(&mut search, &atlas, 1);
+    count(&page, "matches_seen", 3); count(&page, "retained_hits", 3);
+    assert!(page.contains("\"case_sensitive\":false"));
+    assert!(page.contains("\"name_case\":\"unicode-lowercase\""));
+    for name in ["k", "K", "K"] { assert!(page.contains(&format!("\"name\":\"{name}\""))); }
+    fs::write(fixture.0.join("source.txt"), b"replacement").unwrap();
+    let (reader, receipt) = search.open_reader(&atlas, ArenaOwnerId::new(31608).unwrap(), 1, 3, || false).unwrap();
+    assert_eq!(reader.capture().bytes(), source);
+    assert!(receipt.as_str().contains("\"source_reopened\":false"));
+    let hit = search.hit(&atlas, 1, 3).unwrap();
+    assert_eq!(&source[hit.original_range.start().get() as usize..hit.original_range.end().get() as usize], "K".as_bytes());
+    // Name-policy support is intentionally confined to occurrences on this route.
+    assert_eq!(search.begin_structure(&atlas, 2, "K", AtlasSearchScope::all().with_case_sensitive(false),
+        options(AtlasStructureMode::Symbols), || false).err(), Some(AtlasSearchError::InvalidScope));
+    assert_eq!(search.hit(&atlas, 1, 3).unwrap(), hit);
+}

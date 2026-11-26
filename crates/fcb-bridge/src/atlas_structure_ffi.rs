@@ -25,7 +25,21 @@ pub unsafe extern "C" fn fcb_atlas_structure_begin(handle: u64, generation: u64,
     mode: u64, name_mode: u64, needle: *const c_char, extensions: *const c_char,
     filenames: *const c_char, path_kind: u64, path: *const c_char,
     max_matches: u64, max_files: u64, max_file_bytes: u64, max_source_bytes: u64) -> *mut c_char {
+    unsafe { fcb_atlas_structure_begin_matching(handle, generation, mode, name_mode, needle,
+        extensions, filenames, path_kind, path, 1, max_matches, max_files, max_file_bytes, max_source_bytes) }
+}
+
+/// Choose exact spelling or Unicode scalar-lowercase equality for occurrences.
+/// case_sensitive is strictly 0 or 1. Symbols and headings still require 1.
+/// # Safety
+/// Same foreign-string and response-ownership contract as structure_begin.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_structure_begin_matching(handle: u64, generation: u64,
+    mode: u64, name_mode: u64, needle: *const c_char, extensions: *const c_char,
+    filenames: *const c_char, path_kind: u64, path: *const c_char,
+    case_sensitive: u64, max_matches: u64, max_files: u64, max_file_bytes: u64, max_source_bytes: u64) -> *mut c_char {
     reply(|| answer(handle, |atlases| {
+        let case_sensitive = parse_case_sensitive(case_sensitive)?;
         let mode = match mode { 1 => AtlasStructureMode::Symbols, 2 => AtlasStructureMode::Headings,
             4 => AtlasStructureMode::Occurrences,
             _ => return Err(AccessError::InvalidArgument) };
@@ -33,7 +47,7 @@ pub unsafe extern "C" fn fcb_atlas_structure_begin(handle: u64, generation: u64,
             2 => SymbolNameMode::Contains, _ => return Err(AccessError::InvalidArgument) };
         let needle = unsafe { cstr(needle) }.ok_or(AccessError::InvalidArgument)?;
         if needle.is_empty() || needle.len() > MAX_ATLAS_SEARCH_NEEDLE_BYTES { return Err(AccessError::InvalidArgument); }
-        let scope = unsafe { parse_path_scope(extensions, filenames, path_kind, path) }?;
+        let scope = unsafe { parse_path_scope(extensions, filenames, path_kind, path) }?.with_case_sensitive(case_sensitive);
         let limits = AtlasSearchOptions { max_matches: number(max_matches)?, max_files: number(max_files)?,
             max_file_bytes: number(max_file_bytes)?, max_source_bytes: number(max_source_bytes)? };
         atlases.execute(handle, Command::StructureBegin { generation, needle, scope: &scope,
@@ -54,14 +68,28 @@ pub unsafe extern "C" fn fcb_atlas_structure_indexed_begin(handle: u64, generati
     index_generation: u64, mode: u64, name_mode: u64, needle: *const c_char,
     extensions: *const c_char, filenames: *const c_char, path_kind: u64,
     path: *const c_char, max_matches: u64, max_scan_bytes: u64) -> *mut c_char {
+    unsafe { fcb_atlas_structure_indexed_begin_matching(handle, generation, index_generation,
+        mode, name_mode, needle, extensions, filenames, path_kind, path, 1, max_matches, max_scan_bytes) }
+}
+
+/// Select occurrence matching policy over the same immutable index capture set.
+/// case_sensitive is strictly 0 or 1. Legacy indexed queries remain exact.
+/// # Safety
+/// Same foreign-string and response-ownership contract as indexed_begin.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_structure_indexed_begin_matching(handle: u64, generation: u64,
+    index_generation: u64, mode: u64, name_mode: u64, needle: *const c_char,
+    extensions: *const c_char, filenames: *const c_char, path_kind: u64,
+    path: *const c_char, case_sensitive: u64, max_matches: u64, max_scan_bytes: u64) -> *mut c_char {
     reply(|| answer(handle, |atlases| {
+        let case_sensitive = parse_case_sensitive(case_sensitive)?;
         let mode = match mode { 1 => AtlasStructureMode::Symbols, 2 => AtlasStructureMode::Headings,
             4 => AtlasStructureMode::Occurrences, _ => return Err(AccessError::InvalidArgument) };
         let name_mode = match name_mode { 0 => SymbolNameMode::Exact, 1 => SymbolNameMode::Prefix,
             2 => SymbolNameMode::Contains, _ => return Err(AccessError::InvalidArgument) };
         let needle = unsafe { cstr(needle) }.ok_or(AccessError::InvalidArgument)?;
         if needle.is_empty() || needle.len() > MAX_ATLAS_SEARCH_NEEDLE_BYTES { return Err(AccessError::InvalidArgument); }
-        let scope = unsafe { parse_path_scope(extensions, filenames, path_kind, path) }?;
+        let scope = unsafe { parse_path_scope(extensions, filenames, path_kind, path) }?.with_case_sensitive(case_sensitive);
         let options = AtlasIndexedStructureOptions { mode, name_mode,
             max_matches: number(max_matches)?, max_scan_bytes };
         atlases.execute_index(handle, IndexCommand::BeginStructure { generation, index_generation,
@@ -84,7 +112,23 @@ pub unsafe extern "C" fn fcb_atlas_structure_indexed_begin_window(handle: u64, g
     extensions: *const c_char, filenames: *const c_char, path_kind: u64,
     path: *const c_char, count_all_matches: u64, result_offset: u64,
     max_matches: u64, max_scan_bytes: u64) -> *mut c_char {
+    unsafe { fcb_atlas_structure_indexed_begin_window_matching(handle, generation, index_generation,
+        mode, name_mode, needle, extensions, filenames, path_kind, path, 1, count_all_matches,
+        result_offset, max_matches, max_scan_bytes) }
+}
+
+/// Select occurrence matching policy for a later immutable-source result window.
+/// Both boolean flags are strictly 0 or 1 and checked before reading needle.
+/// # Safety
+/// Same bounded-needle, scope and response-ownership contract as indexed_begin_window.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_atlas_structure_indexed_begin_window_matching(handle: u64, generation: u64,
+    index_generation: u64, mode: u64, name_mode: u64, needle: *const c_char,
+    extensions: *const c_char, filenames: *const c_char, path_kind: u64,
+    path: *const c_char, case_sensitive: u64, count_all_matches: u64, result_offset: u64,
+    max_matches: u64, max_scan_bytes: u64) -> *mut c_char {
     reply(|| answer(handle, |atlases| {
+        let case_sensitive = parse_case_sensitive(case_sensitive)?;
         let mode = match mode { 1 => AtlasStructureMode::Symbols, 2 => AtlasStructureMode::Headings,
             4 => AtlasStructureMode::Occurrences, _ => return Err(AccessError::InvalidArgument) };
         let name_mode = match name_mode { 0 => SymbolNameMode::Exact, 1 => SymbolNameMode::Prefix,
@@ -92,7 +136,7 @@ pub unsafe extern "C" fn fcb_atlas_structure_indexed_begin_window(handle: u64, g
         let count_all_matches = parse_case_sensitive(count_all_matches)?;
         let needle = unsafe { bounded_needle(needle) }?;
         if needle.is_empty() { return Err(AccessError::InvalidArgument); }
-        let scope = unsafe { parse_path_scope(extensions, filenames, path_kind, path) }?;
+        let scope = unsafe { parse_path_scope(extensions, filenames, path_kind, path) }?.with_case_sensitive(case_sensitive);
         let options = AtlasIndexedStructureOptions { mode, name_mode,
             max_matches: number(max_matches)?, max_scan_bytes };
         let window = AtlasResultWindow { result_offset, count_all_matches };

@@ -13,8 +13,9 @@ extern "C" {
 
 /* Whole-token TEXT occurrences in an existing OPEN reader's retained capture.
  * This is not compiler name/reference resolution. Comments and string literals
- * participate. Matching is exact and case-sensitive; no normalization or full
- * Unicode identifier claim is made. The shared Rust token policy groups ASCII
+ * participate. Legacy entry points match exact case-sensitive spelling; the
+ * matching-window entry point also supports Unicode scalar lowercase equality.
+ * No normalization or full Unicode identifier claim is made. The token policy groups ASCII
  * letters/digits, '_' and '$', and conservatively keeps non-ASCII runs intact.
  * It never rescans or reopens a working-tree pathname during navigation.
  *
@@ -69,6 +70,21 @@ char *fcb_reader_references(uint64_t handle, uint64_t generation,
 char *fcb_reader_references_window(uint64_t handle, uint64_t generation,
     const char *name, uint64_t max_items, uint64_t count_all_matches,
     uint64_t result_offset);
+
+/* Choose the matching policy for a bounded occurrence window. case_sensitive
+ * is strictly 0 or 1: 1 compares exact spelling; 0 compares each Unicode
+ * scalar's lowercase expansion across complete original tokens. This is not
+ * full case folding or normalization. All window/count/generation rules above
+ * apply, including rejection of invalid boolean flags before reading name.
+ *
+ * name_case is "sensitive" or "unicode-lowercase" on the initial response and
+ * every metadata page. Reference ranges, navigation and copied bytes always
+ * identify the original source spelling, which can differ in UTF-8 byte length
+ * from name. Existing exact entry points and their response shapes are unchanged.
+ */
+char *fcb_reader_references_window_matching(uint64_t handle, uint64_t generation,
+    const char *name, uint64_t max_items, uint64_t case_sensitive,
+    uint64_t count_all_matches, uint64_t result_offset);
 
 /* Page the accepted inventory; limit is 1..128. start is a zero-based offset
  * and next_offset continues that inventory. reference_id is one-based within

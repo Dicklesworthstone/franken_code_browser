@@ -38,8 +38,9 @@ impl AtlasStructureMode {
     }
 }
 
-/// Query matching is exact, case-sensitive Unicode text over extracted names
-/// or upstream heading titles. Occurrences require one exact whole token under
+/// Symbol and heading matching is case-sensitive Unicode text over extracted
+/// names or upstream titles. Occurrences compare one complete token, optionally
+/// through Unicode scalar lowercase selected by the query scope, under
 /// the shared reference engine's declared text policy, including comments and
 /// literals. Scope is frozen before source or match quotas. The file-byte limit
 /// is intersected with the owning extractor's source cap.
@@ -85,6 +86,7 @@ pub struct AtlasResultWindow {
 pub(super) struct StructureQuery {
     mode: AtlasStructureMode,
     name_mode: SymbolNameMode,
+    case_sensitive: bool,
     source_limit: usize,
     metadata_limit: usize,
     metadata_bytes: usize,
@@ -120,7 +122,9 @@ impl StructureQuery {
         out.literal(",\"requested_mode\":")?; out.quoted(self.mode.requested())?;
         out.literal(",\"realized_mode\":")?; out.quoted(self.mode.realized())?;
         out.literal(",\"evidence_level\":")?; out.quoted(self.mode.realized())?;
-        out.literal(",\"semantic_complete\":false,\"name_case\":\"sensitive\",\"name_mode\":")?;
+        out.literal(",\"semantic_complete\":false,\"name_case\":")?;
+        out.quoted(if self.case_sensitive { "sensitive" } else { "unicode-lowercase" })?;
+        out.literal(",\"name_mode\":")?;
         out.quoted(match self.name_mode { SymbolNameMode::Exact => "exact",
             SymbolNameMode::Prefix => "prefix", SymbolNameMode::Contains => "contains" })?;
         // Complete means all admitted extraction work finished. It never says
@@ -234,9 +238,11 @@ impl RetainedAtlasSearch {
         indexed: Option<(u64, u64)>, window: Option<AtlasResultWindow>, mut canceled: impl FnMut() -> bool)
         -> Result<HostResponse, AtlasSearchError> {
         self.validate(atlas)?;
-        // The text-only lowercase option cannot silently change or mislabel
-        // the existing case-sensitive symbol/heading-name contract.
-        if !scope.case_sensitive() { return Err(AtlasSearchError::InvalidScope); }
+        // Whole-token matching shares the public reference engine's lowercase
+        // policy. Symbol/heading extraction keeps its existing name contract.
+        if !scope.case_sensitive() && options.mode != AtlasStructureMode::Occurrences {
+            return Err(AtlasSearchError::InvalidScope);
+        }
         self.attempt(generation)?;
         let count_all_matches = window.is_some_and(|window| window.count_all_matches);
         if count_all_matches { options.limits.validate_counted()?; } else { options.limits.validate()?; }
@@ -268,16 +274,22 @@ impl RetainedAtlasSearch {
             MAX_ATLAS_SEARCH_FILES * size_of::<FileId>()
         } else { 0 }).ok_or(AppError::Admission)?;
         let capacity = options.limits.max_matches.min(options.limits.max_files);
-        // Occurrence rows retain only the exact query name and no slug. One
+        // Occurrence rows retain the exact SOURCE spelling and no slug. A
+        // lowercase-equivalent token can be wider than the query (K / Kelvin
+        // sign), so reserve that bound and reusable decoding scratch first. One
         // source is captured at a time, so the source budget plus one file
         // covers retained captures and the in-flight capture copy. The extent
         // and reference decoder keep their own separate managed reservations.
         // Preserve the existing symbol/heading envelopes unchanged.
+        let name_capacity = if options.mode == AtlasStructureMode::Occurrences {
+            matched_text_capacity(needle, &scope)?.max(needle.len())
+        } else { 0 };
         let (live_source_charge, mut metadata_limit) = if options.mode == AtlasStructureMode::Occurrences {
             (options.limits.max_source_bytes.checked_add(options.limits.max_file_bytes)
                 .ok_or(AppError::Admission)?,
-             options.limits.max_matches.checked_mul(needle.len()).ok_or(AppError::Admission)?)
+             options.limits.max_matches.checked_mul(name_capacity).ok_or(AppError::Admission)?)
         } else { (2 * options.limits.max_source_bytes, MAX_ATLAS_STRUCTURE_METADATA_BYTES) };
+        metadata_limit = metadata_limit.min(MAX_ATLAS_STRUCTURE_METADATA_BYTES);
         if window.is_some() {
             metadata_limit = metadata_limit.min(options.limits.max_matches
                 .checked_mul(2 * MAX_ATLAS_STRUCTURE_NAME_BYTES).ok_or(AppError::Admission)?);
@@ -291,6 +303,7 @@ impl RetainedAtlasSearch {
             .and_then(|n| n.checked_add(options.limits.max_matches
                 * (size_of::<AtlasSearchHit>() + size_of::<StructureRow>())))
             .and_then(|n| n.checked_add(metadata_limit))
+            .and_then(|n| n.checked_add(name_capacity))
             .and_then(|n| n.checked_add(MAX_DIAGNOSTICS * size_of::<Unavailable>()
                 + needle.len() + size_of::<SearchWork>() + scope_bytes)).ok_or(AppError::Admission)?;
         let state_id = self.next_id()?;
@@ -311,6 +324,7 @@ impl RetainedAtlasSearch {
         let pending = eligible_files.checked_sub(unavailable).ok_or(AtlasSearchError::WrongAtlas)?;
         let snapshot = Snapshot { generation, needle: copy_text(needle)?, expression: None,
             structure: Some(StructureQuery { mode: options.mode, name_mode: options.name_mode,
+                case_sensitive: scope.case_sensitive(),
                 source_limit: options.limits.max_file_bytes, metadata_limit, metadata_bytes: 0, metadata_omitted: 0,
                 unsupported_files: 0, extraction_limited_files: 0, window,
                 window_capacity: options.limits.max_matches }),
@@ -457,9 +471,9 @@ impl RetainedAtlasSearch {
                 };
                 let remaining = work.options.limits.max_matches.checked_sub(used)
                     .ok_or(AtlasSearchError::WrongAtlas)?;
-                let references = match CapturedReferences::build_window(capture.bytes(), *capture.request(),
+                let references = match CapturedReferences::build_matching_window(capture.bytes(), *capture.request(),
                     generation, &candidate.needle, None, remaining, skip, candidate.count_all_matches,
-                    &self.budget, work.extract_id,
+                    candidate.scope.case_sensitive(), &self.budget, work.extract_id,
                     || canceled() || atlas.validate_active().is_err()) {
                     Ok(references) => references,
                     Err(ReferenceError::Canceled) => return Err(AtlasSearchError::Canceled),
@@ -470,13 +484,20 @@ impl RetainedAtlasSearch {
                     Err(error) => { candidate.unavailable(file, error.code()); return Ok(()); }
                 };
                 candidate.scanned += 1;
+                let name_capacity = matched_text_capacity(&candidate.needle, &candidate.scope)?
+                    .max(candidate.needle.len());
+                let mut source_name = String::new();
+                source_name.try_reserve_exact(name_capacity).map_err(|_| AppError::Admission)?;
+                if source_name.capacity() > name_capacity { return Err(AppError::Admission.into()); }
                 for occurrence in references.candidates() {
                     check(canceled)?;
+                    references.write_source_text(occurrence.id(), &mut source_name)
+                        .map_err(ReaderSessionError::from)?;
                     let selected = occurrence.original_range();
                     let occurrence_id = before_matches.checked_add(skip)
                         .and_then(|n| n.checked_add(occurrence.id())).ok_or(AtlasSearchError::IdentityExhausted)?;
                     if !retain_row(candidate, work, file, revision, node, capture.bytes().len(), selected,
-                        selected, references.name(), "identifier-occurrence", "text", occurrence.id(),
+                        selected, &source_name, "identifier-occurrence", "text", occurrence.id(),
                         occurrence_id, None)? { break; }
                 }
                 candidate.matches_seen = before_matches.checked_add(references.total_matches_counted() as u64)

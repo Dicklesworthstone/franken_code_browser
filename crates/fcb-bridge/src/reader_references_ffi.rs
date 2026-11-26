@@ -38,6 +38,24 @@ pub unsafe extern "C" fn fcb_reader_references_window(handle: u64, generation: u
     }))
 }
 
+/// Select exact spelling or Unicode scalar-lowercase whole-token equality.
+/// Both boolean flags are strictly 0 or 1. Original source ranges and selected
+/// spelling survive paging; legacy entry points remain case sensitive.
+/// # Safety
+/// Same foreign-string lifetime and response-ownership contract as references.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_reader_references_window_matching(handle: u64, generation: u64,
+    name: *const c_char, max_items: u64, case_sensitive: u64, count_all_matches: u64,
+    result_offset: u64) -> *mut c_char {
+    reply(|| answer(handle, |readers| {
+        if case_sensitive > 1 || count_all_matches > 1 { return Err(AccessError::InvalidArgument); }
+        let name = unsafe { cstr(name) }.ok_or(AccessError::InvalidArgument)?;
+        readers.execute(handle, Command::ReferencesMatchingWindow { generation, name,
+            max_items: number(max_items)?, case_sensitive: case_sensitive == 1,
+            count_all_matches: count_all_matches == 1, result_offset }, || false)
+    }))
+}
+
 /// Page already-retained occurrences without rescanning or source I/O. start is
 /// a zero-based page offset; activate the returned one-based reference_id.
 #[unsafe(no_mangle)]

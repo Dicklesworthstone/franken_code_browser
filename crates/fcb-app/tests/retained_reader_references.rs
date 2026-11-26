@@ -497,3 +497,71 @@ fn large_retained_occurrence_windows_copy_exact_utf8_and_utf16_after_live_replac
         assert_eq!(selected(&r, r.reference_range(1, 1).unwrap()), expected);
     }
 }
+
+#[test]
+fn lowercase_reference_windows_preserve_source_spelling_policy_and_copy_across_encodings() {
+    for little in [None, Some(true), Some(false)] {
+        let encode = |text: &str| -> Vec<u8> {
+            match little {
+                None => text.as_bytes().to_vec(),
+                Some(little) => text.encode_utf16()
+                    .flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect(),
+            }
+        };
+        let text = "😀\r\nk K K kx _K 1K\nİ i\u{307} I\u{307} i";
+        let source = encode(&format!("{}{text}", if little.is_some() { "\u{feff}" } else { "" }));
+        let mut r = reader(&source);
+        let address = r.capture().bytes().as_ptr();
+        let first = r.prepare_references_matching_window(1, "K", 2, false, true, 1, || false).unwrap();
+        assert_eq!(first.exit_code(), EXIT_OK);
+        for (field, expected) in [("matches_counted", 3), ("retained_references", 2),
+            ("result_offset", 1), ("occurrence_id", 2)] { count(first.as_str(), field, expected); }
+        assert!(first.as_str().contains("\"name_case\":\"unicode-lowercase\""));
+        assert!(first.as_str().contains("\"has_more_matches\":false"));
+        for (id, spelling) in [(1, "K"), (2, "K")] {
+            assert_eq!(selected(&r, r.reference_range(1, id).unwrap()), encode(spelling));
+            let window = r.reference_window(1, id, 32, || false).unwrap();
+            count(window.as_str(), "additional_source_bytes_read", 0);
+            let copied = r.copy_reference(1, id, || false).unwrap();
+            assert!(copied.as_str().contains(&format!("\"original_hex\":\"{}\"", hex(&encode(spelling)))));
+        }
+        let metadata = r.reference_page(1, 1, 1, || false).unwrap();
+        assert!(metadata.as_str().contains("\"name_case\":\"unicode-lowercase\""));
+        count(metadata.as_str(), "reference_id", 2); count(metadata.as_str(), "occurrence_id", 3);
+        let expanded = r.prepare_references_matching_window(2, "i\u{307}", 16, false, true, 0, || false).unwrap();
+        count(expanded.as_str(), "matches_counted", 3);
+        for (id, spelling) in [(1, "İ"), (2, "i\u{307}"), (3, "I\u{307}")] {
+            assert_eq!(selected(&r, r.reference_range(2, id).unwrap()), encode(spelling));
+        }
+        let legacy = r.prepare_references(3, "K", 16, || false).unwrap();
+        count(legacy.as_str(), "matches_counted", 1);
+        assert!(legacy.as_str().contains("\"name_case\":\"sensitive\""));
+        assert!(!legacy.as_str().contains("\"result_offset\":"));
+        assert!(r.reference_range(1, 1).is_err());
+        assert_eq!(r.capture().bytes().as_ptr(), address);
+    }
+}
+
+#[test]
+fn canceled_lowercase_replacement_preserves_policy_and_wide_original_ranges() {
+    let name = "K".repeat(MAX_READER_REFERENCE_NAME_BYTES);
+    let spelling = "K".repeat(MAX_READER_REFERENCE_NAME_BYTES);
+    let source = format!("{spelling} {}", spelling.to_lowercase());
+    let mut r = reader(source.as_bytes());
+    let accepted = r.prepare_references_matching_window(1, &name, 1, false, true, 0, || false).unwrap();
+    count(accepted.as_str(), "matches_counted", 2);
+    assert_eq!(selected(&r, r.reference_range(1, 1).unwrap()), spelling.as_bytes());
+    assert!(r.prepare_references_matching_window(2, &name, 1, true, true, 0, || true).is_err());
+    let page = r.reference_page(1, 0, 1, || false).unwrap();
+    assert!(page.as_str().contains("\"name_case\":\"unicode-lowercase\""));
+    assert_eq!(selected(&r, r.reference_range(1, 1).unwrap()), spelling.as_bytes());
+    let counted = r.prepare_references_matching_window(3, &name, 0, false, true, 0, || false).unwrap();
+    count(counted.as_str(), "matches_counted", 2);
+    count(counted.as_str(), "retained_references", 0);
+    assert!(counted.as_str().contains("\"count_complete\":true"));
+    assert!(counted.as_str().contains("\"next_match_offset\":null"));
+    let beyond = r.prepare_references_matching_window(4, &name, 1, false, true, u64::MAX, || false).unwrap();
+    count(beyond.as_str(), "matches_counted", 2);
+    count(beyond.as_str(), "skipped_matches", 2);
+    assert!(beyond.as_str().contains("\"references\":[]"));
+}

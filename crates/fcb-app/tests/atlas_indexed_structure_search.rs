@@ -520,3 +520,49 @@ fn large_indexed_symbols_reach_late_lines_and_keep_captures_after_index_release(
         assert!(outline.as_str().contains("\"name\":\"late_target\""));
     }
 }
+
+#[test]
+fn lowercase_captured_windows_keep_original_unicode_names_and_budget_wider_spelling() {
+    for little in [None, Some(true), Some(false)] {
+        let encode = |text: &str| -> Vec<u8> {
+            match little {
+                None => text.as_bytes().to_vec(),
+                Some(little) => text.encode_utf16()
+                    .flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect(),
+            }
+        };
+        let long_query = "K".repeat(1024); let long_source = "K".repeat(1024);
+        let source = encode(&format!("{}k K K kx _K 1K\n{long_source}",
+            if little.is_some() { "\u{feff}" } else { "" }));
+        let fixture = Fixture::new(&[("source.txt", &source)]);
+        let atlas = fixture.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
+        search.prepare_index(&atlas, 1, index_options(), || false).unwrap();
+        fs::write(fixture.0.join("source.txt"), b"replacement").unwrap();
+        let mut settings = options(AtlasStructureMode::Occurrences); settings.max_matches = 1;
+        for (generation, offset, spelling) in [(2, 1, "K"), (3, 2, "K")] {
+            search.begin_indexed_structure_window(&atlas, generation, 1, "K",
+                AtlasSearchScope::all().with_case_sensitive(false), settings,
+                AtlasResultWindow { result_offset: offset, count_all_matches: true }, || false).unwrap();
+            let page = finish(&mut search, &atlas, generation);
+            count(&page, "matches_seen", 3); count(&page, "retained_hits", 1);
+            count(&page, "occurrence_id", offset + 1);
+            count(&page, "source_bytes_read", 0); count(&page, "read_calls", 0);
+            assert!(page.contains("\"case_sensitive\":false"));
+            assert!(page.contains("\"name_case\":\"unicode-lowercase\""));
+            assert!(page.contains(&format!("\"name\":\"{spelling}\"")));
+            let hit = search.hit(&atlas, generation, 1).unwrap();
+            assert_eq!(&source[hit.original_range.start().get() as usize..hit.original_range.end().get() as usize], encode(spelling));
+            if offset == 1 { count(&page, "next_match_offset", 2); }
+            else { assert!(page.contains("\"next_match_offset\":null")); }
+        }
+        search.begin_indexed_structure(&atlas, 4, 1, &long_query,
+            AtlasSearchScope::all().with_case_sensitive(false), settings, || false).unwrap();
+        let page = finish(&mut search, &atlas, 4);
+        count(&page, "matches_seen", 1); count(&page, "retained_hits", 1);
+        assert!(page.contains(&format!("\"name\":\"{long_source}\"")));
+        search.clear_index(&atlas, 5, || false).unwrap();
+        let (reader, receipt) = search.open_reader(&atlas, ArenaOwnerId::new(31640).unwrap(), 4, 1, || false).unwrap();
+        assert_eq!(reader.capture().bytes(), source);
+        assert!(receipt.as_str().contains("\"source_reopened\":false"));
+    }
+}

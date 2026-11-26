@@ -221,6 +221,8 @@ fn c_window_flags_refusals_full_width_offsets_and_zero_storage_keep_exact_contra
 fn c_reference_types_and_public_header_declarations_agree() {
     let _: unsafe extern "C" fn(u64, u64, *const c_char, u64) -> *mut c_char = fcb_reader_references;
     let _: unsafe extern "C" fn(u64, u64, *const c_char, u64, u64, u64) -> *mut c_char = fcb_reader_references_window;
+    let _: unsafe extern "C" fn(u64, u64, *const c_char, u64, u64, u64, u64) -> *mut c_char
+        = fcb_reader_references_window_matching;
     let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_reader_reference_page;
     let _: extern "C" fn(u64, u64, u64, u64) -> *mut c_char = fcb_reader_reference;
     let _: extern "C" fn(u64, u64, u64) -> *mut c_char = fcb_reader_copy_reference;
@@ -229,8 +231,44 @@ fn c_reference_types_and_public_header_declarations_agree() {
     assert!(header.contains(&format!(
         "#define FCB_READER_REFERENCE_SOURCE_BYTES UINT64_C({})",
         fcb_app::host::reader::MAX_READER_REFERENCE_SOURCE_BYTES)));
-    for name in ["fcb_reader_references(", "fcb_reader_references_window(", "fcb_reader_reference_page(", "fcb_reader_reference(",
+    for name in ["fcb_reader_references(", "fcb_reader_references_window(", "fcb_reader_references_window_matching(", "fcb_reader_reference_page(", "fcb_reader_reference(",
         "fcb_reader_copy_reference(", "fcb_reader_references_clear("] {
         assert_eq!(header.matches(name).count(), 1, "{name}");
+    }
+}
+
+#[test]
+fn c_lowercase_occurrence_windows_copy_original_utf16_and_preserve_matching_receipts() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let name = CString::new("K").unwrap();
+    for little in [true, false] {
+        let bytes: Vec<_> = "\u{feff}k K K kx _K".encode_utf16()
+            .flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect();
+        let (path, handle) = source(&bytes);
+        fs::write(path, b"replacement").unwrap();
+        let inventory = take(unsafe { fcb_reader_references_window_matching(handle, 1,
+            name.as_ptr(), 1, 0, 1, 2) });
+        for fragment in ["\"name_case\":\"unicode-lowercase\"", "\"matches_counted\":\"3\"",
+            "\"retained_references\":\"1\"", "\"reference_id\":\"1\"", "\"occurrence_id\":\"3\"",
+            "\"count_complete\":true", "\"has_more_matches\":false", "\"next_match_offset\":null",
+            "\"original_range\":{\"start\":\"10\",\"end\":\"12\"}"] {
+            assert!(inventory.contains(fragment), "{fragment}: {inventory}");
+        }
+        let page = take(fcb_reader_reference_page(handle, 1, 0, 1));
+        assert!(page.contains("\"name_case\":\"unicode-lowercase\""));
+        for (case_sensitive, counted) in [(2, 0), (0, 2), (u64::MAX, 1)] {
+            let refused = take(unsafe { fcb_reader_references_window_matching(handle, 2,
+                std::ptr::null(), 1, case_sensitive, counted, 0) });
+            assert!(refused.contains("INVALID_ARGUMENT"));
+        }
+        assert!(take(fcb_reader_info(handle)).contains("\"accepted_reference_generation\":\"1\""));
+        let copy = fcb_reader_copy_reference(handle, 1, 1);
+        let legacy = take(unsafe { fcb_reader_references_window(handle, 2, name.as_ptr(), 4, 1, 0) });
+        assert!(legacy.contains("\"name_case\":\"sensitive\""));
+        assert!(legacy.contains("\"matches_counted\":\"1\""));
+        assert!(take(fcb_reader_reference(handle, 1, 1, 0)).contains("REFERENCE_STALE_QUERY"));
+        assert_eq!(fcb_reader_close(handle), 1);
+        let expected = if little { "2a21" } else { "212a" };
+        assert!(take(copy).contains(&format!("\"original_hex\":\"{expected}\"")));
     }
 }

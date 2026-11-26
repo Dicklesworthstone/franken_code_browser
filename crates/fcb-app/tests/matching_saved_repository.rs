@@ -8,6 +8,7 @@ use support::{Json, parse};
 use fcb::search::snapshot::{SnapshotData, SnapshotEntry};
 use fcb_app::{EXIT_OK, EXIT_PARTIAL};
 use fcb_app::host::{HostResponse, saved_repository::{SavedRepositorySession, SavedRepositoryError}};
+use fcb_app::host::saved_repository::structure::{StructureMode, SymbolNameMode};
 
 fn json(response: &HostResponse) -> Json { parse(response.as_str().as_bytes()).unwrap() }
 fn hex(bytes: &[u8]) -> String { bytes.iter().map(|byte| format!("{byte:02x}")).collect() }
@@ -157,4 +158,85 @@ fn compatible_pruning_cannot_turn_unknown_saved_members_into_exact_absence() {
     assert_eq!(page.get("index_eliminated_files").number(), 1);
     assert_eq!(page.get("unavailable_files").number(), 1);
     assert!(!page.get("search_complete").flag()); assert!(!page.get("matches_seen_exact").flag());
+}
+
+#[test]
+fn lowercase_saved_occurrences_keep_query_spelling_counts_and_original_utf16_handoffs() {
+    let le: Vec<_> = "\u{feff}K K k Kx".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let f = Fixture::new(&[entry(b"a.txt", &le), entry(b"b.txt", "K K".as_bytes())], true);
+    let mut session = f.open(88861);
+    let first = session.structure_search_matching_page(1, StructureMode::Occurrences,
+        SymbolNameMode::Exact, "K", 1, 4096, false, true, 1, || false).unwrap();
+    assert_eq!(first.exit_code(), EXIT_OK);
+    let first = json(&first);
+    assert!(!first.get("case_sensitive").flag());
+    assert_eq!(first.get("name_case").text(), "unicode-lowercase");
+    assert_eq!(first.get("needle").text(), "K");
+    assert_eq!(first.get("matches_seen").number(), 5);
+    assert_eq!(first.get("skipped_matches").number(), 1);
+    assert_eq!(first.get("next_match_offset").number(), 2);
+    assert!(first.get("complete").flag()); assert!(first.get("matches_seen_exact").flag());
+    let hit = &first.get("hits").array()[0];
+    assert_eq!(hit.get("structure").get("name").text(), "K");
+    assert_eq!(hit.get("original_range").get("start").number(), 6);
+    assert_eq!(hit.get("original_range").get("end").number(), 8);
+    let reads = field(&mut session, "member_bytes_read");
+    assert_eq!(json(&session.structure_results(1, 0, 1, || false).unwrap()), first);
+    assert_eq!(field(&mut session, "member_bytes_read"), reads);
+
+    let (mut reader, receipt) = session.open_structure_hit_reader(owner(88862), 1, 1, || false).unwrap();
+    let receipt = json(&receipt);
+    assert_eq!(receipt.get("needle").text(), "K");
+    assert_eq!(receipt.get("structure").get("name").text(), "K");
+    assert_eq!(receipt.get("selection").get("original_hex").text(), "2a21");
+    assert!(!receipt.get("live_source_reopened").flag());
+    assert_eq!(reader.capture().bytes(), le);
+    let later = json(&session.structure_search_matching_page(2, StructureMode::Occurrences,
+        SymbolNameMode::Exact, "K", 1, 4096, false, true, 3, || false).unwrap());
+    assert_eq!(later.get("hits").array()[0].get("member").number(), 1);
+    assert_eq!(later.get("hits").array()[0].get("structure").get("name").text(), "K");
+    assert_eq!(later.get("matches_seen").number(), 5);
+    assert_eq!(later.get("next_match_offset").number(), 4);
+    assert!(session.structure_search_matching(3, StructureMode::Occurrences,
+        SymbolNameMode::Prefix, "K", 1, 4096, false, true, || false).is_err());
+    assert!(session.structure_search_matching(4, StructureMode::Occurrences,
+        SymbolNameMode::Exact, "K", 1, 4096, false, true, || true).err().unwrap().is_canceled());
+    assert_eq!(json(&session.structure_results(2, 0, 1, || false).unwrap()), later);
+    let counted = json(&session.structure_search_matching(5, StructureMode::Occurrences,
+        SymbolNameMode::Exact, "K", 0, 4096, false, true, || false).unwrap());
+    assert_eq!(counted.get("matches_seen").number(), 5);
+    assert_eq!(counted.get("retained_hits").number(), 0);
+    assert!(counted.get("complete").flag()); assert!(!counted.get("has_more_matches").flag());
+    session.clear_structure(6, || false).unwrap(); drop(session);
+    assert_eq!(json(&reader.copy_range(6, 8, || false).unwrap()).get("original_hex").text(), "2a21");
+}
+
+#[test]
+fn saved_whole_token_lowercase_does_not_reuse_literal_expansion_or_source_name_as_query() {
+    let text = "İ i\u{307} I\u{307} i I ß ẞ ss SS";
+    let f = Fixture::new(&[entry(b"tokens.txt", text.as_bytes())], true);
+    let mut session = f.open(88871);
+    for (generation, needle, names) in [(1, "i", vec!["i", "I"]),
+        (2, "i\u{307}", vec!["İ", "i\u{307}", "I\u{307}"]),
+        (3, "ß", vec!["ß", "ẞ"]), (4, "ss", vec!["ss", "SS"])] {
+        let report = json(&session.structure_search_matching(generation, StructureMode::Occurrences,
+            SymbolNameMode::Exact, needle, 16, 4096, false, true, || false).unwrap());
+        assert_eq!(report.get("matches_seen").number(), names.len() as u64);
+        assert_eq!(report.get("hits").array().iter()
+            .map(|hit| hit.get("structure").get("name").text()).collect::<Vec<_>>(), names);
+        assert!(report.get("complete").flag());
+    }
+
+    let needle = "K".repeat(512); let spelling = "K".repeat(512);
+    let f = Fixture::new(&[entry(b"wide.txt", spelling.as_bytes())], true);
+    let mut session = f.open(88872);
+    let report = json(&session.structure_search_matching(1, StructureMode::Occurrences,
+        SymbolNameMode::Exact, &needle, 1, 4096, false, true, || false).unwrap());
+    assert_eq!(report.get("needle").text(), needle);
+    assert_eq!(report.get("hits").array()[0].get("structure").get("name").text(), spelling);
+    let (_, receipt) = session.open_structure_hit_reader(owner(88873), 1, 1, || false).unwrap();
+    let receipt = json(&receipt);
+    assert_eq!(receipt.get("needle").text(), needle);
+    assert_eq!(receipt.get("structure").get("name").text(), spelling);
+    assert_eq!(receipt.get("selection").get("original_hex").text(), hex(spelling.as_bytes()));
 }

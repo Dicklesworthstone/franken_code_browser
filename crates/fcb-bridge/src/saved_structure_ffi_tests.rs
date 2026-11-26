@@ -218,7 +218,7 @@ fn c_structure_matching_rejects_invalid_flags_and_preserves_exact_occurrences() 
         needle.as_ptr(), 1, 1, 1, 4096) });
     assert!(accepted.contains("\"matches_seen\":\"2\""), "{accepted}");
     assert!(accepted.contains("\"retained_hits\":\"1\""), "{accepted}");
-    for (case_sensitive, count_all) in [(2, 1), (1, 2), (0, 1)] {
+    for (case_sensitive, count_all) in [(2, 1), (1, 2)] {
         let error = take(unsafe { fcb_saved_structure_search_matching(handle, 2, 4, 0,
             needle.as_ptr(), case_sensitive, count_all, 1, 4096) });
         assert!(error.contains("SAVED_HANDLE_INVALID_ARGUMENT"), "{error}");
@@ -228,5 +228,73 @@ fn c_structure_matching_rejects_invalid_flags_and_preserves_exact_occurrences() 
     assert!(retained.contains("\"matches_seen\":\"2\""), "{retained}");
     assert!(retained.contains("\"case_sensitive\":true"), "{retained}");
     assert!(retained.contains("\"name_case\":\"sensitive\""), "{retained}");
+    // The new false policy is valid and retains the original mixed-case token.
+    let later = take(unsafe { fcb_saved_structure_search_matching_page(handle, 2, 4, 0,
+        needle.as_ptr(), 0, 1, 1, 4096, 1) });
+    for expected in ["\"matches_seen\":\"3\"", "\"retained_hits\":\"1\"",
+        "\"case_sensitive\":false", "\"name_case\":\"unicode-lowercase\"",
+        "\"name\":\"Needle\"", "\"next_match_offset\":\"2\""] {
+        assert!(later.contains(expected), "missing {expected}: {later}");
+    }
+    // Lowercase changes equality only; prefixes and malformed query tokens
+    // cannot replace the accepted complete-token result.
+    for (generation, name_mode) in [(3, 1), (4, 2)] {
+        let error = take(unsafe { fcb_saved_structure_search_matching(handle, generation, 4,
+            name_mode, needle.as_ptr(), 0, 1, 1, 4096) });
+        assert!(error.contains("\"status\":\"error\""), "{error}");
+    }
+    let invalid_token = CString::new("needle::other").unwrap();
+    let error = take(unsafe { fcb_saved_structure_search_matching(handle, 5, 4, 0,
+        invalid_token.as_ptr(), 0, 1, 1, 4096) });
+    assert!(error.contains("\"status\":\"error\""), "{error}");
+    assert!(!error.contains("needle::other"), "{error}");
+    let retained = take(fcb_saved_structure_results(handle, 2, 0, 64));
+    assert!(retained.contains("\"matches_seen\":\"3\"") && retained.contains("\"name\":\"Needle\""));
     assert_eq!(fcb_saved_close(handle), 1);
+}
+
+#[test]
+fn c_lowercase_occurrence_windows_preserve_original_utf16_and_independent_reader_bytes() {
+    let _guard = crate::reader_ffi::FFI_TEST_LOCK.lock().unwrap();
+    let bytes: Vec<_> = "\u{feff}K K k Kx".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let path = archive(&[(b"a.txt", &bytes), (b"b.txt", "K K".as_bytes())]);
+    let handle = fcb_saved_create(); assert_ne!(handle, 0);
+    assert!(take(unsafe { fcb_saved_open(handle, path.as_ptr()) }).contains("\"status\":\"ok\""));
+    let needle = CString::new("K").unwrap();
+    let first = take(unsafe { fcb_saved_structure_search_matching_page(handle, 1, 4, 0,
+        needle.as_ptr(), 0, 1, 1, 4096, 1) });
+    for expected in ["\"case_sensitive\":false", "\"name_case\":\"unicode-lowercase\"",
+        "\"requested_mode\":\"occurrences\"", "\"name_mode\":\"exact\"", "\"needle\":\"K\"",
+        "\"matches_seen\":\"5\"", "\"matches_seen_exact\":true", "\"complete\":true",
+        "\"retained_hits\":\"1\"", "\"skipped_matches\":\"1\"", "\"next_match_offset\":\"2\"",
+        "\"name\":\"K\"", "\"original_range\":{\"start\":\"6\",\"end\":\"8\"}"] {
+        assert!(first.contains(expected), "missing {expected}: {first}");
+    }
+    let reader = crate::reader_ffi::fcb_reader_create(); assert_ne!(reader, 0);
+    let opened = take(fcb_saved_open_structure_hit_reader(handle, reader, 1, 1));
+    for expected in ["\"needle\":\"K\"", "\"name\":\"K\"", "\"original_hex\":\"2a21\"",
+        "\"live_source_reopened\":false", "\"case_sensitive\":false"] {
+        assert!(opened.contains(expected), "missing {expected}: {opened}");
+    }
+    let metadata = take(fcb_saved_structure_results(handle, 1, 0, 1));
+    assert_eq!(metadata, first);
+    let last = take(unsafe { fcb_saved_structure_search_matching_page(handle, 2, 4, 0,
+        needle.as_ptr(), 0, 1, 1, 4096, 4) });
+    for expected in ["\"matches_seen\":\"5\"", "\"name\":\"K\"", "\"member\":\"1\"",
+        "\"skipped_matches\":\"4\"", "\"has_more_matches\":false", "\"next_match_offset\":null"] {
+        assert!(last.contains(expected), "missing {expected}: {last}");
+    }
+    let count = take(unsafe { fcb_saved_structure_search_matching(handle, 3, 4, 0,
+        needle.as_ptr(), 0, 1, 0, 4096) });
+    for expected in ["\"matches_seen\":\"5\"", "\"retained_hits\":\"0\"",
+        "\"complete\":true", "\"matches_seen_exact\":true", "\"has_more_matches\":false"] {
+        assert!(count.contains(expected), "missing {expected}: {count}");
+    }
+    // The legacy ABI still applies exact spelling after a lowercase query.
+    let exact = search(handle, 4, 4, 0, "K");
+    assert!(exact.contains("\"case_sensitive\":true") && exact.contains("\"matches_seen\":\"2\""), "{exact}");
+    assert_eq!(fcb_saved_close(handle), 1);
+    assert!(take(crate::reader_ffi::fcb_reader_copy_range(reader, 6, 8))
+        .contains("\"original_hex\":\"2a21\""));
+    assert_eq!(crate::reader_ffi::fcb_reader_close(reader), 1);
 }

@@ -122,6 +122,39 @@ char *fcb_atlas_structure_indexed_begin_window(uint64_t handle, uint64_t generat
     uint64_t path_kind, const char *path, uint64_t count_all_matches,
     uint64_t result_offset, uint64_t max_matches, uint64_t max_scan_bytes);
 
+/* Matching variants add case_sensitive, strictly 0 or 1. A zero value is
+ * supported for mode=4 (Occurrences), name_mode=0, and compares the Unicode
+ * scalar lowercase expansions of complete original tokens. No full case
+ * folding, normalization or partial expansion match is performed. Symbols
+ * and headings require case_sensitive=1. Legacy entry points above remain
+ * case sensitive.
+ *
+ * Receipts preserve case_sensitive and name_case ("sensitive" or
+ * "unicode-lowercase") through progress, metadata pages and later windows.
+ * structure.name is each match's ORIGINAL decoded source spelling; its UTF-8
+ * length can differ from needle. Original-byte ranges and capture identities
+ * remain authoritative for activation. All limits and pointer contracts above
+ * apply. The window variant validates both flags before reading needle.
+ */
+char *fcb_atlas_structure_begin_matching(uint64_t handle, uint64_t generation,
+    uint64_t mode, uint64_t name_mode, const char *needle,
+    const char *extensions, const char *filenames, uint64_t path_kind,
+    const char *path, uint64_t case_sensitive, uint64_t max_matches,
+    uint64_t max_files, uint64_t max_file_bytes, uint64_t max_source_bytes);
+
+char *fcb_atlas_structure_indexed_begin_matching(uint64_t handle, uint64_t generation,
+    uint64_t index_generation, uint64_t mode, uint64_t name_mode,
+    const char *needle, const char *extensions, const char *filenames,
+    uint64_t path_kind, const char *path, uint64_t case_sensitive,
+    uint64_t max_matches, uint64_t max_scan_bytes);
+
+char *fcb_atlas_structure_indexed_begin_window_matching(uint64_t handle, uint64_t generation,
+    uint64_t index_generation, uint64_t mode, uint64_t name_mode,
+    const char *needle, const char *extensions, const char *filenames,
+    uint64_t path_kind, const char *path, uint64_t case_sensitive,
+    uint64_t count_all_matches, uint64_t result_offset, uint64_t max_matches,
+    uint64_t max_scan_bytes);
+
 #ifdef __cplusplus
 }
 #endif

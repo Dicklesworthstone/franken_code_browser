@@ -98,6 +98,8 @@ pub(super) enum Command<'a> {
     References { generation: u64, name: &'a str, max_items: usize },
     ReferencesWindow { generation: u64, name: &'a str, max_items: usize,
         count_all_matches: bool, result_offset: u64 },
+    ReferencesMatchingWindow { generation: u64, name: &'a str, max_items: usize,
+        case_sensitive: bool, count_all_matches: bool, result_offset: u64 },
     ReferencePage { generation: u64, start: usize, limit: usize },
     Reference { generation: u64, id: u64, context: usize },
     CopyReference { generation: u64, id: u64 },
@@ -370,6 +372,9 @@ impl ReaderSessions {
             Command::References { generation, name, max_items } => reader.prepare_references(generation, name, max_items, &mut stop),
             Command::ReferencesWindow { generation, name, max_items, count_all_matches, result_offset } =>
                 reader.prepare_references_window(generation, name, max_items, count_all_matches, result_offset, &mut stop),
+            Command::ReferencesMatchingWindow { generation, name, max_items, case_sensitive, count_all_matches, result_offset } =>
+                reader.prepare_references_matching_window(generation, name, max_items, case_sensitive,
+                    count_all_matches, result_offset, &mut stop),
             Command::ReferencePage { generation, start, limit } => reader.reference_page(generation, start, limit, &mut stop),
             Command::Reference { generation, id, context } => reader.reference_window(generation, id, context, &mut stop),
             Command::CopyReference { generation, id } => reader.copy_reference(generation, id, &mut stop),

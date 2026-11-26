@@ -525,9 +525,11 @@ char *fcb_saved_structure_search_page(uint64_t handle, uint64_t generation,
     uint64_t mode, uint64_t name_mode, const char *needle,
     uint64_t max_hits, uint64_t max_source_bytes, uint64_t skip_matches);
 /* Matching/count variants preserve the legacy functions and generation space.
- * Both flags are exactly 0 or 1. case_sensitive=0 compares symbol and heading
- * names with Unicode scalar lowercase, not full folding or normalization.
- * Occurrences require case_sensitive=1 and exact token-name matching.
+ * Both flags are exactly 0 or 1. case_sensitive=0 compares symbol/heading
+ * names and whole-token occurrences with Unicode scalar lowercase, not full
+ * folding or normalization. Occurrences still require name_mode=0 and a valid
+ * shared-engine token name. Each result retains its ORIGINAL source spelling,
+ * whose UTF-8 length can differ from needle; source ranges remain exact.
  *
  * count_all_matches=1 continues admitted extraction after max_hits is reached;
  * the limit bounds retained witnesses only. max_hits=0 counts without rows or a

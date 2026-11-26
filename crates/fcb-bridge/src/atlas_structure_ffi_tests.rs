@@ -23,6 +23,19 @@ fn structural_query_signature_and_public_header_match() {
         = fcb_atlas_structure_indexed_begin_window;
     assert_eq!(header.matches("fcb_atlas_structure_indexed_begin_window(").count(), 1);
     assert!(header.contains("retained-capture-structure"));
+    let _: unsafe extern "C" fn(u64, u64, u64, u64, *const c_char, *const c_char,
+        *const c_char, u64, *const c_char, u64, u64, u64, u64, u64) -> *mut c_char
+        = fcb_atlas_structure_begin_matching;
+    let _: unsafe extern "C" fn(u64, u64, u64, u64, u64, *const c_char,
+        *const c_char, *const c_char, u64, *const c_char, u64, u64, u64) -> *mut c_char
+        = fcb_atlas_structure_indexed_begin_matching;
+    let _: unsafe extern "C" fn(u64, u64, u64, u64, u64, *const c_char,
+        *const c_char, *const c_char, u64, *const c_char, u64, u64, u64, u64, u64) -> *mut c_char
+        = fcb_atlas_structure_indexed_begin_window_matching;
+    for name in ["fcb_atlas_structure_begin_matching(", "fcb_atlas_structure_indexed_begin_matching(",
+        "fcb_atlas_structure_indexed_begin_window_matching("] {
+        assert_eq!(header.matches(name).count(), 1, "{name}");
+    }
 }
 
 
@@ -353,4 +366,53 @@ fn c_structural_windows_validate_inputs_and_full_width_offsets_without_losing_re
     assert!(limited.contains("\"search_complete\":false"), "{limited}");
     assert_eq!(integer(&limited, "pending_files"), 1);
     assert_eq!(integer(&limited, "source_bytes_read"), 0);
+}
+
+#[test]
+fn c_matching_occurrences_share_policy_across_live_indexed_windows_and_exact_reader_copies() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let mut fixture = Fixture::new(&[("source.txt", "k K K kx _K".as_bytes())]);
+    let name = CString::new("K").unwrap(); let null = std::ptr::null();
+    let started = take(unsafe { fcb_atlas_structure_begin_matching(fixture.handle, 1,
+        4, 0, name.as_ptr(), null, null, 0, null, 0, 100, 100, 1024, 1024) });
+    assert!(started.contains("\"status\":\"ok\""), "{started}");
+    let live = finish(fixture.handle, 1);
+    assert_eq!(integer(&live, "retained_hits"), 3);
+    assert!(live.contains("\"case_sensitive\":false"));
+    assert!(live.contains("\"name_case\":\"unicode-lowercase\""));
+    assert!(live.contains("\"name\":\"K\""));
+    let prepared = take(fcb_atlas_index_prepare(fixture.handle, 2, 100, 1024, 1024, 0));
+    assert!(prepared.contains("\"capture_complete\":true"), "{prepared}");
+    fs::write(fixture.root.join("source.txt"), b"replacement").unwrap();
+    let later = take(unsafe { fcb_atlas_structure_indexed_begin_window_matching(fixture.handle, 3, 2,
+        4, 0, name.as_ptr(), null, null, 0, null, 0, 1, 2, 1, 1024) });
+    assert!(later.contains("\"status\":\"ok\""), "{later}");
+    let page = finish(fixture.handle, 3);
+    for (field, expected) in [("matches_seen", 3), ("retained_hits", 1), ("occurrence_id", 3),
+        ("source_bytes_read", 0), ("read_calls", 0)] { assert_eq!(integer(&page, field), expected); }
+    assert!(page.contains("\"name_case\":\"unicode-lowercase\""));
+    assert!(page.contains("\"name\":\"K\""));
+    assert!(page.contains("\"next_match_offset\":null"));
+    let reader = fcb_reader_create(); assert_ne!(reader, 0);
+    assert!(take(fcb_atlas_search_open_reader(fixture.handle, reader, 3, 1))
+        .contains("\"source_reopened\":false"));
+    let direct = take(unsafe { fcb_atlas_structure_indexed_begin_matching(fixture.handle, 4, 2,
+        4, 0, name.as_ptr(), null, null, 0, null, 0, 10, 1024) });
+    assert!(direct.contains("\"status\":\"ok\""), "{direct}");
+    assert_eq!(integer(&finish(fixture.handle, 4), "retained_hits"), 3);
+    let exact = take(unsafe { fcb_atlas_structure_indexed_begin(fixture.handle, 5, 2,
+        4, 0, name.as_ptr(), null, null, 0, null, 10, 1024) });
+    assert!(exact.contains("\"status\":\"ok\""), "{exact}");
+    let legacy = finish(fixture.handle, 5);
+    assert_eq!(integer(&legacy, "retained_hits"), 1);
+    assert!(legacy.contains("\"name_case\":\"sensitive\""));
+    for (case_sensitive, counted) in [(2, 0), (0, 2), (u64::MAX, 1)] {
+        let refused = take(unsafe { fcb_atlas_structure_indexed_begin_window_matching(fixture.handle, 6, 2,
+            4, 0, null, null, null, 0, null, case_sensitive, counted, 0, 1, 1024) });
+        assert!(refused.contains("INVALID_ARGUMENT"));
+    }
+    assert_eq!(integer(&take(fcb_atlas_search_page(fixture.handle, 5, 0, 100)), "retained_hits"), 1);
+    fixture.close();
+    assert!(take(fcb_reader_copy_range(reader, 4, 7)).contains("\"original_hex\":\"e284aa\""));
+    assert_eq!(fcb_reader_close(reader), 1);
 }
