@@ -2920,10 +2920,19 @@ exact Unicode spelling, and includes overlapping occurrences. The response
 counts every match in the accepted document; **Previous match** and **Next
 match** navigate across bounded pages of results.
 
-Opening a match selects **Text** and shows the logical flow context where it
-starts. Separators between displayed rows lead to the next available row;
+Opening a match temporarily shows **Text** and its logical flow context, with
+the selected occurrence highlighted and underlined. A phrase spanning wrapped
+rows or pages highlights each visible matching segment. Exact UTF-8 spelling
+is preserved when translating those segments into native text attributes;
+combining marks and non-BMP characters keep their correct positions. This
+temporary Text presentation preserves a chosen Styled preference for a later
+explicit reflow. Choosing Text explicitly still keeps that preference.
+
+Separators between displayed rows lead to the next available row;
 trailing separators lead to the last row. A document that renders only
-separators can have matches with an empty display context. These locations are
+separators can have matches with an empty display context. Separators and
+trimmed padding remain counted without highlighting adjacent text or a blank-row
+placeholder. These locations are
 rendered UTF-8 ranges. The existing **Show source** and copy actions continue
 to use their qualified enclosing-source mapping.
 
@@ -2933,7 +2942,7 @@ rendered text using the shared incremental matcher, with bounded cancellation
 checks and no source reads, reparsing or full-document hit table. Native query,
 job, document-generation and page identities fence asynchronous results.
 Editing the query, reflowing, replacing the capture or closing the preview
-withdraws stale Find actions. A failed or canceled search preserves the
+withdraws stale Find actions and highlights. A failed or canceled search preserves the
 accepted preview and source reader.
 
 The public host method is `ReaderSession::find_document`; the C entrypoint is

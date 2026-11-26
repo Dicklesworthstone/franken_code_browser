@@ -209,6 +209,14 @@ struct AtlasMarkdownPreviewPreference {
               results.needle.utf8.elementsEqual(findInput.utf8) else { return nil }
         return results
     }
+    /// A visible logical-text decoration, not a source selection or Styled
+    /// glyph map. Old view callbacks cannot borrow the replacement page token.
+    func findHighlight(for line: AtlasReaderDocumentLine, pageID: UUID) -> NSRange? {
+        guard authorized, !showsStyled, let page, page.id == pageID,
+              let results = currentFindResults, let selectedFindID,
+              let target = results.target(id: selectedFindID) else { return nil }
+        return AtlasRenderedFindHighlight.range(in: line, page: page, target: target)
+    }
     var findStatus: String {
         if let results = currentFindResults {
             if results.total == 0 { return "No matches in the rendered document." }
@@ -617,7 +625,8 @@ struct AtlasMarkdownPreviewPreference {
                   model.page?.id == previous.id,
                   model.history.commit(move, resolved: page.first) else { throw AtlasReaderError.invalidResponse }
             model.installNavigationPage(page, display: nil)
-            model.prefersStyled = false
+            // Find presents exact logical text without changing the user's
+            // preferred presentation for a later explicit reflow or toggle.
             model.selectedFindID = target.match.id
             model.authorized = true; model.canRestoreNavigation = false
         }
@@ -643,8 +652,9 @@ struct AtlasMarkdownPreviewPreference {
                 guard let target = matches.target(id: selected) else { throw AtlasReaderError.invalidResponse }
                 selectedTarget = target
                 // A match range may cross rows or name renderer separators.
-                // Open the engine's context row; never synthesize a highlight
-                // or an original-source selection from these rendered offsets.
+                // Open the engine's context row. Only its visible exact text
+                // can be highlighted; these offsets confer no original-source
+                // selection or native Styled glyph correspondence.
                 self?.authorized = false; self?.canRestoreNavigation = true; self?.source = nil
                 let opened = try await execute(.findMatch(target))
                 guard case .page(let page) = opened, page.inventory.matches(matches.inventory),
@@ -660,7 +670,6 @@ struct AtlasMarkdownPreviewPreference {
                     guard matches.target(id: selectedTarget.match.id) == selectedTarget,
                           model.history.commit(move, resolved: restored.first) else { throw AtlasReaderError.invalidResponse }
                     model.installNavigationPage(restored, display: nil)
-                    model.prefersStyled = false
                     model.selectedFindID = selectedTarget.match.id
                     model.authorized = true; model.canRestoreNavigation = false
                 } else {

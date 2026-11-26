@@ -12,6 +12,8 @@ import Foundation
     var holdFindWindow = false
     var findTotal: UInt64 = 130
     var findStartLine: UInt64 = 17
+    var findOffsets: [UInt64]?
+    var rowText: [UInt64: String] = [:]
     var renderedBytes: UInt64 = 16384
     var totalHeadings: UInt64 = 130
     var exactSourceRows = false
@@ -126,15 +128,16 @@ import Foundation
             next: end < totalDisplayItems ? end : nil)
     }
     func matches(needle: String, first: UInt64) -> AtlasReaderDocumentMatches {
-        let inventory = inventory!, end = min(first + AtlasReaderDocumentLimits.findMatches, findTotal)
+        let inventory = inventory!, total = findOffsets.map { UInt64($0.count) } ?? findTotal
+        let end = min(first + AtlasReaderDocumentLimits.findMatches, total)
         let rows = (first..<end).map { index in
-            let offset = totalLines == 0 ? index : index * 2
+            let offset = findOffsets?[Int(index)] ?? (totalLines == 0 ? index : index * 2)
             return AtlasReaderDocumentMatch(id: index + 1,
                 rendered: .init(start: offset, end: offset + UInt64(needle.utf8.count)),
                 firstLine: totalLines == 0 ? 0 : min(totalLines - 1, findStartLine + index))
         }
         return .init(id: UUID(), inventory: inventory, needle: needle, first: first,
-            rows: rows, total: findTotal, next: end < findTotal ? end : nil)
+            rows: rows, total: total, next: end < total ? end : nil)
     }
     func links(first: UInt64) -> AtlasReaderDocumentLinks {
         let inventory = inventory!, total: UInt64 = 130, end = min(total, first + 64)
@@ -168,7 +171,7 @@ import Foundation
         for row in first..<end {
             let rendered = AtlasDocumentByteRange(start: row * 16, end: row * 16 + 15)
             let original = AtlasDocumentByteRange(start: 3 + row * 8, end: 7 + row * 8)
-            lines.append(AtlasReaderDocumentLine(id: row, text: "Row \(row)",
+            lines.append(AtlasReaderDocumentLine(id: row, text: rowText[row] ?? "Row \(row)",
                 rendered: rendered, enclosingOriginal: unmappedRows.contains(row) ? nil : original))
         }
         return .init(id: UUID(), inventory: inventory, first: first, lines: lines,
@@ -446,6 +449,7 @@ import Foundation
         await sourceFollowing()
         await styledNavigationTransactions()
         await documentFind()
+        await documentFindHighlights()
         for encoding in ["utf16le", "utf16be"] {
             let f = Fixture(); f.identity = Fixture.identity(encoding: encoding)
             let m = f.model()
@@ -1312,6 +1316,169 @@ import Foundation
             m.openExternalLink(target) { _ in opens += 1; return true }
             check(opens == 0 && f.requests.count == requests && m.notice.contains("Only absolute HTTP"),
                   "A disallowed address reached the worker or OS adapter")
+        }
+    }
+
+    @MainActor private static func documentFindHighlights() async {
+        func line(_ id: UInt64, _ text: String, _ start: UInt64, _ end: UInt64) -> AtlasReaderDocumentLine {
+            .init(id: id, text: text, rendered: .init(start: start, end: end), enclosingOriginal: nil)
+        }
+        func page(_ lines: [AtlasReaderDocumentLine], generation: UInt64 = 1) -> AtlasReaderDocumentPage {
+            let inventory = AtlasReaderDocumentInventory(identity: Fixture.identity(), generation: generation,
+                width: 96, totalLines: (lines.last?.id ?? 0) + 1, totalHeadings: 0,
+                renderedBytes: max(1024, lines.map(\.rendered.end).max() ?? 0), sourceBase: 3)
+            return .init(id: UUID(), inventory: inventory, first: lines.first?.id ?? 0, lines: lines,
+                next: nil, wholeDocumentVisible: false)
+        }
+        func target(_ page: AtlasReaderDocumentPage, _ needle: String, _ start: UInt64,
+                    _ end: UInt64, id: UInt64 = 1) -> AtlasReaderDocumentMatchTarget {
+            .init(inventory: page.inventory, pageID: UUID(), needle: needle,
+                match: .init(id: id, rendered: .init(start: start, end: end), firstLine: page.first))
+        }
+        func highlight(_ page: AtlasReaderDocumentPage, _ target: AtlasReaderDocumentMatchTarget,
+                       _ row: Int = 0) -> NSRange? {
+            AtlasRenderedFindHighlight.range(in: page.lines[row], page: page, target: target)
+        }
+        do {
+            let p = page([line(0, "hit then hit", 0, 12)])
+            check(highlight(p, target(p, "hit", 9, 12, id: 2)) == NSRange(location: 9, length: 3),
+                "Only the selected repeated occurrence receives a highlight")
+            check(highlight(p, target(p, "hit", 0, 3)) == NSRange(location: 0, length: 3),
+                "Selecting an earlier occurrence moves the exact text decoration")
+        }
+        do {
+            let p = page([line(0, "bold", 0, 5), line(1, "phrase", 5, 11)])
+            let hit = target(p, "bold phrase", 0, 11)
+            check(highlight(p, hit) == NSRange(location: 0, length: 4)
+                    && highlight(p, hit, 1) == NSRange(location: 0, length: 6),
+                "A wrapped phrase highlights both visible segments without inventing its trimmed space")
+            let later = AtlasReaderDocumentPage(id: UUID(), inventory: p.inventory, first: 1,
+                lines: [p.lines[1]], next: nil, wholeDocumentVisible: false)
+            check(highlight(later, hit) == NSRange(location: 0, length: 6),
+                "A later page can display the remaining segment of a match that began on the previous page")
+            check(highlight(p, target(p, " ", 4, 5)) == nil
+                    && highlight(p, target(p, " ", 4, 5), 1) == nil,
+                "Layout trailing whitespace does not highlight an adjacent character")
+        }
+        do {
+            let p = page([line(0, "left", 0, 4), line(1, "right", 5, 10), line(2, "", 10, 11)])
+            let hit = target(p, "ft\nri", 2, 7)
+            check(highlight(p, hit) == NSRange(location: 2, length: 2)
+                    && highlight(p, hit, 1) == NSRange(location: 0, length: 2),
+                "Visible portions of a match spanning a rendered separator remain exact")
+            let separator = target(p, "\n", 4, 5)
+            check(p.lines.indices.allSatisfy { highlight(p, separator, $0) == nil },
+                "A separator-only match keeps its context without a false visible highlight")
+            check(highlight(p, target(p, "\n", 10, 11), 2) == nil,
+                "The blank-row placeholder is not part of the rendered match")
+        }
+        do {
+            let p = page([line(0, "π😀 café e\u{301}!", 0, 17)])
+            check(highlight(p, target(p, "café e\u{301}", 7, 16)) == NSRange(location: 4, length: 7),
+                "UTF-8 coordinates become bounded UTF-16 text attributes after a non-BMP prefix")
+            check(highlight(p, target(p, "\u{301}", 14, 16)) == NSRange(location: 10, length: 1),
+                "A combining scalar retains its own exact text coordinate")
+            check(highlight(p, target(p, "cafe\u{301}", 7, 13)) == nil,
+                "Canonical equivalence cannot replace the selected query bytes")
+            check(highlight(p, target(p, "x", 3, 4)) == nil,
+                "A forged scalar-interior range cannot produce a highlight")
+        }
+        do {
+            let accepted = line(0, "cafe\u{301}", 0, 6), substituted = line(0, "café", 0, 6)
+            let p = page([accepted])
+            check(accepted.text == substituted.text && !accepted.text.utf8.elementsEqual(substituted.text.utf8),
+                "The membership negative control has canonically equal text with distinct original bytes")
+            check(AtlasRenderedFindHighlight.range(in: substituted, page: p,
+                target: target(p, "café", 0, 5)) == nil,
+                "A canonically equivalent forged row cannot replace the accepted page's actual UTF-8 text")
+            check(highlight(p, target(p, "cafe\u{301}", 0, 6)) == NSRange(location: 0, length: 5),
+                "The accepted decomposed spelling still receives its exact text highlight")
+        }
+        do {
+            let p = page([line(0, "needle", 0, 6)]), hit = target(page([line(0, "needle", 0, 6)]), "needle", 0, 6)
+            check(highlight(p, hit) == NSRange(location: 0, length: 6),
+                "Independent response pages can agree on the same immutable logical inventory")
+            let replacement = page(p.lines, generation: 2)
+            check(highlight(replacement, hit) == nil, "A replacement layout cannot borrow an old match range")
+            check(AtlasRenderedFindHighlight.range(in: line(0, "other!", 0, 6), page: p, target: hit) == nil,
+                "A row absent from the accepted page cannot borrow its identity")
+            for invalid in [target(p, "need", 0, 6), target(p, "noodle", 0, 6),
+                            target(p, "", 0, 0), target(p, "needle", 2, 1),
+                            target(p, "needle", UInt64.max - 6, UInt64.max)] {
+                check(highlight(p, invalid) == nil, "Invalid range, query, or visible bytes received a highlight")
+            }
+            let long = page([line(0, String(repeating: "a", count: 1025), 0, 1025)])
+            check(highlight(long, target(long, String(repeating: "a", count: 1024), 0, 1024))
+                    == NSRange(location: 0, length: 1024)
+                    && highlight(long, target(long, String(repeating: "a", count: 1025), 0, 1025)) == nil,
+                "The inclusive query-byte allowance also bounds highlight matching work")
+            let clipped = page([line(0, "needle", 0, 5)])
+            check(highlight(clipped, target(clipped, "needle", 0, 6)) == nil,
+                "Visible text wider than its claimed rendered range is refused")
+            let large = page([line(0, String(repeating: "a", count: 256 * 1024 + 1), 0, 256 * 1024 + 1)])
+            check(highlight(large, target(large, "a", 0, 1)) == nil, "Decoration cannot enlarge the row text budget")
+            // Pure coordinate arithmetic only: the production Find decoder
+            // separately enforces its much smaller document scan allowance.
+            let high = page([line(0, "needle", UInt64.max - 6, UInt64.max)])
+            check(highlight(high, target(high, "needle", UInt64.max - 6, UInt64.max)) == NSRange(location: 0, length: 6),
+                "Global full-width offsets are subtracted before conversion to native local indices")
+        }
+        func fixture() -> Fixture {
+            let f = Fixture()
+            f.exactSourceRows = true
+            f.findOffsets = [279, 295, 311]
+            f.rowText = [17: "Row 17 needle", 18: "Row 18 needle", 19: "Row 19 needle"]
+            return f
+        }
+        do {
+            let f = fixture(), m = f.model(richSupported: true)
+            await ready(f, m)
+            m.findInput = "needle"; m.find(); await wait { !m.busy }
+            let first = m.page!, row = first.lines[0]
+            check(!m.showsStyled && m.findHighlight(for: row, pageID: first.id) == NSRange(location: 7, length: 6),
+                "Find opens Text with the selected occurrence visibly identified")
+            check(m.findHighlight(for: first.lines[1], pageID: first.id) == nil,
+                "Another identical phrase on this page is not the selected occurrence")
+            m.nextFind(); await wait { !m.busy }
+            let second = m.page!
+            check(m.selectedFindID == 2
+                    && m.findHighlight(for: second.lines[0], pageID: second.id) == NSRange(location: 7, length: 6),
+                "Next match moves both the logical page and its selected highlight")
+            check(m.findHighlight(for: row, pageID: first.id) == nil
+                    && m.findHighlight(for: second.lines[0], pageID: first.id) == nil,
+                "An old view token cannot lend its match decoration to a replacement page")
+            m.widthInput = "80"; m.prepare(); await wait { !m.busy }
+            check(m.findResults == nil && m.showsStyled && m.findHighlight(for: row, pageID: first.id) == nil,
+                "Reflow revokes old matches and restores the user's Styled preference after temporary Text Find")
+            m.selectStyled(false); await wait { !m.busy }
+            m.find(); await wait { !m.busy }
+            m.widthInput = "88"; m.prepare(); await wait { !m.busy }
+            check(!m.showsStyled, "An explicit Text choice remains Text after Find and reflow")
+        }
+        do {
+            let f = fixture(), m = f.model()
+            await ready(f, m)
+            m.findInput = "needle"; m.find(); await wait { !m.busy }
+            let prior = m.page!, row = prior.lines[0]
+            f.holdFindWindow = true; m.nextFind(); await wait { f.pending.count == 1 }
+            check(m.findHighlight(for: row, pageID: prior.id) == nil,
+                "Pending match navigation cannot leave an old highlight authorized")
+            m.cancel(); f.release(); await settle()
+            check(m.page?.id == prior.id && m.findHighlight(for: row, pageID: prior.id) == nil,
+                "A canceled late context page cannot publish its match decoration")
+            f.holdFindWindow = false; m.find(); await wait { !m.busy }
+            let recovered = m.page!
+            check(m.findHighlight(for: recovered.lines[0], pageID: recovered.id) == NSRange(location: 7, length: 6),
+                "A fresh Find restores a verified highlight after canceled context navigation")
+            f.held = true; m.find(); await wait { f.pending.count == 1 }
+            m.findInput = "different"; f.release(); await settle()
+            check(m.findResults == nil && m.findHighlight(for: recovered.lines[0], pageID: recovered.id) == nil,
+                "Editing the query revokes both accepted and late Find decorations")
+            m.bind(identity: Fixture.identity(revision: 2), sourceOffset: 0)
+            check(m.findHighlight(for: recovered.lines[0], pageID: recovered.id) == nil,
+                "Replacing the capture cannot reuse a prior rendered range")
+            m.close()
+            check(m.page == nil && m.findResults == nil, "Closing releases the Find presentation state")
         }
     }
 

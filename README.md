@@ -338,7 +338,9 @@ Executable and physical-Mac verification remain pending.
 **Find in a Markdown preview searches the rendered document.** Literal phrases can
 cross emphasis or link markup, with a complete match count and Previous/Next navigation
 through bounded result pages. Each match opens its logical text context using the retained
-layout; source actions keep their existing provenance checks. See
+layout and highlights the selected occurrence, including visible segments across
+wrapped rows. Find temporarily shows Text while preserving the chosen Styled
+preference for a later reflow; source actions keep their existing provenance checks. See
 [finding rendered text](native/macos/README.md#finding-text-in-a-markdown-preview)
 for exact matching rules, limits and pending independent verification.
 

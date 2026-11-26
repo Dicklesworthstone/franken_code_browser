@@ -13,6 +13,7 @@ import AppKit
     var closePreview: (() -> Void)?
     var returnToSource: (() -> Void)?
     @Environment(\.dismiss) private var dismiss
+    @AtlasAppearance private var appearance
     @State private var showsContents = false
     @State private var browsesLinks = false
     @State private var shownSource: AtlasSource?
@@ -168,7 +169,7 @@ import AppKit
                             Text(String(line.id + 1))
                                 .font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary)
                                 .frame(width: 38, alignment: .trailing).accessibilityHidden(true)
-                            Text(verbatim: line.text.isEmpty ? " " : line.text)
+                            Text(renderedLine(line, page: page))
                                 .font(.system(size: 13, design: .monospaced))
                                 .textSelection(.enabled)
                                 .fixedSize(horizontal: true, vertical: true)
@@ -214,6 +215,17 @@ import AppKit
             }
             .padding(20).frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+    }
+
+    private func renderedLine(_ line: AtlasReaderDocumentLine, page: AtlasReaderDocumentPage) -> AttributedString {
+        let text = NSMutableAttributedString(string: line.text.isEmpty ? " " : line.text)
+        if let range = model.findHighlight(for: line, pageID: page.id) {
+            text.addAttributes([
+                .backgroundColor: appearance.search.withAlpha(appearance.increasedContrast ? 0.35 : 0.22).nsColor,
+                .underlineStyle: NSUnderlineStyle.single.rawValue
+            ], range: range)
+        }
+        return AttributedString(text)
     }
 
     private var documentNavigation: some View {

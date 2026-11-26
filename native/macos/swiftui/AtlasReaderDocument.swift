@@ -290,6 +290,39 @@ struct AtlasReaderDocumentMatches: Sendable {
     }
 }
 
+/// Decoration of the accepted logical text only. The shared reader verifies
+/// that each row is the visible prefix of its rendered UTF-8 range, with layout
+/// trailing whitespace removed. Intersect that prefix with one selected match;
+/// never paint an adjacent row for a separator or infer original/glyph ranges.
+enum AtlasRenderedFindHighlight {
+    static func range(in line: AtlasReaderDocumentLine, page: AtlasReaderDocumentPage,
+                      target: AtlasReaderDocumentMatchTarget) -> NSRange? {
+        let match = target.match.rendered, count = UInt64(line.text.utf8.count)
+        guard page.inventory.matches(target.inventory),
+              page.lines.count <= Int(AtlasReaderDocumentLimits.pageLines), page.lines.contains(line),
+              AtlasReaderDocumentLimits.validFindNeedle(target.needle),
+              match.valid(upTo: page.inventory.renderedBytes, nonempty: true),
+              match.length == UInt64(target.needle.utf8.count),
+              line.rendered.valid(upTo: page.inventory.renderedBytes),
+              count <= AtlasReaderDocumentLimits.pageTextBytes, count <= line.rendered.length else { return nil }
+        // Addition cannot overflow: visible bytes fit within the checked row
+        // range. Convert only bounded local differences to native indices.
+        let start = max(match.start, line.rendered.start)
+        let end = min(match.end, line.rendered.start + count)
+        guard start < end else { return nil }
+        let local = Int(start - line.rendered.start)..<Int(end - line.rendered.start)
+        let expected = Int(start - match.start)..<Int(end - match.start)
+        let bytes = Array(line.text.utf8), needle = Array(target.needle.utf8)
+        // Independent replies must agree about the actual visible characters.
+        // Strict decoding refuses scalar-interior boundaries; no normalization
+        // or replacement characters may broaden the selected occurrence.
+        guard bytes[local].elementsEqual(needle[expected]),
+              let prefix = String(bytes: bytes[..<local.lowerBound], encoding: .utf8),
+              let selected = String(bytes: bytes[local], encoding: .utf8) else { return nil }
+        return NSRange(location: prefix.utf16.count, length: selected.utf16.count)
+    }
+}
+
 /// These are engine classifications, not permission to open a filesystem path
 /// or external URL. Occurrence IDs are local to this exact document generation.
 enum AtlasReaderDocumentLinkKind: String, Sendable, Decodable {
