@@ -108,6 +108,15 @@ private final class ReleaseProbe {
 /// lifetime admission. The injected bytes are fixtures, not a source parser or
 /// proof of a native window/GPU performance result.
 @MainActor @main struct AtlasViewportResidencyTests {
+    /// Tests drive the production pressure controller explicitly; host memory
+    /// pressure must never change fixture demand or timing behind their backs.
+    static func residency(limits: AtlasViewportLimits = AtlasViewportLimits(),
+        transport: AtlasViewportSourceTransport = .live, markdown: AtlasViewportMarkdownTransport? = nil,
+        memoryPressure: AtlasViewportMemoryPressure? = nil) -> AtlasViewportResidency {
+        AtlasViewportResidency(limits: limits, transport: transport, markdown: markdown,
+            memoryPressure: memoryPressure ?? AtlasViewportMemoryPressure())
+    }
+
     static func entry(_ id: UInt64, _ path: String, x: Double = 0, y: Double = 0,
         width: Double = 160, height: Double = 120, bytes: UInt64 = 32) -> AtlasProjectCatalog.Entry {
         .init(id: id, rawPath: Array(path.utf8), displayPath: path, sourcePath: path, observedBytes: bytes,
@@ -152,11 +161,17 @@ private final class ReleaseProbe {
         try await preparedArtifactCancellationRetainsEnteredLease()
         try await preparedFontChangeRejectsEnteredCandidate()
         try await preparedCacheRefusalAndDecoderBudgetsPreserveSource()
-        print("AtlasViewportResidency: 26 real worker/demand/placement/lifetime/cache scenarios passed")
+        pressureRecoveryRequiresQuietIntervals()
+        try await pressureTrimsBytesAndRetainsIndependentOwners()
+        try await criticalPressureRejectsCanceledCaptureAfterRecovery()
+        try await pressureRecoveryRestoresStationaryDemandInStages()
+        try await pressureRecoveryRetriesCapacityWithUnchangedDemand()
+        try await pressureRespectsHiddenClosedAndReinstalledViews()
+        print("AtlasViewportResidency: 32 real worker/demand/placement/lifetime/cache/pressure scenarios passed")
     }
 
     static func coldOverviewAndLateParcel() async throws {
-        let fixture = ViewportFixture(), model = AtlasViewportResidency(transport: fixture.transport)
+        let fixture = ViewportFixture(), model = residency(transport: fixture.transport)
         // Metadata before the target exceeds the former eager 64MiB prefix.
         let files = (0..<80).map { entry(UInt64($0 + 1), "file-\($0).rs", x: Double($0) * 200, bytes: 2 * 1024 * 1024) }
         let layout = UUID()
@@ -188,7 +203,7 @@ private final class ReleaseProbe {
     }
 
     static func denseRegionHasNoPrefixStarvation() async throws {
-        let fixture = ViewportFixture(), model = AtlasViewportResidency(transport: fixture.transport)
+        let fixture = ViewportFixture(), model = residency(transport: fixture.transport)
         var files = (0..<5000).map {
             entry(UInt64($0 + 1), "dense-\($0).rs", x: Double($0) / 10_000, width: 0.00008, height: 0.001)
         }
@@ -206,7 +221,7 @@ private final class ReleaseProbe {
     }
 
     static func readerOnlyMetadataDoesNotCrowdOutSource() async throws {
-        let fixture = ViewportFixture(), model = AtlasViewportResidency(transport: fixture.transport)
+        let fixture = ViewportFixture(), model = residency(transport: fixture.transport)
         // More than an entire spatial candidate window of reader-only parcels
         // near the viewport center must leave the visible source reachable.
         let oversized = UInt64(AtlasViewportLimits.sourceFileBytes) + 1
@@ -224,7 +239,7 @@ private final class ReleaseProbe {
     static func stationaryViewportBackfillsUnavailableSource() async throws {
         var limits = AtlasViewportLimits(); limits.maximumDemand = 1
         let fixture = ViewportFixture(initiallyUnavailable: true)
-        let model = AtlasViewportResidency(limits: limits, transport: fixture.transport)
+        let model = residency(limits: limits, transport: fixture.transport)
         let first = entry(1, "first.rs"), second = entry(2, "second.rs", x: 160)
         precondition(model.install(root: "/fixture", entries: [first, second], layoutRevision: UUID(), accessLease: nil))
         model.updateViewport(rect(first).union(rect(second)), scale: 1, selectedPath: first.sourcePath)
@@ -241,7 +256,7 @@ private final class ReleaseProbe {
     }
 
     static func newestDemandWaitsForEnteredCapture() async throws {
-        let fixture = ViewportFixture(blockFirst: true), model = AtlasViewportResidency(transport: fixture.transport)
+        let fixture = ViewportFixture(blockFirst: true), model = residency(transport: fixture.transport)
         let a = entry(1, "a.rs"), b = entry(2, "b.rs", x: 1000)
         precondition(model.install(root: "/fixture", entries: [a, b], layoutRevision: UUID(), accessLease: nil))
         model.updateViewport(rect(a), scale: 4, selectedPath: nil)
@@ -259,7 +274,7 @@ private final class ReleaseProbe {
     }
 
     static func replacedRootDrainsItsGrant() async throws {
-        let fixture = ViewportFixture(blockFirst: true), model = AtlasViewportResidency(transport: fixture.transport)
+        let fixture = ViewportFixture(blockFirst: true), model = residency(transport: fixture.transport)
         let file = entry(1, "same.rs")
         var grant: ViewportAccess? = ViewportAccess()
         weak var observedGrant = grant
@@ -285,7 +300,7 @@ private final class ReleaseProbe {
 
     static func selectedProtectionCapacityRetryAndEviction() async throws {
         var limits = AtlasViewportLimits(); limits.documents = 1
-        let fixture = ViewportFixture(), model = AtlasViewportResidency(limits: limits, transport: fixture.transport)
+        let fixture = ViewportFixture(), model = residency(limits: limits, transport: fixture.transport)
         let a = entry(1, "selected.rs"), b = entry(2, "later.rs", x: 1000)
         let layout = UUID()
         precondition(model.install(root: "/fixture", entries: [a, b], layoutRevision: layout, accessLease: nil))
@@ -309,7 +324,7 @@ private final class ReleaseProbe {
     }
 
     static func scopeRefitsRetainedRowsWithoutRecapture() async throws {
-        let fixture = ViewportFixture(), model = AtlasViewportResidency(transport: fixture.transport)
+        let fixture = ViewportFixture(), model = residency(transport: fixture.transport)
         let original = entry(1, "scope.rs"), firstLayout = UUID()
         precondition(model.install(root: "/fixture", entries: [original], layoutRevision: firstLayout, accessLease: nil))
         model.updateViewport(rect(original), scale: 4, selectedPath: nil)
@@ -344,7 +359,7 @@ private final class ReleaseProbe {
     }
 
     static func refusalsRemainExplicitAndRetryable() async throws {
-        let fixture = ViewportFixture(initiallyUnavailable: true), model = AtlasViewportResidency(transport: fixture.transport)
+        let fixture = ViewportFixture(initiallyUnavailable: true), model = residency(transport: fixture.transport)
         let file = entry(1, "retry.rs")
         let layout = UUID()
         precondition(model.install(root: "/fixture", entries: [file], layoutRevision: layout, accessLease: nil))
@@ -361,7 +376,7 @@ private final class ReleaseProbe {
         model.close()
         try await until { model.retainedNativeSlots == 0 }
 
-        let emptyFixture = ViewportFixture(empty: true), emptyModel = AtlasViewportResidency(transport: emptyFixture.transport)
+        let emptyFixture = ViewportFixture(empty: true), emptyModel = residency(transport: emptyFixture.transport)
         let emptyFile = entry(2, "empty.rs", bytes: 0)
         precondition(emptyModel.install(root: "/fixture", entries: [emptyFile], layoutRevision: UUID(), accessLease: nil))
         emptyModel.updateViewport(rect(emptyFile), scale: 4, selectedPath: nil)
@@ -373,7 +388,7 @@ private final class ReleaseProbe {
     }
 
     static func byteIdentityAndMetadataAdmission() async throws {
-        let fixture = ViewportFixture(), model = AtlasViewportResidency(transport: fixture.transport)
+        let fixture = ViewportFixture(), model = residency(transport: fixture.transport)
         let composed = entry(1, "é.rs"), decomposed = entry(2, "e\u{301}.rs", x: 200)
         precondition(composed.sourcePath == decomposed.sourcePath && composed.rawPath != decomposed.rawPath)
         let layout = UUID()
@@ -451,7 +466,7 @@ private final class ReleaseProbe {
         second = nil; third = nil
         try await until { pool.reservedSlots == 0 && pool.reservedBytes == 0 }
 
-        let fixture = ViewportFixture(), model = AtlasViewportResidency(transport: fixture.transport), file = entry(1, "held.rs")
+        let fixture = ViewportFixture(), model = residency(transport: fixture.transport), file = entry(1, "held.rs")
         precondition(model.install(root: "/fixture", entries: [file], layoutRevision: UUID(), accessLease: nil))
         model.updateViewport(rect(file), scale: 4, selectedPath: nil)
         try await ready(model, file)
@@ -469,7 +484,7 @@ private final class ReleaseProbe {
 
     static func retirementBackpressureResumesLatestDemand() async throws {
         var limits = AtlasViewportLimits(); limits.documents = 1
-        let fixture = ViewportFixture(), model = AtlasViewportResidency(limits: limits, transport: fixture.transport)
+        let fixture = ViewportFixture(), model = residency(limits: limits, transport: fixture.transport)
         let files = (0..<32).map { entry(UInt64($0 + 1), "flight-\($0).rs", x: Double($0) * 1000) }
         precondition(model.install(root: "/fixture", entries: files, layoutRevision: UUID(), accessLease: nil))
         var heldFrames: [[AtlasTextTile]] = [], blocked: AtlasProjectCatalog.Entry?
@@ -505,7 +520,7 @@ private final class ReleaseProbe {
 
     static func markdownWarmToggleCachesExactCapture() async throws {
         let source = ViewportFixture(), markdown = ViewportMarkdownFixture()
-        let model = AtlasViewportResidency(transport: source.transport, markdown: markdown.transport)
+        let model = residency(transport: source.transport, markdown: markdown.transport)
         let file = entry(1, "README.md"), layout = UUID()
         precondition(model.install(root: "/fixture", entries: [file], layoutRevision: layout, accessLease: nil))
         model.updateViewport(rect(file), scale: 4, selectedPath: nil)
@@ -539,7 +554,7 @@ private final class ReleaseProbe {
 
     static func markdownRapidToggleRetainsReadySource() async throws {
         let source = ViewportFixture(), markdown = ViewportMarkdownFixture(blockFirst: true)
-        let model = AtlasViewportResidency(transport: source.transport, markdown: markdown.transport)
+        let model = residency(transport: source.transport, markdown: markdown.transport)
         let file = entry(1, "rapid.md")
         precondition(model.install(root: "/fixture", entries: [file], layoutRevision: UUID(), accessLease: nil))
         model.updateViewport(rect(file), scale: 4, selectedPath: nil)
@@ -578,7 +593,7 @@ private final class ReleaseProbe {
 
     static func markdownScopeRefitPreservesMapsAndRetirement() async throws {
         let source = ViewportFixture(), markdown = ViewportMarkdownFixture()
-        let model = AtlasViewportResidency(transport: source.transport, markdown: markdown.transport)
+        let model = residency(transport: source.transport, markdown: markdown.transport)
         let file = entry(1, "scope.markdown"), firstLayout = UUID()
         model.setMarkdownPreviewEnabled(true)
         precondition(model.install(root: "/fixture", entries: [file], layoutRevision: firstLayout, accessLease: nil))
@@ -617,7 +632,7 @@ private final class ReleaseProbe {
 
     static func markdownProjectReplacementRejectsOldCandidate() async throws {
         let source = ViewportFixture(), markdown = ViewportMarkdownFixture(blockFirst: true)
-        let model = AtlasViewportResidency(transport: source.transport, markdown: markdown.transport)
+        let model = residency(transport: source.transport, markdown: markdown.transport)
         let file = entry(1, "same.md")
         var grant: ViewportAccess? = ViewportAccess()
         weak var observedGrant = grant
@@ -655,7 +670,7 @@ private final class ReleaseProbe {
     static func markdownFallbackPreservesExactSource() async throws {
         for behavior in [ViewportMarkdownFixture.Behavior.unsupported, .overBudget] {
             let source = ViewportFixture(), markdown = ViewportMarkdownFixture(behavior: behavior)
-            let model = AtlasViewportResidency(transport: source.transport, markdown: markdown.transport)
+            let model = residency(transport: source.transport, markdown: markdown.transport)
             let file = entry(1, "fallback.mdown")
             precondition(model.install(root: "/fixture", entries: [file], layoutRevision: UUID(), accessLease: nil))
             model.updateViewport(rect(file), scale: 4, selectedPath: nil)
@@ -684,7 +699,7 @@ private final class ReleaseProbe {
 
     static func markdownDemandIsVisibleOnly() async throws {
         let source = ViewportFixture(), markdown = ViewportMarkdownFixture()
-        let model = AtlasViewportResidency(transport: source.transport, markdown: markdown.transport)
+        let model = residency(transport: source.transport, markdown: markdown.transport)
         var files = (0..<80).map { entry(UInt64($0 + 1), "doc-\($0).MD", x: Double($0) * 200) }
         let code = entry(100, "docs.md/source.rs", x: 20_000)
         files.append(code)
@@ -711,6 +726,206 @@ private final class ReleaseProbe {
             "returning to the retained Markdown capture must reuse its warm display")
         model.close()
         try await until { model.retainedNativeSlots == 0 && model.retainedNativeBytes == 0 }
+    }
+
+    static func pressureRecoveryRequiresQuietIntervals() {
+        let monitor = AtlasViewportMemoryPressure(), quiet = AtlasViewportMemoryPressure.quietInterval
+        monitor.receive([.normal, .warning, .critical], at: 100)
+        precondition(monitor.state.phase == .critical && monitor.state.selectedOnly,
+            "the most severe coalesced system event wins")
+        monitor.receive(.normal, at: 200)
+        monitor.receive(.normal, at: 201)
+        monitor.advanceRecovery(at: 200 + quiet - 1)
+        precondition(monitor.state.phase == .recovery && monitor.state.selectedOnly,
+            "normal signals cannot bypass or restart the first quiet interval")
+        monitor.advanceRecovery(at: 200 + quiet)
+        precondition(monitor.state.phase == .recovery && !monitor.state.selectedOnly)
+        monitor.receive(.warning, at: 300 + quiet)
+        monitor.advanceRecovery(at: 200 + quiet * 2)
+        precondition(monitor.state.phase == .constrained,
+            "a timer from an older recovery cannot undo renewed pressure")
+        monitor.receive(.normal, at: 400 + quiet * 2)
+        monitor.advanceRecovery(at: 400 + quiet * 3)
+        precondition(monitor.state == .normal)
+        monitor.receive(.critical, at: UInt64.max - 2)
+        monitor.receive(.normal, at: UInt64.max - 1)
+        monitor.advanceRecovery(at: UInt64.max)
+        precondition(monitor.state.phase == .recovery && monitor.state.selectedOnly,
+            "monotonic deadline overflow remains conservative")
+    }
+
+    static func pressureTrimsBytesAndRetainsIndependentOwners() async throws {
+        let monitor = AtlasViewportMemoryPressure(), fixture = ViewportFixture()
+        var limits = AtlasViewportLimits()
+        let oneSource = "let exact_capture = \"/fixture/aa.rs\";\n".utf8.count
+        limits.sourceBytes = oneSource * 3
+        let model = residency(limits: limits, transport: fixture.transport, memoryPressure: monitor)
+        let a = entry(1, "aa.rs"), b = entry(2, "bb.rs", x: 200), c = entry(3, "cc.rs", x: 400)
+        let layout = UUID(), viewport = rect(a).union(rect(c))
+        precondition(model.install(root: "/fixture", entries: [a, b, c], layoutRevision: layout, accessLease: nil))
+        model.updateViewport(viewport, scale: 4, selectedPath: a.sourcePath)
+        try await until { model.residentCount == 3 && !model.isLoading }
+        var selected: AtlasSource? = model.document(forRawPath: a.rawPath)?.source
+        var pinned: AtlasSource? = model.document(forRawPath: b.rawPath)?.source
+        var frame = model.tiles.filter { $0.path.utf8.elementsEqual(b.rawPath) }
+        let frameRects = frame.map(\.rect), capturedPaths = fixture.snapshot.paths
+        precondition(!frame.isEmpty && selected != nil && pinned != nil)
+        precondition(model.residentCost.sourceBytes == limits.sourceBytes)
+        monitor.receive(.warning, at: 1)
+        precondition(model.residentCount == 1 && model.residentCost.sourceBytes <= limits.sourceBytes / 2,
+            "warning trims resident byte cost even below its eight-document ceiling")
+        precondition(model.document(forRawPath: a.rawPath)?.source === selected
+            && model.document(forRawPath: b.rawPath) == nil && model.layoutRevision == layout)
+        precondition(frame.map(\.rect) == frameRects && pinned?.text.contains("/fixture/bb.rs") == true,
+            "eviction does not mutate independently retained frame or reader captures")
+        precondition(fixture.snapshot.paths == capturedPaths && !model.isLoading,
+            "idle pressure trimming must not immediately recapture its evicted victims")
+        monitor.receive(.critical, at: 2)
+        precondition(model.residentCount == 1 && model.document(forRawPath: a.rawPath)?.source === selected)
+        model.close(); selected = nil
+        precondition(model.retainedNativeSlots > 0 && model.retainedNativeBytes > 0)
+        frame = []
+        precondition(model.retainedNativeSlots > 0, "the independent source still owns its retirement credit")
+        withExtendedLifetime(pinned) {}
+        pinned = nil
+        try await until { model.retainedNativeSlots == 0 && model.retainedNativeBytes == 0 }
+    }
+
+    static func criticalPressureRejectsCanceledCaptureAfterRecovery() async throws {
+        let monitor = AtlasViewportMemoryPressure(), fixture = ViewportFixture(blockFirst: true)
+        let model = residency(transport: fixture.transport, memoryPressure: monitor)
+        let a = entry(1, "first.rs"), b = entry(2, "later.rs", x: 200)
+        let viewport = rect(a).union(rect(b)), quiet = AtlasViewportMemoryPressure.quietInterval
+        precondition(model.install(root: "/fixture", entries: [a, b], layoutRevision: UUID(), accessLease: nil))
+        model.updateViewport(viewport, scale: 4, selectedPath: nil)
+        try await until { fixture.snapshot.paths == ["/fixture/first.rs"] }
+        monitor.receive(.critical, at: 1)
+        model.updateViewport(viewport, scale: 4, selectedPath: b.sourcePath)
+        monitor.receive(.normal, at: 2)
+        monitor.advanceRecovery(at: 2 + quiet)
+        monitor.advanceRecovery(at: 2 + quiet * 2)
+        precondition(fixture.snapshot.paths.count == 1 && model.documents.isEmpty,
+            "pressure and recovery cannot overlap a second worker with entered foreign capture")
+        fixture.firstGate!.signal()
+        try await until { model.previewStates[a.id] == .ready && model.previewStates[b.id] == .ready && !model.isLoading }
+        precondition(fixture.snapshot.paths == ["/fixture/first.rs", "/fixture/later.rs", "/fixture/first.rs"],
+            "a canceled result stays rejected when recovery wants that same file again")
+        precondition(fixture.snapshot.maximum == 1)
+        model.close()
+        try await until { model.retainedNativeSlots == 0 }
+    }
+
+    static func pressureRecoveryRestoresStationaryDemandInStages() async throws {
+        let monitor = AtlasViewportMemoryPressure(), fixture = ViewportFixture()
+        var limits = AtlasViewportLimits(); limits.pixels = 16 * 1024 * 1024
+        let model = residency(limits: limits, transport: fixture.transport, memoryPressure: monitor)
+        let files = (0..<12).map { entry(UInt64($0 + 1), "recover-\($0).rs", x: Double($0) * 200) }
+        let layout = UUID(), quiet = AtlasViewportMemoryPressure.quietInterval
+        monitor.receive(.critical, at: 1)
+        precondition(model.install(root: "/fixture", entries: files, layoutRevision: layout, accessLease: nil))
+        model.updateViewport(rect(files.first!).union(rect(files.last!)), scale: 4, selectedPath: files[0].sourcePath)
+        try await ready(model, files[0])
+        let selected = ObjectIdentifier(model.document(forRawPath: files[0].rawPath)!.source)
+        precondition(model.residentCount == 1 && fixture.snapshot.paths.count == 1,
+            "newly installed views inherit existing critical pressure")
+        monitor.receive(.normal, at: 100)
+        monitor.advanceRecovery(at: 100 + quiet - 1)
+        precondition(model.residentCount == 1 && fixture.snapshot.paths.count == 1)
+        monitor.advanceRecovery(at: 100 + quiet)
+        try await until { model.residentCount == 8 && !model.isLoading }
+        precondition(model.memoryPressure.phase == .recovery && fixture.snapshot.paths.count == 8)
+        monitor.advanceRecovery(at: 100 + quiet * 2 - 1)
+        precondition(model.residentCount == 8 && !model.isLoading)
+        monitor.advanceRecovery(at: 100 + quiet * 2)
+        try await until { model.residentCount == 12 && !model.isLoading }
+        precondition(model.memoryPressure == .normal && fixture.snapshot.paths.count == 12)
+        precondition(model.layoutRevision == layout
+            && ObjectIdentifier(model.document(forRawPath: files[0].rawPath)!.source) == selected,
+            "stationary recovery expands demand without reparsing the selected capture or moving parcels")
+        model.close()
+        try await until { model.retainedNativeSlots == 0 }
+    }
+
+    static func pressureRecoveryRetriesCapacityWithUnchangedDemand() async throws {
+        let monitor = AtlasViewportMemoryPressure(), fixture = ViewportFixture()
+        var limits = AtlasViewportLimits()
+        limits.sourceBytes = "let exact_capture = \"/fixture/budget.rs\";\n".utf8.count
+        let model = residency(limits: limits, transport: fixture.transport, memoryPressure: monitor)
+        let file = entry(1, "budget.rs"), quiet = AtlasViewportMemoryPressure.quietInterval
+        monitor.receive(.warning, at: 1)
+        precondition(model.install(root: "/fixture", entries: [file], layoutRevision: UUID(), accessLease: nil))
+        model.updateViewport(rect(file), scale: 4, selectedPath: nil)
+        try await until { model.previewStates[file.id] == .capacityLimited && !model.isLoading }
+        precondition(model.residentCount == 0 && fixture.snapshot.paths.count == 1)
+        monitor.receive(.normal, at: 2)
+        precondition(model.previewStates[file.id] == .capacityLimited && !model.isLoading,
+            "entering recovery with unchanged caps must not recapture a refused preview")
+        monitor.advanceRecovery(at: 2 + quiet)
+        try await ready(model, file)
+        precondition(fixture.snapshot.paths.count == 2,
+            "the unchanged visible demand retries once its original byte budget returns")
+        monitor.receive(.warning, at: 3 + quiet)
+        precondition(model.previewStates[file.id] == .capacityLimited && model.residentCount == 0)
+        model.updateViewport(rect(file), scale: 4, selectedPath: file.sourcePath)
+        try await ready(model, file)
+        precondition(model.residentCost.sourceBytes == limits.sourceBytes
+            && fixture.snapshot.paths.count == 3 && model.memoryPressure.phase == .constrained,
+            "newly selected source may exceed the reduced soft cap while respecting the original hard limit")
+        model.close()
+        try await until { model.retainedNativeSlots == 0 }
+    }
+
+    static func pressureRespectsHiddenClosedAndReinstalledViews() async throws {
+        let monitor = AtlasViewportMemoryPressure(), fixture = ViewportFixture()
+        let model = residency(transport: fixture.transport, memoryPressure: monitor)
+        let file = entry(1, "hidden.rs"), quiet = AtlasViewportMemoryPressure.quietInterval
+        precondition(model.install(root: "/fixture", entries: [file], layoutRevision: UUID(), accessLease: nil))
+        model.updateViewport(rect(file), scale: 4, selectedPath: nil)
+        try await ready(model, file)
+        model.suspend()
+        monitor.receive(.critical, at: 1)
+        precondition(model.isSuspended && model.residentCount == 0 && !model.isLoading)
+
+        let otherFixture = ViewportFixture(), other = residency(transport: otherFixture.transport, memoryPressure: monitor)
+        precondition(other.install(root: "/fixture", entries: [file], layoutRevision: UUID(), accessLease: nil))
+        other.updateViewport(rect(file), scale: 4, selectedPath: nil)
+        precondition(other.memoryPressure.phase == .critical && otherFixture.snapshot.paths.isEmpty)
+        other.updateViewport(rect(file), scale: 4, selectedPath: file.sourcePath)
+        try await ready(other, file)
+        var pinned: AtlasSource? = other.document(forRawPath: file.rawPath)?.source
+        let moved = entry(1, "hidden.rs", x: 500)
+        precondition(other.install(root: "/fixture", entries: [moved], layoutRevision: UUID(),
+            accessLease: nil, preservingCaptures: true))
+        precondition(other.memoryPressure.phase == .critical && other.residentCount == 0 && other.documents.isEmpty,
+            "scope replacement cannot silently retain optional previews during existing critical pressure")
+        precondition(pinned?.text.contains("/fixture/hidden.rs") == true)
+        other.close()
+
+        let refusedFixture = ViewportFixture(initiallyUnavailable: true)
+        let refused = residency(transport: refusedFixture.transport, memoryPressure: monitor)
+        precondition(refused.install(root: "/fixture", entries: [file], layoutRevision: UUID(), accessLease: nil))
+        refused.updateViewport(rect(file), scale: 4, selectedPath: file.sourcePath)
+        try await until { refused.previewStates[file.id] == .unavailable && !refused.isLoading }
+        monitor.receive(.normal, at: 2)
+        monitor.advanceRecovery(at: 2 + quiet)
+        monitor.advanceRecovery(at: 2 + quiet * 2)
+        precondition(model.isSuspended && !model.isLoading && model.pendingCount == 0 && fixture.snapshot.paths.count == 1)
+        precondition(!other.isInstalled && !other.isLoading && otherFixture.snapshot.paths.count == 1,
+            "normal pressure does not reopen closed views or resume hidden demand")
+        precondition(refused.previewStates[file.id] == .unavailable && refusedFixture.snapshot.paths.count == 1,
+            "memory recovery does not retry explicit unavailable source")
+        model.updateViewport(rect(file), scale: 4, selectedPath: nil)
+        try await ready(model, file)
+        precondition(!model.isSuspended && fixture.snapshot.paths.count == 2)
+        model.close(); refused.close(); pinned = nil
+        try await until { model.retainedNativeSlots == 0 && other.retainedNativeSlots == 0 && refused.retainedNativeSlots == 0 }
+
+        var transient: AtlasViewportResidency? = residency(transport: ViewportFixture().transport, memoryPressure: monitor)
+        weak var observed = transient
+        precondition(transient!.install(root: "/fixture", entries: [], layoutRevision: UUID(), accessLease: nil))
+        transient = nil
+        precondition(observed == nil, "the shared monitor cannot retain abandoned window histories")
+        monitor.receive(.warning, at: 3 + quiet * 2)
     }
 
 }

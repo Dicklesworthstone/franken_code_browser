@@ -3,6 +3,109 @@ import CoreGraphics
 import Observation
 import Dispatch
 
+/// One process-wide native signal, shared by all atlas windows. Recovery uses
+/// monotonic deadlines and never grants a new per-window memory allowance.
+/// Tests inject the same signal path without subscribing to the operating system.
+@MainActor final class AtlasViewportMemoryPressure {
+    enum Phase: Equatable, Sendable { case normal, constrained, critical, recovery }
+    struct State: Equatable, Sendable {
+        let phase: Phase
+        let selectedOnly: Bool
+        static let normal = State(phase: .normal, selectedOnly: false)
+    }
+    static let shared = AtlasViewportMemoryPressure(observingSystem: true)
+    static let quietInterval: UInt64 = 5_000_000_000
+    private(set) var state = State.normal
+    private var recoveryDeadline: UInt64?
+    private var source: DispatchSourceMemoryPressure?
+    private var timer: DispatchSourceTimer?
+    private let observingSystem: Bool
+    private final class Observer {
+        weak var value: AtlasViewportResidency?
+        init(_ value: AtlasViewportResidency) { self.value = value }
+    }
+    private var observers: [Observer] = []
+
+    init(observingSystem: Bool = false) {
+        self.observingSystem = observingSystem
+        guard observingSystem else { return }
+        let source = DispatchSource.makeMemoryPressureSource(eventMask: [.normal, .warning, .critical], queue: .main)
+        self.source = source
+        source.setEventHandler { [weak self] in
+            // The dispatch source is explicitly delivered on the main queue.
+            MainActor.assumeIsolated {
+                guard let self, let events = self.source?.data else { return }
+                self.receive(events, at: DispatchTime.now().uptimeNanoseconds)
+            }
+        }
+        source.resume()
+    }
+    deinit { source?.cancel(); timer?.cancel() }
+
+    fileprivate func attach(_ value: AtlasViewportResidency) {
+        observers.removeAll { $0.value == nil || $0.value === value }
+        observers.append(Observer(value))
+        value.applyMemoryPressure(state)
+    }
+    fileprivate func detach(_ value: AtlasViewportResidency) {
+        observers.removeAll { $0.value == nil || $0.value === value }
+    }
+
+    /// Coalesced native flags prefer the strongest pressure. Repeated normal
+    /// notifications cannot bypass or restart a recovery interval.
+    func receive(_ events: DispatchSource.MemoryPressureEvent, at now: UInt64) {
+        let previous = state
+        if events.contains(.critical) {
+            state = State(phase: .critical, selectedOnly: true); recoveryDeadline = nil
+        } else if events.contains(.warning) {
+            state = State(phase: .constrained, selectedOnly: false); recoveryDeadline = nil
+        } else if events.contains(.normal), state.phase != .normal, state.phase != .recovery {
+            state = State(phase: .recovery, selectedOnly: state.selectedOnly)
+            recoveryDeadline = deadline(after: now)
+        } else { return }
+        if previous != state { publish() }
+        scheduleRecovery(from: now)
+    }
+
+    /// A critical recovery first keeps selected-only admission for five quiet
+    /// seconds, then allows a small visible set for another five. Warning
+    /// recovery keeps its reduced budget for one interval. An old timer checks
+    /// the current deadline, so it cannot undo a renewed warning or critical event.
+    func advanceRecovery(at now: UInt64) {
+        guard state.phase == .recovery, let deadline = recoveryDeadline, now >= deadline else { return }
+        if state.selectedOnly {
+            state = State(phase: .recovery, selectedOnly: false)
+            recoveryDeadline = self.deadline(after: now)
+        } else {
+            state = .normal; recoveryDeadline = nil
+        }
+        publish()
+        scheduleRecovery(from: now)
+    }
+
+    private func deadline(after now: UInt64) -> UInt64? {
+        let (value, overflow) = now.addingReportingOverflow(Self.quietInterval)
+        // An exhausted clock stays conservative rather than wrapping into an
+        // immediately expired deadline.
+        return overflow ? nil : value
+    }
+    private func scheduleRecovery(from now: UInt64) {
+        timer?.cancel(); timer = nil
+        guard observingSystem, let deadline = recoveryDeadline, deadline > now else { return }
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        self.timer = timer
+        timer.schedule(deadline: .now() + .nanoseconds(Int(min(deadline - now, UInt64(Int.max)))))
+        timer.setEventHandler { [weak self] in
+            MainActor.assumeIsolated { self?.advanceRecovery(at: DispatchTime.now().uptimeNanoseconds) }
+        }
+        timer.resume()
+    }
+    private func publish() {
+        observers.removeAll { $0.value == nil }
+        for observer in observers { observer.value?.applyMemoryPressure(state) }
+    }
+}
+
 /// A hierarchy over immutable metadata. Exact viewport culling happens before
 /// leaf candidates consume the bounded query allowance, so a late small parcel
 /// in a dense region remains reachable when the camera zooms into that region.
@@ -136,6 +239,7 @@ struct AtlasViewportLayout: Sendable {
     private(set) var residentCost = AtlasViewportCost()
     private(set) var residentCount = 0
     private(set) var pendingCount = 0
+    private(set) var memoryPressure = AtlasViewportMemoryPressure.State.normal
     private var readerOnlyCount = 0
     private var unavailableCount = 0
     private var capacityLimitedCount = 0
@@ -143,6 +247,7 @@ struct AtlasViewportLayout: Sendable {
     @ObservationIgnored private let limits: AtlasViewportLimits
     @ObservationIgnored private let worker: AtlasViewportWorker
     @ObservationIgnored private let retirement: AtlasNativeRetirement
+    @ObservationIgnored private let pressureMonitor: AtlasViewportMemoryPressure
     @ObservationIgnored private var entries: [UInt64: AtlasProjectCatalog.Entry] = [:]
     @ObservationIgnored private var index = AtlasViewportIndex(entries: [])
     @ObservationIgnored private var rawIDs: [[UInt8]: UInt64] = [:]
@@ -169,9 +274,11 @@ struct AtlasViewportLayout: Sendable {
     }
 
     init(limits: AtlasViewportLimits = AtlasViewportLimits(), transport: AtlasViewportSourceTransport = .live,
-         markdown: AtlasViewportMarkdownTransport? = nil) {
+         markdown: AtlasViewportMarkdownTransport? = nil, memoryPressure: AtlasViewportMemoryPressure? = nil) {
         precondition(limits.valid)
         self.limits = limits; worker = AtlasViewportWorker(transport: transport, markdown: markdown)
+        pressureMonitor = memoryPressure ?? .shared
+        self.memoryPressure = pressureMonitor.state
         // Source rows, cached Markdown and current placement can have separate
         // retained lifetimes. Admit all three bounded sets plus preparation. Older
         // accepted/flight frames consume this same finite pool and apply
@@ -232,6 +339,12 @@ struct AtlasViewportLayout: Sendable {
         if readerOnlyCount > 0 { result += " · \(readerOnlyCount) reader-only" }
         if unavailableCount > 0 { result += " · \(unavailableCount) previews unavailable" }
         if capacityLimitedCount > 0 { result += " · \(capacityLimitedCount) waiting for preview memory" }
+        switch memoryPressure.phase {
+        case .normal: break
+        case .constrained: result += " · low memory: fewer source previews"
+        case .critical: result += " · memory pressure: selected preview only"
+        case .recovery: result += " · restoring previews gradually"
+        }
         return result + ". Zoom to load source; every parcel remains selectable."
     }
 
@@ -263,6 +376,7 @@ struct AtlasViewportLayout: Sendable {
         unavailableCount = 0; capacityLimitedCount = 0
         publish()
         isLoading = active != nil
+        pressureMonitor.attach(self)
         return true
     }
 
@@ -277,7 +391,12 @@ struct AtlasViewportLayout: Sendable {
         guard isSuspended || lastViewport != worldRect || lastScale != scale || lastSelected != selected else { return }
         isSuspended = false
         lastViewport = worldRect; lastScale = scale; lastSelected = selected
+        let previousSelection = selectedID
         selectedID = selected.flatMap { rawIDs[$0] }
+        if previousSelection != selectedID, let selectedID, blocked.remove(selectedID) != nil,
+           previewStates[selectedID] == .capacityLimited {
+            setState(selectedID, .cold)
+        }
         var candidates: [(id: UInt64, area: Double, distance: Double)] = []
         let eligible = index.candidates(in: worldRect, scale: scale) { id in
             previewStates[id] != .readerOnly && previewStates[id] != .unavailable
@@ -301,7 +420,8 @@ struct AtlasViewportLayout: Sendable {
             ranked.append(selectedID)
         }
         for candidate in candidates where candidate.id != selectedID { ranked.append(candidate.id) }
-        let next = ranked.prefix(limits.maximumDemand)
+        if memoryPressure.selectedOnly { ranked = ranked.filter { $0 == selectedID } }
+        let next = ranked.prefix(effectiveLimits.maximumDemand)
         remainingDemand = ranked.dropFirst(next.count)
         setDemand(Array(next))
     }
@@ -313,6 +433,7 @@ struct AtlasViewportLayout: Sendable {
     }
 
     func close() {
+        pressureMonitor.detach(self)
         active?.cancellation.cancel()
         isInstalled = false; isSuspended = true; root = ""; layoutRevision = UUID()
         entries = [:]; rawIDs = [:]; index = AtlasViewportIndex(entries: [])
@@ -351,6 +472,80 @@ struct AtlasViewportLayout: Sendable {
         return resident.prepared.preparation
     }
 
+    /// These are soft residency targets within the existing hard limits, not
+    /// a process-footprint promise. In-flight frames and entered preparation
+    /// keep their existing credits until their actual final owner releases them.
+    private var effectiveLimits: AtlasViewportLimits {
+        guard memoryPressure.phase != .normal else { return limits }
+        var result = limits
+        result.documents = min(result.documents, memoryPressure.selectedOnly ? 1 : 8)
+        result.maximumDemand = min(result.maximumDemand, memoryPressure.selectedOnly ? 1 : 8)
+        result.sourceBytes = max(1, result.sourceBytes / 2)
+        result.glyphs = max(1, result.glyphs / 2)
+        result.runs = max(1, result.runs / 2)
+        result.tiles = max(1, result.tiles / 2)
+        result.pixels = max(1, result.pixels / 2)
+        result.estimatedBytes = max(1, result.estimatedBytes / 2)
+        return result
+    }
+
+    fileprivate func applyMemoryPressure(_ state: AtlasViewportMemoryPressure.State) {
+        let admissionChanged = memoryPressure.selectedOnly != state.selectedOnly
+            || (memoryPressure.phase == .normal) != (state.phase == .normal)
+        memoryPressure = state
+        guard isInstalled else { return }
+        // Retry capacity refusals when the admission band changes, including
+        // identical demand IDs after recovery. Starting a quiet interval alone
+        // changes no budget and must not recapture an already refused preview.
+        if admissionChanged {
+            for id in blocked where previewStates[id] == .capacityLimited { setState(id, .cold) }
+            blocked = []
+        }
+        if !isSuspended, let viewport = lastViewport {
+            lastViewport = nil
+            updateViewport(viewport, scale: lastScale,
+                selectedPath: lastSelected.flatMap { String(bytes: $0, encoding: .utf8) })
+        } else {
+            trimForMemoryPressure()
+            // An idle/hidden view must not resume discovery or source work.
+            if !isSuspended { pump() }
+        }
+    }
+
+    private func trimForMemoryPressure() {
+        guard memoryPressure.phase != .normal else { return }
+        let target = effectiveLimits
+        var changed = false
+        // At most the configured resident count is visited. Remove cold
+        // entries before considering useful visible previews; selected source
+        // is protected even when it alone exceeds a reduced soft target.
+        for id in residents.keys.filter({ $0 != selectedID && !wanted.contains($0) }) {
+            residents.removeValue(forKey: id)
+            if entries[id] != nil { setState(id, .cold) }
+            changed = true
+        }
+        var cost = residents.values.reduce(AtlasViewportCost()) { $0 + $1.prepared.cost }
+        let victims = residents.keys.filter { $0 != selectedID }.sorted {
+            let left = wanted.firstIndex(of: $0) ?? Int.max
+            let right = wanted.firstIndex(of: $1) ?? Int.max
+            if left != right { return left > right }
+            return $0 > $1
+        }
+        for id in victims {
+            if residents.count <= target.documents, cost.fits(target) { break }
+            residents.removeValue(forKey: id)
+            if entries[id] != nil {
+                setState(id, .capacityLimited)
+                blocked.insert(id)
+            }
+            changed = true
+            cost = residents.values.reduce(AtlasViewportCost()) { $0 + $1.prepared.cost }
+        }
+        // Normal owner release preserves independently pinned readers and
+        // displayed/in-flight tiles. Their retirement leases remain charged.
+        if changed { publish() }
+    }
+
     private func backfillRefused(_ id: UInt64) {
         guard let slot = wanted.firstIndex(of: id) else { return }
         wanted.remove(at: slot)
@@ -374,6 +569,7 @@ struct AtlasViewportLayout: Sendable {
             if previewStates[id] == nil || previewStates[id] == .cold { setState(id, .queued) }
         }
         if let active, !wanted.contains(active.entry.id) { active.cancellation.cancel() }
+        trimForMemoryPressure()
         pump()
     }
 
@@ -440,6 +636,18 @@ struct AtlasViewportLayout: Sendable {
     }
 
     private func admit(_ prepared: AtlasViewportPreparedSource, for id: UInt64) -> Bool {
+        guard prepared.cost.fits(limits) else { return false }
+        var limits = effectiveLimits
+        if id == selectedID {
+            // One selected preview may retain its original admitted quality.
+            // All optional neighbors still compete within the reduced target.
+            limits.sourceBytes = max(limits.sourceBytes, prepared.cost.sourceBytes)
+            limits.glyphs = max(limits.glyphs, prepared.cost.glyphs)
+            limits.runs = max(limits.runs, prepared.cost.runs)
+            limits.tiles = max(limits.tiles, prepared.cost.tiles)
+            limits.pixels = max(limits.pixels, prepared.cost.pixels)
+            limits.estimatedBytes = max(limits.estimatedBytes, prepared.cost.estimatedBytes)
+        }
         guard prepared.cost.fits(limits) else { return false }
         let priority = wanted.firstIndex(of: id) ?? Int.max
         var count = residents.count - (residents[id] == nil ? 0 : 1)

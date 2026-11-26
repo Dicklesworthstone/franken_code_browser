@@ -98,7 +98,7 @@ extension AtlasViewportResidencyTests {
     private static func cacheModel(_ fixture: ViewportArtifactFixture, file: AtlasProjectCatalog.Entry,
         root: String = "/fixture", limits: AtlasViewportLimits = AtlasViewportLimits(),
         lease: AnyObject? = nil) -> AtlasViewportResidency {
-        let model = AtlasViewportResidency(limits: limits, transport: fixture.transport)
+        let model = residency(limits: limits, transport: fixture.transport)
         precondition(model.install(root: root, entries: [file], layoutRevision: UUID(), accessLease: nil,
             sourceCacheHandle: 17, cacheLease: lease ?? fixture))
         model.updateViewport(rect(file), scale: 4, selectedPath: nil)
