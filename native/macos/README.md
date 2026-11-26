@@ -2214,7 +2214,8 @@ selected byte and read-call limits still apply, at most 256 rows are retained,
 and **Stop and keep matches** remains available. Returning to Text or Occurrences
 restores the user's counting preference.
 
-Choose **Occurrences** for one complete, case-sensitive identifier. This route
+Choose **Occurrences** for one complete identifier. **Match case** starts enabled;
+turn it off to compare the complete token using Unicode scalar lowercase. This route
 continues beyond the captured occurrence extractor's 32 MiB source allowance,
 subject to the same total scan limits as Text. It uses the same token policy as
 captured occurrences: ASCII letters, digits, underscore and dollar are token
@@ -2227,9 +2228,11 @@ The matcher carries token state across decoder windows and work quanta.
 Only an observed delimiter or actual source end can finish a matching token;
 a scan-budget cutoff does not turn a prefix of a longer token into a hit.
 Occurrences supports the same scopes, progress, Stop, cancellation and
-**Count all matches** options. Match case is fixed on in this mode; returning
-to Text restores the saved case preference. Opening from the sidebar's
-Occurrences mode selects it automatically.
+**Count all matches** options. Lowercase matching retains each hit's original
+spelling and exact byte range: `k` can find `K` and `K`, while `i` does not match
+only part of the lowercase expansion of the whole token `İ`. There is no full
+case folding or canonical normalization. Opening from the sidebar's Occurrences
+mode selects it automatically.
 
 The sheet freezes the location and file-type selection when it opens. Moving the
 camera, changing the sidebar or refreshing the sheet's catalog cannot widen that
@@ -2246,8 +2249,8 @@ policy exclusions and do not consume file-read, byte or result budgets.
 Open the sheet, enter the literal, expression or identifier, choose **256 MiB**, **1 GiB**, or **4 GiB** as
 the total source I/O budget, and press **Search**. There is no per-file capture
 ceiling. The scan admits at most 1,048,576 read calls and retains at most 256
-matches. It uses a 16 KiB input buffer. Exact Text, Expression and Occurrences share one
-encoded primary witness per file with retained matches; lowercase Text and Expression retain each
+matches. It uses a 16 KiB input buffer. Case-sensitive Text, Expression and Occurrences share one
+encoded primary witness per file with retained matches; their lowercase modes retain each
 hit's original spelling and bytes. Each retained hit also keeps up to 160 original
 bytes before and 160 after the match, from those same reads. Context residency
 stays bounded per match; the scan does not retain a separate whole-file capture.
@@ -2462,7 +2465,9 @@ The **Observed Range Reader** can search a file without capturing its complete
 contents. Open it from the current source or Quick Open, choose UTF-8, UTF-16 LE,
 or UTF-16 BE, and select **Text**, **Expression**, or **Occurrences**. Text uses a
 literal; **Match case** chooses exact spelling or Unicode scalar lowercase
-matching. Occurrences uses one exact whole identifier. Search uses the same
+matching. Occurrences uses one whole identifier with the same case control;
+its complete transformed token must match, and the original spelling and byte
+range remain available for copying and verified navigation. Search uses the same
 opened file object as byte navigation, including after that pathname is replaced.
 Reopen explicitly to observe the replacement file.
 

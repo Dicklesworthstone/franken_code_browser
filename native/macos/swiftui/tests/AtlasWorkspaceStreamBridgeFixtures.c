@@ -314,8 +314,8 @@ char *fcb_atlas_stream_search_scoped_page_progress(uint64_t owner, const char *n
     workspace_fixture_poll poll, workspace_fixture_poll stop,
     fcb_atlas_stream_progress_callback progress, void *context) {
     assert(case_sensitive <= 1 && count_all_matches <= 1 && occurrences <= 1);
-    assert(occurrences == 0 || case_sensitive == 1);
-    assert(start_after == UINT64_C(9007199254740993)); /* above exact Double range */
+    assert(start_after == UINT64_C(9007199254740993)
+        || (start_after == 0 && occurrences == 1 && case_sensitive == 0)); /* first/later lowercase identifiers */
     counts[WINDOW_COUNTED] += (uint32_t)count_all_matches;
     counts[WINDOW_OCCURRENCES] += (uint32_t)occurrences;
     counts[WINDOW_LOWERCASE] += (uint32_t)(case_sensitive == 0);

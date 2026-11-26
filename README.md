@@ -113,6 +113,10 @@ progressive finalized-file previews, **Stop and keep matches**, optional
 reporting, retained-match copying, and separately verified current-context reads.
 Workspace, folder and exact-file searches keep bounded discovery pages while
 visiting later files; visible-atlas searches retain their explicit map membership.
+Whole-identifier searches in this sheet and the Observed Range Reader support
+**Match case** or Unicode lowercase matching, retaining each original spelling
+and byte range. The CLI exposes the same option with
+`fcb search ./project --workspace --whole-file --identifier Name --ignore-case --count-all --json`.
 See the [native search workflow](native/macos/README.md#searching-large-files-across-a-project)
 for discovery, I/O and result limits. This addition still requires executable and
 physical-Mac qualification; it is not a claim about an already released binary.

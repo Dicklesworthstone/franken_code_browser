@@ -27,7 +27,7 @@ enum AtlasWorkspaceStreamMode: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .text: return "Text to find"
         case .expression: return "Text, required terms, -excluded, path: or lang:"
-        case .occurrences: return "Exact identifier"
+        case .occurrences: return "Whole identifier"
         }
     }
     func wireMode(caseSensitive: Bool) -> String {
@@ -49,7 +49,7 @@ enum AtlasWorkspaceStreamError: Error, Sendable {
         case .invalidResponse: return "The search response could not be verified. Previously accepted evidence is unchanged."
         case .canceled: return "Search canceled. Entered file work may still be draining."
         case .engine("STREAM_READ_INVALID_IDENTIFIER"):
-            return "Enter one exact identifier without spaces or ASCII punctuation other than _ and $. An identifier cannot start with an ASCII digit."
+            return "Enter one identifier without spaces or ASCII punctuation other than _ and $. An identifier cannot start with an ASCII digit."
         case .engine(let code) where code.hasPrefix("QUERY_"):
             return AtlasSearchError.query(code).message
         case .engine(let code): return "The requested search operation is unavailable (\(code))."
@@ -84,7 +84,6 @@ struct AtlasWorkspaceStreamRequest: Equatable, Sendable {
               !needle.utf8.contains(0), (1...AtlasWorkspaceStreamLimits.hits).contains(maximumMatches),
               (1...AtlasWorkspaceStreamLimits.maximumScanBytes).contains(maximumScanBytes),
               (1...AtlasWorkspaceStreamLimits.readCalls).contains(maximumReadCalls),
-              mode != .occurrences || caseSensitive,
               catalogScope.map({ pathScope.isContained(in: $0) }) != false,
               discoveryPolicy == .repositoryRules || !pathScope.isVisible || catalogScope != nil else {
             throw AtlasWorkspaceStreamError.invalidInput
@@ -289,7 +288,8 @@ struct AtlasWorkspaceStreamSummary: Equatable, Sendable {
     }
     var coverage: String {
         var result = request.mode == .occurrences
-            ? "Exact whole-identifier text candidates, including comments and literals; no compiler resolution. "
+            ? (request.caseSensitive ? "Exact whole-identifier text candidates, including comments and literals; no compiler resolution. "
+                : "Unicode lowercase whole-identifier text candidates, including comments and literals; no canonical normalization, full case folding or compiler resolution. ")
             : (request.caseSensitive ? "Exact text matching. " : "Unicode lowercase matching without canonical normalization or full case folding. ")
         if let expression {
             result += "Expression counts and highlights the primary literal; required and excluded terms were checked against the same completed file observation. \(expression.excludedFiles) of \(eligibleFiles) location/type-eligible files excluded by expression path or language filters. "
@@ -1037,7 +1037,7 @@ struct AtlasWorkspaceStreamWire: Decodable {
             throw AtlasWorkspaceStreamError.invalidResponse
         }
         if mode == .occurrences {
-            guard caseSensitive, try flag("case_sensitive"),
+            guard try flag("case_sensitive") == caseSensitive,
                   try text("evidence_level") == "whole-token-text-candidate",
                   try flag("includes_comments_and_literals"), try flag("compiler_resolved") == false,
                   try flag("semantic_complete") == false else { throw AtlasWorkspaceStreamError.invalidResponse }

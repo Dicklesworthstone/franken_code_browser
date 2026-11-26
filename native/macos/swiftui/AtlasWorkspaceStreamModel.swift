@@ -297,7 +297,7 @@ private final class AtlasWorkspaceStreamProgressMailbox: @unchecked Sendable {
         }
         return try .init(needle: queryText, maximumScanBytes: scanBytes,
             fileScope: authority.fileScope, pathScope: authority.pathScope,
-            countAllMatches: effectiveCountAllMatches, caseSensitive: mode == .occurrences || caseSensitive,
+            countAllMatches: effectiveCountAllMatches, caseSensitive: caseSensitive,
             mode: mode, pageStartAfter: startAfter, discoveryPolicy: discoveryPolicy,
             catalogScope: transport.retainedCatalogScope)
     }

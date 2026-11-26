@@ -334,11 +334,9 @@ extension AtlasObservedReaderModel {
                 Picker("Find mode", selection: $model.searchMode) {
                     ForEach(AtlasObservedReaderSearchMode.allCases) { Text($0.label).tag($0) }
                 }.frame(width: 185)
-                Toggle("Match case", isOn: Binding(get: { model.searchMode == .occurrences || model.searchCaseSensitive },
+                Toggle("Match case", isOn: Binding(get: { model.searchCaseSensitive },
                     set: { model.searchCaseSensitive = $0 })).toggleStyle(.checkbox)
-                    .disabled(model.searchMode == .occurrences)
-                    .help(model.searchMode == .occurrences ? "Whole identifiers always use exact case."
-                        : "When off, use Unicode lowercase matching and retain the original spelling and byte ranges")
+                    .help("When off, use Unicode lowercase matching and retain the original spelling and byte ranges")
                 Toggle("Count all matches", isOn: Binding(get: { model.effectiveSearchCountAllMatches },
                     set: { model.countAllSearchMatches = $0 })).toggleStyle(.checkbox)
                     .disabled(model.searchMode == .expression)
@@ -351,7 +349,7 @@ extension AtlasObservedReaderModel {
                     .font(.caption2).foregroundStyle(.secondary)
             }
             Text(model.searchMode == .occurrences
-                ? "Occurrences use shared whole-token rules and exact spelling, including comments and literals. Compiler resolution is not claimed. Scanning starts at byte 0; at most 256 matches are retained."
+                ? "Occurrences use shared whole-token rules and the selected case policy, including comments and literals. Compiler resolution is not claimed. Scanning starts at byte 0; at most 256 matches are retained."
                 : model.searchMode == .expression
                 ? "Use required terms, quoted phrases and -excluded terms, within 1024 UTF-8 bytes and 64 tokens. All predicates use the same observed stream. A scan cutoff leaves the expression undecided; primary matches alone are not published. Path/language/type filters and regex are unavailable here."
                 : "Find starts at byte 0 using the selected decoding, with at most 256 retained matches. A scan limit or file change leaves the total count unknown.")

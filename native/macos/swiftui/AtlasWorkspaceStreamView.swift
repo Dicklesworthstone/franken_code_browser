@@ -74,11 +74,9 @@ import AppKit
                 }
             }
             HStack(spacing: 8) {
-                Toggle("Match case", isOn: Binding(get: { model.mode == .occurrences || model.caseSensitive },
+                Toggle("Match case", isOn: Binding(get: { model.caseSensitive },
                     set: { model.caseSensitive = $0 })).toggleStyle(.checkbox)
-                    .disabled(model.mode == .occurrences)
-                    .help(model.mode == .occurrences ? "Whole identifiers always match exact case."
-                        : "When off, use Unicode lowercase matching while retaining the original spelling and byte ranges")
+                    .help("When off, use Unicode lowercase matching while retaining the original spelling and byte ranges")
                 Toggle("Count all matches", isOn: Binding(get: { model.effectiveCountAllMatches },
                     set: { model.countAllMatches = $0 })).toggleStyle(.checkbox)
                     .disabled(model.mode == .expression)
@@ -93,7 +91,7 @@ import AppKit
                     .font(.caption).foregroundStyle(.secondary)
             }
             if model.mode == .occurrences {
-                Text("Occurrences match one complete identifier with exact case, including comments and literals. ASCII letters, digits, _ and $ are token characters; an identifier cannot start with an ASCII digit. Non-ASCII runs use conservative boundaries. These are text candidates, without compiler resolution.")
+                Text("Occurrences match one complete identifier with the selected case policy, including comments and literals. ASCII letters, digits, _ and $ are token characters; an identifier cannot start with an ASCII digit. Non-ASCII runs use conservative boundaries. These are text candidates, without compiler resolution.")
                     .font(.caption).foregroundStyle(.secondary)
             } else if model.mode == .expression {
                 Text("Use literal terms, quoted phrases, -excluded terms, path: and lang: filters. The first positive literal supplies matches and highlights. Every required or excluded term is checked through the end of the same file observation before that file supplies hits. Regular expressions are unavailable.")

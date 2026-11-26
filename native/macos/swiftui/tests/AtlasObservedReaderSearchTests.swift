@@ -380,7 +380,7 @@ private final class ObservedSearchProbe: @unchecked Sendable {
             "witness_verified": true, "verification": "equal-original-bytes-in-new-observation"]
         if witness.mode == .occurrences {
             var navigation = page["find_hit"] as! [String: Any]
-            navigation["mode"] = "whole-token-occurrences"; navigation["case_sensitive"] = true
+            navigation["mode"] = "whole-token-occurrences"; navigation["case_sensitive"] = witness.caseSensitive
             navigation["requested_mode"] = "occurrences"; navigation["realized_mode"] = "whole-token-occurrences"
             navigation["evidence_level"] = "whole-token-text-candidate"; navigation["includes_comments_and_literals"] = true
             navigation["compiler_resolved"] = false; navigation["semantic_complete"] = false
@@ -988,7 +988,8 @@ private extension AtlasObservedReaderSearchTests {
         let owner: UInt64 = 77
         let input = try AtlasObservedReaderInput(root: "/repo", relativePath: Array("large.txt".utf8))
         let modes: [(AtlasObservedReaderSearchMode, Bool, String, String)] = [
-            (.text, true, "é🦀", "é🦀"), (.text, false, "σ", "Σ"), (.occurrences, true, "needle", "needle")]
+            (.text, true, "é🦀", "é🦀"), (.text, false, "σ", "Σ"),
+            (.occurrences, true, "needle", "needle"), (.occurrences, false, "k", "K")]
         for encoding in AtlasObservedReaderEncoding.allCases {
             for (mode, sensitive, needle, spelling) in modes {
                 let secondPrefix = "pre " + spelling + "\r\npost "
@@ -1458,6 +1459,7 @@ private extension AtlasObservedReaderSearchTests {
                 (AtlasObservedReaderSearchMode.text, true, "old", ["old", "old"]),
                 (.text, false, "k", ["K", "K"]),
                 (.occurrences, true, "old", ["old", "old"]),
+                (.occurrences, false, "k", ["K", "K"]),
             ] {
                 for counted in [false, true] {
                     let request = try AtlasObservedReaderSearchRequest(generation: 10, needle: needle,
@@ -1593,54 +1595,56 @@ private extension AtlasObservedReaderSearchTests {
     static func lowercaseWireTests() throws {
         let owner: UInt64 = 0xfedcba9876543210
         let input = try AtlasObservedReaderInput(root: "/repo", relativePath: Array("large.txt".utf8))
-        for encoding in AtlasObservedReaderEncoding.allCases {
-            let request = try AtlasObservedReaderSearchRequest(generation: 1, needle: "k", encoding: encoding, caseSensitive: false)
-            let exact = try AtlasObservedReaderSearchRequest(generation: 1, needle: "k", encoding: encoding)
-            precondition(request != exact && !request.caseSensitive)
-            let wire = ObservedSearchFixture.report(owner, input, request, offsets: [4, 8, 12], spellings: ["k", "K", "K"])
-            func decode(_ value: [String: Any], selected: AtlasObservedReaderSearchRequest? = nil) throws -> AtlasObservedReaderSearchReport {
-                try .decode(ObservedReaderFixture.encode(value), handle: owner, input: input, request: selected ?? request)
-            }
-            let report = try decode(wire)
-            let bytes = ["k", "K", "K"].reduce(0) {
-                $0 + AtlasObservedReaderSearchRequest.originalBytes($1, encoding: encoding).count
-            }
-            precondition(report.originalHex == nil && report.witnessSHA256 == nil && report.retainedWitnessBytes == UInt64(bytes))
-            for (index, spelling) in ["k", "K", "K"].enumerated() {
-                let hit = report.hits[index], target = report.target(for: hit)
-                let witness = try AtlasObservedReaderSearchWitness.decode(
-                    ObservedReaderFixture.encode(ObservedSearchFixture.witness(wire, index: index)),
-                    handle: owner, input: input, report: report, target: target)
-                precondition(witness.text.utf8.elementsEqual(spelling.utf8)
-                    && witness.sha256 == hit.witnessSHA256 && witness.originalHex.utf8.count / 2 == Int(hit.range.count))
-            }
-            var invalid = wire; invalid["literal_original_hex"] = request.originalHex
-            rejects("one literal cannot prove all lowercase spellings") { _ = try decode(invalid) }
-            invalid = wire; invalid["literal_sha256"] = String(repeating: "b", count: 64)
-            rejects("global lowercase witness digest") { _ = try decode(invalid) }
-            invalid = wire; invalid["retained_witness_bytes"] = String(bytes + 1)
-            rejects("lowercase witness bytes must count every retained occurrence") { _ = try decode(invalid) }
-            invalid = wire; invalid.removeValue(forKey: "retained_witness_bytes")
-            rejects("missing lowercase witness accounting") { _ = try decode(invalid) }
-            invalid = wire; var rows = invalid["hits"] as! [[String: Any]]
-            rows[0].removeValue(forKey: "witness_sha256"); invalid["hits"] = rows
-            rejects("missing occurrence witness digest") { _ = try decode(invalid) }
-            rejects("lowercase receipt delivered to an exact request") { _ = try decode(wire, selected: exact) }
-            var wrongHit = ObservedSearchFixture.witness(wire)
-            wrongHit["witness_sha256"] = report.hits[1].witnessSHA256
-            rejects("different occurrence witness") {
-                _ = try AtlasObservedReaderSearchWitness.decode(ObservedReaderFixture.encode(wrongHit),
-                    handle: owner, input: input, report: report, target: report.target(for: report.hits[0]))
-            }
-            wrongHit = ObservedSearchFixture.witness(wire); wrongHit.removeValue(forKey: "mode")
-            rejects("missing lowercase hit policy") {
-                _ = try AtlasObservedReaderSearchWitness.decode(ObservedReaderFixture.encode(wrongHit),
-                    handle: owner, input: input, report: report, target: report.target(for: report.hits[0]))
-            }
-            if encoding != .utf8 {
-                invalid = wire; rows = invalid["hits"] as! [[String: Any]]
-                rows[0]["original_range"] = ObservedReaderFixture.range(5, 7); invalid["hits"] = rows
-                rejects("misaligned lowercase UTF16 source span") { _ = try decode(invalid) }
+        for mode in [AtlasObservedReaderSearchMode.text, .occurrences] {
+            for encoding in AtlasObservedReaderEncoding.allCases {
+                let request = try AtlasObservedReaderSearchRequest(generation: 1, needle: "k", encoding: encoding, caseSensitive: false, mode: mode)
+                let exact = try AtlasObservedReaderSearchRequest(generation: 1, needle: "k", encoding: encoding, mode: mode)
+                precondition(request != exact && !request.caseSensitive)
+                let wire = ObservedSearchFixture.report(owner, input, request, offsets: [4, 8, 12], spellings: ["k", "K", "K"])
+                func decode(_ value: [String: Any], selected: AtlasObservedReaderSearchRequest? = nil) throws -> AtlasObservedReaderSearchReport {
+                    try .decode(ObservedReaderFixture.encode(value), handle: owner, input: input, request: selected ?? request)
+                }
+                let report = try decode(wire)
+                let bytes = ["k", "K", "K"].reduce(0) {
+                    $0 + AtlasObservedReaderSearchRequest.originalBytes($1, encoding: encoding).count
+                }
+                precondition(report.originalHex == nil && report.witnessSHA256 == nil && report.retainedWitnessBytes == UInt64(bytes))
+                for (index, spelling) in ["k", "K", "K"].enumerated() {
+                    let hit = report.hits[index], target = report.target(for: hit)
+                    let witness = try AtlasObservedReaderSearchWitness.decode(
+                        ObservedReaderFixture.encode(ObservedSearchFixture.witness(wire, index: index)),
+                        handle: owner, input: input, report: report, target: target)
+                    precondition(witness.text.utf8.elementsEqual(spelling.utf8)
+                        && witness.sha256 == hit.witnessSHA256 && witness.originalHex.utf8.count / 2 == Int(hit.range.count))
+                }
+                var invalid = wire; invalid["literal_original_hex"] = request.originalHex
+                rejects("one literal cannot prove all lowercase spellings") { _ = try decode(invalid) }
+                invalid = wire; invalid["literal_sha256"] = String(repeating: "b", count: 64)
+                rejects("global lowercase witness digest") { _ = try decode(invalid) }
+                invalid = wire; invalid["retained_witness_bytes"] = String(bytes + 1)
+                rejects("lowercase witness bytes must count every retained occurrence") { _ = try decode(invalid) }
+                invalid = wire; invalid.removeValue(forKey: "retained_witness_bytes")
+                rejects("missing lowercase witness accounting") { _ = try decode(invalid) }
+                invalid = wire; var rows = invalid["hits"] as! [[String: Any]]
+                rows[0].removeValue(forKey: "witness_sha256"); invalid["hits"] = rows
+                rejects("missing occurrence witness digest") { _ = try decode(invalid) }
+                rejects("lowercase receipt delivered to an exact request") { _ = try decode(wire, selected: exact) }
+                var wrongHit = ObservedSearchFixture.witness(wire)
+                wrongHit["witness_sha256"] = report.hits[1].witnessSHA256
+                rejects("different occurrence witness") {
+                    _ = try AtlasObservedReaderSearchWitness.decode(ObservedReaderFixture.encode(wrongHit),
+                        handle: owner, input: input, report: report, target: report.target(for: report.hits[0]))
+                }
+                wrongHit = ObservedSearchFixture.witness(wire); wrongHit.removeValue(forKey: "mode")
+                rejects("missing lowercase hit policy") {
+                    _ = try AtlasObservedReaderSearchWitness.decode(ObservedReaderFixture.encode(wrongHit),
+                        handle: owner, input: input, report: report, target: report.target(for: report.hits[0]))
+                }
+                if encoding != .utf8 {
+                    invalid = wire; rows = invalid["hits"] as! [[String: Any]]
+                    rows[0]["original_range"] = ObservedReaderFixture.range(5, 7); invalid["hits"] = rows
+                    rejects("misaligned lowercase UTF16 source span") { _ = try decode(invalid) }
+                }
             }
         }
 
@@ -1729,10 +1733,9 @@ private extension AtlasObservedReaderSearchTests {
         let request = try AtlasObservedReaderSearchRequest(generation: 7, needle: "name",
             encoding: .utf8, countAllMatches: true, mode: .occurrences)
         precondition(request.mode == .occurrences && request.wireMode == "whole-token-occurrences")
-        rejects("case-insensitive occurrence request") {
-            _ = try AtlasObservedReaderSearchRequest(generation: 1, needle: "name",
-                encoding: .utf8, caseSensitive: false, mode: .occurrences)
-        }
+        let lowercase = try AtlasObservedReaderSearchRequest(generation: 7, needle: "name",
+            encoding: .utf8, countAllMatches: true, caseSensitive: false, mode: .occurrences)
+        precondition(!lowercase.caseSensitive && lowercase != request)
         rejects("oversized identifier") {
             _ = try AtlasObservedReaderSearchRequest(generation: 1, needle: String(repeating: "a", count: 1025),
                 encoding: .utf8, mode: .occurrences)
@@ -1799,7 +1802,7 @@ private extension AtlasObservedReaderSearchTests {
         // This scheduling fixture uses already-separated names. Shared Rust
         // tests own identifier grammar and neighbor/buffer boundary correctness.
         let input = try AtlasObservedReaderInput(root: "/repo", relativePath: Array("large.rs".utf8))
-        let probe = ObservedSearchProbe(verifiedNavigation: true); probe.setContent("name name\n")
+        let probe = ObservedSearchProbe(verifiedNavigation: true); probe.setContent("NAME name\n")
         let model = AtlasObservedReaderModel(transport: probe.transport)
         model.open(.init(input: input, project: UUID(), access: nil))
         try await wait("occurrence reader opened") { !model.busy && model.page != nil }
@@ -1807,16 +1810,18 @@ private extension AtlasObservedReaderSearchTests {
         model.countAllSearchMatches = true; model.find()
         try await wait("occurrences accepted") { !model.busy && model.searchAuthorized }
         let report = model.searchReport!, target = report.target(for: report.hits[0])
-        precondition(report.request.mode == .occurrences && report.request.caseSensitive
+        precondition(report.request.mode == .occurrences && !report.request.caseSensitive
             && report.request.countAllMatches && report.matchesSeen == 2)
         model.selectSearchHit(target)
         try await wait("occurrence witness") { !model.busy && model.selectedSearchWitness != nil }
+        precondition(model.selectedSearchWitness?.text == "NAME")
         model.readSearchContext()
         try await wait("unqualified fresh context") { !model.busy }
         precondition(model.searchContext == .tokenBoundariesUnverified && model.searchSelection == nil)
         model.goToVerifiedMatch()
         try await wait("verified identifier page") { !model.busy }
         precondition(model.page?.findHit?.tokenBoundariesVerified == true
+            && model.page?.findHit?.caseSensitive == false
             && model.searchSelection == NSRange(location: 0, length: 4))
         let verifiedPage = model.page!.observation
         model.searchMode = .text

@@ -394,7 +394,7 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
         return true
     }
 
-    private var effectiveSearchCaseSensitive: Bool { searchMode == .occurrences || searchCaseSensitive }
+    private var effectiveSearchCaseSensitive: Bool { searchCaseSensitive }
     var effectiveSearchCountAllMatches: Bool { searchMode == .expression || countAllSearchMatches }
     var canSearch: Bool {
         !closed && session != nil && transport.search != nil && lastSearchGeneration < UInt64.max
@@ -849,7 +849,7 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
                 pageStartAfter: pageStartAfter)
         } catch {
             notice = searchMode == .occurrences
-                ? "Enter one exact identifier of at most 1024 UTF-8 bytes, and choose a bounded scan limit."
+                ? "Enter one identifier of at most 1024 UTF-8 bytes, and choose a bounded scan limit."
                 : searchMode == .expression
                 ? "Enter an expression of at most 1024 UTF-8 bytes and choose a bounded scan limit. Path and language filters are unavailable in a single opened file."
                 : "Enter text of 1–4096 UTF-8 bytes without NUL, and choose a bounded scan limit."
@@ -1095,7 +1095,7 @@ private final class AtlasObservedReaderSession: @unchecked Sendable {
                 case "QUERY_LIMIT_EXCEEDED", "QUERY_SYNTAX_ERROR":
                     return "The expression syntax was refused (\(code)). Use required terms, quoted phrases and -excluded terms, within 64 tokens. The accepted range is unchanged."
                 case "STREAM_READ_INVALID_IDENTIFIER":
-                    return "Enter one exact identifier without spaces or ASCII punctuation other than _ and $. An identifier cannot start with an ASCII digit."
+                    return "Enter one identifier without spaces or ASCII punctuation other than _ and $. An identifier cannot start with an ASCII digit."
                 case "OBSERVED_READER_SEARCH_HIT_CHANGED":
                     return "The selected match or its token boundaries changed. The accepted page is unchanged. Run Find again, or read current context explicitly."
                 case "OBSERVED_READER_SEARCH_CONTEXT_UNAVAILABLE":

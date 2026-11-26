@@ -2197,49 +2197,51 @@ private extension AtlasWorkspaceStreamTests {
     static func lowercaseWireTests() throws {
         let owner: UInt64 = 0xfedcba9876543210
         let catalog = try AtlasWorkspaceStreamCatalog.decode(StreamFixture.json(StreamFixture.catalog(owner)), owner: owner)
-        let request = try AtlasWorkspaceStreamRequest(needle: "k", caseSensitive: false)
-        let exact = try AtlasWorkspaceStreamRequest(needle: "k")
-        precondition(request != exact && !request.caseSensitive)
-        for encoding in AtlasObservedReaderEncoding.allCases {
-            let wire = StreamFixture.report(owner, 1, request, count: 3, encoding: encoding, spellings: ["k", "K", "K"])
-            func decode(_ value: [String: Any], selected: AtlasWorkspaceStreamRequest? = nil) throws -> AtlasWorkspaceStreamReport {
-                let page = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(StreamFixture.page(value)),
-                    catalog: catalog, root: catalog.root, request: selected ?? request)
-                return try .init(summary: page.summary, hits: page.hits)
-            }
-            let report = try decode(wire)
-            let bytes = ["k", "K", "K"].reduce(0) {
-                $0 + AtlasObservedReaderSearchRequest.originalBytes($1, encoding: encoding).count
-            }
-            precondition(report.summary.witnessBytes == UInt64(bytes) && report.hits.count == 3)
-            for (index, spelling) in ["k", "K", "K"].enumerated() {
-                let hit = report.hits[index], target = report.target(for: hit)
-                let witness = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(StreamFixture.witness(wire, index: index)),
-                    report: report, root: catalog.root, target: target)
-                precondition(witness.text.utf8.elementsEqual(spelling.utf8))
-                precondition(witness.originalHex == ObservedReaderFixture.hex(
-                    AtlasObservedReaderSearchRequest.originalBytes(spelling, encoding: encoding)))
-                precondition(hit.range.count == UInt64(witness.originalHex.utf8.count / 2))
-            }
-            var invalid = wire; invalid["retained_witness_bytes"] = String(bytes + 1)
-            rejects("lowercase per-occurrence witness accounting") { _ = try decode(invalid) }
-            invalid = wire; invalid["case_sensitive"] = true
-            rejects("wrong matching policy") { _ = try decode(invalid) }
-            invalid = wire; invalid.removeValue(forKey: "case_sensitive")
-            rejects("missing lowercase scope policy") { _ = try decode(invalid) }
-            rejects("lowercase receipt admitted as legacy exact") { _ = try decode(wire, selected: .init(needle: "k")) }
-            var badWitness = StreamFixture.witness(wire, index: 0)
-            var row = badWitness["hit"] as! [String: Any]; row["witness_sha256"] = String(repeating: "c", count: 64)
-            badWitness["hit"] = row
-            rejects("witness from another occurrence") {
-                _ = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(badWitness), report: report,
-                    root: catalog.root, target: report.target(for: report.hits[0]))
-            }
-            if encoding != .utf8 {
-                invalid = wire; var hits = invalid["hits"] as! [[String: Any]]
-                hits[0]["original_range"] = ObservedReaderFixture.range(StreamFixture.start + 1, StreamFixture.start + 3)
-                invalid["hits"] = hits
-                rejects("misaligned UTF16 lowercase witness") { _ = try decode(invalid) }
+        for mode in [AtlasWorkspaceStreamMode.text, .occurrences] {
+            let request = try AtlasWorkspaceStreamRequest(needle: "k", caseSensitive: false, mode: mode)
+            let exact = try AtlasWorkspaceStreamRequest(needle: "k", mode: mode)
+            precondition(request != exact && !request.caseSensitive)
+            for encoding in AtlasObservedReaderEncoding.allCases {
+                let wire = StreamFixture.report(owner, 1, request, count: 3, encoding: encoding, spellings: ["k", "K", "K"])
+                func decode(_ value: [String: Any], selected: AtlasWorkspaceStreamRequest? = nil) throws -> AtlasWorkspaceStreamReport {
+                    let page = try AtlasWorkspaceStreamPage.decode(StreamFixture.json(StreamFixture.page(value)),
+                        catalog: catalog, root: catalog.root, request: selected ?? request)
+                    return try .init(summary: page.summary, hits: page.hits)
+                }
+                let report = try decode(wire)
+                let bytes = ["k", "K", "K"].reduce(0) {
+                    $0 + AtlasObservedReaderSearchRequest.originalBytes($1, encoding: encoding).count
+                }
+                precondition(report.summary.witnessBytes == UInt64(bytes) && report.hits.count == 3)
+                for (index, spelling) in ["k", "K", "K"].enumerated() {
+                    let hit = report.hits[index], target = report.target(for: hit)
+                    let witness = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(StreamFixture.witness(wire, index: index)),
+                        report: report, root: catalog.root, target: target)
+                    precondition(witness.text.utf8.elementsEqual(spelling.utf8))
+                    precondition(witness.originalHex == ObservedReaderFixture.hex(
+                        AtlasObservedReaderSearchRequest.originalBytes(spelling, encoding: encoding)))
+                    precondition(hit.range.count == UInt64(witness.originalHex.utf8.count / 2))
+                }
+                var invalid = wire; invalid["retained_witness_bytes"] = String(bytes + 1)
+                rejects("lowercase per-occurrence witness accounting") { _ = try decode(invalid) }
+                invalid = wire; invalid["case_sensitive"] = true
+                rejects("wrong matching policy") { _ = try decode(invalid) }
+                invalid = wire; invalid.removeValue(forKey: "case_sensitive")
+                rejects("missing lowercase scope policy") { _ = try decode(invalid) }
+                rejects("lowercase receipt admitted as legacy exact") { _ = try decode(wire, selected: exact) }
+                var badWitness = StreamFixture.witness(wire, index: 0)
+                var row = badWitness["hit"] as! [String: Any]; row["witness_sha256"] = String(repeating: "c", count: 64)
+                badWitness["hit"] = row
+                rejects("witness from another occurrence") {
+                    _ = try AtlasWorkspaceStreamWitness.decode(StreamFixture.json(badWitness), report: report,
+                        root: catalog.root, target: report.target(for: report.hits[0]))
+                }
+                if encoding != .utf8 {
+                    invalid = wire; var hits = invalid["hits"] as! [[String: Any]]
+                    hits[0]["original_range"] = ObservedReaderFixture.range(StreamFixture.start + 1, StreamFixture.start + 3)
+                    invalid["hits"] = hits
+                    rejects("misaligned UTF16 lowercase witness") { _ = try decode(invalid) }
+                }
             }
         }
 
@@ -2321,9 +2323,8 @@ private extension AtlasWorkspaceStreamTests {
         let request = try AtlasWorkspaceStreamRequest(needle: "old", mode: .occurrences)
         let literalRequest = try AtlasWorkspaceStreamRequest(needle: "old")
         precondition(request != literalRequest)
-        rejects("case-insensitive identifier request") {
-            _ = try AtlasWorkspaceStreamRequest(needle: "old", caseSensitive: false, mode: .occurrences)
-        }
+        let lowercase = try AtlasWorkspaceStreamRequest(needle: "old", caseSensitive: false, mode: .occurrences)
+        precondition(!lowercase.caseSensitive && lowercase != request)
         for encoding in AtlasObservedReaderEncoding.allCases {
             let wire = StreamFixture.report(owner, 1, request, count: 3, encoding: encoding)
             func decode(_ value: [String: Any], selected: AtlasWorkspaceStreamRequest? = nil) throws -> AtlasWorkspaceStreamReport {
@@ -2405,8 +2406,8 @@ private extension AtlasWorkspaceStreamTests {
         let calls = probe.hitCount; model.select(oldTarget); precondition(probe.hitCount == calls)
         model.search(); try await wait("whole identifier inventory") { !model.busy && model.reportAuthorized }
         let report = model.report!
-        precondition(report.summary.request.mode == .occurrences && report.summary.request.caseSensitive
-            && report.summary.witnessBytes == 3 && report.summary.coverage.contains("no compiler resolution"))
+        precondition(report.summary.request.mode == .occurrences && !report.summary.request.caseSensitive
+            && report.summary.witnessBytes == 120 && report.summary.coverage.contains("no compiler resolution"))
         model.select(report.target(for: report.hits[0]))
         try await wait("whole identifier witness") { !model.busy && model.witness != nil }
         precondition(model.witness?.text == "old")
@@ -2421,7 +2422,7 @@ private extension AtlasWorkspaceStreamTests {
         model.mode = .occurrences; model.countAllMatches = true; model.search()
         try await wait("counted whole identifiers") { !model.busy && model.reportAuthorized }
         precondition(model.report?.summary.matchesSeen == 2_000 && model.report?.summary.matchCountComplete == true
-            && model.report?.summary.retainedHits == 256 && model.report?.summary.witnessBytes == 3)
+            && model.report?.summary.retainedHits == 256 && model.report?.summary.witnessBytes == 256 * 3)
         model.clear(); try await wait("identifier clear") { !model.busy }
         precondition(model.canSearch && model.report == nil && model.witness == nil
             && model.notice.contains("Retained search literals cleared"))

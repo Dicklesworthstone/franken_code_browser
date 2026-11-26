@@ -157,14 +157,14 @@ enum AtlasObservedReaderSearchMode: String, CaseIterable, Identifiable, Sendable
     var prompt: String {
         switch self {
         case .text: "Find text in the opened file"
-        case .occurrences: "Find exact identifier"
+        case .occurrences: "Find whole identifier"
         case .expression: "Expression, e.g. \"request failed\" timeout -deprecated"
         }
     }
     var help: String {
         switch self {
         case .text: "Literal text with optional Unicode lowercase matching. Up to 4096 UTF-8 bytes; NUL is unsupported."
-        case .occurrences: "One exact identifier, up to 1024 UTF-8 bytes. Includes comments and literals; compiler references are not established."
+        case .occurrences: "One whole identifier, up to 1024 UTF-8 bytes, with optional Unicode lowercase matching. Includes comments and literals; compiler references are not established."
         case .expression: "Required terms, quoted phrases and -excluded terms in this opened file. Up to 1024 UTF-8 bytes. Path/language filters and regular expressions are unavailable."
         }
     }
@@ -190,7 +190,7 @@ struct AtlasObservedReaderSearchRequest: Equatable, Sendable {
         guard generation > 0, !needle.isEmpty,
               needle.utf8.count <= AtlasObservedReaderSearchLimits.needleBytes,
               !needle.utf8.contains(0),
-              mode != .occurrences || (caseSensitive && needle.utf8.count <= 1024),
+              mode != .occurrences || needle.utf8.count <= 1024,
               mode != .expression || needle.utf8.count <= AtlasObservedReaderSearchLimits.expressionBytes,
               (1...AtlasObservedReaderSearchLimits.matches).contains(maximumMatches),
               (1...AtlasObservedReaderSearchLimits.maximumScanBytes).contains(maximumScanBytes) else {
@@ -317,7 +317,8 @@ struct AtlasObservedReaderHitNavigation: Equatable, Sendable, Decodable {
         if mode != nil || caseSensitive != nil || tokenBoundariesVerified != nil {
             guard let mode, let caseSensitive, let tokenBoundariesVerified,
                   ["exact-decoded-text", "unicode-lowercase-text", "whole-token-occurrences", "decoded-text-expression"].contains(mode),
-                  mode == "decoded-text-expression" || caseSensitive == (mode != "unicode-lowercase-text"),
+                  mode == "decoded-text-expression" || mode == "whole-token-occurrences"
+                    || caseSensitive == (mode != "unicode-lowercase-text"),
                   tokenBoundariesVerified == (mode == "whole-token-occurrences") else {
                 throw AtlasObservedReaderError.invalidResponse
             }
@@ -780,7 +781,7 @@ struct AtlasObservedReaderSearchWitness: Sendable {
               selected.decodedRange.end <= UInt64(page.text.utf8.count),
               page.verifiedSearchSelection != nil,
               (mode != .occurrences || (selected.mode == "whole-token-occurrences"
-                && selected.caseSensitive == true && selected.tokenBoundariesVerified == true)),
+                && selected.caseSensitive == caseSensitive && selected.tokenBoundariesVerified == true)),
               (mode != .expression || (selected.mode == "decoded-text-expression"
                 && selected.caseSensitive == caseSensitive && selected.tokenBoundariesVerified == false
                 && expression != nil && selected.expression == expression)),

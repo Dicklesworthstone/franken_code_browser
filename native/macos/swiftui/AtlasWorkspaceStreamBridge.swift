@@ -93,7 +93,7 @@ extension AtlasWorkspaceStreamTransport {
             request.needle.withCString { needle in
                 request.fileScope.withCStrings { extensions, filenames in
                     request.pathScope.withCString { kind, path in
-                        if request.pageStartAfter > 0 {
+                        if request.pageStartAfter > 0 || (request.mode == .occurrences && !request.caseSensitive) {
                             if request.mode == .expression {
                                 return workspaceStreamExpressionPageProgress(owner, needle, request.maximumMatches,
                                     request.maximumScanBytes, request.maximumReadCalls, extensions, filenames,
@@ -261,7 +261,7 @@ private func workspaceStreamProgressive(_ owner: UInt64, _ request: AtlasWorkspa
             let pointer = request.needle.withCString { needle in
                 request.fileScope.withCStrings { extensions, filenames in
                     request.pathScope.withCString { kind, path in
-                        if request.pageStartAfter > 0 {
+                        if request.pageStartAfter > 0 || (request.mode == .occurrences && !request.caseSensitive) {
                             if request.mode == .expression {
                                 return workspaceStreamExpressionPageProgress(owner, needle, request.maximumMatches,
                                     request.maximumScanBytes, request.maximumReadCalls, extensions, filenames,

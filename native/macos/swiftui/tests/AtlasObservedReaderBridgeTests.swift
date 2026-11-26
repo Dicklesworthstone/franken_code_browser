@@ -256,17 +256,21 @@ import Foundation
         precondition(count(11) == enteredObserveHit)
         precondition(count(12) == enteredLines)
         precondition(count(19) == enteredFile)
-        let beforeOccurrences = count(16), beforeCountedOccurrences = count(17)
+        let beforeOccurrences = count(16), beforeCountedOccurrences = count(17), beforeLowercaseOccurrences = count(30)
         let legacyFinds = count(9), legacyCounted = count(13), legacyMatching = count(14)
         for encoding in AtlasObservedReaderEncoding.allCases {
             for countAll in [false, true] {
-                let selectedMode = try AtlasObservedReaderSearchRequest(generation: observation, needle: "exact_é",
-                    encoding: encoding, maximumScanBytes: 1 << 32, countAllMatches: countAll, mode: .occurrences)
-                let result = try search.find(handle, selectedMode, AtlasSearchCancellation())
-                precondition(result == expected)
+                for caseSensitive in [true, false] {
+                    let selectedMode = try AtlasObservedReaderSearchRequest(generation: observation, needle: "exact_é",
+                        encoding: encoding, maximumScanBytes: 1 << 32, countAllMatches: countAll,
+                        caseSensitive: caseSensitive, mode: .occurrences)
+                    let result = try search.find(handle, selectedMode, AtlasSearchCancellation())
+                    precondition(result == expected)
+                }
             }
         }
-        precondition(count(16) == beforeOccurrences + 6 && count(17) == beforeCountedOccurrences + 3)
+        precondition(count(16) == beforeOccurrences + 12 && count(17) == beforeCountedOccurrences + 6
+            && count(30) == beforeLowercaseOccurrences + 6)
         precondition(count(9) == legacyFinds && count(13) == legacyCounted && count(14) == legacyMatching,
             "Occurrences must use the additive mode ABI; literal dispatch remains unchanged")
         let enteredOccurrences = count(16)
@@ -283,7 +287,7 @@ import Foundation
             for countAll in [false, true] {
                 for (selectedMode, caseSensitive, needle) in [
                     (AtlasObservedReaderSearchMode.text, true, "exact é😀"),
-                    (.text, false, "exact é😀"), (.occurrences, true, "exact_é"),
+                    (.text, false, "exact é😀"), (.occurrences, true, "exact_é"), (.occurrences, false, "exact_é"),
                 ] {
                     let selectedPage = try AtlasObservedReaderSearchRequest(generation: observation, needle: needle,
                         encoding: encoding, maximumScanBytes: 1 << 32, countAllMatches: countAll,
@@ -293,8 +297,8 @@ import Foundation
                 }
             }
         }
-        precondition(count(20) == beforePages + 18 && count(21) == beforeCountedPages + 9
-            && count(22) == beforeLowercasePages + 6 && count(23) == beforeOccurrencePages + 6,
+        precondition(count(20) == beforePages + 24 && count(21) == beforeCountedPages + 12
+            && count(22) == beforeLowercasePages + 12 && count(23) == beforeOccurrencePages + 12,
             "The page ABI preserves full-width skip positions, all decoding modes, matching policies and count flags")
         do {
             _ = try search.find(handle, pageRequest, AtlasSearchCancellation())
