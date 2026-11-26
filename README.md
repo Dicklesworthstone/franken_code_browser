@@ -67,6 +67,14 @@ Back/Forward, saved landmarks and visible-file search preserve that exact file
 target and the selected discovery policy. The native integration and its
 regression sources await independent executable and physical-Mac verification.
 
+The main retained reader's **Locate** menu also reaches these destinations
+directly from Quick Open, source links and reader history, without retaining a
+discovery row or initial atlas entry. **Focus file in atlas** and **Focus folder
+in atlas** include all file types; atlas Back restores the previous filter and
+map position. **Browse containing folder** opens Project Files with its current
+filter. These actions discover the current path while keeping the captured
+source and reading position available. Native qualification remains pending.
+
 The global search sidebar also offers **Occurrences** for exact whole-token
 identifier text across the selected workspace, folder, file or visible scope.
 Results include comments and strings and open their retained source with exact

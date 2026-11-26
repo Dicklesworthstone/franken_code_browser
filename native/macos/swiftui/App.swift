@@ -492,6 +492,24 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         return AtlasObservedReaderSource(input: input, project: authority.identity.project, access: authority.access)
     }
 
+    /// A retained capture can outlive both its discovery page and atlas membership.
+    /// Explicit current-path navigation uses that capture's raw path and the live
+    /// project grant, while leaving the accepted source and its reading position alone.
+    private var workspaceReaderAtlasNavigation: AtlasReaderAtlasNavigation? {
+        guard projectViewActive, !loadingProject, !readerHistory.busy,
+              projectOpening.canBrowse, !projectBrowser.closed, browserProject == loadGeneration,
+              projectBrowser.root.utf8.elementsEqual(root.utf8),
+              let capture = workspaceReader, !capture.reader.busy, let page = capture.reader.page else { return nil }
+        let grant = projectBrowser.rootAccessIdentity
+#if FCB_APP_STORE
+        guard !rootAccessLoader.isLoading, let access = rootAccess,
+              access.url.path.utf8.elementsEqual(root.utf8), grant == ObjectIdentifier(access) else { return nil }
+#endif
+        return AtlasReaderAtlasNavigation(project: loadGeneration, root: root, grant: grant,
+            browser: ObjectIdentifier(projectBrowser), visit: capture.id, activation: focusRequest,
+            captureRoot: capture.root, relativePath: capture.relativePath, identity: page.identity)
+    }
+
     private func closeObservedReader() {
         observedReader?.close()
         observedReader = nil
@@ -2158,6 +2176,26 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         return true
     }
 
+    private func focusReaderInAtlas(_ source: AtlasReaderAtlasNavigation, containingFolder: Bool) {
+        guard source.isCurrent(workspaceReaderAtlasNavigation), canChangeAtlasDirectory,
+              let destination = containingFolder ? source.directoryDestination : source.fileDestination else { return }
+        // The explicit destination includes this file even when Quick Open bypassed
+        // the current type filter. The old filter/camera enter history only on success.
+        let move = atlasFolderNavigation.visit(destination, from: currentAtlasDestination())
+        requestAtlasDestination(destination, project: loadGeneration, move: move, readerSource: source)
+    }
+
+    private func browseReaderFolder(_ source: AtlasReaderAtlasNavigation) {
+        guard source.isCurrent(workspaceReaderAtlasNavigation), canChangeAtlasDirectory,
+              !projectBrowser.busy, let directory = source.directory else { return }
+        if directory != projectBrowser.directory {
+            guard requestProjectDirectory(directory) else { return }
+        }
+        showsCatalog = true
+        showsCity = false
+        status = "Browsing \(directory.display) in Project Files. The retained source stays open."
+    }
+
     private func openCatalogFile(_ id: UInt64, project: UUID, catalogRevision: UUID) {
         guard !loadingProject, let entry = projectOpening.file(id, in: project, catalogRevision: catalogRevision),
               let path = entry.sourcePath, fileScope.includes(path, custom: customExtensions) else { return }
@@ -2259,6 +2297,19 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Spacer()
+                    if let source = workspaceReaderAtlasNavigation {
+                        Menu("Locate") {
+                            Button("Focus file in atlas") { focusReaderInAtlas(source, containingFolder: false) }
+                                .disabled(!canChangeAtlasDirectory || source.fileDestination == nil)
+                            Button("Focus folder in atlas") { focusReaderInAtlas(source, containingFolder: true) }
+                                .disabled(!canChangeAtlasDirectory || source.directoryDestination == nil)
+                            Button("Browse containing folder") { browseReaderFolder(source) }
+                                .disabled(!canChangeAtlasDirectory || projectBrowser.busy || source.directory == nil)
+                                .help("Open this folder in Project Files using the current file-type filter.")
+                        }
+                        .controlSize(.small)
+                        .help("Focus the map on this file or folder, or browse its folder. Your retained source stays open.")
+                    }
                     if let source = selectedObservedSource {
                         Button("Read current ranges") {
                             guard selectedObservedSource?.identity == source.identity else { return }
@@ -3018,9 +3069,10 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     /// History and landmarks use the same transaction as explicit folder focus.
     /// The proposed origin is recorded only when the destination is published.
     private func requestAtlasDestination(_ destination: AtlasFolderDestination, project: UUID,
-        move: AtlasFolderNavigation.Move) {
+        move: AtlasFolderNavigation.Move, readerSource: AtlasReaderAtlasNavigation? = nil) {
         guard project == loadGeneration, canChangeAtlasDirectory,
-              atlasFolderNavigation.accepts(move) else { return }
+              atlasFolderNavigation.accepts(move),
+              readerSource?.isCurrent(workspaceReaderAtlasNavigation) != false else { return }
         let target = destination.catalogTarget
         if target == atlasCatalogTarget, hasMetadataAtlas, !hasRetainedAtlas,
            destination.matchesScope(fileScope: fileScope, customExtensions: customExtensions),
@@ -3088,12 +3140,14 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                       root.utf8.elementsEqual(requestedRoot.utf8), atlasCatalogTarget == previousTarget,
                       projectOpening.catalogRevision == previousCatalogRevision,
                       browser.discoveryPolicy == discoveryPolicy,
-                      fileScope == originalScope, Array(customExtensions.utf8) == originalExtensions else { return }
+                      fileScope == originalScope, Array(customExtensions.utf8) == originalExtensions,
+                      readerSource?.isCurrent(workspaceReaderAtlasNavigation) != false else { return }
                 let installed = await installAtlasScope(root: requestedRoot, project: project, request: request,
                     cancellation: cancellation, accessLease: accessLease,
                     preservingCaptures: target == previousTarget,
-                    replacementCatalog: catalog, folderMove: move)
-                guard installed, atlasLayoutRequest == request else { return }
+                    replacementCatalog: catalog, folderMove: move, readerSource: readerSource)
+                guard installed, atlasLayoutRequest == request,
+                      readerSource?.isCurrent(workspaceReaderAtlasNavigation) != false else { return }
                 // Keep Project Files mounted: a reader may have opened while
                 // focus was preparing. Show text atlas remains an explicit action.
                 showsCity = false
@@ -3102,7 +3156,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                         ? " The saved file is not in this catalog; showing the scope overview." : "")
                     + (showsCatalog ? " Choose Show text atlas to view this location." : "")
             } catch {
-                guard !Task.isCancelled, !cancellation.isCanceled, atlasLayoutRequest == request else { return }
+                guard !Task.isCancelled, !cancellation.isCanceled, atlasLayoutRequest == request,
+                      readerSource?.isCurrent(workspaceReaderAtlasNavigation) != false else { return }
                 status = "The focused atlas could not be prepared. The current map and source readers remain available."
             }
         }
@@ -3113,13 +3168,15 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     private func installAtlasScope(root requestedRoot: String, project: UUID, request: UUID,
         cancellation: AtlasSearchCancellation, accessLease: AnyObject?, preservingCaptures: Bool,
         replacementCatalog: AtlasProjectCatalog? = nil,
-        folderMove: AtlasFolderNavigation.Move? = nil) async -> Bool {
+        folderMove: AtlasFolderNavigation.Move? = nil,
+        readerSource: AtlasReaderAtlasNavigation? = nil) async -> Bool {
         let browser = projectBrowser, requestedDiscoveryPolicy = browser.discoveryPolicy
         let previousTarget = atlasCatalogTarget, previousCatalogRevision = projectOpening.catalogRevision
         guard let catalog = replacementCatalog ?? projectOpening.catalog,
               catalog.requestedRoot?.utf8.elementsEqual(requestedRoot.utf8) == true,
               catalog.matchesDiscoveryPolicy(requestedDiscoveryPolicy.wireName),
-              replacementCatalog != nil || catalog.requestedTarget == previousTarget else { return false }
+              replacementCatalog != nil || catalog.requestedTarget == previousTarget,
+              readerSource?.isCurrent(workspaceReaderAtlasNavigation) != false else { return false }
         let originalScope = fileScope, originalExtensions = Array(customExtensions.utf8)
         let requestedScope = folderMove?.target.fileScope ?? fileScope
         let requestedExtensions = folderMove?.target.customExtensions ?? customExtensions
@@ -3145,7 +3202,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 return (entries: placed, layout: layout)
             }
         } catch {
-            if !cancellation.isCanceled, atlasLayoutRequest == request, loadGeneration == project {
+            if !cancellation.isCanceled, atlasLayoutRequest == request, loadGeneration == project,
+               readerSource?.isCurrent(workspaceReaderAtlasNavigation) != false {
                 status = "The atlas layout is unavailable. Project Files and source readers remain available."
             }
             return false
@@ -3155,7 +3213,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
               atlasLayoutRequest == request, root.utf8.elementsEqual(requestedRoot.utf8),
               browser.discoveryPolicy == requestedDiscoveryPolicy, atlasCatalogTarget == previousTarget,
               projectOpening.catalogRevision == previousCatalogRevision,
-              fileScope == originalScope, Array(customExtensions.utf8) == originalExtensions else { return false }
+              fileScope == originalScope, Array(customExtensions.utf8) == originalExtensions,
+              readerSource?.isCurrent(workspaceReaderAtlasNavigation) != false else { return false }
 #if FCB_APP_STORE
         guard !rootAccessLoader.isLoading,
               rootAccess.map(ObjectIdentifier.init) == accessLease.map(ObjectIdentifier.init),

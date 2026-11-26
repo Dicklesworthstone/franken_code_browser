@@ -22,6 +22,7 @@ fn main() {
         "swiftui/AtlasSource.swift",
         "swiftui/AtlasSourceReader.swift",
         "swiftui/AtlasReader.swift",
+        "swiftui/AtlasReaderAtlasNavigation.swift",
         "swiftui/AtlasReaderDocument.swift",
         "swiftui/AtlasReaderDocumentBridge.swift",
         "swiftui/AtlasReaderCoordinator.swift",

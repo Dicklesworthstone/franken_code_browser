@@ -98,6 +98,23 @@ original project root; it performs metadata discovery without reading source
 payloads. A file receipt can contain zero or one entry. Its completeness applies
 only to that selected file, never to its folder or the whole project.
 
+An accepted main-window reader also has **Locate → Focus file in atlas**,
+**Focus folder in atlas**, and **Browse containing folder**. These actions use
+the reader's original project-relative path bytes, including non-UTF-8 names,
+so they remain available after a Quick Open result page is discarded or when
+the file never belonged to the initial atlas catalog. The two atlas actions
+use **All** file types, then record the old filter and map position for Back
+only when the new layout is accepted. Browsing the folder retains the current
+Project Files filter and does not require its old discovery page.
+
+Locate discovers the current pathname under the current project grant and
+discovery policy. It leaves the reader's exact captured bytes, page, Find state
+and selection available. Replacing the reader, project or access grant retires
+an outstanding reader-specific atlas focus; failed or canceled preparation
+keeps the accepted map and navigation history. These code-first additions and
+their raw-path, authority and history regressions await strict-RCH and physical-Mac
+qualification. File/folder catalog and path limits remain explicit.
+
 The bar identifies the accepted **Atlas file** or **Atlas folder**. Its
 **Previous file or folder** and **Next file or folder** buttons (**⇧⌘[** and
 **⇧⌘]**) return through accepted scopes and file-filter changes, including the
