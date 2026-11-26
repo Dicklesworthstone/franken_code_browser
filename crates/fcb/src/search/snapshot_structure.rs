@@ -185,6 +185,7 @@ pub struct StructureQuery<'archive, R: Read + Seek> {
     first_unretained: Option<u64>,
     next: usize,
     metadata_limit: usize,
+    occurrence_name_bytes: usize,
     state: StructureState,
     stats: StructureStats,
     _lease: ResourceLease,
@@ -206,9 +207,9 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
         Self::new_matching_page(archive, needle, options, skip_matches, true, false, budget, allocations)
     }
     /// Select the name-matching and counting policy without changing legacy
-    /// constructors. Insensitive symbol/heading names use Unicode scalar
-    /// lowercase, not full case folding or normalization. Occurrences keep their
-    /// exact whole-token semantics. Counting visits the admitted saved scope
+    /// constructors. Insensitive names and whole-token occurrences use Unicode
+    /// scalar lowercase, not full case folding or normalization. Each result
+    /// retains its original source spelling. Counting visits the admitted saved scope
     /// after the retained window fills; coverage and stored rows stay distinct.
     #[allow(clippy::too_many_arguments)]
     pub fn new_matching_page(archive: &'archive mut PagedSnapshot<R>, needle: &str, options: StructureOptions,
@@ -223,7 +224,7 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
             return Err(StructureError::InvalidLimits);
         }
         if options.mode == StructureMode::Occurrences {
-            if options.name_mode != SymbolNameMode::Exact || !case_sensitive { return Err(StructureError::InvalidLimits); }
+            if options.name_mode != SymbolNameMode::Exact { return Err(StructureError::InvalidLimits); }
             validate_reference_name(needle)?;
         }
         #[cfg(not(feature = "markdown"))]
@@ -233,6 +234,16 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
         options.first_revision.get().checked_add(last).ok_or(StructureError::IdentityExhausted)?;
         let metadata_limit = options.max_matches.checked_mul(MAX_STRUCTURE_NAME_BYTES * 2)
             .ok_or(StructureError::ResourceDenied)?.min(MAX_STRUCTURE_METADATA_BYTES);
+        // Lowercase equality can match a wider source spelling (K versus K).
+        // Each original scalar contributes at least one lowercase scalar and
+        // occupies at most four UTF-8 bytes. Admit one reusable source witness
+        // independently of retained result metadata before loading any member.
+        let occurrence_name_bytes = if options.mode == StructureMode::Occurrences {
+            if case_sensitive { needle.len() } else {
+                needle.chars().flat_map(char::to_lowercase).count().checked_mul(4)
+                    .ok_or(StructureError::ResourceDenied)?
+            }
+        } else { 0 };
         // Contains reuses the shared incremental matcher one name at a time.
         // Reserve its needle-sized tables/ring and transient growth before any
         // allocation; never build a source-sized lowercase string.
@@ -244,7 +255,7 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
         } else { 0 };
         let charge = options.max_matches.checked_mul(size_of::<StructureHit>())
             .and_then(|n| n.checked_add(metadata_limit + needle.len() + size_of::<Self>() + size_of::<StructureReport>()))
-            .and_then(|n| n.checked_add(matching_charge))
+            .and_then(|n| n.checked_add(matching_charge).and_then(|n| n.checked_add(occurrence_name_bytes)))
             .ok_or(StructureError::ResourceDenied)?;
         let lease = budget.try_reserve_managed(owner, allocations[0], ByteLength::new(charge as u64))
             .map_err(|_| StructureError::ResourceDenied)?;
@@ -253,7 +264,7 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
         if hits.capacity() > options.max_matches { return Err(StructureError::ResourceDenied); }
         Ok(Self { archive, options, needle: copy_text(needle)?, allocations, hits, seen: 0, skip_matches,
             case_sensitive, count_all_matches, first_unretained: None, next: 0,
-            metadata_limit, state: StructureState::Pending, stats: StructureStats::default(), _lease: lease })
+            metadata_limit, occurrence_name_bytes, state: StructureState::Pending, stats: StructureStats::default(), _lease: lease })
     }
     pub const fn state(&self) -> StructureState { self.state }
     pub const fn stats(&self) -> StructureStats { self.stats }
@@ -335,8 +346,9 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
             StructureMode::Occurrences => {
                 let remaining = self.options.max_matches - self.hits.len();
                 let file_skip = self.skip_matches.saturating_sub(self.seen);
-                let references = match CapturedReferences::build_window(source.bytes(), request, self.options.generation,
-                    &self.needle, None, remaining, file_skip, self.count_all_matches, budget, self.allocations[3], &mut *canceled) {
+                let references = match CapturedReferences::build_matching_window(source.bytes(), request, self.options.generation,
+                    &self.needle, None, remaining, file_skip, self.count_all_matches, self.case_sensitive,
+                    budget, self.allocations[3], &mut *canceled) {
                     Ok(references) => references,
                     Err(ReferenceError::Canceled) => return Err(StructureError::Canceled),
                     Err(ReferenceError::ResourceDenied) => return Err(StructureError::ResourceDenied),
@@ -346,10 +358,15 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
                 self.stats.files_searched += 1;
                 let skipped = file_skip.min(references.total_matches_counted() as u64);
                 self.seen = self.seen.checked_add(skipped).ok_or(StructureError::IdentityExhausted)?;
+                let capacity = if references.candidates().is_empty() { 0 } else { self.occurrence_name_bytes };
+                let mut source_name = String::new();
+                source_name.try_reserve_exact(capacity).map_err(|_| StructureError::ResourceDenied)?;
+                if source_name.capacity() > capacity { return Err(StructureError::ResourceDenied); }
                 for occurrence in references.candidates() {
                     check(canceled)?;
                     let range = occurrence.original_range();
-                    self.append(identity, range, range, references.name(), "identifier-occurrence", "text", occurrence.id(), None)?;
+                    references.write_source_text(occurrence.id(), &mut source_name)?;
+                    self.append(identity, range, range, &source_name, "identifier-occurrence", "text", occurrence.id(), None)?;
                 }
                 let later = (references.total_matches_counted() as u64)
                     .checked_sub(skipped).and_then(|n| n.checked_sub(references.candidates().len() as u64))

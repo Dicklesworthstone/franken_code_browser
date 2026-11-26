@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Exact, whole-token source occurrences for candidate reference navigation.
+//! Whole-token source occurrences for candidate reference navigation.
 //!
 //! This is NOT compiler reference resolution or a language lexer. Comments and
 //! string literals participate. ASCII letters/digits, `_`, and `$` form tokens;
@@ -82,6 +82,7 @@ pub struct CapturedReferences<'source> {
     generation: QueryGeneration,
     encoding: DetectedEncoding,
     name: String,
+    case_sensitive: bool,
     candidates: Vec<ReferenceCandidate>,
     counted: usize,
     limited: bool,
@@ -122,7 +123,23 @@ impl<'source> CapturedReferences<'source> {
     pub fn build_window(source: &'source [u8], request: CaptureRequest, generation: QueryGeneration,
         name: &str, encoding: Option<DetectedEncoding>, max_items: usize, skip_matches: u64,
         count_all_matches: bool, budget: &ResourceBudget, allocation: ResourceAllocationId,
-        mut canceled: impl FnMut() -> bool) -> Result<Self, ReferenceError> {
+        canceled: impl FnMut() -> bool) -> Result<Self, ReferenceError> {
+        Self::build_matching_window(source, request, generation, name, encoding, max_items, skip_matches,
+            count_all_matches, true, budget, allocation, canceled)
+    }
+
+    /// Select exact spelling or Unicode scalar lowercase equality while
+    /// preserving whole original-token boundaries. Lowercase is neither full
+    /// case folding nor Unicode normalization, and never creates a source-sized
+    /// transformed string. Original and decoded ranges always name the source
+    /// spelling; use write_source_text() for a bounded decoded witness.
+    /// Counting, lookahead, cancellation and result-window semantics match
+    /// build_window(). Legacy builders remain case sensitive.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_matching_window(source: &'source [u8], request: CaptureRequest, generation: QueryGeneration,
+        name: &str, encoding: Option<DetectedEncoding>, max_items: usize, skip_matches: u64,
+        count_all_matches: bool, case_sensitive: bool, budget: &ResourceBudget,
+        allocation: ResourceAllocationId, mut canceled: impl FnMut() -> bool) -> Result<Self, ReferenceError> {
         if generation.owner() != request.file().owner() { return Err(ReferenceError::OwnerMismatch); }
         if request.range().is_some() { return Err(ReferenceError::InvalidEvidence); }
         if source.len() > MAX_REFERENCE_SOURCE_BYTES { return Err(ReferenceError::SourceLimit); }
@@ -151,7 +168,7 @@ impl<'source> CapturedReferences<'source> {
         if owned_name.capacity() > name.len() { return Err(ReferenceError::ResourceDenied); }
         owned_name.push_str(name);
         let mut scan = ReferenceScan {
-            cursor: IdentifierCursor::new(name).map_err(|_| ReferenceError::InvalidName)?,
+            cursor: IdentifierCursor::new_matching(name, case_sensitive).map_err(|_| ReferenceError::InvalidName)?,
             candidates, max_items, skip_matches, count_all_matches, counted: 0, limited: false,
             token_raw: 0, token_decoded: 0, token_line: 1, line: 1, previous_cr: false,
             raw_end: 0, decoded_end: 0,
@@ -176,7 +193,7 @@ impl<'source> CapturedReferences<'source> {
             scan.record(scan.raw_end, scan.decoded_end)?;
         }
         if canceled() { return Err(ReferenceError::Canceled); }
-        Ok(Self { source, request, generation, encoding, name: owned_name, candidates: scan.candidates,
+        Ok(Self { source, request, generation, encoding, name: owned_name, case_sensitive, candidates: scan.candidates,
             counted: scan.counted, limited: scan.limited,
             count_complete: count_all_matches || !scan.limited, _lease: lease })
     }
@@ -185,7 +202,9 @@ impl<'source> CapturedReferences<'source> {
     pub const fn revision(&self) -> SourceRevision { self.request.revision() }
     pub const fn generation(&self) -> QueryGeneration { self.generation }
     pub const fn encoding(&self) -> DetectedEncoding { self.encoding }
+    /// The requested token, which can differ from each occurrence's spelling.
     pub fn name(&self) -> &str { &self.name }
+    pub const fn case_sensitive(&self) -> bool { self.case_sensitive }
     pub fn candidates(&self) -> &[ReferenceCandidate] { &self.candidates }
     /// Observed occurrences, including skipped matches. Legacy builders count
     /// at most one unstored lookahead; an explicit counting window scans to EOF.
@@ -219,6 +238,43 @@ impl<'source> CapturedReferences<'source> {
         let range = self.candidate(id).ok_or(ReferenceError::NotFound)?.original_range;
         let (start, end) = range.as_usize_bounds().map_err(|_| ReferenceError::InvalidEvidence)?;
         self.source.get(start..end).ok_or(ReferenceError::InvalidEvidence)
+    }
+
+    /// Replace the caller's admitted scratch text with the original spelling.
+    /// No capacity is allocated for the output: its existing capacity must hold
+    /// the candidate's decoded UTF-8 range. Admission and unknown-ID errors
+    /// preserve the previous output; a decoding error clears partial output.
+    ///
+    /// Callers can reserve name().len() bytes for exact matching, or four times
+    /// the number of scalars in name().chars().flat_map(char::to_lowercase) for
+    /// lowercase matching. Every source scalar contributes at least one
+    /// lowercase scalar and occupies at most four UTF-8 bytes.
+    ///
+    /// Decoding reuses this collection's admitted bounded-window scratch and
+    /// starts at the candidate's original offset. Interior BOM scalars remain
+    /// part of the source spelling; UTF-16 ranges stay on the captured grid.
+    pub fn write_source_text(&self, id: u64, output: &mut String) -> Result<(), ReferenceError> {
+        let candidate = self.candidate(id).ok_or(ReferenceError::NotFound)?;
+        let decoded_len = candidate.decoded_range.end().get()
+            .checked_sub(candidate.decoded_range.start().get()).ok_or(ReferenceError::InvalidEvidence)?;
+        let expected = usize::try_from(decoded_len).map_err(|_| ReferenceError::InvalidEvidence)?;
+        if output.capacity() < expected { return Err(ReferenceError::ResourceDenied); }
+        let bytes = self.source_bytes(id)?;
+        output.clear();
+        let result = (|| {
+            let mut decoder = StatefulChunkDecoder::with_raw_offset(self.encoding, candidate.original_range.start().get());
+            for chunk in bytes.chunks(DECODE_WINDOW_BYTES) {
+                let map = decoder.decode_chunk(chunk).map_err(decoder_error)?;
+                append_source_text(&map, output, expected)?;
+            }
+            if let Some(map) = decoder.finish().map_err(decoder_error)? {
+                append_source_text(&map, output, expected)?;
+            }
+            if output.len() != expected { return Err(ReferenceError::InvalidEvidence); }
+            Ok(())
+        })();
+        if result.is_err() { output.clear(); }
+        result
     }
 }
 
@@ -309,6 +365,17 @@ impl ReferenceScan<'_> {
     }
 }
 
+fn append_source_text(map: &CaptureEncodingMap, output: &mut String, expected: usize)
+    -> Result<(), ReferenceError> {
+    if map.spans().iter().any(|span| matches!(span.kind, SpanKind::ReplacementMalformed | SpanKind::EscapedByte)) {
+        return Err(ReferenceError::UnsupportedEncoding);
+    }
+    let length = output.len().checked_add(map.decoded_text().len()).ok_or(ReferenceError::InvalidEvidence)?;
+    if length > expected { return Err(ReferenceError::InvalidEvidence); }
+    output.push_str(map.decoded_text());
+    Ok(())
+}
+
 fn decoder_error(error: fcb_source::SourceError) -> ReferenceError {
     match error {
         fcb_source::SourceError::PayloadTooLarge => ReferenceError::ResourceDenied,
@@ -321,6 +388,9 @@ fn decoder_error(error: fcb_source::SourceError) -> ReferenceError {
 pub fn validate_reference_name(name: &str) -> Result<(), ReferenceError> {
     validate_identifier(name).map_err(|_| ReferenceError::InvalidName)
 }
+
+#[cfg(test)]
+mod lowercase_tests;
 
 #[cfg(test)]
 mod tests {

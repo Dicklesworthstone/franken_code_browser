@@ -246,11 +246,89 @@ fn counting_never_overrides_scope_coverage_work_limits_or_cancellation() {
 }
 
 #[test]
-fn insensitive_occurrences_are_rejected_before_io() {
-    let budget = budget(); let mut saved = archive(&[entry(b"a.txt", b"needle")], true, &budget);
-    assert!(matches!(StructureQuery::new_matching_page(&mut saved, "needle",
-        options(StructureMode::Occurrences, 1), 0, false, true, &budget, allocations()), Err(StructureError::InvalidLimits)));
-    assert_eq!(saved.load_stats().loaded_members, 0);
+fn insensitive_occurrences_keep_whole_source_tokens_and_verified_encoded_anchors() {
+    let text = "k K K kx _K $K 1K K\u{307}\nİ i\u{307} I\u{307} i I ß ẞ ss SS ΟΣ οσ ος É é e\u{301}";
+    for little in [None, Some(true), Some(false)] {
+        let budget = budget();
+        let bytes = little.map_or_else(|| text.as_bytes().to_vec(), |little| encoded(text, little));
+        let mut saved = archive(&[entry(b"saved.txt", &bytes)], true, &budget);
+        for (needle, expected) in [
+            ("K", vec!["k", "K", "K"]),
+            ("i\u{307}", vec!["İ", "i\u{307}", "I\u{307}"]),
+            ("i", vec!["i", "I"]), ("ß", vec!["ß", "ẞ"]),
+            ("ss", vec!["ss", "SS"]), ("οσ", vec!["ΟΣ", "οσ"]),
+            ("ος", vec!["ος"]), ("é", vec!["É", "é"]),
+        ] {
+            let opts = options(StructureMode::Occurrences, 16);
+            let report = run_matching(&mut saved, needle, opts, 0, false, true, &budget);
+            assert!(report.is_complete()); assert!(report.matches_seen_exact());
+            assert!(!report.case_sensitive()); assert!(report.count_all_matches());
+            assert_eq!(report.matches_seen(), expected.len() as u64);
+            assert_eq!(report.hits().iter().map(|hit| hit.name()).collect::<Vec<_>>(), expected);
+            for hit in report.hits() {
+                let range = hit.original_range();
+                let wanted = little.map_or_else(|| hit.name().as_bytes().to_vec(),
+                    |little| encoded(hit.name(), little)[2..].to_vec());
+                assert_eq!(&bytes[range.start().get() as usize..range.end().get() as usize], wanted);
+                assert_eq!(hit.evidence_range(), range);
+                let capture = hit.open(&mut saved, opts.generation, &budget,
+                    [allocation(30), allocation(31)], || false).unwrap();
+                assert_eq!(capture.bytes(), bytes);
+            }
+        }
+        let legacy = run(&mut saved, "K", options(StructureMode::Occurrences, 16), &budget);
+        assert!(legacy.case_sensitive());
+        assert_eq!(legacy.hits().iter().map(|hit| hit.name()).collect::<Vec<_>>(), ["K"]);
+    }
+}
+
+#[test]
+fn lowercase_occurrence_counts_and_later_windows_span_members_without_retaining_tails() {
+    let budget = budget();
+    let text = "k K K";
+    let utf16 = encoded(text, true);
+    let mut saved = archive(&[entry(b"a.txt", text.as_bytes()), entry(b"b.txt", &utf16)], true, &budget);
+    let opts = options(StructureMode::Occurrences, 1);
+    for skip in 0..6 {
+        let report = run_matching(&mut saved, "K", opts, skip, false, true, &budget);
+        assert!(report.is_complete()); assert!(report.matches_seen_exact());
+        assert_eq!(report.matches_seen(), 6); assert_eq!(report.skipped_matches(), skip);
+        assert_eq!(report.hits().len(), 1);
+        let hit = &report.hits()[0];
+        assert_eq!(hit.name(), ["k", "K", "K"][skip as usize % 3]);
+        assert_eq!(hit.ordinal(), skip as usize / 3);
+        assert_eq!(report.next_match_offset(), if skip < 5 { Some(skip + 1) } else { None });
+        assert_eq!(report.truncated(), skip < 5);
+        assert_eq!(report.stats().members_loaded, 2);
+    }
+    let zero = run_matching(&mut saved, "K", options(StructureMode::Occurrences, 0), 0, false, true, &budget);
+    assert!(zero.hits().is_empty()); assert_eq!(zero.matches_seen(), 6);
+    assert!(zero.is_complete()); assert!(zero.truncated()); assert!(!zero.has_more_matches());
+    assert_eq!(zero.next_match_offset(), None);
+    drop(zero);
+    let beyond = run_matching(&mut saved, "K", opts, u64::MAX, false, true, &budget);
+    assert!(beyond.hits().is_empty()); assert_eq!(beyond.matches_seen(), 6);
+    assert!(beyond.is_complete()); assert!(!beyond.truncated());
+    drop(beyond);
+    let page = run_matching(&mut saved, "K", opts, 1, false, false, &budget);
+    assert_eq!(page.matches_seen(), 3); assert_eq!(page.hits()[0].name(), "K");
+    assert_eq!(page.next_match_offset(), Some(2)); assert!(!page.matches_seen_exact());
+}
+
+#[test]
+fn lowercase_source_names_wider_than_the_query_are_admitted_and_retained_exactly() {
+    let budget = budget();
+    let needle = "K".repeat(1024); let spelling = "K".repeat(1024);
+    let bytes = encoded(&spelling, false);
+    let mut saved = archive(&[entry(b"wide.txt", &bytes)], true, &budget);
+    let report = run_matching(&mut saved, &needle, options(StructureMode::Occurrences, 1),
+        0, false, true, &budget);
+    assert!(report.is_complete()); assert_eq!(report.matches_seen(), 1);
+    assert_eq!(report.hits()[0].name(), spelling);
+    assert_eq!(report.stats().metadata_bytes, spelling.len());
+    assert_eq!(report.stats().metadata_omitted, 0);
+    assert_eq!(report.hits()[0].original_range().start().get(), 2);
+    assert_eq!(report.hits()[0].original_range().end().get(), bytes.len() as u64);
 }
 
 #[cfg(feature = "markdown")]
