@@ -12,7 +12,7 @@
 mod capture_witness;
 use capture_witness::CaptureWitness;
 mod progressive;
-pub use progressive::{AtlasSearchProgress, AtlasSearchStop};
+pub use progressive::{AtlasSearchProgress, AtlasSearchStop, MAX_ATLAS_VERIFICATION_STEP_BYTES};
 use progressive::SearchWork;
 mod indexed;
 pub use indexed::{AtlasIndexOptions, AtlasIndexBuildProgress, MAX_ATLAS_INDEX_GRAMS,

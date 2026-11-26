@@ -199,29 +199,60 @@ fn malformed_sources_after_a_full_hit_buffer_remain_unavailable() {
 
 #[test]
 fn captured_index_bypasses_incompatible_negative_certificates_and_obeys_scan_budget() {
-    let mut f = Fixture::new(&[("a.rs", b"NEEDLE"), ("b.rs", b"quiet")]);
-    f.build(1);
-    // A byte-exact negative certificate is valid for the default mode only.
-    let exact = f.search.search_indexed(&f.atlas, 2, 1, "needle", 100, 0, || false).unwrap();
-    assert_eq!(exact.exit_code(), EXIT_OK);
-    assert_eq!(json(&exact).get("skipped_by_index").number(), 2);
-    let exhausted = f.search.search_indexed_scoped(&f.atlas, 3, 1, "needle", insensitive(),
-        100, 0, || false).unwrap();
-    assert_eq!(exhausted.exit_code(), EXIT_PARTIAL);
-    assert_eq!(json(&exhausted).get("stop_reason").text(), "verification-byte-limit");
-    assert_eq!(json(&exhausted).get("skipped_by_index").number(), 0);
-    fs::write(f.root.join("a.rs"), b"new bytes without a match").unwrap();
-    let result = f.search.search_indexed_scoped(&f.atlas, 4, 1, "needle", insensitive(),
-        100, 131072, || false).unwrap();
-    assert_eq!(result.exit_code(), EXIT_OK);
-    let result = json(&result);
-    assert_eq!(result.get("fallback_files").number(), 2);
-    assert_eq!(result.get("skipped_by_index").number(), 0);
-    assert_eq!(result.get("source_bytes_read").number(), 0);
-    assert_eq!(result.get("hits").array()[0].get("matched_text").text(), "NEEDLE");
-    let exact_again = f.search.search_indexed(&f.atlas, 5, 1, "needle", 100, 0, || false).unwrap();
-    assert_eq!(exact_again.exit_code(), EXIT_OK);
-    assert_eq!(json(&exact_again).get("retained_hits").number(), 0);
+    for (a, b, fallback, skipped, verified, verification_bytes) in [
+        (b"NEEDLE".as_slice(), b"quiet".as_slice(), 0, 1, 1, 6),
+        ("NEEDLE K".as_bytes(), "quiet K".as_bytes(), 2, 0, 2, 19),
+    ] {
+        let mut f = Fixture::new(&[("a.rs", a), ("b.rs", b)]);
+        f.build(1);
+        // Exact UTF-8 grams prove both negatives without verification. For
+        // lowercase mode, ASCII captures admit case-variant gram probes; a
+        // non-ASCII capture must retain direct verification of both files.
+        let exact = f.search.search_indexed(&f.atlas, 2, 1, "needle", 100, 0, || false).unwrap();
+        assert_eq!(exact.exit_code(), EXIT_OK);
+        let exact = json(&exact);
+        assert_eq!(exact.get("skipped_by_index").number(), 2);
+        assert_eq!(exact.get("verified_files").number(), 0);
+        assert_eq!(exact.get("verification_source_bytes").number(), 0);
+        assert_eq!(exact.get("retained_hits").number(), 0);
+        let exhausted = f.search.search_indexed_scoped(&f.atlas, 3, 1, "needle", insensitive(),
+            100, 0, || false).unwrap();
+        assert_eq!(exhausted.exit_code(), EXIT_PARTIAL);
+        let exhausted = json(&exhausted);
+        assert_eq!(exhausted.get("stop_reason").text(), "verification-byte-limit");
+        assert_eq!(exhausted.get("skipped_by_index").number(), 0);
+        assert_eq!(exhausted.get("verification_source_bytes").number(), 0);
+        assert_eq!(exhausted.get("retained_hits").number(), 0);
+        fs::write(f.root.join("a.rs"), b"new bytes without a match").unwrap();
+        let result = f.search.search_indexed_scoped(&f.atlas, 4, 1, "needle", insensitive(),
+            100, verification_bytes, || false).unwrap();
+        assert_eq!(result.exit_code(), EXIT_OK);
+        let result = json(&result);
+        assert!(result.get("search_complete").flag());
+        assert_eq!(result.get("fallback_files").number(), fallback);
+        assert_eq!(result.get("skipped_by_index").number(), skipped);
+        assert_eq!(result.get("verified_files").number(), verified);
+        assert_eq!(result.get("scanned_files").number(), verified);
+        assert_eq!(result.get("examined_files").number(), 2);
+        assert_eq!(result.get("pending_files").number(), 0);
+        assert_eq!(result.get("verification_source_bytes").number(), verification_bytes);
+        assert_eq!(result.get("source_bytes_read").number(), 0);
+        assert_eq!(result.get("matches_seen").number(), 1);
+        assert_eq!(result.get("retained_hits").number(), 1);
+        assert_eq!(result.get("hits").array()[0].get("matched_text").text(), "NEEDLE");
+        let hit = f.search.hit(&f.atlas, 4, 1).unwrap();
+        assert_eq!((hit.original_range.start().get(), hit.original_range.end().get()), (0, 6));
+        let (reader, activation) = f.search.open_reader(&f.atlas, owner(99103), 4, 1, || false).unwrap();
+        assert_eq!(reader.capture().bytes(), a);
+        assert!(!json(&activation).get("source_reopened").flag());
+        let exact_again = f.search.search_indexed(&f.atlas, 5, 1, "needle", 100, 0, || false).unwrap();
+        assert_eq!(exact_again.exit_code(), EXIT_OK);
+        let exact_again = json(&exact_again);
+        assert_eq!(exact_again.get("skipped_by_index").number(), 2);
+        assert_eq!(exact_again.get("verification_source_bytes").number(), 0);
+        assert_eq!(exact_again.get("retained_hits").number(), 0);
+        assert_eq!(reader.capture().bytes(), a);
+    }
 }
 
 #[test]

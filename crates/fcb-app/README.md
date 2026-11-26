@@ -645,6 +645,35 @@ count is exhaustive. A completed counted scan has no `stop_reason` solely
 because rows were omitted. The 8 MiB response cap remains independent of scan
 size. This addition is code-first; executable qualification remains pending.
 
+## Bounded verification in retained atlas search
+
+Retained live and indexed atlas searches can yield while verifying one captured
+file. Each step supplies at most 64 KiB of original source to the shared verifier.
+Exact text, Unicode lowercase matching and explicit expressions retain decoder
+and matcher context between calls, including UTF-8 scalars and UTF-16 surrogate
+pairs split across slices.
+
+A file's hits, occurrence count and matching-file count become visible together
+after that file's verification finishes. Expression candidates remain private
+until every required and excluded term has been checked in the same capture.
+This preserves append-only results and prevents a late exclusion from invalidating
+an already activated hit. Count-only queries retain no hit rows.
+
+The current member stays captured across steps. Replacing its live path does not
+change continued verification or later result activation. Source-read quotas
+limit admission of another member; they do not discard unfinished verification
+of bytes already read. Cancellation drops the pending replacement while preserving
+the last accepted query and independently opened readers.
+
+This allowance bounds verification input, not the complete worker call's duration.
+Initial capture still reads an admitted member, and capture witnesses, result
+copying and bounded excerpt encoding have separate work limits. Structural
+analysis retains its existing per-file scheduling. No UI latency, native
+smoothness or physical-Mac qualification is claimed from these source changes.
+Portable Rust compilation and focused search regressions pass on nightly-2026-09-21.
+The pinned-nightly, independent strict-RCH and native macOS qualification lanes
+remain outstanding.
+
 ## Workspace inspection and indexed-capture search
 
 `inspect ROOT --workspace` publishes a sorted catalog of regular files and

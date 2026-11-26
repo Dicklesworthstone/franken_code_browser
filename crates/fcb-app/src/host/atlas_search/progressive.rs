@@ -1,15 +1,15 @@
 #![forbid(unsafe_code)]
 
-//! One-file scheduling slices over the existing live-capture and retained-index
-//! pipelines. The same pending slot, publication and cancellation rules serve
-//! both. A slice admits at most one source member under the existing file cap;
-//! it is worker work, not a fixed-duration UI callback or a native latency claim.
+//! Resumable verification over the live-capture and retained-index pipelines.
+//! Each call verifies at most 64 KiB from at most one source member. Capturing
+//! a new member, hashing retained hits, and encoding excerpts retain their
+//! separate bounds; this is not a fixed-duration UI or native latency claim.
+//! A member's hits and counts publish together only after its scan finishes.
 
 use super::*;
 use crate::workspace;
-use fcb::search::{CaptureRequest, DirectSourceScanner, QueryError, QueryGeneration, QueryOptions,
-    ReaderSearch, SearchCoverage, SearchMode, StreamReadOptions, StreamReadState, StreamReadStep,
-    StreamingNeedle, UnicodeNormalization};
+use fcb::search::{CaptureQueryScan, CaptureRequest, ParsedQuery,
+    QueryGeneration, QueryOptions, SearchCoverage, SearchDocument, SearchMode, UnicodeNormalization};
 use super::indexed::IndexedWork;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,13 +73,25 @@ pub(super) enum SearchExecution {
     Live(LiveWork), Indexed(IndexedWork), Structure(super::structure::StructureWork),
     Expression(super::expression::ExpressionWork),
 }
+/// Raw source bytes offered to the shared verifier by one host step. File
+/// capture and result presentation have independent, explicitly larger limits.
+pub const MAX_ATLAS_VERIFICATION_STEP_BYTES: usize = 64 * 1024;
+
 pub(super) struct LiveWork {
-    // Exact mode keeps the original incremental scanner. Lowercase matching is
-    // delegated to DirectSourceScanner over the same bounded complete capture.
-    pattern: Option<StreamingNeedle>,
     options: AtlasSearchOptions,
     scan_id: ResourceAllocationId,
     io: workspace::IoCounts,
+    current: Option<PendingCaptureScan>,
+}
+
+/// The scan and its exact source survive worker yields together. The cursor
+/// shares the capture's byte allocation; its query/result scratch is admitted
+/// separately and remains charged until final publication or cancellation.
+pub(super) struct PendingCaptureScan {
+    pub(super) capture: CompleteCapture,
+    pub(super) node: AtlasNodeId,
+    pub(super) scan: CaptureQueryScan,
+    _lease: ResourceLease,
 }
 
 impl RetainedAtlasSearch {
@@ -137,7 +149,8 @@ impl RetainedAtlasSearch {
         Ok(response)
     }
 
-    /// Advance at most ONE live or captured file and return append-only progress.
+    /// Advance verification within at most ONE live or captured file. A large
+    /// file can require several calls before its hits and counts are published.
     /// Stale steps never discard a newer request. Any failed/canceled step drops
     /// that request's provisional state, not the previously accepted query.
     /// Repeating a terminal step returns its page without repeating verification.
@@ -184,7 +197,7 @@ impl RetainedAtlasSearch {
         let scope_bytes = if scope.is_all() { 0 } else {
             eligible_files.checked_mul(size_of::<FileId>()).ok_or(AppError::Admission)?
         };
-        let [state_id, pattern_id, scan_id] = [self.next_id()?, self.next_id()?, self.next_id()?];
+        let [state_id, scan_id] = [self.next_id()?, self.next_id()?];
         let capacity = options.max_matches.min(options.max_files);
         let text_capacity = matched_text_capacity(needle, &scope)?;
         let charge = 2 * options.max_source_bytes + capacity * (size_of::<RetainedFile>() + 64)
@@ -207,13 +220,9 @@ impl RetainedAtlasSearch {
             matches_seen: 0, matching_files: 0, source_bytes_read: 0, read_calls: 0, retained_bytes: 0,
             count_all_matches, truncated: false, complete: false, stop_reason: None, step_count: 0,
             last_step_files: 0, last_step_bytes: 0, last_step_calls: 0, index_usage: None, _lease: lease };
-        let pattern = if case_sensitive {
-            Some(StreamingNeedle::text(self.manifest.owner(), needle, &self.budget, pattern_id)
-                .map_err(AppError::from)?)
-        } else { None };
         self.validate(atlas)?; check(canceled)?;
         Ok(SearchWork { snapshot, execution: SearchExecution::Live(LiveWork {
-            pattern, options, scan_id, io: workspace::IoCounts::default() }) })
+            options, scan_id, io: workspace::IoCounts::default(), current: None }) })
     }
 
     pub(super) fn work_response(&mut self, atlas: &AtlasSession, work: &SearchWork,
@@ -244,8 +253,9 @@ impl RetainedAtlasSearch {
             SearchExecution::Expression(expression) => self.advance_expression_work(atlas, snapshot, expression, canceled)?,
         }
         self.validate(atlas)?; check(canceled)?;
-        // Every execution variant advances at most one source member. Count
-        // that member once even when all of its occurrences exceed row storage.
+        // Every execution variant publishes at most one finalized member.
+        // In-progress slices expose no tentative counts, so a matching file is
+        // counted once even when verification spans many worker calls.
         if snapshot.matches_seen > before_matches { snapshot.matching_files += 1; }
         snapshot.step_count = snapshot.step_count.checked_add(1).ok_or(AtlasSearchError::IdentityExhausted)?;
         snapshot.last_step_files = snapshot.examined - before_files;
@@ -256,124 +266,121 @@ impl RetainedAtlasSearch {
 
     fn scan_one_file(&self, atlas: &AtlasSession, candidate: &mut Snapshot, work: &mut LiveWork,
         canceled: &mut impl FnMut() -> bool) -> Result<(), AtlasSearchError> {
-        let catalog = atlas.atlas().catalog();
-        let file = match &candidate.scope_files {
-            Some(files) => files.get(candidate.examined).copied(),
-            None => catalog.file_id(candidate.examined),
-        }.ok_or(AtlasSearchError::WrongAtlas)?;
-        let entry = catalog.entry(file).ok_or(AtlasSearchError::WrongAtlas)?;
-        candidate.examined += 1;
-        if entry.observed_bytes() > work.options.max_file_bytes as u64 {
-            candidate.unavailable(file, "FILE_BYTE_LIMIT"); return Ok(());
-        }
-        let qgen = QueryGeneration::new(self.manifest.owner(), candidate.generation)
-            .map_err(|_| AtlasSearchError::IdentityExhausted)?;
-        let revision = SourceRevision::new(self.manifest.owner(), candidate.generation)
-            .map_err(|_| AtlasSearchError::IdentityExhausted)?;
-        let request = CaptureRequest::new(file, revision).map_err(|_| AtlasSearchError::WrongAtlas)?;
-        let root = catalog.grant().root_path().to_path_buf();
-        let captured = workspace::read_capture(&root, request, entry.path(), work.options.max_file_bytes,
-            work.options.max_source_bytes as u64, &mut work.io, &self.budget,
-            &mut || canceled() || atlas.validate_active().is_err());
-        self.validate(atlas)?; check(canceled)?;
-        let capture = match captured {
-            Ok(capture) => capture,
-            Err(fcb::source::SourceError::Canceled) => return Err(AtlasSearchError::Canceled),
-            Err(error) => { candidate.unavailable(file, error.code()); return Ok(()); }
-        };
-        let node = atlas.atlas().node_for_file(file).map_err(AtlasSessionError::from)?;
-        let before_hits = candidate.hits.len();
-        if let Some(pattern) = &work.pattern {
-            let mut scan_options = StreamReadOptions::new(qgen);
-            // Once storage is full, zero slots still allow the shared scanner
-            // to prove no match or observe one unstored occurrence. The probe
-            // cannot append hits or retain another source capture below.
-            scan_options.max_matches = work.options.max_matches - before_hits;
-            scan_options.max_bytes = capture.bytes().len() as u64;
-            let mut scan = if candidate.count_all_matches {
-                ReaderSearch::new_counting(capture.bytes(), *capture.request(),
-                    ByteLength::new(capture.bytes().len() as u64), pattern, scan_options,
-                    &self.budget, work.scan_id)
-            } else {
-                ReaderSearch::new(capture.bytes(), *capture.request(),
-                    ByteLength::new(capture.bytes().len() as u64), pattern, scan_options,
-                    &self.budget, work.scan_id)
-            }.map_err(AppError::from)?;
-            while scan.state() == StreamReadState::Pending {
-                scan.step(StreamReadStep::default(), qgen,
-                    || canceled() || atlas.validate_active().is_err()).map_err(AppError::from)?;
+        if work.current.is_none() {
+            let catalog = atlas.atlas().catalog();
+            let file = match &candidate.scope_files {
+                Some(files) => files.get(candidate.examined).copied(),
+                None => catalog.file_id(candidate.examined),
+            }.ok_or(AtlasSearchError::WrongAtlas)?;
+            let entry = catalog.entry(file).ok_or(AtlasSearchError::WrongAtlas)?;
+            if entry.observed_bytes() > work.options.max_file_bytes as u64 {
+                candidate.examined += 1;
+                candidate.unavailable(file, "FILE_BYTE_LIMIT"); return Ok(());
             }
-            let (_, report) = scan.finish().map_err(AppError::from)?;
+            let generation = QueryGeneration::new(self.manifest.owner(), candidate.generation)
+                .map_err(|_| AtlasSearchError::IdentityExhausted)?;
+            let revision = SourceRevision::new(self.manifest.owner(), candidate.generation)
+                .map_err(|_| AtlasSearchError::IdentityExhausted)?;
+            let request = CaptureRequest::new(file, revision).map_err(|_| AtlasSearchError::WrongAtlas)?;
+            let root = catalog.grant().root_path().to_path_buf();
+            let captured = workspace::read_capture(&root, request, entry.path(), work.options.max_file_bytes,
+                work.options.max_source_bytes as u64, &mut work.io, &self.budget,
+                &mut || canceled() || atlas.validate_active().is_err());
             self.validate(atlas)?; check(canceled)?;
-            if report.state() == StreamReadState::Canceled { return Err(AtlasSearchError::Canceled); }
-            if let StreamReadState::Failed(error) = report.state() { return Err(AppError::from(error).into()); }
-            candidate.scanned += 1;
-            candidate.matches_seen = candidate.matches_seen.checked_add(report.matches_seen())
-                .ok_or(AtlasSearchError::IdentityExhausted)?;
-            if report.state() == StreamReadState::Truncated { candidate.truncated = true; }
-            else if !report.input_complete() { candidate.unavailable(file, report.state().code()); }
-            for hit in report.hits() {
-                candidate.hits.push(AtlasSearchHit { id: candidate.hits.len() as u64 + 1,
-                    file, revision, node, original_range: hit.original_range(), source_slot: candidate.files.len() });
-            }
-            if candidate.count_all_matches {
-                candidate.truncated = candidate.matches_seen > candidate.hits.len() as u64;
-            }
-        } else {
-            let remaining = work.options.max_matches - before_hits;
-            let mut scan_options = QueryOptions::new(qgen).with_mode(SearchMode::DecodedText {
-                case_sensitive: false, normalization: UnicodeNormalization::Exact,
+            let capture = match captured {
+                Ok(capture) => capture,
+                Err(fcb::source::SourceError::Canceled) => return Err(AtlasSearchError::Canceled),
+                Err(error) => {
+                    candidate.examined += 1;
+                    candidate.unavailable(file, error.code()); return Ok(());
+                }
+            };
+            let node = atlas.atlas().node_for_file(file).map_err(AtlasSessionError::from)?;
+            let remaining = work.options.max_matches - candidate.hits.len();
+            let mut options = QueryOptions::new(generation).with_mode(SearchMode::DecodedText {
+                case_sensitive: candidate.scope.case_sensitive(), normalization: UnicodeNormalization::Exact,
             });
-            // Legacy mode uses one lookahead when rows are full. Counted mode
-            // accepts zero retained rows and still verifies every occurrence.
-            scan_options.max_matches = if candidate.count_all_matches { remaining } else { remaining.max(1) };
-            scan_options.max_bytes_scanned = Some(capture.bytes().len() as u64);
-            let scratch = text_matching::scan_scratch_bytes(scan_options.max_matches,
-                candidate.matched_text_capacity)?;
-            let _scan_lease = self.budget.try_reserve_managed(self.manifest.owner(), work.scan_id,
-                ByteLength::new(scratch as u64)).map_err(|_| AppError::Admission)?;
-            let scanned = if candidate.count_all_matches {
-                DirectSourceScanner::scan_complete_capture_counting_with_cancel(&capture,
-                    &candidate.needle, &scan_options, || canceled() || atlas.validate_active().is_err())
+            // Non-counting probes retain one temporary row when global storage
+            // is full; only the first unstored occurrence affects the result.
+            options.max_matches = if candidate.count_all_matches { remaining } else { remaining.max(1) };
+            options.max_bytes_scanned = Some(capture.bytes().len() as u64);
+            // Literal entry points never parse spaces, signs or field syntax.
+            let query = ParsedQuery { primary_needle: copy_text(&candidate.needle)?,
+                is_phrase: true, conjunction_terms: Vec::new(), exclusion_terms: Vec::new(),
+                path_filters: Vec::new(), lang_filters: Vec::new(), raw_query: copy_text(&candidate.needle)? };
+            let text_capacity = candidate.matched_text_capacity.max(candidate.needle.len());
+            // No path predicates occur in this literal AST; membership was
+            // already frozen by the atlas scope at query admission.
+            work.current = Some(self.prepare_capture_scan(capture, node, "", &query, &options,
+                candidate.count_all_matches, text_capacity, work.scan_id)?);
+        }
+        let current = work.current.as_mut().ok_or(AtlasSearchError::WrongAtlas)?;
+        current.scan.step(MAX_ATLAS_VERIFICATION_STEP_BYTES,
+            || canceled() || atlas.validate_active().is_err()).map_err(IndexError::from)?;
+        self.validate(atlas)?; check(canceled)?;
+        if current.scan.is_terminal() {
+            let current = work.current.take().ok_or(AtlasSearchError::WrongAtlas)?;
+            self.publish_capture_scan(atlas, candidate, current, work.options.max_matches, canceled)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn prepare_capture_scan(&self, capture: CompleteCapture, node: AtlasNodeId,
+        path: &str, query: &ParsedQuery, options: &QueryOptions, count_all: bool,
+        text_capacity: usize, allocation: ResourceAllocationId) -> Result<PendingCaptureScan, AtlasSearchError> {
+        let result_scratch = text_matching::scan_scratch_bytes(options.max_matches, text_capacity)?
+            .checked_sub(text_matching::LOWERCASE_SCAN_SCRATCH_BYTES).ok_or(AppError::Admission)?;
+        let scratch = CaptureQueryScan::scratch_bytes(query, options).map_err(IndexError::from)?
+            .checked_add(result_scratch).and_then(|n| n.checked_add(size_of::<PendingCaptureScan>()))
+            .ok_or(AppError::Admission)?;
+        let lease = self.budget.try_reserve_managed(self.manifest.owner(), allocation,
+            ByteLength::new(scratch as u64)).map_err(|_| AppError::Admission)?;
+        let document = SearchDocument::new(capture.request().file(), path, &capture);
+        let scan = CaptureQueryScan::new(&document, query, options, 0, count_all).map_err(IndexError::from)?;
+        Ok(PendingCaptureScan { capture, node, scan, _lease: lease })
+    }
+
+    /// Transfer a finalized member once. Returning byte/coverage information
+    /// lets expression queries apply their separate cumulative work allowance.
+    pub(super) fn publish_capture_scan(&self, atlas: &AtlasSession, candidate: &mut Snapshot,
+        current: PendingCaptureScan, max_matches: usize, canceled: &mut impl FnMut() -> bool)
+        -> Result<(u64, bool), AtlasSearchError> {
+        let PendingCaptureScan { capture, node, scan, _lease } = current;
+        let report = scan.into_result().map_err(IndexError::from)?;
+        self.validate(atlas)?; check(canceled)?;
+        if report.coverage == SearchCoverage::CanceledEarly { return Err(AtlasSearchError::Canceled); }
+        let file = capture.request().file();
+        let revision = capture.request().revision();
+        let before_hits = candidate.hits.len();
+        let remaining = max_matches.checked_sub(before_hits).ok_or(AtlasSearchError::WrongAtlas)?;
+        let work_limited = matches!(report.coverage, SearchCoverage::BudgetExhausted { .. });
+        if candidate.count_all_matches && matches!(report.coverage, SearchCoverage::TruncatedAtLimit { .. })
+            || report.unsupported_files.iter().any(|&unsupported| unsupported != file) {
+            return Err(AtlasSearchError::WrongAtlas);
+        }
+        candidate.examined += 1;
+        candidate.scanned += 1;
+        let counted = if candidate.count_all_matches { report.total_matches_counted }
+            else { report.total_matches_counted.min(remaining + 1) };
+        candidate.matches_seen = candidate.matches_seen.checked_add(counted as u64)
+            .ok_or(AtlasSearchError::IdentityExhausted)?;
+        candidate.truncated |= counted > remaining
+            || matches!(report.coverage, SearchCoverage::TruncatedAtLimit { .. });
+        if !report.unsupported_files.is_empty() { candidate.unavailable(file, "unsupported-text"); }
+        else if work_limited { candidate.unavailable(file, "verification-byte-limit"); }
+        for hit in report.matches.into_iter().take(remaining) {
+            check(canceled)?;
+            if hit.file_id != file || hit.revision != revision || hit.original_byte_range.is_empty()
+                || hit.original_byte_range.end().get() > capture.bytes().len() as u64
+                || hit.matched_text.is_empty() { return Err(AtlasSearchError::WrongAtlas); }
+            if candidate.scope.case_sensitive() {
+                if hit.matched_text.as_bytes() != candidate.needle.as_bytes() { return Err(AtlasSearchError::WrongAtlas); }
             } else {
-                DirectSourceScanner::scan_complete_capture_with_cancel(&capture,
-                    &candidate.needle, &scan_options, || canceled() || atlas.validate_active().is_err())
-            };
-            self.validate(atlas)?; check(canceled)?;
-            let report = match scanned {
-                Ok(report) => report,
-                Err(QueryError::UnsupportedEncoding) => {
-                    candidate.scanned += 1;
-                    candidate.unavailable(file, "unsupported-text");
-                    return Ok(());
-                }
-                Err(error) => return Err(IndexError::from(error).into()),
-            };
-            if report.coverage == SearchCoverage::CanceledEarly { return Err(AtlasSearchError::Canceled); }
-            candidate.scanned += 1;
-            let counted = if candidate.count_all_matches { report.total_matches_counted }
-                else { report.total_matches_counted.min(remaining + 1) };
-            candidate.matches_seen = candidate.matches_seen.checked_add(counted as u64)
-                .ok_or(AtlasSearchError::IdentityExhausted)?;
-            if counted > remaining || matches!(report.coverage, SearchCoverage::TruncatedAtLimit { .. }) {
-                candidate.truncated = true;
-            }
-            if !report.unsupported_files.is_empty() {
-                candidate.unavailable(file, "unsupported-text");
-            } else if matches!(report.coverage, SearchCoverage::BudgetExhausted { .. }) {
-                candidate.unavailable(file, "verification-byte-limit");
-            }
-            for hit in report.matches.into_iter().take(remaining) {
-                check(canceled)?;
-                if hit.file_id != file || hit.revision != revision || hit.original_byte_range.is_empty()
-                    || hit.original_byte_range.end().get() > capture.bytes().len() as u64
-                    || hit.matched_text.is_empty() || hit.matched_text.capacity() > candidate.matched_text_capacity {
-                    return Err(AtlasSearchError::WrongAtlas);
-                }
+                if hit.matched_text.capacity() > candidate.matched_text_capacity { return Err(AtlasSearchError::WrongAtlas); }
                 candidate.matched_texts.push(hit.matched_text);
-                candidate.hits.push(AtlasSearchHit { id: candidate.hits.len() as u64 + 1,
-                    file, revision, node, original_range: hit.original_byte_range, source_slot: candidate.files.len() });
             }
+            candidate.hits.push(AtlasSearchHit { id: candidate.hits.len() as u64 + 1,
+                file, revision, node, original_range: hit.original_byte_range, source_slot: candidate.files.len() });
         }
         let hits = candidate.hits.len() - before_hits;
         if hits != 0 {
@@ -382,7 +389,7 @@ impl RetainedAtlasSearch {
                 &mut || canceled() || atlas.validate_active().is_err())?;
             candidate.files.push(RetainedFile { capture, node, hits, witness });
         }
-        Ok(())
+        Ok((report.scanned_bytes, work_limited))
     }
 }
 fn update_coverage(atlas: &AtlasSession, q: &mut Snapshot, work: &LiveWork) {
@@ -397,7 +404,8 @@ fn update_coverage(atlas: &AtlasSession, q: &mut Snapshot, work: &LiveWork) {
         Some(AtlasSearchStop::MatchLimit)
     } else if q.examined == work.options.max_files {
         Some(AtlasSearchStop::FileLimit)
-    } else if work.io.bytes >= work.options.max_source_bytes as u64 {
+    } else if work.current.is_none() && work.io.bytes >= work.options.max_source_bytes as u64 {
+        // Already captured bytes remain searchable after I/O admission closes.
         Some(AtlasSearchStop::SourceByteLimit)
     } else { None };
     q.complete = q.stop_reason.is_some() && atlas.atlas().discovery_complete()
