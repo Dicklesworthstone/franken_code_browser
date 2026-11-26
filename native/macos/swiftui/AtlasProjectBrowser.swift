@@ -69,6 +69,30 @@ struct AtlasProjectBrowserFile: Decodable, Sendable, Identifiable {
     private enum CodingKeys: CodingKey { case file_id, path, observed_bytes }
 }
 
+/// A discovered immediate child of the accepted browse scope. Directory IDs
+/// have their own namespace; they can never be used to open a source reader.
+struct AtlasProjectBrowserDirectory: Decodable, Sendable, Identifiable {
+    let id: UInt64
+    let rawPath: [UInt8]
+    let display: String
+    let withinBrowseLimits: Bool
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(AtlasCatalogNumber.self, forKey: .directory_id).value
+        let path = try c.decode(AtlasCatalogPath.self, forKey: .path)
+        rawPath = path.raw; display = path.display
+        withinBrowseLimits = try c.decode(Bool.self, forKey: .within_browse_limits)
+        guard id > 0,
+              withinBrowseLimits == (rawPath.split(separator: 47).count <= AtlasProjectBrowserScope.maximumDirectoryComponents) else {
+            throw AtlasProjectBrowserError.invalidResponse
+        }
+    }
+    func matches(_ other: Self) -> Bool {
+        id == other.id && rawPath == other.rawPath && withinBrowseLimits == other.withinBrowseLimits
+    }
+    private enum CodingKeys: CodingKey { case directory_id, path, within_browse_limits }
+}
+
 private struct AtlasCatalogPath: Decodable {
     let raw: [UInt8]
     let display: String
@@ -127,6 +151,8 @@ struct AtlasProjectBrowserScope: Decodable, Equatable, Sendable {
 
 struct AtlasProjectBrowserInfo: Sendable {
     let owner, latest, firstRetained, retainedPages, retainedFiles, retainedPathBytes, discovered: UInt64
+    let supportsDirectoryRows: Bool
+    let cataloguedDirectories, retainedDirectories: UInt64
     let state: String
     let more, paused, complete: Bool
     let directories, excluded, symlinks, special, unavailable, cycles, pathLimited, depthLimited, queueRefused: UInt64
@@ -147,6 +173,7 @@ struct AtlasProjectBrowserInfo: Sendable {
         do {
             let w = try JSONDecoder().decode(Wire.self, from: data)
             let scope = try JSONDecoder().decode(AtlasProjectBrowserScope.self, from: data)
+            let folders = try JSONDecoder().decode(DirectoryRows.self, from: data)
             let latest = w.latest_page.value, first = w.first_retained_page.value
             let policy = try AtlasRepositoryPolicy.admit(name: w.policy, enabled: w.rule_files_enabled,
                 evidence: w.rule_policy, discoveryComplete: w.discovery_complete)
@@ -163,6 +190,10 @@ struct AtlasProjectBrowserInfo: Sendable {
                   latest > 0, first > 0, first <= latest, latest - first < 4,
                   w.retained_pages.value == latest - first + 1,
                   w.retained_files.value <= 1024, w.retained_files.value <= w.catalogued_files.value,
+                  !folders.enabled || scope.echoed,
+                  folders.catalogued <= w.discovery.directories.value,
+                  folders.retained <= folders.catalogued,
+                  folders.retained <= 1024 - w.retained_files.value,
                   w.retained_path_bytes.value <= 270_336,
                   w.limits.page_entries.value == 256, w.limits.page_path_bytes.value == 67_584,
                   w.limits.max_path_bytes.value == 2048, w.limits.retained_pages.value == 4,
@@ -171,7 +202,9 @@ struct AtlasProjectBrowserInfo: Sendable {
             }
             return Self(owner: owner, latest: latest, firstRetained: first, retainedPages: w.retained_pages.value,
                 retainedFiles: w.retained_files.value, retainedPathBytes: w.retained_path_bytes.value,
-                discovered: w.catalogued_files.value, state: w.state, more: w.more, paused: w.paused,
+                discovered: w.catalogued_files.value, supportsDirectoryRows: folders.enabled,
+                cataloguedDirectories: folders.catalogued, retainedDirectories: folders.retained,
+                state: w.state, more: w.more, paused: w.paused,
                 complete: w.discovery_complete, directories: w.discovery.directories.value,
                 excluded: w.discovery.excluded_entries.value, symlinks: w.discovery.symlinks_not_followed.value,
                 special: w.discovery.special_objects.value, unavailable: w.discovery.unavailable.value,
@@ -180,6 +213,25 @@ struct AtlasProjectBrowserInfo: Sendable {
                 policy: policy, scope: scope)
         } catch let error as AtlasProjectBrowserError { throw error }
         catch { throw AtlasProjectBrowserError.invalidResponse }
+    }
+    private struct DirectoryRows: Decodable {
+        let enabled: Bool
+        let catalogued, retained: UInt64
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            let keys: [CodingKeys] = [.directory_rows_policy, .catalogued_directories, .retained_directories]
+            if keys.allSatisfy({ !c.contains($0) }) {
+                enabled = false; catalogued = 0; retained = 0; return
+            }
+            guard keys.allSatisfy({ c.contains($0) }),
+                  try c.decode(String.self, forKey: .directory_rows_policy) == "direct-child-directories-v1" else {
+                throw AtlasProjectBrowserError.invalidResponse
+            }
+            enabled = true
+            catalogued = try c.decode(AtlasCatalogNumber.self, forKey: .catalogued_directories).value
+            retained = try c.decode(AtlasCatalogNumber.self, forKey: .retained_directories).value
+        }
+        private enum CodingKeys: CodingKey { case directory_rows_policy, catalogued_directories, retained_directories }
     }
     private struct Limits: Decodable {
         let page_entries, page_path_bytes, max_path_bytes, retained_pages, retained_files, retained_path_bytes: AtlasCatalogNumber
@@ -204,13 +256,18 @@ struct AtlasProjectBrowserPage: Sendable {
     let info: AtlasProjectBrowserInfo
     let id: UInt64
     let files: [AtlasProjectBrowserFile]
+    let directories: [AtlasProjectBrowserDirectory]
     static func decode(_ json: String?, owner: UInt64, page expected: UInt64? = nil) throws -> Self {
         let data = try AtlasProjectBrowserWire.admit(json, owner: owner, command: "page")
         do {
             let info = try AtlasProjectBrowserInfo.decode(data, owner: owner)
             let w = try JSONDecoder().decode(Wire.self, from: data), id = w.page_id.value
             guard info.retains(id), expected == nil || expected == id, w.after_page.value == id - 1,
-                  UInt64(w.files.count) <= info.retainedFiles else { throw AtlasProjectBrowserError.invalidResponse }
+                  UInt64(w.files.count) <= info.retainedFiles,
+                  info.supportsDirectoryRows == (w.directories != nil),
+                  UInt64(w.directories?.count ?? 0) <= info.retainedDirectories else {
+                throw AtlasProjectBrowserError.invalidResponse
+            }
             var ids = Set<UInt64>(), paths = Set<[UInt8]>(), bytes = 0, charged = 0, previousID: UInt64 = 0
             for file in w.files {
                 guard file.id > previousID, file.id <= info.discovered,
@@ -225,15 +282,30 @@ struct AtlasProjectBrowserPage: Sendable {
                     throw AtlasProjectBrowserError.invalidResponse
                 }
             }
+            var previousDirectoryID: UInt64 = 0
+            for directory in w.directories ?? [] {
+                guard directory.id > previousDirectoryID, directory.id <= info.cataloguedDirectories,
+                      try AtlasDirectoryFocus.containingFile(rawPath: directory.rawPath) == info.scope.directory,
+                      paths.insert(directory.rawPath).inserted else {
+                    throw AtlasProjectBrowserError.invalidResponse
+                }
+                previousDirectoryID = directory.id
+                bytes += directory.rawPath.count
+                charged += directory.rawPath.count * 3 + directory.display.utf8.count + 256
+                guard bytes <= 67_584, charged <= AtlasProjectBrowserWire.maximumResponseBytes else {
+                    throw AtlasProjectBrowserError.invalidResponse
+                }
+            }
             guard UInt64(bytes) <= info.retainedPathBytes else { throw AtlasProjectBrowserError.invalidResponse }
-            return Self(info: info, id: id, files: w.files)
+            return Self(info: info, id: id, files: w.files, directories: w.directories ?? [])
         } catch let error as AtlasProjectBrowserError { throw error }
         catch { throw AtlasProjectBrowserError.invalidResponse }
     }
     private struct Wire: Decodable {
         let page_id, after_page: AtlasCatalogNumber
         let files: [AtlasProjectBrowserFile]
-        enum CodingKeys: CodingKey { case page_id, after_page, files }
+        let directories: [AtlasProjectBrowserDirectory]?
+        enum CodingKeys: CodingKey { case page_id, after_page, files, directories }
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             page_id = try c.decode(AtlasCatalogNumber.self, forKey: .page_id)
@@ -246,6 +318,17 @@ struct AtlasProjectBrowserPage: Sendable {
                 files.append(try rows.decode(AtlasProjectBrowserFile.self))
             }
             self.files = files
+            if c.contains(.directories) {
+                var rows = try c.nestedUnkeyedContainer(forKey: .directories)
+                let remaining = 256 - files.count
+                guard rows.count.map({ $0 <= remaining }) ?? true else { throw AtlasProjectBrowserError.invalidResponse }
+                var directories: [AtlasProjectBrowserDirectory] = []; directories.reserveCapacity(rows.count ?? 0)
+                while !rows.isAtEnd {
+                    guard directories.count < remaining else { throw AtlasProjectBrowserError.invalidResponse }
+                    directories.append(try rows.decode(AtlasProjectBrowserDirectory.self))
+                }
+                self.directories = directories
+            } else { self.directories = nil }
         }
     }
 }
@@ -641,9 +724,10 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
         self.discoveryPolicy = discoveryPolicy
         self.directory = directory
     }
-    func validate(_ info: AtlasProjectBrowserInfo, expected: AtlasProjectBrowserScope? = nil) throws {
+    func validate(_ info: AtlasProjectBrowserInfo, expected: AtlasProjectBrowserInfo? = nil) throws {
         guard info.scope.directory == directory, directory.isProject || info.scope.echoed,
-              expected == nil || expected == info.scope,
+              expected == nil || (expected?.scope == info.scope
+                && expected?.supportsDirectoryRows == info.supportsDirectoryRows),
               discoveryPolicy.admits(info.policy.name, legacyDefault: legacyPolicy) else {
             throw AtlasProjectBrowserError.invalidResponse
         }
@@ -664,6 +748,23 @@ private final class AtlasProjectBrowserSession: @unchecked Sendable {
 }
 
 enum AtlasProjectBrowserDirectoryMove { case visit, back, forward }
+
+struct AtlasProjectBrowserBreadcrumb: Identifiable, Sendable {
+    let directory: AtlasDirectoryFocus
+    let title: String
+    var id: [UInt8] { directory.rawPath }
+
+    static func trail(to directory: AtlasDirectoryFocus) -> [Self] {
+        var result: [Self] = [], current: AtlasDirectoryFocus? = directory
+        while let target = current, result.count <= AtlasProjectBrowserScope.maximumDirectoryComponents {
+            let component = target.rawPath.split(separator: 47).last.map { Array($0) } ?? []
+            let title = (try? AtlasDirectoryFocus(rawPath: component))?.display ?? target.display
+            result.append(Self(directory: target, title: title))
+            current = target.parent
+        }
+        return Array(result.reversed())
+    }
+}
 
 /// One visible metadata page and one entered operation. The Rust session owns
 /// at most four pages; Swift never accumulates the traversed project tree.
@@ -709,6 +810,19 @@ enum AtlasProjectBrowserDirectoryMove { case visit, back, forward }
         return accepted.files.first(where: { $0.matches(file) })
     }
 
+    /// A folder action uses the same accepted page as its displayed row, then
+    /// the existing root-granted navigation transaction. Labels confer no scope.
+    func currentDirectory(_ directory: AtlasProjectBrowserDirectory,
+        from page: AtlasProjectBrowserPage) -> AtlasProjectBrowserDirectory? {
+        guard canOperate, currentPage, directory.withinBrowseLimits,
+              let accepted = self.page, let lease = session,
+              page.info.owner == lease.owner, accepted.id == page.id,
+              accepted.info.owner == page.info.owner,
+              page.directories.contains(where: { $0.matches(directory) }) else { return nil }
+        return accepted.directories.first(where: { $0.matches(directory) })
+    }
+
+    var directoryBreadcrumbs: [AtlasProjectBrowserBreadcrumb] { AtlasProjectBrowserBreadcrumb.trail(to: directory) }
     var supportsDiscoveryPolicy: Bool { transport.openWithPolicy != nil }
     var supportsDirectoryBrowsing: Bool { transport.openDirectoryWithPolicy != nil }
 
@@ -796,7 +910,7 @@ enum AtlasProjectBrowserDirectoryMove { case visit, back, forward }
             do {
                 let next = try AtlasProjectBrowserPage.decode(await model.run(lease, .advance(after: after), flag: flag),
                     owner: lease.owner, page: after + 1)
-                try lease.validate(next.info, expected: model.info?.scope)
+                try lease.validate(next.info, expected: model.info)
                 guard !model.closed, model.session === lease else { throw AtlasProjectBrowserError.canceled }
                 model.accept(next)
             } catch {
@@ -810,7 +924,7 @@ enum AtlasProjectBrowserDirectoryMove { case visit, back, forward }
         guard canOperate, info?.retains(id) == true else { return }
         perform { model, lease, flag in
             let page = try AtlasProjectBrowserPage.decode(await model.run(lease, .page(id), flag: flag), owner: lease.owner, page: id)
-            try lease.validate(page.info, expected: model.info?.scope)
+            try lease.validate(page.info, expected: model.info)
             guard !model.closed, model.session === lease else { throw AtlasProjectBrowserError.canceled }
             model.accept(page)
         }
@@ -837,7 +951,7 @@ enum AtlasProjectBrowserDirectoryMove { case visit, back, forward }
         perform { model, lease, flag in
             do {
                 let info = try AtlasProjectBrowserInfo.decode(await model.run(lease, .stop, flag: flag), owner: lease.owner, command: "stop")
-                try lease.validate(info, expected: model.info?.scope)
+                try lease.validate(info, expected: model.info)
                 guard !model.closed, model.session === lease else { throw AtlasProjectBrowserError.canceled }
                 model.info = info
                 model.notice = "Discovery paused. Retained pages remain readable; Continue resumes from this cursor."
@@ -1016,9 +1130,9 @@ enum AtlasProjectBrowserDirectoryMove { case visit, back, forward }
         let recovery = AtlasSearchCancellation()
         do {
             let info = try AtlasProjectBrowserInfo.decode(await run(lease, .info, flag: recovery), owner: lease.owner)
-            try lease.validate(info, expected: self.info?.scope)
+            try lease.validate(info, expected: self.info)
             let page = try AtlasProjectBrowserPage.decode(await run(lease, .page(info.latest), flag: recovery), owner: lease.owner, page: info.latest)
-            try lease.validate(page.info, expected: info.scope)
+            try lease.validate(page.info, expected: info)
             guard !closed, session === lease else { return false }
             accept(page); return true
         } catch {

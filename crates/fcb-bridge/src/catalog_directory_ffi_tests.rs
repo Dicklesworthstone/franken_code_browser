@@ -142,6 +142,52 @@ fn c_directory_policy_selects_inherited_rules_or_metadata_only_inclusion() {
 }
 
 #[test]
+fn c_directory_rows_drill_into_raw_child_folders_through_existing_scoped_open() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    let root = root();
+    let directory = b"selected";
+    let child = b"selected/raw-\xff";
+    let child_native = root.join(OsString::from_vec(child.to_vec()));
+    fs::create_dir_all(&child_native).unwrap();
+    fs::create_dir(root.join("selected/empty")).unwrap();
+    let source = b"fn discovered_child() {}\n";
+    fs::write(child_native.join("source.rs"), source).unwrap();
+    let croot = CString::new(root.to_str().unwrap()).unwrap();
+    let parent = fcb_catalog_create(); assert_ne!(parent, 0);
+    let opened = take(unsafe { fcb_catalog_open_directory_with_policy(parent, croot.as_ptr(),
+        directory.as_ptr(), directory.len() as u64, 1) });
+    scope(&opened, directory);
+    assert!(opened.contains("\"directory_rows_policy\":\"direct-child-directories-v1\""), "{opened}");
+    assert!(opened.contains("\"catalogued_directories\":\"2\""), "{opened}");
+    assert!(opened.contains("\"retained_directories\":\"2\""), "{opened}");
+    assert!(opened.contains("\"catalogued_files\":\"1\""), "folders do not consume file IDs: {opened}");
+    let directories = opened.split_once("\"directories\":[").unwrap().1;
+    assert!(directories.contains("\"directory_id\":\"1\""));
+    assert!(directories.contains("\"directory_id\":\"2\""));
+    assert!(directories.contains(&format!("\"hex\":\"{}\"", hex(child))), "{opened}");
+    assert!(directories.contains("\"within_browse_limits\":true"), "{opened}");
+    let page = take(fcb_catalog_page(parent, 1));
+    assert_eq!(page, take(fcb_catalog_page(parent, 1)), "folder page replay is immutable");
+
+    let nested = fcb_catalog_create(); assert_ne!(nested, 0);
+    let next = take(unsafe { fcb_catalog_open_directory_with_policy(nested, croot.as_ptr(),
+        child.as_ptr(), child.len() as u64, 1) });
+    scope(&next, child);
+    assert!(next.contains("\"directories\":[]"), "{next}");
+    assert!(next.contains("\"catalogued_directories\":\"0\""), "{next}");
+    assert!(next.contains("\"file_id\":\"1\""), "{next}");
+    assert_eq!(fcb_catalog_close(parent), 1);
+    let reader = fcb_reader_create(); assert_ne!(reader, 0);
+    let receipt = take(fcb_catalog_open_reader(nested, reader, 1, 1, 4096));
+    scope(&receipt, child);
+    assert!(receipt.contains("\"directory_rows_policy\":\"direct-child-directories-v1\""));
+    assert_eq!(fcb_catalog_close(nested), 1);
+    let copied = take(fcb_reader_copy_range(reader, 0, source.len() as u64));
+    assert!(copied.contains(&format!("\"original_hex\":\"{}\"", hex(source))), "{copied}");
+    assert_eq!(fcb_reader_close(reader), 1);
+}
+
+#[test]
 fn c_directory_open_signature_matches_its_additive_public_declaration() {
     let _: unsafe extern "C" fn(u64, *const c_char, *const u8, u64, u64) -> *mut c_char =
         fcb_catalog_open_directory_with_policy;

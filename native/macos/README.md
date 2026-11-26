@@ -358,17 +358,26 @@ independent exclusions for FCB's own artifacts still apply.
 
 ### Browsing a folder directly in Project Files
 
-**Project Files → Browse folder** starts progressive metadata discovery directly
-in a project-relative directory. Enter a folder path or choose **Browse containing
-folder** from a current file row. **Back**, **Forward**, **Up** and **Whole project**
-move between scopes without replacing the project, rebuilding the text atlas or
-closing retained readers. Navigation history keeps at most 32 destinations in
-each direction; returning to a destination starts a new bounded discovery cursor.
-The latest four metadata pages remain the catalog's residency limit.
+**Project Files** shows observed immediate child folders alongside each page's
+files, including empty folders and names that are not valid UTF-8. Click a folder
+to browse it, use a breadcrumb to return to an ancestor, enter a path in **Browse
+folder**, or choose **Browse containing folder** from a current file row.
+**Back**, **Forward**, **Up** and **Whole project** move between scopes without
+replacing the project, rebuilding the text atlas or closing retained readers.
+Navigation history keeps at most 32 destinations in each direction; returning
+to a destination starts a new bounded discovery cursor.
+
+Folders and files share the existing 256-entry and 67,584-path-byte page limits
+and four-page retained window. Folder rows are immediate children; file rows
+can include deeper descendants. The file filter leaves folder navigation
+visible. Continue discovery to reveal later folders; a metadata page is not a
+complete sorted tree. Folder identities are separate from file-reader identities.
 
 The original root grant and discovery policy remain authoritative. Directory
 requests preserve raw native bytes, including non-UTF-8 names reached through a
-file row or navigation history, with a 2,048-byte and 31-component limit. Paths
+folder row, breadcrumb, file row or navigation history, with a 2,048-byte and
+31-component limit. A folder observed at depth 32 remains visible with its
+browsing action disabled. Paths
 in every page remain relative to the original project root. Rule-aware discovery
 retains ancestor ignore rules; Include ignored and generated files applies to
 the chosen folder. Explicit local-document links may open another file inside
@@ -389,6 +398,9 @@ cover raw paths, scope-echo refusal, sibling-row rejection, transactional
 navigation/cancellation, retained readers, explicit links outside the folder,
 history bounds and scoped refresh. This is a **fcb-mhpb** code-first checkpoint;
 batch verification and physical-Mac interaction checks remain pending.
+The **fcb-g50a.2** folder-row slice adds host, C ABI and native regressions for
+folder-only pages, mixed retention limits, raw-path drilling, stale actions and
+the visible depth boundary. Its executable verification is also pending.
 
 ### Reading large files from Project Files
 

@@ -7,6 +7,8 @@
 //! reads have separate admission, counters and limits from source-payload I/O.
 //! Four immutable pages remain addressable independently of total files visited.
 //! Discovery order is provisional, not a globally sorted namespace snapshot.
+//! Each page also retains observed direct child folders for navigation. Folder
+//! rows share its entry/path bounds with files and never acquire file-reader IDs.
 //!
 //! A directory iterator cannot be rolled back. A consumed batch is retained
 //! BEFORE response encoding/cancellation; advance(N) can therefore replay page
@@ -53,7 +55,9 @@ pub const MAX_CATALOG_RESPONSE_BYTES: usize = 1024 * 1024;
 const WALK_QUEUE: u32 = 4096;
 const WALK_DEPTH: u32 = 32;
 // Covers queued normalized paths/segments/ancestry, ReadDir observations,
-// retained and incoming pages, root/path scratch, and native metadata overlap.
+// retained and incoming pages (including both bounded row-slot vectors),
+// root/path scratch, and native metadata overlap. Folder and file payloads
+// SHARE each page's existing entry/path bounds; no second path budget exists.
 // It is constant even after millions of visited entries. Response leases are
 // separately reserved; opening a reader uses its existing independent budget.
 const STATE_BYTES: u64 = 64 * 1024 * 1024;
@@ -127,7 +131,10 @@ impl From<ReaderSessionError> for CatalogSessionError { fn from(e: ReaderSession
 impl From<OutputError> for CatalogSessionError { fn from(e: OutputError) -> Self { Self::App(e.into()) } }
 
 struct CatalogFile { id: FileId, path: NormalizedPath, observed_bytes: u64 }
-struct CatalogPage { id: u64, files: Vec<CatalogFile>, path_bytes: usize }
+// A session-local metadata identity in a namespace separate from FileId. It is
+// not a directory descriptor or authority to reopen a previously observed path.
+struct CatalogDirectory { id: u64, path: NormalizedPath }
+struct CatalogPage { id: u64, files: Vec<CatalogFile>, directories: Vec<CatalogDirectory>, path_bytes: usize }
 
 pub struct CatalogSession {
     grant: RootGrant,
@@ -147,6 +154,7 @@ pub struct CatalogSession {
     pages: VecDeque<CatalogPage>,
     latest_page: u64,
     catalogued_files: u64,
+    catalogued_directories: u64,
     next_link_file: u64,
     complete: bool,
     paused: bool,
@@ -228,7 +236,8 @@ impl CatalogSession {
         if pages.capacity() > MAX_CATALOG_RETAINED_PAGES { return Err(AppError::Admission.into()); }
         let mut session = Self { grant, discovery_policy: policy, directory, requested_root, root_identity, discovery: Some(discovery), repository_rules: None,
             aggregate: DiscoveryAggregate::default(),
-            pages, latest_page: 0, catalogued_files: 0, next_link_file: FIRST_CATALOG_LINK_FILE_ID, complete: false, paused: false,
+            pages, latest_page: 0, catalogued_files: 0, catalogued_directories: 0,
+            next_link_file: FIRST_CATALOG_LINK_FILE_ID, complete: false, paused: false,
             reader_receipts: document_links::CatalogReaderReceipts::default(), next_allocation: 3, budget, _lease: lease };
         session.consume_page(&mut canceled)?;
         session.validate_active()?;
@@ -299,6 +308,19 @@ impl CatalogSession {
             out.literal("{\"file_id\":")?; out.integer(file.id.get())?;
             out.literal(",\"path\":")?; out.path(&file.path.raw().to_path_buf())?;
             out.literal(",\"observed_bytes\":")?; out.integer(file.observed_bytes)?;
+            out.literal("}")?;
+        }
+        out.literal("],\"directories\":[")?;
+        for (i, directory) in page.directories.iter().enumerate() {
+            check(&mut canceled)?;
+            if i != 0 { out.literal(",")?; }
+            out.literal("{\"directory_id\":")?; out.integer(directory.id)?;
+            out.literal(",\"path\":")?; out.path(&directory.path.raw().to_path_buf())?;
+            out.literal(",\"within_browse_limits\":")?;
+            // The walker may observe a depth-32 child without descending into
+            // it. Keep that observation visible; scoped opening admits at most
+            // 31 components and must not turn this row into a whole-page error.
+            out.boolean(directory.path.segments().len() < WALK_DEPTH as usize)?;
             out.literal("}")?;
         }
         out.literal("]}\n")?;
@@ -409,9 +431,14 @@ impl CatalogSession {
         let id = self.latest_page.checked_add(1).ok_or(CatalogSessionError::IdentityExhausted)?;
         self.catalogued_files.checked_add(MAX_CATALOG_PAGE_ENTRIES as u64)
             .filter(|last| *last < FIRST_CATALOG_LINK_FILE_ID).ok_or(CatalogSessionError::IdentityExhausted)?;
+        self.catalogued_directories.checked_add(MAX_CATALOG_PAGE_ENTRIES as u64)
+            .ok_or(CatalogSessionError::IdentityExhausted)?;
         let mut files = Vec::new();
         files.try_reserve_exact(MAX_CATALOG_PAGE_ENTRIES).map_err(|_| AppError::Admission)?;
         if files.capacity() > MAX_CATALOG_PAGE_ENTRIES { return Err(AppError::Admission.into()); }
+        let mut directories = Vec::new();
+        directories.try_reserve_exact(MAX_CATALOG_PAGE_ENTRIES).map_err(|_| AppError::Admission)?;
+        if directories.capacity() > MAX_CATALOG_PAGE_ENTRIES { return Err(AppError::Admission.into()); }
         let discovery = self.discovery.as_mut().ok_or(CatalogSessionError::NoMorePages)?;
         // An FnMut poll cannot be installed inside this existing synchronous
         // walker. Its documented entry/path/transition limits bound the step.
@@ -427,11 +454,21 @@ impl CatalogSession {
         let mut path_bytes = 0;
         if let Some(batch) = batch {
             for entry in batch.entries() {
-                if entry.kind() != DiscoveryKind::File || entry.is_excluded() { continue; }
-                self.catalogued_files += 1; // Whole-batch identity headroom checked before advancing.
-                let file = FileId::new(self.owner(), self.catalogued_files).expect("checked nonzero catalog identity");
-                path_bytes += entry.path().as_bytes().len();
-                files.push(CatalogFile { id: file, path: entry.path().clone(), observed_bytes: entry.observed_len().unwrap_or(0) });
+                if entry.is_excluded() { continue; }
+                match entry.kind() {
+                    DiscoveryKind::File => {
+                        self.catalogued_files += 1; // Whole-batch headroom checked before advancing.
+                        let file = FileId::new(self.owner(), self.catalogued_files).expect("checked nonzero catalog identity");
+                        path_bytes += entry.path().as_bytes().len();
+                        files.push(CatalogFile { id: file, path: entry.path().clone(), observed_bytes: entry.observed_len().unwrap_or(0) });
+                    }
+                    DiscoveryKind::Directory if direct_child(entry.path().as_bytes(), self.directory.as_ref()) => {
+                        self.catalogued_directories += 1;
+                        path_bytes += entry.path().as_bytes().len();
+                        directories.push(CatalogDirectory { id: self.catalogued_directories, path: entry.path().clone() });
+                    }
+                    _ => {}
+                }
             }
         }
         let a = self.aggregate;
@@ -441,7 +478,7 @@ impl CatalogSession {
         if !more { self.retire_discovery(); }
         self.paused = false;
         if self.pages.len() == MAX_CATALOG_RETAINED_PAGES { self.pages.pop_front(); }
-        self.pages.push_back(CatalogPage { id, files, path_bytes });
+        self.pages.push_back(CatalogPage { id, files, directories, path_bytes });
         self.latest_page = id;
         Ok(()) // No fallible work between cursor consumption and page retention.
     }
@@ -460,6 +497,7 @@ impl CatalogSession {
         if let Some(directory) = &self.directory { out.path(&directory.raw().to_path_buf())?; }
         else { out.literal("null")?; }
         out.literal(",\"path_basis\":\"project-root\"")?;
+        out.literal(",\"directory_rows_policy\":\"direct-child-directories-v1\"")?;
         self.encode_rule_policy(&mut out)?;
         out.literal(",\"native_presented\":false,\"discovery_source_bytes_read\":\"0\",\"discovery_source_read_calls\":\"0\",\"state\":")?;
         out.quoted(if self.complete { "complete" } else if self.discovery.is_none() { "partial" }
@@ -471,8 +509,9 @@ impl CatalogSession {
             ("first_retained_page", self.pages.front().map_or(0, |page| page.id)),
             ("retained_pages", self.pages.len() as u64),
             ("retained_files", self.pages.iter().map(|page| page.files.len() as u64).sum()),
+            ("retained_directories", self.pages.iter().map(|page| page.directories.len() as u64).sum()),
             ("retained_path_bytes", self.pages.iter().map(|page| page.path_bytes as u64).sum()),
-            ("catalogued_files", self.catalogued_files)] {
+            ("catalogued_files", self.catalogued_files), ("catalogued_directories", self.catalogued_directories)] {
             out.literal(",")?; out.quoted(key)?; out.literal(":")?; out.integer(value)?;
         }
         out.literal(",\"limits\":{")?;
@@ -514,6 +553,10 @@ impl CatalogSession {
         self.validate_active()?; check(canceled)?;
         Ok(HostResponse { text, exit_code: if self.complete { EXIT_OK } else { EXIT_PARTIAL }, _lease: lease })
     }
+}
+fn direct_child(path: &[u8], directory: Option<&NormalizedPath>) -> bool {
+    let parent = path.iter().rposition(|byte| *byte == b'/').map_or(&[][..], |at| &path[..at]);
+    parent == directory.map_or(&[][..], NormalizedPath::as_bytes)
 }
 fn allocation(value: u64) -> Result<ResourceAllocationId, CatalogSessionError> {
     ResourceAllocationId::new(value).map_err(|_| CatalogSessionError::IdentityExhausted)

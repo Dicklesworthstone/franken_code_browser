@@ -61,7 +61,9 @@ import SwiftUI
             }
             if let info = model.info {
                 HStack {
-                    Text("\(info.discovered) files discovered").font(.callout.weight(.semibold))
+                    Text(info.supportsDirectoryRows
+                        ? "\(info.discovered) files discovered · \(info.cataloguedDirectories) subfolders"
+                        : "\(info.discovered) files discovered").font(.callout.weight(.semibold))
                     Text(info.more ? (info.paused ? "Paused" : "More to discover")
                         : (info.complete ? (model.directory.isProject ? "Discovery complete" : "Folder discovery complete")
                             : "Discovery incomplete"))
@@ -80,57 +82,34 @@ import SwiftUI
                         .font(.caption2).foregroundStyle(.orange).textSelection(.enabled)
                 }
                 if let page = model.page, model.currentPage {
-                    Text("Page \(page.id) · \(entries.count) of \(page.files.count) files in this page · \(scopeLabel)")
+                    Text(info.supportsDirectoryRows
+                        ? "Page \(page.id) · \(page.directories.count) folders · \(entries.count) of \(page.files.count) files · \(scopeLabel)"
+                        : "Page \(page.id) · \(entries.count) of \(page.files.count) files in this page · \(scopeLabel)")
                         .font(.caption).foregroundStyle(.secondary)
                     Divider()
-                    if entries.isEmpty {
+                    if entries.isEmpty && page.directories.isEmpty {
                         ContentUnavailableView {
-                            Label(page.files.isEmpty ? "No files in this batch" : "No files match this filter", systemImage: "folder")
+                            Label(page.files.isEmpty
+                                ? (info.supportsDirectoryRows ? "No files or folders in this batch" : "No files in this batch")
+                                : "No files match this filter", systemImage: "folder")
                         } description: {
                             Text(info.more
-                                ? "Directories and excluded entries can fill a batch. Continue discovery to reach more files, or change the current file filter."
+                                ? (info.supportsDirectoryRows
+                                    ? "Continue discovery to reach more files and immediate subfolders, or change the current file filter. Nested directories and excluded entries can fill a batch."
+                                    : "Directories and excluded entries can fill a batch. Continue discovery to reach more files, or change the current file filter.")
                                 : (info.complete ? "Discovery has finished. Try another retained page or change the file filter."
                                     : "Discovery finished with omissions. Files outside the discovered pages are not known to be absent."))
                         }.frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else {
-                        List(entries) { file in
-                            HStack(alignment: .top, spacing: 12) {
-                                Button { open(file, from: page) } label: {
-                                    HStack(alignment: .top) {
-                                        Image(systemName: "doc.text").foregroundStyle(.secondary)
-                                        Text(verbatim: file.display).font(.system(size: 12, design: .monospaced))
-                                            .lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
-                                        VStack(alignment: .trailing, spacing: 2) {
-                                            Text("\(file.observedBytes) bytes observed")
-                                            if file.observedBytes > AtlasReaderLimits.captureBytes {
-                                                Text("Read ranges recommended").foregroundStyle(.orange)
-                                            }
-                                        }.font(.caption2).foregroundStyle(.secondary)
-                                    }.contentShape(Rectangle())
-                                }.buttonStyle(.plain).disabled(!model.canOperate || readerTask != nil)
-                                    .accessibilityLabel("Open " + file.display)
-                                    .help("Capture up to 32 MiB now and read it independently of discovery. Choose Read ranges for larger files.")
-                                Button("Read ranges") { observe(file, from: page) }
-                                    .buttonStyle(.bordered).controlSize(.small)
-                                    .disabled(!canReadRanges || !model.canOperate || readerTask != nil)
-                                    .accessibilityLabel("Read current ranges of " + file.display)
-                                    .help("Open bounded observations of this current project file, including files larger than 32 MiB")
-                            }.contextMenu {
-                                if browseDirectory != nil {
-                                    Button("Browse containing folder") { browseContainingFolder(file, from: page) }
-                                        .disabled(!canNavigateDirectory
-                                            || (try? AtlasDirectoryFocus.containingFile(rawPath: file.rawPath)) == model.directory)
-                                        .help("Start bounded discovery directly in this folder, keeping the original project and open readers.")
+                        List {
+                            if !page.directories.isEmpty {
+                                Section("Folders in this directory") {
+                                    ForEach(page.directories) { folder in directoryRow(folder, from: page) }
                                 }
-                                if focusFile != nil {
-                                    Button("Focus this file") { focusExactFile(file, from: page) }
-                                        .disabled(!canFocusFile || !model.canOperate || readerTask != nil)
-                                        .help("Build a single-file atlas, including a file beyond a large folder's atlas limit.")
-                                }
-                                if focusDirectory != nil {
-                                    Button("Focus containing folder") { focus(file, from: page) }
-                                        .disabled(!canFocusDirectory || !model.canOperate || readerTask != nil)
-                                        .help("Focus the text atlas on this file's containing folder.")
+                            }
+                            if !entries.isEmpty {
+                                Section("Files in this page") {
+                                    ForEach(entries) { file in fileRow(file, from: page) }
                                 }
                             }
                         }.listStyle(.inset).id("\(info.owner):\(page.id)")
@@ -144,7 +123,9 @@ import SwiftUI
                         Spacer()
                         Text("Retained pages \(info.firstRetained)…\(info.latest)").font(.caption).foregroundStyle(.secondary)
                     }.controlSize(.small)
-                    Text("The latest four pages stay available as you continue; Refresh starts discovery again in the current folder. Page order follows discovery, and the file filter applies to the displayed page.")
+                    Text(info.supportsDirectoryRows
+                        ? "Folders are immediate children of the current directory; files can be anywhere below it. The latest four pages stay available. Refresh starts discovery again in this folder. Page order follows discovery; the file filter leaves folder navigation visible."
+                        : "The latest four pages stay available as you continue; Refresh starts discovery again in the current folder. Page order follows discovery, and the file filter applies to the displayed page.")
                         .font(.caption2).foregroundStyle(.secondary)
                     Text("Click a filename to retain a complete capture up to 32 MiB. Read ranges opens the current file in bounded observations; earlier captures keep their original bytes.")
                         .font(.caption2).foregroundStyle(.secondary)
@@ -191,6 +172,66 @@ import SwiftUI
     private var canNavigateDirectory: Bool {
         canBrowseDirectory && model.canOperate && readerTask == nil && !preparing
     }
+    private func directoryRow(_ folder: AtlasProjectBrowserDirectory, from page: AtlasProjectBrowserPage) -> some View {
+        Button { browse(folder, from: page) } label: {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "folder").foregroundStyle(.secondary)
+                Text(verbatim: folder.display).font(.system(size: 12, design: .monospaced))
+                    .lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
+                if folder.withinBrowseLimits {
+                    Image(systemName: "chevron.right").foregroundStyle(.secondary)
+                } else {
+                    Text("Browsing depth limit").font(.caption2).foregroundStyle(.orange)
+                }
+            }.contentShape(Rectangle())
+        }.buttonStyle(.plain)
+            .disabled(!canNavigateDirectory || browseDirectory == nil || !folder.withinBrowseLimits)
+            .accessibilityLabel("Browse folder " + folder.display)
+            .help(folder.withinBrowseLimits
+                ? "Browse this folder under the same project, keeping open readers and the text atlas."
+                : "This folder is visible at the 32-component discovery boundary. Browsing supports up to 31 components from the project root.")
+    }
+    private func fileRow(_ file: AtlasProjectBrowserFile, from page: AtlasProjectBrowserPage) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Button { open(file, from: page) } label: {
+                HStack(alignment: .top) {
+                    Image(systemName: "doc.text").foregroundStyle(.secondary)
+                    Text(verbatim: file.display).font(.system(size: 12, design: .monospaced))
+                        .lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text("\(file.observedBytes) bytes observed")
+                        if file.observedBytes > AtlasReaderLimits.captureBytes {
+                            Text("Read ranges recommended").foregroundStyle(.orange)
+                        }
+                    }.font(.caption2).foregroundStyle(.secondary)
+                }.contentShape(Rectangle())
+            }.buttonStyle(.plain).disabled(!model.canOperate || readerTask != nil)
+                .accessibilityLabel("Open " + file.display)
+                .help("Capture up to 32 MiB now and read it independently of discovery. Choose Read ranges for larger files.")
+            Button("Read ranges") { observe(file, from: page) }
+                .buttonStyle(.bordered).controlSize(.small)
+                .disabled(!canReadRanges || !model.canOperate || readerTask != nil)
+                .accessibilityLabel("Read current ranges of " + file.display)
+                .help("Open bounded observations of this current project file, including files larger than 32 MiB")
+        }.contextMenu {
+            if browseDirectory != nil {
+                Button("Browse containing folder") { browseContainingFolder(file, from: page) }
+                    .disabled(!canNavigateDirectory
+                        || (try? AtlasDirectoryFocus.containingFile(rawPath: file.rawPath)) == model.directory)
+                    .help("Start bounded discovery directly in this folder, keeping the original project and open readers.")
+            }
+            if focusFile != nil {
+                Button("Focus this file") { focusExactFile(file, from: page) }
+                    .disabled(!canFocusFile || !model.canOperate || readerTask != nil)
+                    .help("Build a single-file atlas, including a file beyond a large folder's atlas limit.")
+            }
+            if focusDirectory != nil {
+                Button("Focus containing folder") { focus(file, from: page) }
+                    .disabled(!canFocusDirectory || !model.canOperate || readerTask != nil)
+                    .help("Focus the text atlas on this file's containing folder.")
+            }
+        }
+    }
     private var inputDirectory: AtlasDirectoryFocus? {
         let raw = Array(directoryInput.utf8)
         guard raw.count <= AtlasDirectoryFocus.maximumPathBytes,
@@ -208,10 +249,23 @@ import SwiftUI
                     .disabled(!canNavigateDirectory || model.directory.isProject)
                 Button("Whole project") { navigate(.project) }
                     .disabled(!canNavigateDirectory || model.directory.isProject)
-                Text(verbatim: model.directory.isProject ? "Whole project" : model.directory.display)
-                    .font(.system(size: 12, design: .monospaced)).lineLimit(2).textSelection(.enabled)
                 Spacer(minLength: 0)
             }.controlSize(.small)
+            ScrollView(.horizontal) {
+                HStack(spacing: 6) {
+                    ForEach(model.directoryBreadcrumbs) { crumb in
+                        if !crumb.directory.isProject {
+                            Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.secondary)
+                        }
+                        Button { navigate(crumb.directory) } label: {
+                            Text(verbatim: crumb.title).font(.system(size: 12, design: .monospaced))
+                        }.buttonStyle(.plain)
+                            .disabled(!canNavigateDirectory || crumb.directory == model.directory)
+                            .accessibilityLabel("Browse " + crumb.directory.display)
+                            .help(crumb.directory.display)
+                    }
+                }.padding(.vertical, 2)
+            }.scrollIndicators(.hidden)
             HStack {
                 TextField("Folder relative to project root", text: Binding(get: { directoryInput }, set: { value in
                     // Keep one extra byte so oversized input is rejected, never
@@ -242,6 +296,11 @@ import SwiftUI
         guard canNavigateDirectory, let accepted = model.currentFile(file, from: page) else { return }
         do { navigate(try AtlasDirectoryFocus.containingFile(rawPath: accepted.rawPath)) }
         catch { readerNotice = "This containing folder exceeds the directory browsing limit." }
+    }
+    private func browse(_ folder: AtlasProjectBrowserDirectory, from page: AtlasProjectBrowserPage) {
+        guard canNavigateDirectory, let accepted = model.currentDirectory(folder, from: page) else { return }
+        do { navigate(try AtlasDirectoryFocus(rawPath: accepted.rawPath)) }
+        catch { readerNotice = "This folder exceeds the directory browsing limit." }
     }
     private func focus(_ file: AtlasProjectBrowserFile, from page: AtlasProjectBrowserPage) {
         guard canFocusDirectory, readerTask == nil, let focusDirectory else { return }

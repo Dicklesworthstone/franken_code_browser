@@ -555,14 +555,26 @@ private final class ProjectBrowserFixture: @unchecked Sendable {
 /// causal catalog, reader, cancellation and exact-link fixture behavior.
 private final class ProjectBrowserDirectoryFixture: @unchecked Sendable {
     let base: ProjectBrowserFixture
+    let folderRows: Bool
     private let lock = NSLock()
     private var directories: [UInt64: AtlasDirectoryFocus] = [:]
     private var failure: String?
     private var requests: [(String, AtlasDirectoryFocus, AtlasDiscoveryPolicy)] = []
-    init(complete: Bool = false) { base = ProjectBrowserFixture(completeFirst: complete, policyAware: true) }
+    init(complete: Bool = false, folderRows: Bool = false, emptyFirst: Bool = false) {
+        base = ProjectBrowserFixture(emptyFirst: emptyFirst, completeFirst: complete, policyAware: true)
+        self.folderRows = folderRows
+    }
     private func locked<T>(_ work: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return work() }
     func corrupt(_ failure: String?) { locked { self.failure = failure } }
     var opens: [(String, AtlasDirectoryFocus, AtlasDiscoveryPolicy)] { locked { requests } }
+    private func folderPath(_ directory: AtlasDirectoryFocus, page: UInt64) -> [UInt8] {
+        let component: [UInt8] = directory.isProject && page == 1 ? [255] : Array("child\(page)".utf8)
+        return directory.isProject ? component : directory.rawPath + [47] + component
+    }
+    func page(_ id: UInt64 = 1, owner: UInt64 = 40, latest: UInt64 = 1) -> [String: Any] {
+        let json = decorate(base.json(base.page(id, owner: owner, latest: latest)), owner: owner)!
+        return try! JSONSerialization.jsonObject(with: Data(json.utf8)) as! [String: Any]
+    }
     private func decorate(_ json: String?, owner: UInt64) -> String? {
         guard let json, var value = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any],
               value["status"] as? String == "ok" else { return json }
@@ -585,6 +597,19 @@ private final class ProjectBrowserDirectoryFixture: @unchecked Sendable {
                 }
             }
         }
+        if folderRows {
+            let latest = UInt64(value["latest_page"] as! String)!, first = UInt64(value["first_retained_page"] as! String)!
+            value["directory_rows_policy"] = "direct-child-directories-v1"
+            value["catalogued_directories"] = String(latest)
+            value["retained_directories"] = String(latest - first + 1)
+            let folderBytes = (first...latest).reduce(0) { $0 + folderPath(directory, page: $1).count }
+            value["retained_path_bytes"] = String(UInt64(value["retained_path_bytes"] as! String)! + UInt64(folderBytes))
+            if let page = value["page_id"] as? String, value["command"] as? String == "page" {
+                let id = UInt64(page)!, raw = folderPath(directory, page: id)
+                value["directories"] = [["directory_id": page, "path": base.path(raw),
+                    "within_browse_limits": raw.split(separator: 47).count <= AtlasProjectBrowserScope.maximumDirectoryComponents]]
+            }
+        }
         switch failure {
         case "missing":
             value.removeValue(forKey: "discovery_scope")
@@ -596,6 +621,15 @@ private final class ProjectBrowserDirectoryFixture: @unchecked Sendable {
         case "outside-row":
             if var rows = value["files"] as? [[String: Any]], !rows.isEmpty {
                 rows[0]["path"] = base.path(Array("outside.rs".utf8)); value["files"] = rows
+            }
+        case "missing-folder-policy": value.removeValue(forKey: "directory_rows_policy")
+        case "outside-folder-row":
+            if var rows = value["directories"] as? [[String: Any]], !rows.isEmpty {
+                rows[0]["path"] = base.path(Array("sibling/child".utf8)); value["directories"] = rows
+            }
+        case "legacy-folder-contract":
+            for key in ["directory_rows_policy", "catalogued_directories", "retained_directories", "directories"] {
+                value.removeValue(forKey: key)
             }
         default: break
         }
@@ -639,6 +673,10 @@ private final class ProjectBrowserDirectoryFixture: @unchecked Sendable {
         try await retainedLabelsAndNonUTF8PathsStayImageInert()
         try boundedWireAndCoverage()
         try directoryScopeWireAndCoverage()
+        try directoryRowsWireAndBounds()
+        try directoryBreadcrumbsKeepRawAncestors()
+        try await directoryRowsKeepAcceptedAuthority()
+        try await directoryOnlyPagesAndFailedClicksKeepTheAcceptedScope()
         try await directoryNavigationKeepsGrantHistoryAndReaders()
         try await directoryNavigationRejectsWrongScopeAndDrainsCancellation()
         try await directoryRefreshAndBoundedHistory()
@@ -841,6 +879,239 @@ private final class ProjectBrowserDirectoryFixture: @unchecked Sendable {
         _ = try AtlasProjectBrowserPage.decode(f.json(deep), owner: 40)
         deep["discovery_directory"] = f.path(Array(Array(repeating: "d", count: 32).joined(separator: "/").utf8))
         reject("overdeep folder echo admitted") { _ = try AtlasProjectBrowserPage.decode(f.json(deep), owner: 40) }
+    }
+
+    private static func directoryRowsWireAndBounds() throws {
+        let f = ProjectBrowserFixture()
+        func envelope(_ paths: [[UInt8]], scope: AtlasDirectoryFocus = .project,
+            files: [[String: Any]] = []) -> [String: Any] {
+            var value = f.page(), discovery = value["discovery"] as! [String: String]
+            value["files"] = files
+            value["catalogued_files"] = String(files.count); value["retained_files"] = String(files.count)
+            discovery["files"] = String(files.count); discovery["directories"] = String(paths.count)
+            value["discovery"] = discovery
+            value["discovery_scope"] = scope.isProject ? "workspace" : "directory"
+            value["discovery_directory"] = scope.isProject ? NSNull() : f.path(scope.rawPath) as Any
+            value["path_basis"] = "project-root"
+            value["directory_rows_policy"] = "direct-child-directories-v1"
+            value["catalogued_directories"] = String(paths.count); value["retained_directories"] = String(paths.count)
+            value["directories"] = paths.enumerated().map { index, raw in
+                ["directory_id": String(index + 1), "path": f.path(raw),
+                    "within_browse_limits": raw.split(separator: 47).count <= 31] as [String: Any]
+            }
+            let fileBytes = files.reduce(0) { count, row in
+                count + ((row["path"] as! [String: Any])["hex"] as! String).utf8.count / 2
+            }
+            value["retained_path_bytes"] = String(fileBytes + paths.reduce(0) { $0 + $1.count })
+            return value
+        }
+        func decode(_ value: [String: Any]) throws -> AtlasProjectBrowserPage {
+            try AtlasProjectBrowserPage.decode(f.json(value), owner: 40, page: 1)
+        }
+        let legacy = try decode(f.page())
+        precondition(!legacy.info.supportsDirectoryRows && legacy.directories.isEmpty)
+        let rawFolders: [[UInt8]] = [[255], Array("src".utf8)]
+        let full = envelope(rawFolders, files: [f.row(1)]), page = try decode(full)
+        precondition(page.info.supportsDirectoryRows && page.info.cataloguedDirectories == 2
+            && page.info.retainedDirectories == 2 && page.directories.map(\.rawPath) == rawFolders)
+        precondition(page.directories[0].id == page.files[0].id,
+            "The independent directory namespace collided with file identities")
+        let directoriesOnly = try decode(envelope([[255]]))
+        precondition(directoriesOnly.files.isEmpty && directoriesOnly.directories.count == 1 && directoriesOnly.info.more)
+
+        for field in ["directory_rows_policy", "catalogued_directories", "retained_directories", "directories"] {
+            var missing = full; missing.removeValue(forKey: field)
+            reject("partial directory extension admitted: \(field)") { _ = try decode(missing) }
+            var null = full; null[field] = NSNull()
+            reject("null directory extension admitted: \(field)") { _ = try decode(null) }
+        }
+        var unqualified = f.page(); unqualified["directories"] = []
+        reject("directory array gained authority without its policy") { _ = try decode(unqualified) }
+        var wrongPolicy = full; wrongPolicy["directory_rows_policy"] = "recursive-directories-v1"
+        reject("unknown directory policy admitted") { _ = try decode(wrongPolicy) }
+        var noScope = full
+        for key in ["discovery_scope", "discovery_directory", "path_basis"] { noScope.removeValue(forKey: key) }
+        reject("directory rows borrowed a legacy implicit scope") { _ = try decode(noScope) }
+        for path in ["", "/absolute", "src//child", "src/../child", "src/./child", "src/", "a\0b"] {
+            reject("malformed folder admitted: \(path)") { _ = try decode(envelope([Array(path.utf8)])) }
+        }
+        reject("nested folder was presented as an immediate child") {
+            _ = try decode(envelope([Array("src/nested".utf8)]))
+        }
+        let scope = try AtlasDirectoryFocus(rawPath: Array("src".utf8))
+        _ = try decode(envelope([Array("src/nested".utf8)], scope: scope))
+        for path in ["src", "sr/nested", "src-other/nested", "src/nested/deeper"] {
+            reject("folder outside the exact parent admitted: \(path)") {
+                _ = try decode(envelope([Array(path.utf8)], scope: scope))
+            }
+        }
+        reject("duplicate folder path admitted") { _ = try decode(envelope([[255], [255]])) }
+        var collision = f.row(1); collision["path"] = f.path(Array("src".utf8))
+        reject("file and directory shared one path") {
+            _ = try decode(envelope([Array("src".utf8)], files: [collision]))
+        }
+        for id in ["0", "2", "18446744073709551615"] {
+            var forged = envelope([[255]]), rows = forged["directories"] as! [[String: Any]]
+            rows[0]["directory_id"] = id; forged["directories"] = rows
+            reject("unqualified directory ID admitted: \(id)") { _ = try decode(forged) }
+        }
+        var duplicateID = full, rows = duplicateID["directories"] as! [[String: Any]]
+        rows[1]["directory_id"] = "1"; duplicateID["directories"] = rows
+        reject("duplicate directory ID admitted") { _ = try decode(duplicateID) }
+        var reversedIDs = full
+        reversedIDs["directories"] = Array((full["directories"] as! [[String: Any]]).reversed())
+        reject("directory discovery IDs reordered") { _ = try decode(reversedIDs) }
+        for key in ["catalogued_directories", "retained_directories"] {
+            var understated = full; understated[key] = "1"
+            reject("directory counts understate accepted rows: \(key)") { _ = try decode(understated) }
+        }
+        var unseen = full; unseen["catalogued_directories"] = "3"
+        reject("catalogued folders exceeded discovered directories") { _ = try decode(unseen) }
+
+        let deepParent = try AtlasDirectoryFocus(rawPath: Array(Array(repeating: "d", count: 31).joined(separator: "/").utf8))
+        let boundary = envelope([deepParent.rawPath + [47, 100]], scope: deepParent)
+        let boundaryPage = try decode(boundary)
+        precondition(!boundaryPage.directories[0].withinBrowseLimits)
+        var falsePermission = boundary, boundaryRows = boundary["directories"] as! [[String: Any]]
+        boundaryRows[0]["within_browse_limits"] = true; falsePermission["directories"] = boundaryRows
+        reject("depth-boundary row became navigable") { _ = try decode(falsePermission) }
+        var falseLimit = envelope([[255]]), shortRows = falseLimit["directories"] as! [[String: Any]]
+        shortRows[0]["within_browse_limits"] = false; falseLimit["directories"] = shortRows
+        reject("false directory limit admitted") { _ = try decode(falseLimit) }
+        let depth30 = deepParent.parent!
+        let lastBrowsable = try decode(envelope([deepParent.rawPath], scope: depth30))
+        precondition(lastBrowsable.directories[0].withinBrowseLimits)
+
+        let many = (0..<255).map { Array("child\($0)".utf8) }
+        let maximum = try decode(envelope(many, files: [f.row(1)]))
+        precondition(maximum.files.count + maximum.directories.count == 256)
+        reject("files and folders exceeded one shared page limit") {
+            _ = try decode(envelope(many + [Array("extra".utf8)], files: [f.row(1)]))
+        }
+        let long = (0..<33).map { index -> [UInt8] in
+            let prefix = Array("folder\(index)-".utf8)
+            return prefix + Array(repeating: UInt8(120), count: 2048 - prefix.count)
+        }
+        let fullPathPage = try decode(envelope(long))
+        precondition(fullPathPage.info.retainedPathBytes == 67_584)
+        reject("folder paths exceeded the shared page byte limit") {
+            _ = try decode(envelope(long + [Array("extra".utf8)]))
+        }
+        reject("overlong folder path admitted") { _ = try decode(envelope([Array(repeating: 120, count: 2049)])) }
+        var retained = full, discovery = retained["discovery"] as! [String: String]
+        retained["latest_page"] = "4"; retained["retained_pages"] = "4"
+        retained["catalogued_files"] = "1022"; retained["retained_files"] = "1022"
+        discovery["files"] = "1022"; retained["discovery"] = discovery
+        _ = try decode(retained)
+        retained["catalogued_directories"] = "3"; retained["retained_directories"] = "3"
+        discovery["directories"] = "3"; retained["discovery"] = discovery
+        reject("retained files and folders exceeded the shared limit") { _ = try decode(retained) }
+    }
+
+    private static func directoryBreadcrumbsKeepRawAncestors() throws {
+        let raw: [UInt8] = [255, 47, 10, 47] + Array("leaf".utf8)
+        let trail = AtlasProjectBrowserBreadcrumb.trail(to: try AtlasDirectoryFocus(rawPath: raw))
+        precondition(trail.map(\.directory.rawPath) == [[], [255], [255, 47, 10], raw])
+        precondition(trail.map(\.title) == ["Project", "\\xff", "\\u{a}", "leaf"])
+        precondition(trail.map(\.id) == trail.map(\.directory.rawPath))
+        let deep = try AtlasDirectoryFocus(rawPath: Array(Array(repeating: "d", count: 31).joined(separator: "/").utf8))
+        let bounded = AtlasProjectBrowserBreadcrumb.trail(to: deep)
+        precondition(bounded.count == 32 && bounded.first?.directory.isProject == true
+            && bounded.last?.directory == deep)
+    }
+
+    @MainActor private static func directoryRowsKeepAcceptedAuthority() async throws {
+        let f = ProjectBrowserDirectoryFixture(folderRows: true), model = AtlasProjectBrowserModel(transport: f.transport)
+        let grant = NSObject()
+        try await model.open(root: "/repo", accessLease: grant, discoveryPolicy: .includeExcluded)
+        let first = model.page!, folder = first.directories[0]
+        precondition(folder.rawPath == [255] && model.currentDirectory(folder, from: first)?.rawPath == [255])
+        let capture = try await model.openFile(first.files[0], from: first, readerTransport: f.base.readerTransport)
+        let captured = capture.reader.page!.identity, rootIdentity = model.rootAccessIdentity
+        var forged = f.page(), rows = forged["directories"] as! [[String: Any]], path = rows[0]["path"] as! [String: Any]
+        path["display"] = "a different folder label"; rows[0]["path"] = path; forged["directories"] = rows
+        let relabeled = try AtlasProjectBrowserPage.decode(f.base.json(forged), owner: first.info.owner)
+        precondition(model.currentDirectory(relabeled.directories[0], from: relabeled)?.display == folder.display,
+            "A display label replaced the accepted folder's raw identity")
+        rows[0]["path"] = f.base.path([254]); forged["directories"] = rows
+        let substituted = try AtlasProjectBrowserPage.decode(f.base.json(forged), owner: first.info.owner)
+        precondition(model.currentDirectory(substituted.directories[0], from: substituted) == nil)
+        let foreign = try AtlasProjectBrowserPage.decode(f.base.json(f.page(owner: 99)), owner: 99)
+        precondition(model.currentDirectory(foreign.directories[0], from: foreign) == nil)
+
+        let destination = try AtlasDirectoryFocus(rawPath: model.currentDirectory(folder, from: first)!.rawPath)
+        precondition(model.navigate(to: destination))
+        await wait("clicked raw folder did not publish") { !model.busy }
+        precondition(model.directory == destination && model.rootAccessIdentity == rootIdentity
+            && model.discoveryPolicy == .includeExcluded && model.root == "/repo")
+        precondition(f.opens.last?.1.rawPath == [255] && model.currentDirectory(folder, from: first) == nil)
+        precondition(model.directoryBreadcrumbs.map(\.directory.rawPath) == [[], [255]])
+        precondition(capture.reader.page?.identity.matches(captured) == true)
+        precondition(model.navigate(to: .project, move: .back))
+        await wait("folder Back did not replace the cursor") { !model.busy }
+        let returned = model.page!, returnedFolder = returned.directories[0]
+        precondition(returnedFolder.id == folder.id && returned.info.owner != first.info.owner
+            && model.currentDirectory(folder, from: first) == nil)
+        precondition(model.currentDirectory(returnedFolder, from: returned) != nil)
+        model.advance()
+        await wait("folder page did not advance") { !model.busy }
+        precondition(model.info?.retains(returned.id) == true
+            && model.currentDirectory(returnedFolder, from: returned) == nil,
+            "A retained but undisplayed page remained clickable")
+        model.load(page: returned.id)
+        await wait("retained folder page did not replay") { !model.busy }
+        precondition(model.currentDirectory(returnedFolder, from: returned) != nil)
+        for _ in 0..<4 {
+            model.advance(); await wait("folder eviction did not finish") { !model.busy }
+        }
+        precondition(model.info?.retains(returned.id) == false
+            && model.currentDirectory(returnedFolder, from: returned) == nil)
+        precondition(capture.reader.page?.identity.matches(captured) == true)
+        capture.reader.close(); model.close()
+    }
+
+    @MainActor private static func directoryOnlyPagesAndFailedClicksKeepTheAcceptedScope() async throws {
+        let f = ProjectBrowserDirectoryFixture(folderRows: true, emptyFirst: true)
+        let model = AtlasProjectBrowserModel(transport: f.transport)
+        try await model.open(root: "/repo", accessLease: NSObject())
+        let first = model.page!, folder = first.directories[0]
+        precondition(first.files.isEmpty && first.info.more && model.currentDirectory(folder, from: first) != nil)
+        let destination = try AtlasDirectoryFocus(rawPath: folder.rawPath)
+        for failure in ["missing-folder-policy", "outside-folder-row", "wrong-directory"] {
+            f.corrupt(failure)
+            precondition(model.navigate(to: destination))
+            await wait("invalid folder candidate did not drain") { !model.busy }
+            precondition(model.directory.isProject && model.previousDirectories.isEmpty
+                && model.page?.info.owner == first.info.owner && model.currentDirectory(folder, from: first) != nil)
+        }
+        f.corrupt("legacy-folder-contract"); model.load(page: first.id)
+        await wait("directory extension downgrade did not drain") { !model.busy }
+        precondition(model.info?.supportsDirectoryRows == true && model.currentDirectory(folder, from: first) != nil)
+        f.corrupt(nil); f.base.blockNext()
+        precondition(model.navigate(to: destination))
+        await wait("clicked folder did not enter") { f.base.entered.wait(timeout: .now()) == .success }
+        precondition(model.currentDirectory(folder, from: first) == nil && !model.navigate(to: destination))
+        model.stop(); f.base.resume.signal()
+        await wait("canceled folder click did not drain") { !model.busy }
+        precondition(model.directory.isProject && model.previousDirectories.isEmpty
+            && model.currentDirectory(folder, from: first) != nil)
+        precondition(!f.base.calls.contains("cancel:\(first.info.owner)"))
+        precondition(model.navigate(to: destination))
+        await wait("folder-only retry did not publish") { !model.busy }
+        precondition(model.directory == destination && model.page?.files.isEmpty == true
+            && model.page?.directories.count == 1)
+        model.close()
+
+        let boundary = ProjectBrowserDirectoryFixture(folderRows: true, emptyFirst: true)
+        let deep = AtlasProjectBrowserModel(transport: boundary.transport)
+        let parent = try AtlasDirectoryFocus(rawPath: Array(Array(repeating: "d", count: 31).joined(separator: "/").utf8))
+        try await deep.open(root: "/repo", accessLease: nil, directory: parent)
+        let page = deep.page!, limited = page.directories[0], opened = boundary.opens.count
+        precondition(!limited.withinBrowseLimits && deep.currentDirectory(limited, from: page) == nil)
+        let limitedTarget = try AtlasDirectoryFocus(rawPath: limited.rawPath)
+        precondition(!deep.navigate(to: limitedTarget))
+        precondition(boundary.opens.count == opened && deep.page?.info.owner == page.info.owner)
+        deep.close()
     }
 
     @MainActor private static func directoryNavigationKeepsGrantHistoryAndReaders() async throws {
