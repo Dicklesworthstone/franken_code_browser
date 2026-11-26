@@ -52,6 +52,11 @@ private func beginStructureSearch(_ handle: UInt64, _ generation: UInt64, _ mode
     _ query: UnsafePointer<CChar>?, _ extensions: UnsafePointer<CChar>?, _ filenames: UnsafePointer<CChar>?,
     _ pathKind: UInt64, _ path: UnsafePointer<CChar>?,
     _ maxMatches: UInt64, _ maxFiles: UInt64, _ maxFileBytes: UInt64, _ maxSourceBytes: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_atlas_structure_begin_matching")
+private func beginMatchingStructureSearch(_ handle: UInt64, _ generation: UInt64, _ mode: UInt64, _ nameMode: UInt64,
+    _ query: UnsafePointer<CChar>?, _ extensions: UnsafePointer<CChar>?, _ filenames: UnsafePointer<CChar>?,
+    _ pathKind: UInt64, _ path: UnsafePointer<CChar>?, _ caseSensitive: UInt64,
+    _ maxMatches: UInt64, _ maxFiles: UInt64, _ maxFileBytes: UInt64, _ maxSourceBytes: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_search_step_cancelable")
 private func stepSearch(_ handle: UInt64, _ generation: UInt64,
     _ poll: SearchPoll?, _ context: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
@@ -147,6 +152,11 @@ enum AtlasNativeSearch {
                                     1024 * 1024, 32 * 1024 * 1024, AtlasSearchExpression.scanLimit)
                             }
                             if !input.mode.isTextual {
+                                if !input.caseSensitive {
+                                    return beginMatchingStructureSearch(handle, 1, input.mode.code, input.nameMode.code,
+                                        queryPointer, extensions, filenames, kind, path, 0,
+                                        1000, 4096, 1024 * 1024, 32 * 1024 * 1024)
+                                }
                                 return beginStructureSearch(handle, 1, input.mode.code, input.nameMode.code,
                                     queryPointer, extensions, filenames, kind, path,
                                     1000, 4096, 1024 * 1024, 32 * 1024 * 1024)
@@ -519,7 +529,7 @@ private struct SearchStream {
               page.search_in_progress == (page.stop_reason == nil) else { throw invalid() }
         let structureCoverage: AtlasSearchStructureCoverage?
         if mode == .occurrences {
-            guard nameMode == .exact, caseSensitive,
+            guard nameMode == .exact,
                   page.includes_comments_and_literals == true, page.compiler_resolved == false,
                   page.token_policy == AtlasSearchOccurrencePolicy.tokenPolicy,
                   page.name_syntax == AtlasSearchOccurrencePolicy.nameSyntax,
@@ -539,7 +549,8 @@ private struct SearchStream {
             structureCoverage = nil
         } else {
             guard page.requested_mode == mode.rawValue, page.realized_mode == mode.evidence,
-                  page.name_mode == nameMode.rawValue, page.name_case == "sensitive",
+                  page.name_mode == nameMode.rawValue,
+                  page.name_case == (caseSensitive ? "sensitive" : "unicode-lowercase"),
                   page.evidence_level == mode.evidence, page.semantic_complete == false,
                   page.completeness_basis == "admitted-extraction-processing",
                   let cap = page.structure_file_byte_limit,
@@ -639,11 +650,11 @@ private struct SearchStream {
                       value.kind == "heading", value.language == "markdown",
                       evidenceStart == start, evidenceEnd == end else { throw invalid() }
             } else if mode == .occurrences {
-                guard value.name.utf8.elementsEqual(query.utf8),
+                guard AtlasSearchOccurrencePolicy.matches(source: value.name, query: query, caseSensitive: caseSensitive),
                       value.kind == "identifier-occurrence", value.language == "text",
                       value.heading_slug == nil, evidenceStart == start, evidenceEnd == end,
-                      end - start == UInt64(query.utf8.count)
-                        || end - start == UInt64(query.utf16.count * 2) else { throw invalid() }
+                      end - start == UInt64(value.name.utf8.count)
+                        || end - start == UInt64(value.name.utf16.count * 2) else { throw invalid() }
             } else {
                 guard value.heading_slug == nil,
                       ["rust", "python", "javascript", "typescript", "jsx", "tsx", "go", "cpp", "swift", "java", "csharp"].contains(value.language) else { throw invalid() }
@@ -658,7 +669,7 @@ private struct SearchStream {
             excerpt: try wire.excerpt?.validated(hitStart: start, hitEnd: end,
                 capturedBytes: length, actualText: mode.isTextual
                     ? (wire.matched_text ?? state?.expression?.primaryNeedle ?? query)
-                    : (mode == .occurrences ? query : nil)), rawPath: raw)
+                    : (mode == .occurrences ? structure?.name : nil)), rawPath: raw)
     }
     private func invalid() -> AtlasSearchError { .invalidResponse }
     private func number(_ text: String) throws -> UInt64 {

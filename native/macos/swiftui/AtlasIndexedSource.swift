@@ -13,12 +13,15 @@ enum AtlasIndexedSource {
             guard hits.indices.contains(candidate.id), hits[candidate.id].matches(candidate),
                   mode.isTextual ? candidate.structure == nil : candidate.structure?.mode == mode,
                   mode != .expression || candidate.actualText != nil,
+                  mode != .occurrences || AtlasIndexedStructure.accepts(candidate, mode: mode, needle: needle,
+                    caseSensitive: caseSensitive),
                   !mode.isTextual || AtlasSearchText.accepts(actualText: candidate.actualText, needle: needle,
                     caseSensitive: caseSensitive),
                   let rawPath = candidate.pathBytes, let bytes = candidate.captureByteLength else { return nil }
             let path = candidate.sourcePath ?? candidate.path
             let row = hits[candidate.id]
-            return AtlasSearchCapturedHit(root: root, path: path, needle: candidate.actualText ?? needle,
+            let exactNeedle = mode == .occurrences ? (candidate.structure?.name ?? needle) : (candidate.actualText ?? needle)
+            return AtlasSearchCapturedHit(root: root, path: path, needle: exactNeedle,
                 start: candidate.start, end: candidate.end, capturedBytes: bytes, openReader: { reader in
                     guard reader > 0, reader != basis.owner else { throw AtlasSearchError.invalidRequest }
                     return try owner.call { handle in
@@ -26,7 +29,8 @@ enum AtlasIndexedSource {
                         let json = try importReader(handle, reader, basis.index, row.file, row.revision)
                         return try validate(json, reader: reader, basis: basis, row: row)
                     }
-                }, mode: mode, caseSensitive: caseSensitive, rawPath: rawPath)
+                }, mode: mode, caseSensitive: caseSensitive,
+                occurrenceQuery: mode == .occurrences ? needle : nil, rawPath: rawPath)
         })
     }
     static func validate(_ json: String?, reader: UInt64, basis: AtlasIndexedBasis, row: AtlasIndexedHit) throws -> String {

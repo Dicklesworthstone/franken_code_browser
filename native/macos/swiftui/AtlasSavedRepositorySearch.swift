@@ -45,8 +45,9 @@ struct AtlasSavedStructurePolicy: Equatable, Sendable {
     /// Older pages carry only name_case; older reader receipts omit it.
     static func admit(caseSensitive: Bool?, countAll: Bool?, nameCase: String?, mode: AtlasSavedSearchMode) throws -> Self {
         let policy = Self(caseSensitive: caseSensitive ?? true, countAllMatches: countAll ?? false)
-        guard (caseSensitive == nil) == (countAll == nil),
-              mode != .occurrences || policy.caseSensitive else { throw AtlasSavedError.invalidResponse }
+        guard mode.structure != nil, (caseSensitive == nil) == (countAll == nil) else {
+            throw AtlasSavedError.invalidResponse
+        }
         if caseSensitive != nil || nameCase != nil {
             guard nameCase == (policy.caseSensitive ? "sensitive" : "unicode-lowercase") else {
                 throw AtlasSavedError.invalidResponse
@@ -260,7 +261,7 @@ struct AtlasSavedStructureHit: Decodable, Sendable, Identifiable {
             throw AtlasSavedError.invalidResponse
         }
     }
-    func validate(mode: AtlasSavedSearchMode, needle: String) throws {
+    func validate(mode: AtlasSavedSearchMode, needle: String, caseSensitive: Bool = true) throws {
         guard let expected = mode.structure, structure.mode == expected, structure.evidence == expected.evidence,
               structure.evidenceEnd <= expected.structureFileByteLimit else { throw AtlasSavedError.invalidResponse }
         switch mode {
@@ -276,9 +277,10 @@ struct AtlasSavedStructureHit: Decodable, Sendable, Identifiable {
             }
         case .occurrences:
             guard structure.headingSlug == nil, structure.kind == "identifier-occurrence", structure.language == "text",
-                  structure.name.utf8.elementsEqual(needle.utf8),
+                  AtlasSearchOccurrencePolicy.matches(source: structure.name, query: needle, caseSensitive: caseSensitive),
                   structure.evidenceStart == hit.start, structure.evidenceEnd == hit.end,
-                  hit.end - hit.start == UInt64(needle.utf8.count) || hit.end - hit.start == UInt64(needle.utf16.count * 2) else {
+                  hit.end - hit.start == UInt64(structure.name.utf8.count)
+                    || hit.end - hit.start == UInt64(structure.name.utf16.count * 2) else {
                 throw AtlasSavedError.invalidResponse
             }
         case .literal, .expression: throw AtlasSavedError.invalidResponse
@@ -398,7 +400,7 @@ struct AtlasSavedStructurePage: Sendable {
                 guard hit.id == start + UInt64(position) + 1, hit.member < identity.members else {
                     throw AtlasSavedError.invalidResponse
                 }
-                try item.validate(mode: mode, needle: w.needle)
+                try item.validate(mode: mode, needle: w.needle, caseSensitive: policy.caseSensitive)
                 if let previous {
                     guard hit.member >= previous.hit.member else { throw AtlasSavedError.invalidResponse }
                     if hit.member == previous.hit.member {

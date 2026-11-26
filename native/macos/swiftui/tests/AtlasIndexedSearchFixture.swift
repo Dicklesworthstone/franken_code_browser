@@ -180,6 +180,27 @@ final class IndexedFixture: @unchecked Sendable {
         return transport
     }
 
+    var matchingStructuralTransport: AtlasIndexedSearchTransport {
+        var transport = structuralTransport
+        transport.matchingStructureQueryBegin = { h, g, index, mode, nameMode, needle, scope, pathScope, matching in
+            precondition(index == 1 && !mode.isTextual)
+            return try self.response("query-begin", h, generation: g, needle: needle, scope: scope,
+                pathScope: pathScope, caseSensitive: matching, structureMode: mode, nameMode: nameMode)
+        }
+        return transport
+    }
+
+    var matchingStructuralWindowTransport: AtlasIndexedSearchTransport {
+        var transport = matchingStructuralTransport
+        transport.matchingStructureWindowQueryBegin = { h, g, index, mode, nameMode, needle, scope, pathScope, matching, countAll, skip in
+            precondition(index == 1 && !mode.isTextual)
+            return try self.response("query-begin", h, generation: g, needle: needle, scope: scope,
+                pathScope: pathScope, caseSensitive: matching, countAllMatches: countAll, resultOffset: skip,
+                structureMode: mode, nameMode: nameMode)
+        }
+        return transport
+    }
+
     private func response(_ phase: String, _ h: UInt64, generation: UInt64 = 1,
                           needle: String = "", start: Int = 0, reader: UInt64 = 100, sourceFile: UInt64 = 1,
                           scope: AtlasSearchFileScope = .all,
@@ -351,18 +372,19 @@ final class IndexedFixture: @unchecked Sendable {
             var rows: [[String: Any]] = []
             if first < end {
                 for n in first..<end {
+                    let name = s.structureMode == .occurrences && !s.caseSensitive ? c.insensitiveText : s.needle
                     let width = s.structureMode == .occurrences && c.encoding.hasPrefix("utf16")
-                        ? s.needle.utf16.count * 2 : (s.structureMode != nil ? s.needle.utf8.count
+                        ? name.utf16.count * 2 : (s.structureMode != nil ? name.utf8.count
                         : (s.caseSensitive ? (s.expression == nil ? 1 : s.needle.utf8.count) : c.insensitiveRangeBytes))
                     let position = Int(s.resultOffset ?? 0) + n + metadataOmitted
                     let range: [String: String] = ["start": String(position * 2), "end": String(position * 2 + width)]
                     let path: [String: String] = ["encoding": "unix-bytes", "hex": c.pathHex, "display": "a.rs"]
                     var row: [String: Any] = ["hit_id": String(n + 1), "file_id": String(c.fileID), "source_revision": "1",
                         "capture_sha256": c.digest, "capture_byte_length": String(c.captureBytes), "original_range": range, "path": path]
-                    if !s.caseSensitive { row["matched_text"] = c.insensitiveText }
+                    if !s.caseSensitive && s.structureMode == nil { row["matched_text"] = c.insensitiveText }
                     else if s.expression != nil { row["matched_text"] = s.needle }
                     if let mode = s.structureMode {
-                        var structure: [String: Any] = ["name": s.needle,
+                        var structure: [String: Any] = ["name": name,
                             "kind": mode == .headings ? "heading" : (mode == .occurrences ? "identifier-occurrence" : "function"),
                             "language": mode == .headings ? "markdown" : (mode == .occurrences ? "text" : "rust"),
                             "candidate_id": String(n + 1), "evidence_level": mode.evidence,
@@ -401,7 +423,8 @@ final class IndexedFixture: @unchecked Sendable {
                 value["command"] = phase == "query-begin" ? "begin-indexed-structure" : (phase == "page" ? "page" : "step")
                 value["mode"] = mode.wireMode; value["search_strategy"] = "retained-capture-structure"
                 value["requested_mode"] = mode.rawValue; value["realized_mode"] = mode.evidence
-                value["name_mode"] = s.nameMode.rawValue; value["name_case"] = "sensitive"
+                value["name_mode"] = s.nameMode.rawValue
+                value["name_case"] = s.caseSensitive ? "sensitive" : "unicode-lowercase"
                 value["evidence_level"] = mode.evidence; value["semantic_complete"] = false
                 value["completeness_basis"] = "admitted-extraction-processing"
                 value["structure_file_byte_limit"] = String(mode.atlasStructureFileByteLimit)

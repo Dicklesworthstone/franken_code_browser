@@ -8,6 +8,8 @@ struct AtlasReaderReferencesTransport: Sendable {
     let reference: @Sendable (UInt64, UInt64, UInt64, UInt64) -> String?
     /// Same retained source, with independent row storage and match counting.
     var prepareWindow: (@Sendable (UInt64, UInt64, String, UInt64, Bool, UInt64) -> String?)? = nil
+    /// Explicit scalar-lowercase policy, retaining the original-byte witnesses.
+    var prepareMatchingWindow: (@Sendable (UInt64, UInt64, String, UInt64, Bool, Bool, UInt64) -> String?)? = nil
 }
 
 struct AtlasReferenceWindowRequest: Equatable, Sendable {
@@ -55,12 +57,13 @@ struct AtlasReferenceTarget: Equatable, Sendable {
     let pageID: UUID
     let name: String
     let occurrence: AtlasReferenceOccurrence
+    var caseSensitive = true
     static let contextBytes: UInt64 = 2048
 
     static func == (a: Self, b: Self) -> Bool {
         a.identity.matches(b.identity) && a.generation == b.generation
             && a.pageID == b.pageID && a.name.utf8.elementsEqual(b.name.utf8)
-            && a.occurrence == b.occurrence
+            && a.caseSensitive == b.caseSensitive && a.occurrence == b.occurrence
     }
 }
 
@@ -81,12 +84,14 @@ struct AtlasReferenceInventory: Sendable {
     let limited: Bool
     var sourceLimit: UInt64 = AtlasReferencePage.sourceLimit
     var window: AtlasReferenceWindow? = nil
+    var caseSensitive = true
 
     var countComplete: Bool { window?.countComplete ?? !limited }
 
     func matches(_ other: Self) -> Bool {
         identity.matches(other.identity) && generation == other.generation
-            && name.utf8.elementsEqual(other.name.utf8) && maxItems == other.maxItems
+            && name.utf8.elementsEqual(other.name.utf8) && caseSensitive == other.caseSensitive
+            && maxItems == other.maxItems
             && retained == other.retained && matchesCounted == other.matchesCounted
             && limited == other.limited && sourceLimit == other.sourceLimit && window == other.window
     }
@@ -114,10 +119,21 @@ struct AtlasReferencePage: Sendable {
         }
     }
 
+    /// Every source scalar emits at least one lowercase scalar. Four bytes per
+    /// lowered query scalar bounds both UTF-8 and UTF-16 source spellings even
+    /// when the spelling and encoded width differ from the query.
+    static func maximumTokenBytes(name: String, caseSensitive: Bool, encoding: String) -> UInt64 {
+        if caseSensitive {
+            return encoding == "utf8" ? UInt64(name.utf8.count) : UInt64(name.utf16.count) * 2
+        }
+        let scalars = name.unicodeScalars.reduce(0) { $0 + String($1).lowercased().unicodeScalars.count }
+        return UInt64(scalars) * 4
+    }
+
     func target(id: UInt64) -> AtlasReferenceTarget? {
         rows.first(where: { $0.id == id }).map {
             AtlasReferenceTarget(identity: inventory.identity, generation: inventory.generation,
-                pageID: self.id, name: inventory.name, occurrence: $0)
+                pageID: self.id, name: inventory.name, occurrence: $0, caseSensitive: inventory.caseSensitive)
         }
     }
 
@@ -138,7 +154,7 @@ struct AtlasReferencePage: Sendable {
     static func decode(_ json: String?, info: AtlasReaderInfo, generation: UInt64,
         name: String, request: AtlasReferencePageRequest, preparing: Bool = false,
         inventory: AtlasReferenceInventory? = nil, maxItems: UInt64 = AtlasReferencePage.maxItems,
-        window: AtlasReferenceWindowRequest? = nil) throws -> Self {
+        window: AtlasReferenceWindowRequest? = nil, caseSensitive: Bool = true) throws -> Self {
         try validateName(name)
         try request.validate()
         guard generation > 0, maxItems <= Self.maxItems else { throw AtlasReaderError.invalidInput }
@@ -151,7 +167,8 @@ struct AtlasReferencePage: Sendable {
                   wire.header.command == (preparing ? "references" : "reference-page"),
                   !preparing || request == .initial,
                   AtlasReaderWire.integer(wire.reference_generation) == generation,
-                  wire.name.utf8.elementsEqual(name.utf8), wire.name_case == "sensitive",
+                  wire.name.utf8.elementsEqual(name.utf8),
+                  wire.name_case == (caseSensitive ? "sensitive" : "unicode-lowercase"),
                   wire.selection_namespace == "reference", wire.evidence_level == "whole-token-text-candidate",
                   wire.includes_comments_and_literals, !wire.compiler_resolved, !wire.semantic_complete,
                   wire.line_semantics == "LF-counted-source-lines",
@@ -220,13 +237,11 @@ struct AtlasReferencePage: Sendable {
             }
             let basis = AtlasReferenceInventory(identity: identity, generation: generation, name: name,
                 maxItems: maxItems, retained: retained, matchesCounted: counted, limited: wire.output_limited,
-                sourceLimit: declaredLimit, window: acceptedWindow)
+                sourceLimit: declaredLimit, window: acceptedWindow, caseSensitive: caseSensitive)
             if let inventory, !inventory.matches(basis) { throw AtlasReaderError.invalidResponse }
-            // Every exact occurrence has the same encoded byte width. Standard
-            // String views provide that width without duplicating token policy
-            // or the engine's original-to-decoded offset mapping.
-            let tokenBytes = identity.encoding == "utf8"
-                ? UInt64(name.utf8.count) : UInt64(name.utf16.count) * 2
+            // Ranges stay source-owned: lowercase matches may have a different
+            // spelling and width. Navigation verifies the exact decoded witness.
+            let tokenBytes = maximumTokenBytes(name: name, caseSensitive: caseSensitive, encoding: identity.encoding)
             var previousEnd: UInt64 = 0
             var previousLine: UInt64 = 1
             let rows = try wire.references.enumerated().map { index, row -> AtlasReferenceOccurrence in
@@ -234,7 +249,8 @@ struct AtlasReferencePage: Sendable {
                       let line = AtlasReaderWire.integer(row.line), line >= previousLine,
                       line <= identity.capturedBytes + 1 else { throw AtlasReaderError.invalidResponse }
                 let range = try row.original_range.admit(length: identity.capturedBytes)
-                guard range.start >= previousEnd, range.length == tokenBytes else {
+                guard range.start >= previousEnd, range.length > 0,
+                      caseSensitive ? range.length == tokenBytes : range.length <= tokenBytes else {
                     throw AtlasReaderError.invalidResponse
                 }
                 if identity.encoding != "utf8" {

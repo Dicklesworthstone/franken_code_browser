@@ -180,6 +180,37 @@ char *fcb_atlas_structure_indexed_begin(uint64_t h, uint64_t g, uint64_t index, 
     }
     ++calls; return result();
 }
+char *fcb_atlas_structure_indexed_begin_matching(uint64_t h, uint64_t g, uint64_t index, uint64_t search_mode,
+        uint64_t name_mode, const char *needle, const char *extensions, const char *filenames,
+        uint64_t path_kind, const char *path, uint64_t case_sensitive, uint64_t hits, uint64_t bytes) {
+    if (case_sensitive == 1) {
+        return fcb_atlas_structure_indexed_begin(h, g, index, search_mode, name_mode, needle,
+            extensions, filenames, path_kind, path, hits, bytes);
+    }
+    assert(h == handle && g == 73 && index == 1 && search_mode == 4 && name_mode == 0);
+    assert(needle && !strcmp(needle, "SomeName") && !extensions && !filenames);
+    assert(path_kind == 2 && path && !strcmp(path, "src/exact.rs") && case_sensitive == 0);
+    assert(hits == 1000 && bytes == 32 * 1024 * 1024);
+    ++calls; return result();
+}
+char *fcb_atlas_structure_indexed_begin_window_matching(uint64_t h, uint64_t g, uint64_t index,
+        uint64_t search_mode, uint64_t name_mode, const char *needle, const char *extensions,
+        const char *filenames, uint64_t path_kind, const char *path, uint64_t case_sensitive,
+        uint64_t count_all, uint64_t skip, uint64_t hits, uint64_t bytes) {
+    assert(h == handle && index == 1 && search_mode == 4 && name_mode == 0);
+    assert(needle && !strcmp(needle, "SomeName") && !extensions && !filenames && path_kind == 0 && !path);
+    assert(hits == 1000 && bytes == 32 * 1024 * 1024);
+    if (g == 83) assert(case_sensitive == 0 && count_all == 1 && skip == 1000);
+    else assert(g == 84 && case_sensitive == 1 && count_all == 0 && skip == 0);
+    ++calls; return result();
+}
+char *fcb_atlas_structure_indexed_begin_window(uint64_t h, uint64_t g, uint64_t index,
+        uint64_t search_mode, uint64_t name_mode, const char *needle, const char *extensions,
+        const char *filenames, uint64_t path_kind, const char *path, uint64_t count_all, uint64_t skip,
+        uint64_t hits, uint64_t bytes) {
+    return fcb_atlas_structure_indexed_begin_window_matching(h, g, index, search_mode, name_mode, needle,
+        extensions, filenames, path_kind, path, 1, count_all, skip, hits, bytes);
+}
 char *fcb_atlas_search_indexed_begin_window(uint64_t h, uint64_t g, uint64_t index, const char *query,
         const char *extensions, const char *filenames, uint64_t path_kind, const char *path,
         uint64_t case_sensitive, uint64_t expression, uint64_t count_all, uint64_t skip,

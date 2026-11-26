@@ -72,10 +72,11 @@ import Foundation
         }
         precondition(suppliedCalls() == 7)
         guard let references = AtlasReaderTransport.native.references,
-              let referenceWindow = references.prepareWindow else {
+              let referenceWindow = references.prepareWindow,
+              let matchingReferenceWindow = references.prepareMatchingWindow else {
             fatalError("native retained occurrence capability missing")
         }
-        // Exercise the actual four C entry points, including exact decomposed
+        // Exercise the actual five C entry points, including exact decomposed
         // UTF-8 spelling, full-width integers, nullable replies and owned frees.
         // Malformed UTF-8, oversized and empty replies are refused and freed.
         // The fixture intentionally accepts out-of-range page/row coordinates
@@ -103,8 +104,17 @@ import Foundation
                 }.value
                 precondition(window == (mode == 0 ? "{\"reference_window_fixture\":true}" : nil))
             }
-            precondition(suppliedCalls() == before + 5 && suppliedLive() == 0,
-                         "occurrence ABI arguments or response ownership changed")
+            for caseSensitive in [false, true] {
+                for countAll in [false, true] {
+                    let window = await Task.detached {
+                        matchingReferenceWindow(handle, UInt64.max, "İ", AtlasReferencePage.maxItems,
+                            caseSensitive, countAll, UInt64.max - (caseSensitive ? 6 : 8) - (countAll ? 0 : 1))
+                    }.value
+                    precondition(window == (mode == 0 ? "{\"reference_matching_window_fixture\":true}" : nil))
+                }
+            }
+            precondition(suppliedCalls() == before + 9 && suppliedLive() == 0,
+                         "occurrence ABI case/count options, full-width offsets or response ownership changed")
         }
         guard let matchingDelimiter = AtlasReaderTransport.native.matchingDelimiter else {
             fatalError("native retained bracket capability missing")

@@ -7,7 +7,7 @@
 
 static char *responses[5][8]; // open, begin, step, page, captured reader import
 static unsigned cursors[5];
-static _Atomic unsigned counts[18]; // create/open/begin/step/page/close/alloc/free/import/scoped-begin/path-begin/structure-begin/matching-begin/expression-begin/counted-begin/counted-expression/directory-open/file-open
+static _Atomic unsigned counts[19]; // create/open/begin/step/page/close/alloc/free/import/scoped-begin/path-begin/structure-begin/matching-begin/expression-begin/counted-begin/counted-expression/directory-open/file-open/matching-structure-begin
 static int cancel_step, refuse_create;
 static char expected_extensions[1025], expected_filenames[1025];
 static int expected_all;
@@ -25,7 +25,7 @@ void fixture_reset(void) {
         for (unsigned j = 0; j < 8; ++j) { free(responses[i][j]); responses[i][j] = NULL; }
         cursors[i] = 0;
     }
-    for (unsigned i = 0; i < 18; ++i) atomic_store(&counts[i], 0);
+    for (unsigned i = 0; i < 19; ++i) atomic_store(&counts[i], 0);
     expected_extensions[0] = expected_filenames[0] = 0;
     expected_all = 1; expected_path_kind = 0; expected_path[0] = 0; expected_directory_length = expected_file_length = 0;
     cancel_step = refuse_create = 0;
@@ -36,7 +36,7 @@ void fixture_set(unsigned kind, unsigned index, const char *text) {
     assert(kind < 5 && index < 8);
     free(responses[kind][index]); responses[kind][index] = strdup(text);
 }
-unsigned fixture_count(unsigned key) { assert(key < 18); return atomic_load(&counts[key]); }
+unsigned fixture_count(unsigned key) { assert(key < 19); return atomic_load(&counts[key]); }
 void fixture_expect_policy(uint64_t policy) { assert(policy <= 1); expected_policy = policy; }
 void fixture_expect_directory(const uint8_t *directory, uint64_t length) {
     assert(directory && length > 0 && length <= sizeof(expected_directory));
@@ -144,6 +144,15 @@ char *fcb_atlas_structure_begin(uint64_t handle, uint64_t generation, uint64_t m
     else { assert(path && !strcmp(path, expected_path)); }
     ++counts[11];
     return fcb_atlas_search_begin(handle, generation, query, matches, files, file_bytes, source_bytes);
+}
+char *fcb_atlas_structure_begin_matching(uint64_t handle, uint64_t generation, uint64_t mode, uint64_t name_mode,
+                                        const char *query, const char *extensions, const char *filenames,
+                                        uint64_t path_kind, const char *path, uint64_t case_sensitive,
+                                        uint64_t matches, uint64_t files, uint64_t file_bytes, uint64_t source_bytes) {
+    assert(mode == 4 && name_mode == 0 && case_sensitive == 0);
+    ++counts[18];
+    return fcb_atlas_structure_begin(handle, generation, mode, name_mode, query, extensions, filenames,
+        path_kind, path, matches, files, file_bytes, source_bytes);
 }
 char *fcb_atlas_search_begin_counted_matching(uint64_t handle, uint64_t generation, const char *query,
                                      const char *extensions, const char *filenames,

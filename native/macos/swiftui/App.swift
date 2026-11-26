@@ -637,7 +637,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     }
 
     private var wantsCapturedIndex: Bool { useCapturedIndex }
-    private var effectiveSearchCaseSensitive: Bool { !searchMode.isTextual || searchCaseSensitive }
+    private var effectiveSearchCaseSensitive: Bool { !searchMode.supportsCaseMatching || searchCaseSensitive }
     private var effectiveSearchCountAllMatches: Bool { (searchMode.isTextual || wantsCapturedIndex) && searchCountAllMatches }
     private var overlayIsCurrent: Bool {
         !hasRetainedAtlas && searchIsCurrent && overlayContentRevision == atlasResidency.contentRevision
@@ -938,7 +938,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             }
         }
         .onChange(of: searchCaseSensitive) { _, _ in
-            if searchMode.isTextual {
+            if searchMode.supportsCaseMatching {
                 clearSearch()
                 // The captured source index is independent of query case.
                 // Keep it; only replace the query and its visible authority.
@@ -946,7 +946,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             }
         }
         .onChange(of: searchCountAllMatches) { _, _ in
-            if searchMode.isTextual {
+            if searchMode.isTextual || wantsCapturedIndex {
                 clearSearch()
                 runSearch(debounce: true)
             }
@@ -1223,7 +1223,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             }
             .padding(.horizontal, 10)
             .padding(.top, 10)
-            if searchMode.isTextual {
+            if searchMode.supportsCaseMatching {
                 Toggle("Match case", isOn: $searchCaseSensitive)
                     .toggleStyle(.checkbox)
                     .font(.caption)
@@ -3577,10 +3577,10 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         clearSearch()
         let changesInput = searchMode != mode || !query.utf8.elementsEqual(text.utf8)
             || (mode.supportsNameMatching && searchNameMode != .exact)
-            || (mode.isTextual && !searchCaseSensitive)
+            || (mode.supportsCaseMatching && !searchCaseSensitive)
         searchMode = mode
         if mode.supportsNameMatching { searchNameMode = .exact }
-        if mode.isTextual { searchCaseSensitive = true }
+        if mode.supportsCaseMatching { searchCaseSensitive = true }
         query = text
         showsSidebar = true
         searchFocused = false
@@ -3829,7 +3829,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                   let hit = searchPresentation?.captureCandidate(for: row, in: searchContext),
                   let target = capture.target(hit), target.root.utf8.elementsEqual(root.utf8),
                   target.path.utf8.elementsEqual(path.utf8),
-                  target.needle.utf8.elementsEqual((hit.actualText ?? searchReport?.expression?.primaryNeedle ?? query).utf8),
+                  target.needle.utf8.elementsEqual((searchMode == .occurrences
+                    ? (hit.structure?.name ?? query) : (hit.actualText ?? searchReport?.expression?.primaryNeedle ?? query)).utf8),
                   searchMode != .expression || searchReport?.expression?.query.utf8.elementsEqual(query.utf8) == true,
                   target.mode == searchMode, target.caseSensitive == effectiveSearchCaseSensitive else {
                 status = "The retained search capture could not authorize this match. Your current reader is unchanged. Search again, or explicitly open the current file."

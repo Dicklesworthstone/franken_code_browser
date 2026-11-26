@@ -220,15 +220,18 @@ enum AtlasCapturedReader {
             guard isCurrent() else { throw AtlasReaderError.canceled }
         }
         try checkCurrent()
-        guard selected.mode == .occurrences, selected.caseSensitive,
+        let query = selected.occurrenceQuery ?? selected.needle
+        guard selected.mode == .occurrences,
+              AtlasSearchOccurrencePolicy.matches(source: selected.needle, query: query,
+                  caseSensitive: selected.caseSensitive),
               identity.capturedBytes == selected.capturedBytes,
               identity.capturedBytes <= AtlasReferencePage.sourceLimit,
               identity.pathBytes == selected.pathBytes,
               selected.start < selected.end, selected.end <= selected.capturedBytes else {
             throw AtlasReaderError.invalidResponse
         }
-        try AtlasReferencePage.validateName(selected.needle)
-        var current = try await prepare(selected.needle)
+        try AtlasReferencePage.validateName(query)
+        var current = try await prepare(query)
         try checkCurrent()
         if let prepareWindow {
             guard current.inventory.window != nil else { throw AtlasReaderError.invalidResponse }
@@ -237,7 +240,8 @@ enum AtlasCapturedReader {
         }
         let inventory = current.inventory
         guard inventory.identity.matches(identity), inventory.generation > 0,
-              inventory.name.utf8.elementsEqual(selected.needle.utf8),
+              inventory.name.utf8.elementsEqual(query.utf8),
+              inventory.caseSensitive == selected.caseSensitive,
               inventory.maxItems == AtlasReferencePage.maxItems,
               inventory.retained <= AtlasReferencePage.maxItems else {
             throw AtlasReaderError.invalidResponse
@@ -293,6 +297,7 @@ enum AtlasCapturedReader {
             try Task.checkCancellation()
             guard isCurrent() else { throw AtlasReaderError.canceled }
         }
+        let query = selected.occurrenceQuery ?? selected.needle
         guard first.inventory.window?.request.offset == 0,
               first.inventory.matchesCounted <= identity.capturedBytes,
               identity.capturedBytes <= maximumActivationReplayBytes else { throw AtlasReaderError.invalidResponse }
@@ -304,7 +309,8 @@ enum AtlasCapturedReader {
             try checkCurrent()
             let inventory = current.inventory
             guard inventory.identity.matches(identity), inventory.generation > previousGeneration,
-                  inventory.name.utf8.elementsEqual(selected.needle.utf8),
+                  inventory.name.utf8.elementsEqual(query.utf8),
+                  inventory.caseSensitive == selected.caseSensitive,
                   inventory.maxItems == AtlasReferencePage.maxItems,
                   inventory.matchesCounted == total, inventory.countComplete,
                   let window = inventory.window, window.request.countAllMatches,
@@ -348,7 +354,7 @@ enum AtlasCapturedReader {
             previousGeneration = inventory.generation
             remainingBytes -= identity.capturedBytes
             try checkCurrent()
-            current = try await prepareWindow(selected.needle, offset)
+            current = try await prepareWindow(query, offset)
         }
         throw AtlasReaderError.engine("CAPTURED_OCCURRENCE_UNAVAILABLE")
     }

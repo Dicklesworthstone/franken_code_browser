@@ -54,17 +54,18 @@ final class SavedRepositoryFixture: @unchecked Sendable {
     let imageVectors: Bool
     let headingVectors: Bool
     let longHeading: Bool
+    let longOccurrence: Bool
     let lineEncoding: String?
     let lineRange: (UInt64, UInt64)?
     let sourceMemberOverride: Member?
     init(searchVectors: Bool = false, headingVectors: Bool = false, longHeading: Bool = false,
         lineEncoding: String? = nil, lineRange: (UInt64, UInt64)? = nil, expansionVectors: Bool = false,
-        imageVectors: Bool = false, sourceMemberOverride: Member? = nil) {
+        imageVectors: Bool = false, sourceMemberOverride: Member? = nil, longOccurrence: Bool = false) {
         precondition(lineEncoding == nil || (["utf8", "utf16le", "utf16be"].contains(lineEncoding!) && !searchVectors && !headingVectors))
         precondition(!expansionVectors || (searchVectors && !headingVectors && lineEncoding == nil))
         precondition(!imageVectors || (!searchVectors && !headingVectors && lineEncoding == nil))
         self.searchVectors = searchVectors; self.expansionVectors = expansionVectors; self.imageVectors = imageVectors
-        self.headingVectors = headingVectors; self.longHeading = longHeading
+        self.headingVectors = headingVectors; self.longHeading = longHeading; self.longOccurrence = longOccurrence
         self.lineEncoding = lineEncoding; self.lineRange = lineRange
         self.sourceMemberOverride = sourceMemberOverride
     }
@@ -134,9 +135,11 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             bytes: png, digest: pngDigest, encoding: "unsupported") : nil
     }
     var searchUTF8: [UInt8] { expansionVectors ? [0xc4, 0xb0]
+        : longOccurrence ? Array((String(repeating: "K", count: 1024) + "\n").utf8)
         : Array(("é" + String(repeating: "x", count: 200) + "banana\n").utf8) }
     var searchUTF16: [UInt8] {
         if expansionVectors { return [255, 254, 0x30, 0x01] }
+        if longOccurrence { return [255, 254] + Array(repeating: [UInt8(0x2a), 0x21], count: 1024).flatMap { $0 } + [10, 0] }
         return [255, 254, 233, 0] + Array(repeating: [UInt8(120), 0], count: 200).flatMap { $0 }
             + [98, 0, 97, 0, 110, 0, 97, 0, 110, 0, 97, 0, 10, 0]
     }
@@ -145,11 +148,13 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             Member(path: Array("README.md".utf8), display: "README.md", bytes: source, digest: sourceDigest),
             sourceMemberOverride ?? Member(path: rawPath, display: "raw-\\xff.rs",
                 bytes: searchVectors ? searchUTF8 : Array("changed bytes\n".utf8),
-                digest: expansionVectors ? "a65018cffe8e0ed3f3112a79326e4c9718dc498a1f18a3a72f2f77c792c48b70" : searchVectors ? "ec34a752af5a6ce18bfd388bda04c6c9f60b22301b44d413c085507ca994f6cc"
+                digest: longOccurrence ? "151f326e144244c78b246ab5fbdca63e991763e8be33db20af064913c2fad935"
+                    : expansionVectors ? "a65018cffe8e0ed3f3112a79326e4c9718dc498a1f18a3a72f2f77c792c48b70" : searchVectors ? "ec34a752af5a6ce18bfd388bda04c6c9f60b22301b44d413c085507ca994f6cc"
                     : "7c60358cb724c1b671469c5f167cea45a4f70df4e3ac87b79340692e6f17f574"),
             Member(path: Array("skipped.md".utf8), display: "skipped.md",
                 bytes: searchVectors ? searchUTF16 : [255],
-                digest: expansionVectors ? "138366bfcd2687fbf98b5a0f74101c54efbf1fdda422e4a8de157b57e633ac3b" : searchVectors ? "0896dfbe40292ec212fa69dac19c681c8f56ba79c407cbad6817580762413ecf"
+                digest: longOccurrence ? "d7516ffc1185670a55df06c39862d7edfa9a56d8e699c88a1b374837e3949e85"
+                    : expansionVectors ? "138366bfcd2687fbf98b5a0f74101c54efbf1fdda422e4a8de157b57e633ac3b" : searchVectors ? "0896dfbe40292ec212fa69dac19c681c8f56ba79c407cbad6817580762413ecf"
                     : "a8100ae6aa1940d0b663bb31cd466142ebbdbd5187131b92d93818987832eb89",
                 encoding: searchVectors ? "utf16le" : "utf8"),
             imageMember ?? lineMember ?? Member(path: Array((headingVectors ? "docs/guide.md" : "src/lib.rs").utf8),
@@ -375,8 +380,9 @@ final class SavedRepositoryFixture: @unchecked Sendable {
         }
         return out
     }
-    var occurrenceNeedle: String { "é" + String(repeating: "x", count: 200) + "banana" }
-    func structureHits(_ mode: AtlasSavedSearchMode, needle: String) -> [QueryHit] {
+    var occurrenceNeedle: String { longOccurrence ? String(repeating: "K", count: 1024)
+        : "é" + String(repeating: "x", count: 200) + "banana" }
+    func structureHits(_ mode: AtlasSavedSearchMode, needle: String, caseSensitive: Bool = true) -> [QueryHit] {
         // Fixed producer vectors; this fixture does not parse declarations,
         // Markdown or identifier tokens. The shared Rust suites own extraction.
         switch mode {
@@ -387,8 +393,13 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             guard headingVectors, (needle == (longHeading ? "A" : "Café") || (!longHeading && needle == "CAFÉ")) else { return [] }
             return [QueryHit(member: 3, start: longHeading ? 0 : 207, end: longHeading ? 3003 : 223)]
         case .occurrences:
-            guard searchVectors, needle.utf8.elementsEqual(occurrenceNeedle.utf8) else { return [] }
-            return [QueryHit(member: 1, start: 0, end: 208), QueryHit(member: 2, start: 2, end: 416)]
+            // Fixed exact/lowercase producer queries, independent of native matching.
+            let uppercase = longOccurrence ? String(repeating: "K", count: 1024)
+                : "É" + String(repeating: "X", count: 200) + "BANANA"
+            guard searchVectors, needle.utf8.elementsEqual(occurrenceNeedle.utf8)
+                || (!caseSensitive && needle.utf8.elementsEqual(uppercase.utf8)) else { return [] }
+            return longOccurrence ? [QueryHit(member: 1, start: 0, end: 3072), QueryHit(member: 2, start: 2, end: 2050)]
+                : [QueryHit(member: 1, start: 0, end: 208), QueryHit(member: 2, start: 2, end: 416)]
         case .literal, .expression: return []
         }
     }
@@ -409,8 +420,9 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             "heading_slug": slug, "evidence_level": mode.structure!.evidence,
             "evidence_range": ["start": String(hit.start), "end": String(mode == .symbols ? 209 : hit.end)]]
     }
-    func structureHitObject(_ id: UInt64, mode: AtlasSavedSearchMode, needle: String) -> [String: Any] {
-        let hit = structureHits(mode, needle: needle)[Int(id - 1)], member = members[Int(hit.member)]
+    func structureHitObject(_ id: UInt64, mode: AtlasSavedSearchMode, needle: String,
+        caseSensitive: Bool = true) -> [String: Any] {
+        let hit = structureHits(mode, needle: needle, caseSensitive: caseSensitive)[Int(id - 1)], member = members[Int(hit.member)]
         return ["hit_id": String(id), "member": String(hit.member), "file_id": String(hit.member + 1),
             "source_revision": String(hit.member + 1), "source_digest": member.digest!,
             "path": path(member.path, member.display),
@@ -420,7 +432,8 @@ final class SavedRepositoryFixture: @unchecked Sendable {
     func structurePage(_ owner: UInt64, generation: UInt64, mode: AtlasSavedSearchMode = .symbols,
         nameMode: AtlasSearchNameMode = .contains, needle: String = "banana", start: UInt64 = 0,
         limit: UInt64 = 64, policy: AtlasSavedStructurePolicy = .standard) -> [String: Any] {
-        let hits = structureHits(mode, needle: needle), end = min(UInt64(hits.count), start + limit)
+        let hits = structureHits(mode, needle: needle, caseSensitive: policy.caseSensitive)
+        let end = min(UInt64(hits.count), start + limit)
         let indices: [Int] = mode == .symbols ? [1] : (mode == .headings ? [0, 2, 3] : [0, 1, 2, 3])
         let bytes = indices.compactMap { members[$0].bytes }.reduce(0) { $0 + $1.count }
         let searched = mode == .symbols ? 1 : (mode == .headings ? 2 : 4)
@@ -447,7 +460,8 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             "loaded_bytes": String(bytes), "peak_source_bytes": String(indices.compactMap { members[$0].bytes?.count }.max()!),
             "metadata_bytes": String(metadata), "member_bytes_read": String(bytes), "member_read_calls": String(indices.count),
             "retained_source_payload_bytes": "0",
-            "hits": (start..<end).map { structureHitObject($0 + 1, mode: mode, needle: needle) },
+            "hits": (start..<end).map { structureHitObject($0 + 1, mode: mode, needle: needle,
+                caseSensitive: policy.caseSensitive) },
             "next_offset": end < UInt64(hits.count) ? String(end) as Any : NSNull()
         ]) { _, next in next }
         if mode == .occurrences {
@@ -568,7 +582,7 @@ final class SavedRepositoryFixture: @unchecked Sendable {
         }
         if let structure, let hitID, let session = sessions[saved], let mode = session.structureMode,
             let nameMode = session.structureNameMode, let needle = session.structureNeedle {
-            let hit = structureHits(mode, needle: needle)[Int(hitID - 1)]
+            let hit = structureHits(mode, needle: needle, caseSensitive: session.structurePolicy.caseSensitive)[Int(hitID - 1)]
             out["command"] = "structure-open-reader"; out["selection_namespace"] = "saved-structure"
             out["structure_generation"] = String(structure); out["needle"] = needle
             out["requested_mode"] = mode.rawValue; out["name_mode"] = nameMode.rawValue
@@ -616,6 +630,7 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             case "many-read-calls": out["member_read_calls"] = "1024" // Interrupted reads can exceed source length.
             case "page-bytes": wrongPage.insert(reader)
             case "structure-count": out["count_all_matches"] = !(out["count_all_matches"] as! Bool)
+            case "structure-case": out["case_sensitive"] = !(out["case_sensitive"] as! Bool)
             case "structure-namespace": out["selection_namespace"] = "saved-expression"
             case "structure-generation": out["structure_generation"] = String((structure ?? 0) + 1)
             case "structure-mode": out["requested_mode"] = "symbols"
@@ -940,9 +955,11 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                 case .openStructureHit(let reader, let generation, let id):
                     guard let session = sessions[handle], session.structureGeneration == generation,
                           let mode = session.structureMode, let needle = session.structureNeedle, id > 0,
-                          id <= UInt64(structureHits(mode, needle: needle).count) else { return nil }
+                          id <= UInt64(structureHits(mode, needle: needle,
+                            caseSensitive: session.structurePolicy.caseSensitive).count) else { return nil }
                     log.append("structure-open:\(handle):\(generation):\(id)")
-                    return handoff(handle, reader: reader, ordinal: structureHits(mode, needle: needle)[Int(id - 1)].member,
+                    return handoff(handle, reader: reader, ordinal: structureHits(mode, needle: needle,
+                        caseSensitive: session.structurePolicy.caseSensitive)[Int(id - 1)].member,
                         generation: nil, link: nil, side: nil, hitID: id, structure: generation)
                 case .searchWindow, .expressionWindow, .structureWindow:
                     return nil // Dedicated result-window fixture wraps this shared source owner.

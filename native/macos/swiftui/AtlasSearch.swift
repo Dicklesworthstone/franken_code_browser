@@ -195,6 +195,7 @@ enum AtlasSearchMode: String, CaseIterable, Identifiable, Sendable {
     case text, expression, symbols, headings, occurrences
     var id: String { rawValue }
     var isTextual: Bool { self == .text || self == .expression }
+    var supportsCaseMatching: Bool { isTextual || self == .occurrences }
     var supportsNameMatching: Bool { self == .symbols || self == .headings }
     func effectiveNameMode(_ supplied: AtlasSearchNameMode) -> AtlasSearchNameMode {
         self == .occurrences ? .exact : (isTextual ? .contains : supplied)
@@ -257,7 +258,7 @@ enum AtlasSearchMode: String, CaseIterable, Identifiable, Sendable {
         case .expression: return "Quoted phrases, required terms, -excluded terms, path: and lang: filters. All terms apply to the same captured file; results select the first positive term."
         case .symbols: return "Case-sensitive heuristic declaration candidates in Rust, Python, JavaScript, TypeScript, Go, C/C++ and Swift. Compiler resolution and references are not claimed."
         case .headings: return "Case-sensitive Markdown heading names from the shared parser, with canonical slugs and original source ranges."
-        case .occurrences: return "Exact, case-sensitive whole-token names, including comments and literals. Shared token rules preserve Unicode spelling without normalization; results do not establish compiler-resolved references. Atlas captures admit up to 1 MiB per file; Reader and saved-repository captures admit up to 32 MiB. Unsupported text encoding remains outside coverage."
+        case .occurrences: return "Whole-token names with optional Unicode lowercase matching, including comments and literals. Shared token rules preserve original spelling and byte ranges without normalization; results do not establish compiler-resolved references. Atlas captures admit up to 1 MiB per file; Reader and saved-repository captures admit up to 32 MiB. Unsupported text encoding remains outside coverage."
         }
     }
     var placeholder: String {
@@ -266,7 +267,7 @@ enum AtlasSearchMode: String, CaseIterable, Identifiable, Sendable {
         case .expression: return "\"pub fn\" Result -unsafe lang:rust"
         case .symbols: return "Declaration name…"
         case .headings: return "Markdown heading…"
-        case .occurrences: return "Exact identifier name…"
+        case .occurrences: return "Identifier token…"
         }
     }
 }
@@ -276,6 +277,19 @@ enum AtlasSearchMode: String, CaseIterable, Identifiable, Sendable {
 enum AtlasSearchOccurrencePolicy {
     static let tokenPolicy = "ascii-alphanumeric-underscore-dollar-plus-nonascii-nonwhitespace-noncontrol-v1"
     static let nameSyntax = "single-token-no-leading-ascii-digit"
+
+    /// Admit the shared engine's whole-token spelling witness. Rust lowercases
+    /// each scalar independently: whole-string lowercasing would introduce
+    /// contextual Greek final sigma, and Swift equality would normalize Unicode.
+    static func matches(source: String, query: String, caseSensitive: Bool) -> Bool {
+        guard !source.isEmpty, source.utf8.count <= 4096, !source.utf8.contains(0),
+              !query.isEmpty, query.utf8.count <= 1024, !query.utf8.contains(0) else { return false }
+        if caseSensitive { return source.utf8.elementsEqual(query.utf8) }
+        let loweredSource = source.unicodeScalars.map { String($0).lowercased() }.joined()
+        let loweredQuery = query.unicodeScalars.map { String($0).lowercased() }.joined()
+        return loweredSource.utf8.elementsEqual(loweredQuery.utf8)
+    }
+
     static func queryFailure(in data: Data) -> AtlasSearchError? {
         struct Envelope: Decodable {
             struct Failure: Decodable { let code: String }
@@ -456,7 +470,9 @@ struct AtlasSearchReport: Sendable {
         }
         let qualification = mode == .symbols
             ? " Heuristic declaration candidates; compiler resolution and reference completeness are not claimed."
-            : (mode == .occurrences ? " Exact token spelling, including comments and literals; compiler resolution is not claimed."
+            : (mode == .occurrences ? (caseSensitive
+                ? " Exact token spelling, including comments and literals; compiler resolution is not claimed."
+                : " Whole tokens compared using Unicode lowercase; original spelling is preserved, and compiler resolution is not claimed.")
                 : (mode.isTextual && !caseSensitive ? " Compared using Unicode lowercase; source spelling is preserved." : ""))
         if let window = resultWindow {
             let shown = window.rangeLabel
@@ -890,7 +906,7 @@ struct AtlasSearchInput: Sendable {
         self.pathScope = pathScope
         self.mode = mode
         self.nameMode = mode.effectiveNameMode(nameMode)
-        self.caseSensitive = mode.isTextual ? caseSensitive : true
+        self.caseSensitive = mode.supportsCaseMatching ? caseSensitive : true
         self.countAllMatches = countAllMatches
         self.discoveryPolicy = discoveryPolicy
         self.catalogScope = catalogScope
@@ -1354,6 +1370,9 @@ struct AtlasSearchCapturedHit: Sendable {
     let openReader: @Sendable (UInt64) throws -> String
     var mode: AtlasSearchMode = .text
     var caseSensitive: Bool = true
+    /// The submitted token remains within query bounds even when its matched
+    /// source spelling uses more UTF-8 bytes after scalar lowercase comparison.
+    var occurrenceQuery: String? = nil
     /// Independent of the display label. Nil preserves legacy UTF-8 callers.
     var rawPath: [UInt8]? = nil
     var pathBytes: [UInt8] { rawPath ?? Array(path.utf8) }

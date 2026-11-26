@@ -120,7 +120,8 @@ char *fcb_saved_structure_search_matching(uint64_t handle, uint64_t generation, 
     uint64_t name_mode, const char *query, uint64_t case_sensitive, uint64_t count_all_matches,
     uint64_t matches, uint64_t bytes) {
     assert(handle == UINT64_MAX - 10 && generation == UINT64_MAX - 9);
-    assert(mode == 2 && name_mode == 2 && query && strcmp(query, "CAFÉ") == 0);
+    assert(query && ((mode == 2 && name_mode == 2 && strcmp(query, "CAFÉ") == 0)
+        || (mode == 4 && name_mode == 0 && strcmp(query, "E\xcc\x81") == 0)));
     assert(case_sensitive == 0 && count_all_matches == 1 && matches == 4096 && bytes == 67108864);
     calls[24]++; return reply();
 }
@@ -169,8 +170,10 @@ char *fcb_saved_structure_search_matching_page(uint64_t handle, uint64_t generat
     uint64_t name_mode, const char *query, uint64_t case_sensitive, uint64_t count_all_matches,
     uint64_t matches, uint64_t bytes, uint64_t skipped) {
     assert(handle == UINT64_MAX - 10 && generation == UINT64_MAX - 9);
-    assert(query && strcmp(query, "e\xcc\x81") == 0 && mode == 4 && name_mode == 0);
-    assert(case_sensitive == 1 && count_all_matches == 1);
+    assert(query && mode == 4 && name_mode == 0);
+    assert((case_sensitive == 1 && strcmp(query, "e\xcc\x81") == 0)
+        || (case_sensitive == 0 && strcmp(query, "E\xcc\x81") == 0));
+    assert(count_all_matches == 1);
     assert(matches == 4096 && bytes == 67108864 && skipped == UINT64_C(9007199254740993));
     calls[23]++; return reply();
 }

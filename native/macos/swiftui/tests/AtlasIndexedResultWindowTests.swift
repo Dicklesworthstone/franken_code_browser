@@ -33,6 +33,29 @@ import Foundation
 
     @MainActor static func main() throws {
         do {
+            let f = fixture(count: 2001)
+            f.configure { $0.encoding = "utf16le"; $0.insensitiveText = "İ" }
+            let worker = AtlasIndexedSearch(transport: f.matchingStructuralWindowTransport)
+            let first = try run(worker, AtlasSearchInput(root: "/repo", query: "i\u{307}", mode: .occurrences,
+                caseSensitive: false, countAllMatches: true))
+            let next = try run(worker, input(first.resultWindow!.next!))
+            let last = try run(worker, input(next.resultWindow!.next!))
+            check(first.matchesSeen == 2001 && first.hits.count == 1000
+                && next.hits.count == 1000 && last.hits.count == 1 && last.resultWindow?.next == nil,
+                "Lowercase whole-token windows preserve exhaustive counts and bounded navigation rows")
+            check(!last.caseSensitive && last.hits[0].structure?.name == "İ"
+                && last.hits[0].start == 4000 && last.hits[0].end == 4002,
+                "Later lowercase occurrence windows retain the original UTF-16 source coordinates")
+            let target = last.capture!.target(last.hits[0])!
+            check(target.needle == "İ" && target.occurrenceQuery?.utf8.elementsEqual("i\u{307}".utf8) == true,
+                "Later-window activation separates matched spelling from the submitted token")
+            _ = try target.openReader(100)
+            let previous = try run(worker, input(last.resultWindow!.previous!))
+            check(!previous.caseSensitive && previous.resultWindow?.offset == 1000
+                && previous.hits[0].structure?.name == "İ" && f.count("build-begin:") == 1,
+                "Previous lowercase windows reuse the same immutable capture and matching policy")
+        }
+        do {
             let f = fixture(), worker = AtlasIndexedSearch(transport: f.windowTransport)
             let first = try run(worker, firstInput())
             check(first.complete && first.matchCountComplete && first.matchesSeen == 3025

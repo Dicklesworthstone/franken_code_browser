@@ -50,6 +50,78 @@ import Dispatch
         }
         return value
     }
+    @MainActor private static func lowercaseOccurrencesKeepOriginalSpelling() throws {
+        for (source, query, accepted) in [
+            ("Scan", "scan", true), ("Scanner", "scan", false),
+            ("İ", "i\u{307}", true), ("İ", "i", false),
+            ("ΟΣ", "οσ", true), ("ΟΣ", "ος", false),
+            ("Straße", "STRASSE", false), ("é", "e\u{301}", false)
+        ] {
+            check(AtlasSearchOccurrencePolicy.matches(source: source, query: query, caseSensitive: false) == accepted,
+                "Occurrence witnesses use full scalar-lowercase tokens without case folding or normalization")
+        }
+        for encoding in ["utf8", "utf16le", "utf16be"] {
+            let f = IndexedFixture()
+            f.configure { $0.files = 1; $0.encoding = encoding; $0.insensitiveText = "İ" }
+            let worker = AtlasIndexedSearch(transport: f.matchingStructuralTransport)
+            let input = try AtlasSearchInput(root: "/repo", query: "i\u{307}", mode: .occurrences,
+                nameMode: .prefix, caseSensitive: false, countAllMatches: false)
+            let report = try worker.runScoped(input: input, cancellation: AtlasSearchCancellation(),
+                access: AtlasSearchAccessLease(nil), progress: { _ in })
+            check(!input.caseSensitive && input.nameMode == .exact && !report.caseSensitive && report.complete,
+                "Captured occurrence queries retain their submitted lowercase policy")
+            check(report.hits.count == 2 && report.hits[0].structure?.name == "İ"
+                && report.hits[0].end - report.hits[0].start == 2 && report.hits[0].actualText == nil,
+                "Lowercase expansion retains original source spelling and encoding-specific byte coordinates")
+            let target = report.capture!.target(report.hits[0])!
+            check(target.needle.utf8.elementsEqual("İ".utf8)
+                && target.occurrenceQuery?.utf8.elementsEqual(input.query.utf8) == true && !target.caseSensitive,
+                "The reader receives exact source spelling plus the independently frozen occurrence query")
+            _ = try target.openReader(100)
+        }
+        do {
+            let f = IndexedFixture()
+            f.configure { $0.files = 1; $0.insensitiveText = String(repeating: "K", count: 512) }
+            let input = try AtlasSearchInput(root: "/repo", query: String(repeating: "K", count: 512),
+                mode: .occurrences, caseSensitive: false)
+            let report = try AtlasIndexedSearch(transport: f.matchingStructuralTransport).runScoped(input: input,
+                cancellation: AtlasSearchCancellation(), access: AtlasSearchAccessLease(nil), progress: { _ in })
+            let target = report.capture!.target(report.hits[0])!
+            check(target.needle.utf8.count == 1536 && target.occurrenceQuery?.utf8.count == 512,
+                "A longer original spelling does not replace the bounded retained-reference query")
+        }
+        do {
+            let f = IndexedFixture(), worker = AtlasIndexedSearch(transport: f.structuralTransport)
+            let input = try AtlasSearchInput(root: "/repo", query: "x", mode: .occurrences, caseSensitive: false)
+            do { _ = try worker.runScoped(input: input, cancellation: AtlasSearchCancellation(),
+                    access: AtlasSearchAccessLease(nil), progress: { _ in })
+                preconditionFailure("A legacy structural transport silently substituted exact matching") }
+            catch AtlasSearchError.unsupportedMatching { checks += 1 }
+            check(f.count("create:") == 0, "Unsupported occurrence policies refuse before discovery and capture")
+        }
+        for defect in ["name_case", "case_sensitive", "source_name"] {
+            let f = IndexedFixture()
+            f.configure { $0.files = 1; $0.insensitiveText = "X" }
+            f.patch { phase, original in
+                guard phase == "query-step" else { return original }
+                var value = original
+                if defect == "name_case" { value["name_case"] = "sensitive" }
+                else if defect == "case_sensitive" { value["case_sensitive"] = true }
+                else {
+                    var hits = value["hits"] as! [[String: Any]]
+                    var structure = hits[0]["structure"] as! [String: Any]
+                    structure["name"] = "Y"; hits[0]["structure"] = structure; value["hits"] = hits
+                }
+                return value
+            }
+            let input = try AtlasSearchInput(root: "/repo", query: "x", mode: .occurrences, caseSensitive: false)
+            do { _ = try AtlasIndexedSearch(transport: f.matchingStructuralTransport).runScoped(input: input,
+                    cancellation: AtlasSearchCancellation(), access: AtlasSearchAccessLease(nil), progress: { _ in })
+                preconditionFailure("A forged lowercase occurrence policy or source spelling was accepted") }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
+        }
+    }
+
     @MainActor private static func structuralSearch() throws {
         func search(_ worker: AtlasIndexedSearch, _ mode: AtlasSearchMode,
                     nameMode: AtlasSearchNameMode = .contains,
@@ -939,6 +1011,7 @@ import Dispatch
         try directoryCatalogs()
         try exactFileCatalogs()
         try discoveryPolicyOwnership()
+        try lowercaseOccurrencesKeepOriginalSpelling()
         try structuralSearch()
         try countedSearch()
         for caseSensitive in [true, false] {

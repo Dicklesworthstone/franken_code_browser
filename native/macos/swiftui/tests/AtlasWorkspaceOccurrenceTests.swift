@@ -92,12 +92,12 @@ private final class OccurrenceReports: @unchecked Sendable {
                 catalogued: catalogued, name: name, utf16: utf16), index: 1)
         }
     }
-    private static func run(name: String = "run", scope: AtlasSearchFileScope = .all,
+    private static func run(name: String = "run", caseSensitive: Bool = true, scope: AtlasSearchFileScope = .all,
                             path: AtlasSearchPathScope = .workspace,
                             cancellation: AtlasSearchCancellation = AtlasSearchCancellation(),
                             progress: @Sendable (AtlasSearchReport) -> Void = { _ in }) throws -> AtlasSearchReport {
         try AtlasNativeSearch.runScoped(input: AtlasSearchInput(root: "/project", query: name,
-            fileScope: scope, pathScope: path, mode: .occurrences, nameMode: .prefix, caseSensitive: false),
+            fileScope: scope, pathScope: path, mode: .occurrences, nameMode: .prefix, caseSensitive: caseSensitive),
             cancellation: cancellation, access: AtlasSearchAccessLease(nil), progress: progress)
     }
     private static func retired() {
@@ -123,6 +123,62 @@ private final class OccurrenceReports: @unchecked Sendable {
         editFirst(&value) { row in
             var structure = row["structure"] as! [String: Any]
             edit(&structure); row["structure"] = structure
+        }
+    }
+
+    private static func lowercasePage(_ command: String, step: Int, total: Int = 0, start: Int = 0,
+        query: String, spelling: String, utf16: Bool) -> [String: Any] {
+        var value = page(command, step: step, total: total, start: start,
+            running: step == 0, complete: step > 0, name: query, utf16: utf16)
+        value["case_sensitive"] = false; value["name_case"] = "unicode-lowercase"
+        value["structure_metadata_bytes"] = String(total * spelling.utf8.count)
+        let end = min(total, start + (command == "page" ? 128 : 64))
+        value["hits"] = start < end ? ((start + 1)...end).map { hit($0, name: spelling, utf16: utf16) } : []
+        return value
+    }
+    private static func setupLowercase(query: String, spelling: String, utf16: Bool, total: Int) throws {
+        try setup(name: query, total: 0)
+        try install(1, lowercasePage("begin-structure", step: 0, query: query, spelling: spelling, utf16: utf16))
+        try install(2, lowercasePage("step", step: 1, total: total, query: query, spelling: spelling, utf16: utf16))
+        if total > 64 {
+            try install(3, lowercasePage("page", step: 1, total: total, start: 64,
+                query: query, spelling: spelling, utf16: utf16))
+        }
+    }
+    @MainActor private static func lowercaseOccurrencesKeepSubmittedPolicyAndOriginalNames() throws {
+        for utf16 in [false, true] {
+            for (query, spelling) in [("run", "RUN"), ("i\u{307}", "İ"), ("οσ", "ΟΣ"),
+                (String(repeating: "K", count: 1024), String(repeating: "K", count: 1024))] {
+                let total = query.utf8.count > 32 ? 1 : 70
+                try setupLowercase(query: query, spelling: spelling, utf16: utf16, total: total)
+                var report: AtlasSearchReport? = try run(name: query, caseSensitive: false)
+                let width = UInt64(utf16 ? spelling.utf16.count * 2 : spelling.utf8.count)
+                check(report!.complete && !report!.caseSensitive && report!.hits.count == total
+                    && report!.hits.allSatisfy { $0.structure?.name.utf8.elementsEqual(spelling.utf8) == true
+                        && $0.end - $0.start == width && $0.actualText == nil },
+                    "Live whole-token pages preserve original spelling and original encoding widths")
+                var target = report!.capture?.target(report!.hits.last!)
+                check(target?.needle.utf8.elementsEqual(spelling.utf8) == true
+                    && target?.occurrenceQuery?.utf8.elementsEqual(query.utf8) == true
+                    && target?.caseSensitive == false,
+                    "Live captured activation retains the bounded query separately from wider source spelling")
+                check(fixtureCount(18) == 1 && fixtureCount(11) == 1 && fixtureCount(12) == 0
+                    && fixtureCount(4) == (total > 64 ? 1 : 0),
+                    "The matching structural ABI receives lowercase policy without using literal search")
+                target = nil; report = nil; retired()
+            }
+        }
+        for defect in ["name_case", "case_sensitive", "source_name"] {
+            try setupLowercase(query: "run", spelling: "RUN", utf16: false, total: 1)
+            var terminal = lowercasePage("step", step: 1, total: 1, query: "run", spelling: "RUN", utf16: false)
+            if defect == "name_case" { terminal["name_case"] = "sensitive" }
+            else if defect == "case_sensitive" { terminal["case_sensitive"] = true }
+            else { editStructure(&terminal) { $0["name"] = "runner" } }
+            try install(2, terminal)
+            do { _ = try run(name: "run", caseSensitive: false)
+                preconditionFailure("Lowercase occurrence accepted an altered receipt or source spelling") }
+            catch AtlasSearchError.invalidResponse { checks += 1 }
+            retired()
         }
     }
 
@@ -169,10 +225,11 @@ private final class OccurrenceReports: @unchecked Sendable {
 
     @MainActor static func main() throws {
         check(AtlasSearchMode.occurrences.structureFileByteLimit == 33_554_432
-            && AtlasSearchMode.symbols.structureFileByteLimit == 65_536
+            && AtlasSearchMode.symbols.structureFileByteLimit == 1_048_576
             && AtlasSearchMode.headings.structureFileByteLimit == 262_144,
             "occurrence coverage must expand without enlarging declaration or heading extraction")
         try largerCapturesKeepRetainedReaders()
+        try lowercaseOccurrencesKeepSubmittedPolicyAndOriginalNames()
         check(AtlasSearchMode.occurrences.code == 4 && !AtlasSearchMode.occurrences.isTextual,
             "Occurrences uses the structural live path, never the literal index")
         check(AtlasSearchMode.occurrences.structureFileByteLimit == 32 * 1024 * 1024
@@ -184,7 +241,8 @@ private final class OccurrenceReports: @unchecked Sendable {
         for mode in AtlasSearchNameMode.allCases {
             let input = try AtlasSearchInput(root: "/project", query: "run", mode: .occurrences,
                 nameMode: mode, caseSensitive: false)
-            check(input.nameMode == .exact && input.caseSensitive, "Mode switch normalizes stale name/case controls")
+            check(input.nameMode == .exact && !input.caseSensitive,
+                "Whole-token mode fixes the name policy while preserving the submitted case policy")
         }
 
         try setup(total: 70, catalogued: 2)

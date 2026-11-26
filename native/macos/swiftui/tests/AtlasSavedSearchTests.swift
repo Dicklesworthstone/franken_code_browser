@@ -67,6 +67,8 @@ import Dispatch
         try structureCoverageAndEvidenceContracts()
         try await jsxAndTsxSavedDeclarationsKeepRetainedReaderWitnesses()
         try await structuralModesKeepExactReadersAndIndependentState()
+        try await lowercaseOccurrencesKeepOriginalReadersAndFrozenPolicy()
+        try await longLowercaseOccurrencesVerifyTheirReaderWindow()
         await structureRecoveryCancellationAndArchiveReplacement()
         await forgedStructuralReceiptsAndLateReadersRetire()
         try await largeStructuralTargetsRemainBounded()
@@ -1622,6 +1624,79 @@ import Dispatch
         await wait("structural reader did not survive archive close") { !utf16.reader.busy }
         precondition(utf16.reader.page?.originalHex == f.hex(f.searchUTF16[406...]) && !f.calls.contains("LIVE-OPEN"))
         symbolReader.reader.close(); headingReader.reader.close(); utf16.reader.close(); model.close()
+    }
+
+    @MainActor private static func lowercaseOccurrencesKeepOriginalReadersAndFrozenPolicy() async throws {
+        let f = SavedRepositoryFixture(searchVectors: true), model = await prepared(f)
+        let query = "É" + String(repeating: "X", count: 200) + "BANANA"
+        model.searchMode = .occurrences; model.searchNameMode = .contains
+        model.searchCaseSensitive = false; model.searchInput = query; model.search()
+        await wait("lowercase occurrences did not finish") { !model.busy }
+        let page = model.structurePage!
+        precondition(page.needle.utf8.elementsEqual(query.utf8) && page.nameMode == .exact
+            && !page.policy.caseSensitive && page.hits.count == 2 && model.structureIsCurrent)
+        precondition(page.hits.allSatisfy { $0.structure.name.utf8.elementsEqual(f.occurrenceNeedle.utf8) })
+        let utf8 = try await model.openStructureHit(page.hits[0], from: page, readerTransport: f.readerTransport())
+        let utf16 = try await model.openStructureHit(page.hits[1], from: page, readerTransport: f.readerTransport())
+        precondition(utf8.match?.originalHex == f.hex(f.searchUTF8[0..<208])
+            && utf16.match?.originalHex == f.hex(f.searchUTF16[2..<416]))
+        precondition(!utf8.origin.matchingCaseSensitive && !utf16.origin.matchingCaseSensitive)
+        model.searchCaseSensitive = true
+        precondition(!model.structureIsCurrent && utf8.canUseMatch && utf16.canUseMatch)
+        await refused("an edited occurrence policy authorized an accepted row") {
+            _ = try await model.openStructureHit(page.hits[0], from: page, readerTransport: f.readerTransport())
+        }
+        model.searchCaseSensitive = false
+        f.corruptNext("structure-case")
+        await refused("a changed occurrence matching receipt authorized a reader") {
+            _ = try await model.openStructureHit(page.hits[0], from: page, readerTransport: f.readerTransport())
+        }
+        model.loadStructureResults(start: 1, from: page)
+        await wait("lowercase occurrence metadata page did not finish") { !model.busy }
+        precondition(model.structurePage?.start == 1 && model.structurePage?.policy == page.policy)
+        f.corruptNext("structure-lost"); model.search()
+        await wait("lost lowercase occurrence reply did not reconcile") { !model.busy }
+        precondition(model.structureGeneration == 2 && model.structureIsCurrent
+            && model.structurePage?.policy == page.policy)
+        precondition(f.calls.filter { $0.hasPrefix("structure:40:2:") }.count == 1)
+        model.searchCaseSensitive = true; model.search()
+        await wait("exact occurrence replacement did not finish") { !model.busy }
+        precondition(model.structurePage?.retained == 0 && model.structurePage?.policy.caseSensitive == true)
+        model.closeArchive()
+        precondition(utf8.canUseMatch && utf16.canUseMatch && !f.calls.contains("LIVE-OPEN"))
+        _ = try await utf16.withMatchReader { $0 }
+        utf8.reader.close(); utf16.reader.close(); model.close()
+    }
+
+    @MainActor private static func longLowercaseOccurrencesVerifyTheirReaderWindow() async throws {
+        let f = SavedRepositoryFixture(searchVectors: true, longOccurrence: true)
+        let model = AtlasSavedRepositoryModel(transport: f.savedTransport)
+        model.open(path: "/saved/long-occurrences.fcbs", accessLease: nil)
+        await wait("long occurrence archive did not open") { !model.busy }
+        model.searchMode = .occurrences; model.searchCaseSensitive = false
+        model.searchInput = String(repeating: "K", count: 1024); model.search()
+        await wait("long lowercase occurrence query did not finish") { !model.busy }
+        let page = model.structurePage!
+        precondition(page.hits.count == 2 && page.needle.utf8.count == 1024)
+        precondition(page.hits[0].structure.name.utf8.count == 3072)
+        let utf8 = try await model.openStructureHit(page.hits[0], from: page, readerTransport: f.readerTransport())
+        let utf16 = try await model.openStructureHit(page.hits[1], from: page, readerTransport: f.readerTransport())
+        precondition(utf8.match?.start == 0 && utf8.match?.end == 3072
+            && utf8.match?.originalHex == f.hex(f.searchUTF8[0..<3072]) && utf8.canUseMatch)
+        precondition(utf16.match?.start == 2 && utf16.match?.end == 2050
+            && utf16.match?.originalHex == f.hex(f.searchUTF16[2..<2050]) && utf16.canUseMatch)
+        f.corruptNext("structure-large-hex")
+        await refused("a long occurrence accepted an invalid oversized inline receipt") {
+            _ = try await model.openStructureHit(page.hits[0], from: page, readerTransport: f.readerTransport())
+        }
+        f.corruptNext("page-bytes")
+        await refused("a long occurrence accepted original bytes different from its spelling witness") {
+            _ = try await model.openStructureHit(page.hits[0], from: page, readerTransport: f.readerTransport())
+        }
+        model.closeArchive()
+        precondition(utf8.canUseMatch && utf16.canUseMatch && !f.calls.contains("LIVE-OPEN"))
+        _ = try await utf8.withMatchReader { $0 }
+        utf8.reader.close(); utf16.reader.close(); model.close()
     }
 
     @MainActor private static func structureRecoveryCancellationAndArchiveReplacement() async {

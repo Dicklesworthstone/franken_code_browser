@@ -14,6 +14,7 @@ enum AtlasSavedReaderOrigin: Sendable {
     var matchingCaseSensitive: Bool {
         switch self {
         case .hit(_, _, _, let caseSensitive), .expressionHit(_, _, _, _, let caseSensitive): return caseSensitive
+        case .structureHit(_, _, _, _, _, let policy): return policy.caseSensitive
         default: return true
         }
     }
@@ -252,7 +253,7 @@ struct AtlasSavedReaderReceipt: Sendable {
                 match = nil
             case .structureHit(let generation, let mode, let nameMode, let needle, let item, let policy):
                 let hit = item.hit
-                try item.validate(mode: mode, needle: needle)
+                try item.validate(mode: mode, needle: needle, caseSensitive: policy.caseSensitive)
                 struct Receipt: Decodable {
                     let case_sensitive, count_all_matches: Bool?
                     let name_case: String?
@@ -293,7 +294,7 @@ struct AtlasSavedReaderReceipt: Sendable {
                         throw AtlasSavedError.invalidResponse
                     }
                     if mode == .occurrences {
-                        let literal = try AtlasSavedMatchEvidence.literalHex(needle, encoding: info.identity.encoding)
+                        let literal = try AtlasSavedMatchEvidence.sourceHex(item.structure.name, encoding: info.identity.encoding)
                         guard literal.utf8.elementsEqual(originalHex.utf8) else { throw AtlasSavedError.invalidResponse }
                     }
                     let evidence = AtlasSavedMatchEvidence(identity: info.identity, start: hit.start, end: hit.end,
@@ -302,7 +303,15 @@ struct AtlasSavedReaderReceipt: Sendable {
                     match = evidence
                 } else {
                     guard selected["original_hex"] is NSNull else { throw AtlasSavedError.invalidResponse }
-                    request = .window(offset: contextStart, bytes: 16 * 1024); match = nil
+                    request = .window(offset: contextStart, bytes: 16 * 1024)
+                    if mode == .occurrences {
+                        // The receipt caps inline selections at 2 KiB. A longer
+                        // spelling still fits this bounded reader window; admit
+                        // match actions only after its original bytes agree below.
+                        match = AtlasSavedMatchEvidence(identity: info.identity, start: hit.start, end: hit.end,
+                            originalHex: try AtlasSavedMatchEvidence.sourceHex(item.structure.name,
+                                encoding: info.identity.encoding))
+                    } else { match = nil }
                 }
             case .hit(let generation, let needle, let hit, _), .expressionHit(let generation, _, let needle, let hit, _):
                 guard generation > 0, AtlasSavedSearchWire.validNeedle(needle),

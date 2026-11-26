@@ -169,8 +169,8 @@ enum AtlasSearchCaptureFactory {
                   !mode.isTextual || AtlasSearchText.accepts(actualText: hit.actualText,
                 needle: needle, caseSensitive: caseSensitive) else { return nil }
             if mode == .occurrences {
-                guard caseSensitive, let structure = witness.hit.structure,
-                      structure.name.utf8.elementsEqual(needle.utf8),
+                guard let structure = witness.hit.structure,
+                      AtlasSearchOccurrencePolicy.matches(source: structure.name, query: needle, caseSensitive: caseSensitive),
                       structure.kind == "identifier-occurrence", structure.language == "text",
                       structure.headingSlug == nil,
                       structure.evidenceStart == hit.start, structure.evidenceEnd == hit.end,
@@ -178,7 +178,8 @@ enum AtlasSearchCaptureFactory {
             }
             // The exact reader proves the source spelling at the selected
             // original-byte range, even when the workspace query ignored case.
-            let exactNeedle = mode.isTextual ? (hit.actualText ?? needle) : needle
+            let exactNeedle = mode == .occurrences ? (witness.hit.structure?.name ?? needle)
+                : (mode.isTextual ? (hit.actualText ?? needle) : needle)
             return AtlasSearchCapturedHit(root: root, path: path, needle: exactNeedle,
                 start: hit.start, end: hit.end, capturedBytes: hit.captureByteLength ?? 0,
                 openReader: { reader in
@@ -187,7 +188,8 @@ enum AtlasSearchCaptureFactory {
                         let json = try importReader(handle, reader, identity.generation, UInt64(hit.id + 1))
                         return try validatedReader(json, receiver: reader, identity: identity, witness: witness)
                     }
-                }, mode: mode, caseSensitive: caseSensitive, rawPath: rawPath)
+                }, mode: mode, caseSensitive: caseSensitive,
+                occurrenceQuery: mode == .occurrences ? needle : nil, rawPath: rawPath)
         })
     }
 

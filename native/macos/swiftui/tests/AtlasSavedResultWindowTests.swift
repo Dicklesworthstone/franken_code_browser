@@ -340,17 +340,18 @@ enum AtlasSavedResultWindowTests {
         precondition(model.expressionPage?.window == expression.window && f.calls.count == 3)
 
         model.searchMode = .occurrences; model.searchNameMode = .prefix
-        model.searchInput = f.base.occurrenceNeedle; model.search()
+        let occurrenceQuery = "É" + String(repeating: "X", count: 200) + "BANANA"
+        model.searchInput = occurrenceQuery; model.search()
         await wait("first occurrence window did not finish") { !model.busy }
         let firstStructure = model.structurePage!
         precondition(firstStructure.nameMode == .exact && firstStructure.metadataOmitted == 2)
-        precondition(firstStructure.policy.caseSensitive && firstStructure.policy.countAllMatches && firstStructure.seen == 4102)
+        precondition(!firstStructure.policy.caseSensitive && firstStructure.policy.countAllMatches && firstStructure.seen == 4102)
         precondition(firstStructure.window.next == 4098,
             "A continuation must include qualified names omitted from retained metadata")
         model.searchInput += "x"
         model.loadStructureWindow(offset: 4098, from: firstStructure)
         precondition(!model.busy && f.calls.count == 4)
-        model.searchInput = f.base.occurrenceNeedle; f.failNext(.lost)
+        model.searchInput = occurrenceQuery; f.failNext(.lost)
         model.loadStructureWindow(offset: 4098, from: firstStructure)
         await wait("occurrence window did not reconcile") { !model.busy }
         let structure = model.structurePage!, structureCall = f.calls.last!
@@ -358,7 +359,7 @@ enum AtlasSavedResultWindowTests {
         precondition(structure.retained == 2 && structure.window.next == nil && structure.metadataOmitted == 0)
         precondition(structureCall.mode == .occurrences && structureCall.nameMode == .exact
             && structureCall.query == firstStructure.needle && structureCall.bytes == firstStructure.sourceLimit
-            && structureCall.offset == 4098 && structureCall.matching && structureCall.counting)
+            && structureCall.offset == 4098 && !structureCall.matching && structureCall.counting)
         precondition(model.queryGeneration == literalGeneration && model.expressionGeneration == 2)
         precondition(f.metadataCalls.last == "structure:2:0" && f.calls.count == 5)
         let structuralReader = try await model.openStructureHit(structure.hits[1], from: structure,

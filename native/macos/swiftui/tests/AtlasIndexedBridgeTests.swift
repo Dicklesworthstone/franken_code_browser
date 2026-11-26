@@ -161,6 +161,23 @@ import Foundation
             preconditionFailure("Text mode admitted to structural bridge") }
         catch AtlasSearchError.invalidRequest { checks += 1 }
         check(calls() == beforeStructure + 3)
+        let beforeMatchingStructure = calls()
+        check(try t.matchingStructureQueryBegin!(h, 73, 1, .occurrences, .prefix, "SomeName", .all,
+            AtlasSearchPathScope(kind: .file, path: "src/exact.rs"), false) != nil)
+        check(try t.matchingStructureQueryBegin!(h, 70, 1, .symbols, .prefix, "SomeName", .all, .workspace, true) != nil)
+        check(try t.matchingStructureWindowQueryBegin!(h, 83, 1, .occurrences, .contains, "SomeName", .all,
+            .workspace, false, true, 1000) != nil)
+        check(try t.structureWindowQueryBegin!(h, 84, 1, .occurrences, .prefix, "SomeName", .all,
+            .workspace, false, 0) != nil)
+        check(live() == 0 && calls() == beforeMatchingStructure + 4)
+        do { _ = try t.matchingStructureQueryBegin!(h, 73, 1, .symbols, .prefix, "SomeName", .all, .workspace, false)
+            preconditionFailure("Unsupported lowercase declaration mode crossed the captured structural ABI") }
+        catch AtlasSearchError.invalidRequest { checks += 1 }
+        do { _ = try t.matchingStructureWindowQueryBegin!(h, 83, 1, .occurrences, .exact, "SomeName", .all,
+                .workspace, false, true, UInt64.max)
+            preconditionFailure("Unbounded occurrence window crossed the ABI") }
+        catch AtlasSearchError.invalidRequest { checks += 1 }
+        check(calls() == beforeMatchingStructure + 4)
         let beforeWindows = calls()
         check(try t.windowQueryBegin!(h, 80, 1, "exact text", .all, .workspace, true, false, true, 1000) != nil)
         check(try t.windowQueryBegin!(h, 81, 1, expression, AtlasSearchFileScope(extensions: ["rs"]),

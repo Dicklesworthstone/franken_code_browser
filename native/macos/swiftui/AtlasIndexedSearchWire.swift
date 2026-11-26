@@ -240,7 +240,7 @@ enum AtlasIndexedStructure {
             occurrence: value.optionalNumber("occurrence_id"))
     }
 
-    static func accepts(_ hit: SearchHit, mode: AtlasSearchMode, needle: String) -> Bool {
+    static func accepts(_ hit: SearchHit, mode: AtlasSearchMode, needle: String, caseSensitive: Bool = true) -> Bool {
         guard !mode.isTextual, hit.actualText == nil, let value = hit.structure,
               value.mode == mode, value.evidence == mode.evidence,
               !value.name.isEmpty, value.name.utf8.count <= 4096,
@@ -256,12 +256,12 @@ enum AtlasIndexedStructure {
             return value.headingSlug?.isEmpty == false && value.kind == "heading" && value.language == "markdown"
                 && value.evidenceStart == hit.start && value.evidenceEnd == hit.end
         case .occurrences:
-            return value.name.utf8.elementsEqual(needle.utf8)
+            return AtlasSearchOccurrencePolicy.matches(source: value.name, query: needle, caseSensitive: caseSensitive)
                 && value.kind == "identifier-occurrence" && value.language == "text" && value.headingSlug == nil
                 && value.evidenceStart == hit.start && value.evidenceEnd == hit.end
-                && (hit.end - hit.start == UInt64(needle.utf8.count)
-                    || hit.end - hit.start == UInt64(needle.utf16.count) * 2)
-                && hit.excerpt?.matchesSourceText(needle) != false
+                && (hit.end - hit.start == UInt64(value.name.utf8.count)
+                    || hit.end - hit.start == UInt64(value.name.utf16.count) * 2)
+                && hit.excerpt?.matchesSourceText(value.name) != false
         case .symbols:
             return value.headingSlug == nil
                 && ["rust", "python", "javascript", "typescript", "jsx", "tsx", "go", "cpp", "swift", "java", "csharp"].contains(value.language)
@@ -271,7 +271,8 @@ enum AtlasIndexedStructure {
 
     static func coverage(_ w: AtlasIndexWire, mode: AtlasSearchMode, nameMode: AtlasSearchNameMode,
                          scanned: Int, examined: Int, unavailable: Int, retained: Int,
-                         matches: UInt64, window: AtlasIndexedResultWindow?) throws -> AtlasSearchStructureCoverage? {
+                         matches: UInt64, window: AtlasIndexedResultWindow?,
+                         caseSensitive: Bool = true) throws -> AtlasSearchStructureCoverage? {
         if mode == .occurrences {
             guard nameMode == .exact, try w.flag("includes_comments_and_literals"),
                   try !w.flag("compiler_resolved"),
@@ -291,7 +292,8 @@ enum AtlasIndexedStructure {
             return nil
         }
         guard try w.text("requested_mode") == mode.rawValue, try w.text("realized_mode") == mode.evidence,
-              try w.text("name_mode") == nameMode.rawValue, try w.text("name_case") == "sensitive",
+              try w.text("name_mode") == nameMode.rawValue,
+              try w.text("name_case") == (caseSensitive ? "sensitive" : "unicode-lowercase"),
               try w.text("evidence_level") == mode.evidence, try !w.flag("semantic_complete"),
               try w.text("completeness_basis") == "admitted-extraction-processing" else { throw AtlasIndexWire.invalid() }
         let coverage = try AtlasSearchStructureCoverage(fileByteLimit: w.number("structure_file_byte_limit"),
@@ -370,7 +372,9 @@ struct AtlasIndexedQueryPage {
          command: String) throws {
         let w = try AtlasIndexWire.decode(json)
         try basis.validate(w, command: command)
-        guard mode.isTextual || (caseSensitive && (!countAllMatches || resultOffset != nil)) else { throw AtlasIndexWire.invalid() }
+        guard mode.isTextual || ((caseSensitive || mode == .occurrences) && (!countAllMatches || resultOffset != nil)) else {
+            throw AtlasIndexWire.invalid()
+        }
         let kind = try w.optionalText("search_scope")
         try pathScope.validateEcho(kind: w.optionalText("scope_path_kind"),
             path: w.optionalText("scope_path"), hex: w.optionalText("scope_path_hex"),
@@ -468,7 +472,8 @@ struct AtlasIndexedQueryPage {
         }
         let structureCoverage = try AtlasIndexedStructure.coverage(w, mode: mode,
             nameMode: nameMode, scanned: scanned, examined: examined - captureUnavailable,
-            unavailable: unavailable - captureUnavailable, retained: retained, matches: matches, window: resultWindow)
+            unavailable: unavailable - captureUnavailable, retained: retained, matches: matches, window: resultWindow,
+            caseSensitive: caseSensitive)
         if let stop, !["all-files-examined", "file-limit", "source-byte-limit", "capture-scope", "match-limit", "verification-byte-limit"].contains(stop) {
             throw AtlasIndexWire.invalid()
         }
@@ -517,7 +522,7 @@ struct AtlasIndexedQueryPage {
                 ? ($0.hit.structure == nil && (expression == nil || $0.hit.actualText != nil)
                     && AtlasSearchText.accepts(actualText: $0.hit.actualText, needle: primaryNeedle, caseSensitive: caseSensitive)
                     && ($0.hit.excerpt?.matchesSourceText($0.hit.actualText ?? primaryNeedle) != false))
-                : AtlasIndexedStructure.accepts($0.hit, mode: mode, needle: primaryNeedle)) }) else {
+                : AtlasIndexedStructure.accepts($0.hit, mode: mode, needle: primaryNeedle, caseSensitive: caseSensitive)) }) else {
             throw AtlasIndexWire.invalid()
         }
         next = try w.optionalNumber("next_offset")

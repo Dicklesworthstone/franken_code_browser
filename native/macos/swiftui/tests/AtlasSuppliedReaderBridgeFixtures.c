@@ -86,6 +86,15 @@ char *fcb_reader_references_window(uint64_t handle, uint64_t generation,
     assert(result_offset == UINT64_MAX - (count_all_matches ? 4 : 5));
     return reference_reply("{\"reference_window_fixture\":true}");
 }
+char *fcb_reader_references_window_matching(uint64_t handle, uint64_t generation,
+    const char *name, uint64_t max_items, uint64_t case_sensitive,
+    uint64_t count_all_matches, uint64_t result_offset) {
+    assert(handle == fixture_handle && generation == UINT64_MAX);
+    assert(name && !strcmp(name, "\xc4\xb0") && max_items == UINT64_C(4096));
+    assert(case_sensitive <= 1 && count_all_matches <= 1);
+    assert(result_offset == UINT64_MAX - (case_sensitive ? 6 : 8) - (count_all_matches ? 0 : 1));
+    return reference_reply("{\"reference_matching_window_fixture\":true}");
+}
 char *fcb_reader_reference_page(uint64_t handle, uint64_t generation,
     uint64_t start, uint64_t limit) {
     /* Deliberately outside admission bounds: only full-width ABI preservation

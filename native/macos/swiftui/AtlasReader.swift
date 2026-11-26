@@ -154,7 +154,9 @@ enum AtlasReaderRequest: Equatable, Sendable {
             guard target.generation > 0, (1...AtlasReferencePage.maxItems).contains(target.occurrence.id),
                   target.identity.capturedBytes == capturedBytes,
                   capturedBytes <= AtlasReferencePage.sourceLimit,
-                  selected.start < selected.end, selected.end <= capturedBytes else {
+                  selected.start < selected.end, selected.end <= capturedBytes,
+                  selected.length <= AtlasReferencePage.maximumTokenBytes(name: target.name,
+                      caseSensitive: target.caseSensitive, encoding: target.identity.encoding) else {
                 throw AtlasReaderError.invalidInput
             }
         }
@@ -688,7 +690,9 @@ struct AtlasReaderPage: Sendable {
                 let sourceHex = Array(wire.original_hex.utf8)
                 let decoded = Array(wire.text.utf8)[Int(utf8.start)..<Int(utf8.end)]
                 guard sourceHex[hexStart..<hexEnd].elementsEqual(selected.original_hex.utf8),
-                      decoded.elementsEqual(target.name.utf8),
+                      let spelling = String(bytes: decoded, encoding: .utf8),
+                      AtlasSearchOccurrencePolicy.matches(source: spelling, query: target.name,
+                          caseSensitive: target.caseSensitive),
                       let start = AtlasReaderPosition.caret(in: wire.text, atUTF8: utf8.start),
                       let end = AtlasReaderPosition.caret(in: wire.text, atUTF8: utf8.end),
                       try AtlasReaderPosition.verifiesSourceOffset(text: wire.text,

@@ -85,7 +85,7 @@ private final class Calls: @unchecked Sendable {
     }
     private static func referencePage(identity: AtlasReaderIdentity, name: String = "foo",
         ranges: [(UInt64, UInt64)], request: AtlasReferencePageRequest = .initial,
-        generation: UInt64 = 29) -> AtlasReferencePage {
+        generation: UInt64 = 29, caseSensitive: Bool = true) -> AtlasReferencePage {
         let retained = UInt64(ranges.count)
         let end = min(retained, request.start + request.limit)
         let rows = ranges.enumerated().dropFirst(Int(request.start)).prefix(Int(request.limit)).map { index, range in
@@ -94,7 +94,8 @@ private final class Calls: @unchecked Sendable {
         }
         return AtlasReferencePage(id: UUID(),
             inventory: AtlasReferenceInventory(identity: identity, generation: generation, name: name,
-                maxItems: AtlasReferencePage.maxItems, retained: retained, matchesCounted: retained, limited: false),
+                maxItems: AtlasReferencePage.maxItems, retained: retained, matchesCounted: retained,
+                limited: false, caseSensitive: caseSensitive),
             request: request, rows: rows, nextOffset: end < retained ? end : nil)
     }
     // Counted engine receipts expose only the first page of each window. The
@@ -103,7 +104,7 @@ private final class Calls: @unchecked Sendable {
     private static func referenceWindowPage(identity: AtlasReaderIdentity, name: String,
         total: UInt64, offset: UInt64, generation: UInt64, base: UInt64,
         stride: UInt64, width: UInt64, complete: Bool = true, countAll: Bool = true,
-        ordinalAdjustment: UInt64 = 0) -> AtlasReferencePage {
+        ordinalAdjustment: UInt64 = 0, caseSensitive: Bool = true) -> AtlasReferencePage {
         let skipped = min(offset, total)
         let retained = min(AtlasReferencePage.maxItems, total - skipped)
         let count = min(AtlasReferencePageRequest.initial.limit, retained)
@@ -120,7 +121,8 @@ private final class Calls: @unchecked Sendable {
                 maxItems: AtlasReferencePage.maxItems, retained: retained, matchesCounted: total, limited: more,
                 window: AtlasReferenceWindow(request: .init(offset: offset, countAllMatches: countAll),
                     skipped: skipped, countComplete: complete, rowsTruncated: total > retained,
-                    hasMore: more, nextOffset: more && retained > 0 ? offset + retained : nil)),
+                    hasMore: more, nextOffset: more && retained > 0 ? offset + retained : nil),
+                caseSensitive: caseSensitive),
             request: .initial, rows: rows, nextOffset: count < retained ? count : nil)
     }
 
@@ -261,6 +263,91 @@ private final class Calls: @unchecked Sendable {
         do { _ = try await staleProbe.value; preconditionFailure("Superseded ordinal probe delivered") }
         catch AtlasReaderError.canceled { checks += 1 }
         check(staleReads == 0, "A completed late probe cannot outlive its original opening ticket")
+    }
+
+    @MainActor private static func lowercaseOccurrenceActivation() async throws {
+        let longQuery = String(repeating: "K", count: 1024)
+        let longSpelling = String(repeating: "K", count: 1024)
+        for encoding in ["utf8", "utf16le", "utf16be"] {
+            for (query, spelling) in [("k", "K"), ("İ", "i\u{307}"),
+                ("οσ", "ΟΣ"), (longQuery, longSpelling)] {
+                let width = UInt64(encoding == "utf8" ? spelling.utf8.count : spelling.utf16.count * 2)
+                let source = identity(bytes: 2 * width + 8, encoding: encoding)
+                let start = width + 4, end = start + width
+                var hit = selected(needle: spelling, start: start, end: end, bytes: source.capturedBytes,
+                    mode: .occurrences, caseSensitive: false)
+                hit.occurrenceQuery = query
+                var prepares = 0, reads = 0
+                let result = try await AtlasCapturedReader.activateOccurrence(hit, identity: source,
+                    prepare: { name in
+                        prepares += 1
+                        check(name.utf8.elementsEqual(query.utf8) && name.utf8.count <= 1024,
+                            "Captured activation must search the original bounded query, not the wider source witness")
+                        return referencePage(identity: source, name: name,
+                            ranges: [(2, 2 + width), (start, end)], caseSensitive: false)
+                    }, nextPage: { _ in throw AtlasReaderError.invalidResponse },
+                    read: { target in reads += 1; return target })
+                check(prepares == 1 && reads == 1 && !result.target.caseSensitive
+                    && result.target.name.utf8.elementsEqual(query.utf8)
+                    && result.target.occurrence.range == AtlasOutlineRange(start: start, end: end),
+                    "Lowercase activation must retain exact source range and accepted matching policy")
+                check(hit.needle.utf8.elementsEqual(spelling.utf8),
+                    "Re-establishing the local inventory must preserve the original captured spelling")
+            }
+        }
+
+        let total: UInt64 = 5_005, source = identity(bytes: 1 + 5_005 * 4, encoding: "utf8")
+        let start = 1 + (total - 1) * 4
+        var hit = selected(needle: "K", start: start, end: start + 3, bytes: source.capturedBytes,
+            mode: .occurrences, caseSensitive: false)
+        hit.occurrenceQuery = "k"
+        var generation: UInt64 = 1, probes = 0
+        let result = try await AtlasCapturedReader.activateOccurrence(hit, identity: source,
+            prepare: { name in
+                referenceWindowPage(identity: source, name: name, total: total, offset: 0,
+                    generation: 1, base: 1, stride: 4, width: 3, caseSensitive: false)
+            }, nextPage: { _ in throw AtlasReaderError.invalidResponse },
+            prepareWindow: { name, offset in
+                check(name.utf8.elementsEqual("k".utf8), "Later rank probes must retain the original query spelling")
+                generation += 1; probes += 1
+                return referenceWindowPage(identity: source, name: name, total: total, offset: offset,
+                    generation: generation, base: 1, stride: 4, width: 3, caseSensitive: false)
+            }, read: { $0 })
+        check(probes > 0 && probes < 20 && result.target.occurrence.ordinal == total
+            && !result.target.caseSensitive && !result.referencePage.inventory.caseSensitive
+            && result.referencePage.inventory.matchesCounted == total,
+            "Distant lowercase activation must retain count, source range and policy across ordinal probes")
+
+        for faultAtFirst in [true, false] {
+            var reads = 0
+            do {
+                _ = try await AtlasCapturedReader.activateOccurrence(hit, identity: source,
+                    prepare: { name in referenceWindowPage(identity: source, name: name, total: total, offset: 0,
+                        generation: 1, base: 1, stride: 4, width: 3, caseSensitive: faultAtFirst) },
+                    nextPage: { _ in throw AtlasReaderError.invalidResponse },
+                    prepareWindow: { name, offset in
+                        referenceWindowPage(identity: source, name: name, total: total, offset: offset,
+                            generation: 2, base: 1, stride: 4, width: 3, caseSensitive: true)
+                    }, read: { _ in reads += 1; return "wrong policy" })
+                preconditionFailure("Exact inventory substituted for a captured lowercase query")
+            } catch AtlasReaderError.invalidResponse { checks += 1 }
+            check(reads == 0, "Case-policy substitution cannot authorize a read on any activation window")
+        }
+
+        for (query, spelling) in [("i", "İ"), ("ss", "ß"), ("é", "e\u{301}"), ("ος", "ΟΣ")] {
+            var mismatched = selected(needle: spelling, mode: .occurrences, caseSensitive: false)
+            mismatched.occurrenceQuery = query
+            var prepared = false
+            do {
+                _ = try await AtlasCapturedReader.activateOccurrence(mismatched, identity: identity(),
+                    prepare: { _ in
+                        prepared = true
+                        return referencePage(identity: identity(), name: query, ranges: [(10, 12)], caseSensitive: false)
+                    }, nextPage: { _ in throw AtlasReaderError.invalidResponse }, read: { $0 })
+                preconditionFailure("Unrelated spelling was allowed to replace a captured lowercase witness")
+            } catch AtlasReaderError.invalidResponse { checks += 1 }
+            check(!prepared, "Invalid source spelling must fail before replaying the retained capture")
+        }
     }
 
     @MainActor private static func occurrenceActivation() async throws {
@@ -818,6 +905,7 @@ private final class Calls: @unchecked Sendable {
         try await rawPathActivation()
         try await countedOccurrenceActivation()
         try await occurrenceActivation()
+        try await lowercaseOccurrenceActivation()
         try await pagedTextActivation()
         try await rankedTextActivation()
         try await rankedTextRefusalsAndCancellation()

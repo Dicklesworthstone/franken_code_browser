@@ -105,15 +105,20 @@ private struct ReferenceWindowFixture: Sendable {
     }
     func page(owner: UInt64, origin: String, generation: UInt64, name: String,
         window: AtlasReferenceWindowRequest, preparing: Bool,
-        start: UInt64 = 0, limit: UInt64 = 64) -> String {
-        let total = name.utf8.elementsEqual(Self.name.utf8) ? copies : 0
+        start: UInt64 = 0, limit: UInt64 = 64, caseSensitive: Bool = true) -> String {
+        // These fixed query spellings name the advertised source occurrences;
+        // the fixture never reproduces the production matching algorithm.
+        let exact = name.utf8.elementsEqual(Self.name.utf8)
+        let lowercase = !caseSensitive && name.utf8.elementsEqual("CAFÉ𐐨".utf8)
+        let total = exact || lowercase ? copies : 0
         let skipped = min(total, window.offset), retained = min(4096, total - skipped)
         let more = total - skipped > retained
         let counted = window.countAllMatches ? total : skipped + retained + (more ? 1 : 0)
         let complete = window.countAllMatches || !more
         let end = min(retained, start + limit)
         var out = header(preparing ? "references" : "reference-page", owner: owner, origin: origin)
-        out["reference_generation"] = String(generation); out["name"] = name; out["name_case"] = "sensitive"
+        out["reference_generation"] = String(generation); out["name"] = name
+        out["name_case"] = caseSensitive ? "sensitive" : "unicode-lowercase"
         out["selection_namespace"] = "reference"; out["evidence_level"] = "whole-token-text-candidate"
         out["includes_comments_and_literals"] = true; out["compiler_resolved"] = false; out["semantic_complete"] = false
         out["search_complete"] = complete; out["count_complete"] = complete; out["output_limited"] = more
@@ -175,39 +180,48 @@ private struct ReferenceWindowFixture: Sendable {
 private final class ReferenceModelDriver: @unchecked Sendable {
     private let lock = NSLock()
     private let windows: ReferenceWindowFixture?
+    private let matching: Bool
     private var next: UInt64 = 7
     private var calls: [String] = []
     private var origins: [UInt64: String] = [:]
-    private var accepted: [UInt64: (generation: UInt64, name: String, window: AtlasReferenceWindowRequest?)] = [:]
+    private var accepted: [UInt64: (generation: UInt64, name: String, window: AtlasReferenceWindowRequest?, caseSensitive: Bool)] = [:]
     private var paused: String?
     private var failure: String?
     private var malformedWindow = false
+    private var malformedCase = false
     let entered = DispatchSemaphore(value: 0), gate = DispatchSemaphore(value: 0)
-    init(windows: ReferenceWindowFixture? = nil) { self.windows = windows }
+    init(windows: ReferenceWindowFixture? = nil, matching: Bool = false) {
+        precondition(!matching || windows != nil)
+        self.windows = windows; self.matching = matching
+    }
     var log: [String] { lock.lock(); defer { lock.unlock() }; return calls }
     func pause(_ command: String) { lock.lock(); paused = command; lock.unlock() }
     func failNext(_ code: String) { lock.lock(); failure = code; lock.unlock() }
     func malformNextWindow() { lock.lock(); malformedWindow = true; lock.unlock() }
+    func malformNextCase() { lock.lock(); malformedCase = true; lock.unlock() }
     private func record(_ value: String) { lock.lock(); calls.append(value); lock.unlock() }
     private func origin(_ owner: UInt64) -> String {
         lock.lock(); defer { lock.unlock() }
         return origins[owner] ?? "regular-file-observation-not-atomic"
     }
     private func snapshot(_ owner: UInt64, generation: UInt64)
-        -> (name: String, window: AtlasReferenceWindowRequest?)? {
+        -> (name: String, window: AtlasReferenceWindowRequest?, caseSensitive: Bool)? {
         lock.lock(); defer { lock.unlock() }
         guard let inventory = accepted[owner], inventory.generation == generation else { return nil }
-        return (inventory.name, inventory.window)
+        return (inventory.name, inventory.window, inventory.caseSensitive)
     }
     private func info(owner: UInt64, origin: String) -> String {
         ReferenceModelFixture.json(windows?.header("info", owner: owner, origin: origin)
             ?? ReferenceModelFixture.header("info", owner: owner, origin: origin))
     }
     private func deliveredWindow(_ json: String) -> String {
-        lock.lock(); let malformed = malformedWindow; malformedWindow = false; lock.unlock()
-        guard malformed else { return json }
+        lock.lock()
+        let malformed = malformedWindow, wrongCase = malformedCase
+        malformedWindow = false; malformedCase = false; lock.unlock()
+        guard malformed || wrongCase else { return json }
         var out = try! JSONSerialization.jsonObject(with: Data(json.utf8)) as! [String: Any]
-        out["skipped_matches"] = "0"
+        if malformed { out["skipped_matches"] = "0" }
+        if wrongCase { out["name_case"] = "sensitive" }
         return ReferenceModelFixture.json(out)
     }
     private func step(_ command: String, owner: UInt64) -> String? {
@@ -225,7 +239,7 @@ private final class ReferenceModelDriver: @unchecked Sendable {
             let failure = step("prepare", owner: owner)
             defer { record("returned-prepare:\(owner):\(generation)") }
             if let failure { return failure }
-            lock.lock(); accepted[owner] = (generation, name, nil); lock.unlock()
+            lock.lock(); accepted[owner] = (generation, name, nil, true); lock.unlock()
             return ReferenceModelFixture.page(owner: owner, origin: origin(owner), generation: generation,
                 name: name, preparing: true)
         }, page: { [self] owner, generation, start, limit in
@@ -233,8 +247,9 @@ private final class ReferenceModelDriver: @unchecked Sendable {
             if let failure = step("page", owner: owner) { return failure }
             guard let inventory = snapshot(owner, generation: generation) else { return nil }
             if let windows, let window = inventory.window {
-                return windows.page(owner: owner, origin: origin(owner), generation: generation,
-                    name: inventory.name, window: window, preparing: false, start: start, limit: limit)
+                return deliveredWindow(windows.page(owner: owner, origin: origin(owner), generation: generation,
+                    name: inventory.name, window: window, preparing: false, start: start, limit: limit,
+                    caseSensitive: inventory.caseSensitive))
             }
             return ReferenceModelFixture.page(owner: owner, origin: origin(owner), generation: generation,
                 name: inventory.name, preparing: false, start: start, limit: limit)
@@ -258,9 +273,23 @@ private final class ReferenceModelDriver: @unchecked Sendable {
                 defer { record("returned-window:\(owner):\(generation)") }
                 if let failure { return failure }
                 let window = AtlasReferenceWindowRequest(offset: offset, countAllMatches: countAll)
-                lock.lock(); accepted[owner] = (generation, name, window); lock.unlock()
+                lock.lock(); accepted[owner] = (generation, name, window, true); lock.unlock()
                 return deliveredWindow(windows.page(owner: owner, origin: origin(owner), generation: generation,
                     name: name, window: window, preparing: true))
+            }
+        }
+        if matching, let windows {
+            references.prepareWindow = nil
+            references.prepareMatchingWindow = { [self] owner, generation, name, cap, caseSensitive, countAll, offset in
+                precondition(cap == 4096)
+                record("prepare-matching:\(owner):\(generation):\(offset):\(caseSensitive):\(countAll)")
+                let failure = step("prepare-window", owner: owner)
+                defer { record("returned-window:\(owner):\(generation)") }
+                if let failure { return failure }
+                let window = AtlasReferenceWindowRequest(offset: offset, countAllMatches: countAll)
+                lock.lock(); accepted[owner] = (generation, name, window, caseSensitive); lock.unlock()
+                return deliveredWindow(windows.page(owner: owner, origin: origin(owner), generation: generation,
+                    name: name, window: window, preparing: true, caseSensitive: caseSensitive))
             }
         }
         return references
@@ -316,6 +345,90 @@ private final class ReferenceModelDriver: @unchecked Sendable {
     @MainActor private static func find(_ model: AtlasPagedReaderModel, _ name: String = "café") {
         model.referenceName = name; model.findReferences()
         wait("occurrence inventory did not arrive") { !model.busy && model.referencesAreCurrent }
+    }
+
+    @MainActor private static func lowercaseRegressions() {
+        let query = "CAFÉ𐐨"
+        for littleEndian in [true, false] {
+            let driver = ReferenceModelDriver(windows: .init(littleEndian: littleEndian), matching: true)
+            let model = opened(driver)
+            check(model.supportsReferenceMatching && model.supportsReferenceWindows,
+                "matching-only transport did not advertise its window capability")
+            model.referenceCaseSensitive = false
+            find(model, query)
+            let first = model.referencePage!
+            check(!first.inventory.caseSensitive && first.inventory.name.utf8.elementsEqual(query.utf8)
+                && first.inventory.matchesCounted == 5_005 && first.inventory.countComplete
+                && first.inventory.retained == 4_096 && first.target(id: 1)?.caseSensitive == false,
+                "lowercase query lost its original policy, complete count or bounded retained rows")
+            model.nextReferencePage()
+            wait("lowercase metadata page") { !model.busy && model.referencePage?.request.start == 64 }
+            check(model.referencesAreCurrent && model.referencePage?.inventory.caseSensitive == false
+                && model.referencePage?.rows.first?.ordinal == 65 && model.canReferenceBack,
+                "metadata paging lost the accepted lowercase policy")
+            model.previousReferencePage()
+            wait("lowercase previous metadata page") { !model.busy && model.referencePage?.request == .initial }
+            model.nextReferenceWindow()
+            wait("lowercase next results") {
+                !model.busy && model.referencePage?.inventory.window?.request.offset == 4_096
+            }
+            let later = model.referencePage!, target = later.target(id: 1)!
+            check(!target.caseSensitive && !later.inventory.caseSensitive
+                && later.inventory.matchesCounted == 5_005 && later.inventory.retained == 909
+                && target.occurrence.ordinal == 4_097 && !model.canReferenceWindowNext,
+                "later window confused policy, total count, retained count or global ordinal")
+            model.openReference(target)
+            wait("lowercase exact source selection") { !model.busy && model.referenceHex != nil }
+            let expectedHex = littleEndian ? "630061006600e90001d800dc" : "00630061006600e9d801dc00"
+            check(model.referenceHex == expectedHex
+                && model.nativeSelectionRange == NSRange(location: 1026, length: 6)
+                && model.page?.referenceSelection?.target.caseSensitive == false
+                && driver.log.contains("reference:7:2:1"),
+                "lowercase navigation copied query spelling or confused native and original source offsets")
+            let retained = model.source
+            model.previousReferenceWindow()
+            wait("lowercase previous results") {
+                !model.busy && model.referencesAreCurrent && model.referencePage?.inventory.window?.request.offset == 0
+            }
+            check(model.referencePage?.inventory.caseSensitive == false && model.source === retained
+                && driver.log.filter { $0.hasPrefix("prepare-matching:") } == [
+                    "prepare-matching:7:1:0:false:true", "prepare-matching:7:2:4096:false:true",
+                    "prepare-matching:7:3:0:false:true"],
+                "window history silently reverted to exact matching or recaptured source")
+            let beforeMalformed = model.referencePage!
+            driver.malformNextCase(); model.nextReferencePage()
+            wait("foreign case-policy replacement") { !model.busy }
+            check(!model.referencesAreCurrent && model.referencePage?.id == beforeMalformed.id
+                && model.referencePage?.inventory.caseSensitive == false && model.source === retained,
+                "changed foreign case policy acquired retained-page authority")
+            find(model, query)
+            let accepted = model.referencePage!, stale = accepted.target(id: 1)!
+            model.referenceCaseSensitive = true
+            check(model.referencePage == nil && !model.referencesAreCurrent
+                && model.referenceHex == nil && model.nativeSelectionRange == nil && model.source === retained,
+                "editing case policy retained old rows, copy or native selection authority")
+            let calls = driver.log.filter { $0.hasPrefix("reference:") }.count
+            model.openReference(stale)
+            check(!model.busy && driver.log.filter { $0.hasPrefix("reference:") }.count == calls,
+                "an old lowercase target crossed the foreign boundary after a case edit")
+
+            model.referenceCaseSensitive = false
+            driver.pause("prepare-window"); model.findReferences()
+            wait("lowercase request did not enter foreign boundary") {
+                driver.entered.wait(timeout: .now()) == .success
+            }
+            model.referenceCaseSensitive = true
+            driver.gate.signal()
+            wait("late lowercase response did not drain") {
+                driver.log.contains("returned-window:7:\(accepted.inventory.generation + 1)") && !model.busy
+            }
+            check(model.referenceCaseSensitive && model.referencePage == nil && !model.referencesAreCurrent
+                && model.source === retained, "late lowercase delivery overwrote the newly selected case policy")
+            check(driver.log.filter { $0.hasPrefix("open:") }.count == 1
+                && driver.log.filter { $0.hasPrefix("window:") }.count == 1,
+                "lowercase paging or option edits reopened the live source")
+            model.close(); wait("lowercase owner retirement") { driver.log.contains("close:7") }
+        }
     }
 
     @MainActor private static func largeCaptureRegressions() {
@@ -548,6 +661,19 @@ private final class ReferenceModelDriver: @unchecked Sendable {
                 catch { fatalError("unexpected optional-window admission error: \(error)") }
             }
             wait("legacy window refusal") { unavailable }
+            let prepares = driver.log.filter { $0.hasPrefix("prepare:") }.count
+            var lowercaseUnavailable = false
+            Task {
+                do {
+                    _ = try await coordinator.prepareReferences("CAFÉ", caseSensitive: false)
+                    fatalError("lowercase request silently downgraded to the legacy exact transport")
+                } catch AtlasReaderError.unavailable { lowercaseUnavailable = true }
+                catch { fatalError("unexpected lowercase capability error: \(error)") }
+            }
+            wait("legacy lowercase refusal") { lowercaseUnavailable }
+            check(!coordinator.supportsReferenceMatching
+                && driver.log.filter { $0.hasPrefix("prepare:") }.count == prepares,
+                "unsupported case policy consumed generation or reached the foreign boundary")
             let target = inventory!.target(id: 1)!
             driver.pause("reference")
             var refused = false
@@ -668,6 +794,7 @@ private final class ReferenceModelDriver: @unchecked Sendable {
         }
         windowRegressions()
         largeCaptureRegressions()
+        lowercaseRegressions()
         print("Occurrence coordinator, counted windows, paging, exact copy, query races, and independent fork regressions passed.")
     }
 }

@@ -40,6 +40,12 @@ struct AtlasIndexedSearchTransport: Sendable {
     /// while borrowing the same immutable captures as the first result window.
     var structureWindowQueryBegin: (@Sendable (UInt64, UInt64, UInt64, AtlasSearchMode, AtlasSearchNameMode,
         String, AtlasSearchFileScope, AtlasSearchPathScope, Bool, UInt64) throws -> String?)? = nil
+    /// Additive matching capabilities keep legacy structural callers exact.
+    /// The final Bool is match-case; window Bools are match-case and count-all.
+    var matchingStructureQueryBegin: (@Sendable (UInt64, UInt64, UInt64, AtlasSearchMode, AtlasSearchNameMode,
+        String, AtlasSearchFileScope, AtlasSearchPathScope, Bool) throws -> String?)? = nil
+    var matchingStructureWindowQueryBegin: (@Sendable (UInt64, UInt64, UInt64, AtlasSearchMode, AtlasSearchNameMode,
+        String, AtlasSearchFileScope, AtlasSearchPathScope, Bool, Bool, UInt64) throws -> String?)? = nil
     /// Legacy openers retain repository-rules defaults; explicit opt-in must
     /// never silently reuse their narrower discovery universe.
     var openWithPolicy: (@Sendable (UInt64, String, AtlasDiscoveryPolicy, AtlasSearchCancellation) throws -> String?)? = nil
@@ -167,7 +173,8 @@ final class AtlasIndexedSearch: @unchecked Sendable {
             throw AtlasSearchError.unsupportedDiscoveryPolicy
         }
         let usesWindows = input.mode.isTextual ? transport.windowQueryBegin != nil
-            : transport.structureWindowQueryBegin != nil
+            : (transport.matchingStructureWindowQueryBegin != nil
+                || (input.caseSensitive && transport.structureWindowQueryBegin != nil))
         let resultOffset: UInt64? = usesWindows ? (input.resultWindow?.offset ?? 0) : nil
         let countAllMatches = input.countsIndexedMatches(
             supportsCounting: transport.countedQueryBegin != nil || usesWindows)
@@ -177,7 +184,10 @@ final class AtlasIndexedSearch: @unchecked Sendable {
             }
         }
         if !input.mode.isTextual {
-            guard usesWindows || transport.structureQueryBegin != nil else { throw AtlasSearchError.unavailable }
+            guard input.caseSensitive || transport.matchingStructureQueryBegin != nil
+                || transport.matchingStructureWindowQueryBegin != nil else { throw AtlasSearchError.unsupportedMatching }
+            guard usesWindows || transport.matchingStructureQueryBegin != nil
+                || transport.structureQueryBegin != nil else { throw AtlasSearchError.unavailable }
             guard !countAllMatches || usesWindows else { throw AtlasSearchError.unsupportedCounting }
         } else if usesWindows {
             // This single capability admits every textual query policy.
@@ -223,11 +233,19 @@ final class AtlasIndexedSearch: @unchecked Sendable {
             try check(cancellation)
             let began = try owner.call { handle -> String? in
                 if !input.mode.isTextual {
-                    if let window = transport.structureWindowQueryBegin {
+                    if let window = transport.matchingStructureWindowQueryBegin {
+                        return try window(handle, generation, basis.index, input.mode, input.nameMode,
+                            query, scope, pathScope, input.caseSensitive, countAllMatches, resultOffset ?? 0)
+                    }
+                    if input.caseSensitive, let window = transport.structureWindowQueryBegin {
                         return try window(handle, generation, basis.index, input.mode, input.nameMode,
                             query, scope, pathScope, countAllMatches, resultOffset ?? 0)
                     }
-                    guard let structure = transport.structureQueryBegin else { throw AtlasSearchError.unavailable }
+                    if let structure = transport.matchingStructureQueryBegin {
+                        return try structure(handle, generation, basis.index, input.mode, input.nameMode,
+                            query, scope, pathScope, input.caseSensitive)
+                    }
+                    guard input.caseSensitive, let structure = transport.structureQueryBegin else { throw AtlasSearchError.unavailable }
                     return try structure(handle, generation, basis.index, input.mode, input.nameMode, query, scope, pathScope)
                 }
                 if let window = transport.windowQueryBegin {

@@ -252,7 +252,127 @@ private struct ReferenceFixture {
         try sourceLimitRegressions()
         try largerCapturesPreserveExactRanges()
         try windowRegressions()
+        try lowercaseRegressions()
         print("Occurrence wire, exact spelling, source ranges, paging and evidence regressions passed.")
+    }
+
+    private static func lowercaseRegressions() throws {
+        // Protocol fixtures exercise independent source spellings and byte
+        // domains. They do not implement or qualify Rust token extraction.
+        for encoding in ["utf8", "utf16le", "utf16be"] {
+            for (query, spelling) in [("k", "K"), ("İ", "i\u{307}"),
+                ("i\u{307}", "İ"), ("οσ", "ΟΣ"), ("𐐨", "𐐀")] {
+                let fixture = ReferenceFixture(name: spelling, littleEndian: encoding != "utf16be")
+                let raw = encoding == "utf8" ? Array(fixture.text.utf8) : fixture.bytes
+                let visibleStart: UInt64 = encoding == "utf8" ? 0 : 2
+                let width = UInt64(encoding == "utf8" ? spelling.utf8.count : spelling.utf16.count * 2)
+                let separator: UInt64 = encoding == "utf8" ? 1 : 2
+                func header(_ command: String) -> [String: Any] {
+                    var wire = fixture.header(command)
+                    wire["captured_bytes"] = String(raw.count); wire["encoding"] = encoding
+                    return wire
+                }
+                let info = try AtlasReaderInfo.decode(ReferenceFixture.json(header("info")), handle: 7, path: "source.rs")
+                var wire = fixture.page()
+                wire["captured_bytes"] = String(raw.count); wire["encoding"] = encoding
+                wire["name"] = query; wire["name_case"] = "unicode-lowercase"
+                wire["references"] = [
+                    ["reference_id": "1", "line": "1",
+                     "original_range": ReferenceFixture.range(visibleStart, visibleStart + width)],
+                    ["reference_id": "2", "line": "2",
+                     "original_range": ReferenceFixture.range(visibleStart + width + separator,
+                         visibleStart + 2 * width + separator)]
+                ] as [[String: Any]]
+                let page = try AtlasReferencePage.decode(ReferenceFixture.json(wire), info: info, generation: 1,
+                    name: query, request: .initial, preparing: true, caseSensitive: false)
+                let target = page.target(id: 1)!
+                precondition(!page.inventory.caseSensitive && !target.caseSensitive
+                    && target.name.utf8.elementsEqual(query.utf8) && target.occurrence.range.length == width)
+                var exactTarget = target; exactTarget.caseSensitive = true
+                precondition(exactTarget != target, "case policy must participate in row authority")
+                var exactInventory = page.inventory; exactInventory.caseSensitive = true
+                precondition(!exactInventory.matches(page.inventory), "case policy must participate in inventory identity")
+                reject("lowercase response cannot satisfy an exact query") {
+                    _ = try AtlasReferencePage.decode(ReferenceFixture.json(wire), info: info, generation: 1,
+                        name: query, request: .initial, preparing: true)
+                }
+                var switched = wire; switched["name_case"] = "sensitive"
+                reject("case policy changed at the foreign boundary") {
+                    _ = try AtlasReferencePage.decode(ReferenceFixture.json(switched), info: info, generation: 1,
+                        name: query, request: .initial, preparing: true, caseSensitive: false)
+                }
+
+                var source = header("reference")
+                source["text_kind"] = "logical-captured-text-not-shaped"
+                source["requested_original_range"] = ReferenceFixture.range(0, UInt64(raw.count))
+                source["visible_range"] = ReferenceFixture.range(visibleStart, UInt64(raw.count))
+                source["range_limited"] = false; source["boundaries_adjusted"] = visibleStart != 0
+                source["has_replacements"] = false; source["first_physical_line"] = NSNull()
+                source["next_offset"] = NSNull(); source["text"] = fixture.text
+                source["original_hex"] = ReferenceFixture.hex(raw.dropFirst(Int(visibleStart)))
+                let selectedHex = ReferenceFixture.hex(raw[Int(visibleStart)..<Int(visibleStart + width)])
+                var selection: [String: Any] = [
+                    "reference_generation": "1", "reference_id": "1", "reference_line": "1",
+                    "selection_namespace": "reference", "evidence_level": "whole-token-text-candidate",
+                    "includes_comments_and_literals": true, "compiler_resolved": false,
+                    "original_range": ReferenceFixture.range(visibleStart, visibleStart + width),
+                    "window_utf8_range": ReferenceFixture.range(0, UInt64(spelling.utf8.count)),
+                    "original_hex": selectedHex
+                ]
+                source["selection"] = selection
+                let selected = try AtlasReaderPage.decode(ReferenceFixture.json(source), info: info, request: .reference(target))
+                precondition(selected.referenceSelection?.originalHex == selectedHex
+                    && selected.referenceSelection?.utf8End == UInt64(spelling.utf8.count),
+                    "lowercase activation must copy the original spelling and its original bytes")
+                reject("same source bytes cannot satisfy the exact query spelling") {
+                    _ = try AtlasReaderPage.decode(ReferenceFixture.json(source), info: info, request: .reference(exactTarget))
+                }
+                // An equally matching second token is not a witness for the
+                // first token's original range.
+                let second = UInt64(spelling.utf8.count + 1)
+                selection["window_utf8_range"] = ReferenceFixture.range(second, second + UInt64(spelling.utf8.count))
+                source["selection"] = selection
+                reject("a later lowercase-equal span impersonated the selected original bytes") {
+                    _ = try AtlasReaderPage.decode(ReferenceFixture.json(source), info: info, request: .reference(target))
+                }
+            }
+        }
+        for (query, spelling) in [("i", "İ"), ("ss", "ß"), ("é", "e\u{301}"), ("ος", "ΟΣ")] {
+            precondition(!AtlasSearchOccurrencePolicy.matches(source: spelling, query: query, caseSensitive: false),
+                "scalar lowercase must preserve full tokens and avoid folding, normalization and final-sigma context")
+        }
+
+        let fixture = ReferenceFixture(name: "K", copies: 5_005), info = try fixture.info()
+        let window = AtlasReferenceWindowRequest(offset: 4_096, countAllMatches: true)
+        func wire(_ request: AtlasReferencePageRequest, preparing: Bool) -> [String: Any] {
+            var out = fixture.windowPage(window, request, preparing: preparing, cap: 128)
+            out["name"] = "k"; out["name_case"] = "unicode-lowercase"
+            return out
+        }
+        let first = try AtlasReferencePage.decode(ReferenceFixture.json(wire(.initial, preparing: true)),
+            info: info, generation: 1, name: "k", request: .initial, preparing: true,
+            maxItems: 128, window: window, caseSensitive: false)
+        let request = AtlasReferencePageRequest(start: 64, limit: 64)
+        let later = try AtlasReferencePage.decode(ReferenceFixture.json(wire(request, preparing: false)),
+            info: info, generation: 1, name: "k", request: request, inventory: first.inventory,
+            maxItems: 128, caseSensitive: false)
+        precondition(later.inventory.matches(first.inventory) && later.inventory.matchesCounted == 5_005
+            && later.inventory.countComplete && later.inventory.retained == 128
+            && later.rows.first?.ordinal == 4_161 && later.rows.last?.ordinal == 4_224
+            && later.inventory.window?.nextOffset == 4_224 && later.nextOffset == nil,
+            "lowercase metadata paging must retain the complete count and independent window ordinal")
+        var switched = wire(request, preparing: false); switched["name_case"] = "sensitive"
+        reject("exact page cannot be appended to a lowercase inventory") {
+            _ = try AtlasReferencePage.decode(ReferenceFixture.json(switched), info: info, generation: 1,
+                name: "k", request: request, inventory: first.inventory, maxItems: 128)
+        }
+        var wide = wire(.initial, preparing: true), rows = wide["references"] as! [[String: Any]]
+        rows[0]["original_range"] = ReferenceFixture.range(16_386, 16_392)
+        wide["references"] = rows
+        reject("lowercase ranges must remain bounded by the query scalar budget") {
+            _ = try AtlasReferencePage.decode(ReferenceFixture.json(wide), info: info, generation: 1,
+                name: "k", request: .initial, preparing: true, maxItems: 128, window: window, caseSensitive: false)
+        }
     }
 
     private static func sourceLimitRegressions() throws {

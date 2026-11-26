@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Browse exact text occurrences in one retained source. Every activation uses
+/// Browse whole-token text occurrences in one retained source. Every activation uses
 /// the original inventory/page token; list offsets never become source targets.
 @MainActor struct AtlasReferenceBrowser: View {
     @Bindable var model: AtlasPagedReaderModel
@@ -19,12 +19,17 @@ import SwiftUI
             HStack {
                 TextField("Identifier…", text: $model.referenceName)
                     .textFieldStyle(.roundedBorder)
-                    .accessibilityLabel("Exact case-sensitive identifier in the retained source")
+                    .accessibilityLabel("Whole identifier in the retained source")
                     .onSubmit(model.findReferences)
                 Button("Find", action: model.findReferences)
                     .disabled(!model.canFindReferences || model.referenceName.isEmpty || model.busy)
             }
-            Text("Matches the whole identifier, including declarations, comments and string literals. Case-sensitive; no compiler binding resolution.")
+            Toggle("Match case", isOn: $model.referenceCaseSensitive)
+                .disabled(!model.supportsReferenceMatching || model.busy)
+                .help("Turn off to compare Unicode lowercase spellings while keeping exact source ranges.")
+            Text(model.referenceCaseSensitive
+                ? "Matches the whole identifier, including declarations, comments and string literals. Case-sensitive; no compiler binding resolution."
+                : "Matches whole identifiers using Unicode lowercase. Original spelling and source ranges are preserved; comments and literals are included. No compiler binding resolution.")
                 .font(.caption).foregroundStyle(.secondary)
             if let page = model.referencePage {
                 Text(page.summary).font(.caption).foregroundStyle(.secondary)
@@ -98,8 +103,8 @@ import SwiftUI
                     .textSelection(.enabled)
             }
             Text(model.supportsReferenceWindows
-                ? "Searches this retained file up to 32 MiB, counts every whole-token occurrence and retains up to 4,096 per result window. Line numbers count LF boundaries. Changing the identifier or refreshing the capture invalidates old targets."
-                : "Searches this retained file only, up to 32 MiB and 4,096 occurrences. Line numbers count LF boundaries; exact byte ranges also work for CR-only source. Changing the identifier or refreshing the capture invalidates old targets.")
+                ? "Searches this retained file up to 32 MiB, counts every whole-token occurrence and retains up to 4,096 per result window. Line numbers count LF boundaries. Changing the identifier, case option or capture invalidates old targets."
+                : "Searches this retained file only, up to 32 MiB and 4,096 occurrences. Line numbers count LF boundaries; exact byte ranges also work for CR-only source. Changing the identifier, case option or capture invalidates old targets.")
                 .font(.caption2).foregroundStyle(.secondary)
         }
         .padding(12)

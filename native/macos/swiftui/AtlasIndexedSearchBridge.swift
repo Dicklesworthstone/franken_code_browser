@@ -69,6 +69,16 @@ private func indexedWindowQueryBegin(_ h: UInt64, _ g: UInt64, _ index: UInt64,
     _ text: UnsafePointer<CChar>?, _ extensions: UnsafePointer<CChar>?, _ filenames: UnsafePointer<CChar>?,
     _ pathKind: UInt64, _ path: UnsafePointer<CChar>?, _ countAll: UInt64, _ skip: UInt64,
     _ hits: UInt64, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_atlas_structure_indexed_begin_matching") private func indexedMatchingStructureQueryBegin(
+    _ h: UInt64, _ g: UInt64, _ index: UInt64, _ mode: UInt64, _ nameMode: UInt64,
+    _ text: UnsafePointer<CChar>?, _ extensions: UnsafePointer<CChar>?, _ filenames: UnsafePointer<CChar>?,
+    _ pathKind: UInt64, _ path: UnsafePointer<CChar>?, _ caseSensitive: UInt64,
+    _ hits: UInt64, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_atlas_structure_indexed_begin_window_matching") private func indexedMatchingStructureWindowQueryBegin(
+    _ h: UInt64, _ g: UInt64, _ index: UInt64, _ mode: UInt64, _ nameMode: UInt64,
+    _ text: UnsafePointer<CChar>?, _ extensions: UnsafePointer<CChar>?, _ filenames: UnsafePointer<CChar>?,
+    _ pathKind: UInt64, _ path: UnsafePointer<CChar>?, _ caseSensitive: UInt64, _ countAll: UInt64, _ skip: UInt64,
+    _ hits: UInt64, _ bytes: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_index_open_reader") private func indexedReader(_ h: UInt64, _ reader: UInt64,
     _ index: UInt64, _ file: UInt64, _ revision: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_atlas_close") private func indexedClose(_ h: UInt64) -> UInt8
@@ -173,6 +183,28 @@ extension AtlasIndexedSearchTransport {
                 try pathScope.withCString { kind, path in
                     try take(indexedStructureWindowQueryBegin(h, g, index, mode.code, mode.effectiveNameMode(nameMode).code,
                         text, extensions, filenames, kind, path, countAll ? 1 : 0, skip,
+                        AtlasSearchResultWindow.capacity, 32 * 1024 * 1024))
+                }
+            }
+        }
+    }, matchingStructureQueryBegin: { h, g, index, mode, nameMode, query, scope, pathScope, caseSensitive in
+        guard !mode.isTextual, caseSensitive || mode == .occurrences else { throw AtlasSearchError.invalidRequest }
+        return try query.withCString { text in
+            try scope.withCStrings { extensions, filenames in
+                try pathScope.withCString { kind, path in
+                    try take(indexedMatchingStructureQueryBegin(h, g, index, mode.code, mode.effectiveNameMode(nameMode).code,
+                        text, extensions, filenames, kind, path, caseSensitive ? 1 : 0, 1000, 32 * 1024 * 1024))
+                }
+            }
+        }
+    }, matchingStructureWindowQueryBegin: { h, g, index, mode, nameMode, query, scope, pathScope, caseSensitive, countAll, skip in
+        guard !mode.isTextual, caseSensitive || mode == .occurrences,
+              skip <= 32 * 1024 * 1024 else { throw AtlasSearchError.invalidRequest }
+        return try query.withCString { text in
+            try scope.withCStrings { extensions, filenames in
+                try pathScope.withCString { kind, path in
+                    try take(indexedMatchingStructureWindowQueryBegin(h, g, index, mode.code, mode.effectiveNameMode(nameMode).code,
+                        text, extensions, filenames, kind, path, caseSensitive ? 1 : 0, countAll ? 1 : 0, skip,
                         AtlasSearchResultWindow.capacity, 32 * 1024 * 1024))
                 }
             }

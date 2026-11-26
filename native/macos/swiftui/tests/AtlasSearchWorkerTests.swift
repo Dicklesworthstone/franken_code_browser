@@ -453,6 +453,53 @@ private final class ExactFileDiscoverySelection: @unchecked Sendable {
             } catch { preconditionFailure("Production structural capture flow failed: \(error)") }
         }
         pump { retainedHeading != nil }
+
+        let occurrenceRoot = root.appendingPathComponent("lowercase-occurrences")
+        try FileManager.default.createDirectory(at: occurrenceRoot, withIntermediateDirectories: false)
+        let occurrenceText = "Scan scan SCAN Scanner _scan scan_ // Scan\nİ i\u{307} i ΟΣ οσ ος\n"
+        let utf8OccurrenceBytes = Array(occurrenceText.utf8)
+        let utf16LEOccurrenceBytes: [UInt8] = [0xff, 0xfe] + occurrenceText.utf16.flatMap {
+            [UInt8(truncatingIfNeeded: $0), UInt8(truncatingIfNeeded: $0 >> 8)]
+        }
+        let utf16BEOccurrenceBytes: [UInt8] = [0xfe, 0xff] + occurrenceText.utf16.flatMap {
+            [UInt8(truncatingIfNeeded: $0 >> 8), UInt8(truncatingIfNeeded: $0)]
+        }
+        let occurrenceSources = ["utf8.txt": utf8OccurrenceBytes,
+            "utf16le.txt": utf16LEOccurrenceBytes, "utf16be.txt": utf16BEOccurrenceBytes]
+        for (name, bytes) in occurrenceSources {
+            try Data(bytes).write(to: occurrenceRoot.appendingPathComponent(name))
+        }
+        let occurrenceScope = try AtlasSearchPathScope(kind: .directory, path: "lowercase-occurrences")
+        for (query, count, names) in [
+            ("scan", 12, Set(["Scan", "scan", "SCAN"])),
+            ("i\u{307}", 6, Set(["İ", "i\u{307}"])),
+            ("οσ", 6, Set(["ΟΣ", "οσ"]))
+        ] {
+            let result = try execute(AtlasSearchInput(root: root.path, query: query, pathScope: occurrenceScope,
+                mode: .occurrences, caseSensitive: false, countAllMatches: false))
+            precondition(result.complete && !result.caseSensitive && result.hits.count == count
+                && Set(result.hits.compactMap { $0.structure?.name }) == names,
+                "The actual bridge must preserve scalar lowercase whole-token semantics across source encodings")
+            for hit in result.hits {
+                let name = hit.structure!.name
+                let filename = String(hit.path.split(separator: "/").last!)
+                let original = occurrenceSources[filename]!
+                let expected: [UInt8]
+                switch filename {
+                case "utf16le.txt": expected = name.utf16.flatMap {
+                    [UInt8(truncatingIfNeeded: $0), UInt8(truncatingIfNeeded: $0 >> 8)] }
+                case "utf16be.txt": expected = name.utf16.flatMap {
+                    [UInt8(truncatingIfNeeded: $0 >> 8), UInt8(truncatingIfNeeded: $0)] }
+                default: expected = Array(name.utf8)
+                }
+                precondition(original[Int(hit.start)..<Int(hit.end)].elementsEqual(expected),
+                    "Lowercase comparison must not rewrite original source byte ranges")
+                let target = result.capture!.target(hit)!
+                precondition(target.needle.utf8.elementsEqual(name.utf8)
+                    && target.occurrenceQuery?.utf8.elementsEqual(query.utf8) == true && !target.caseSensitive,
+                    "Original spelling and the submitted occurrence query must remain independently retained")
+            }
+        }
         retainedHeading = nil
         try Data(("# " + String(repeating: "A", count: 4097) + "\n\n# A\n").utf8)
             .write(to: structureRoot.appendingPathComponent("README.md"))

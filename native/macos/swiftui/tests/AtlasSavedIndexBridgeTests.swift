@@ -195,7 +195,7 @@ extension AtlasReaderTransport {
                 matches: 4096, sourceBytes: 1, skipMatches: 0),
             .structureWindow(generation: generation, mode: .occurrences, nameMode: .contains, query: "a",
                 matches: 4096, sourceBytes: 1, skipMatches: 0),
-            .structureWindow(generation: generation, mode: .occurrences, nameMode: .exact, query: "a",
+            .structureWindow(generation: generation, mode: .occurrences, nameMode: .prefix, query: "a",
                 matches: 1, sourceBytes: 1, skipMatches: 0, policy: .init(caseSensitive: false, countAllMatches: true)),
             .structureWindow(generation: generation, mode: .symbols, nameMode: .exact, query: "a",
                 matches: 0, sourceBytes: 1, skipMatches: 0),
@@ -216,6 +216,27 @@ extension AtlasReaderTransport {
             query: "CAFÉ", matches: 4096, sourceBytes: 67_108_864,
             policy: .init(caseSensitive: false, countAllMatches: true))) == "{}")
         precondition(count(24) == 1 && count(6) == 61)
+        let lowercaseOccurrences: [AtlasSavedRequest] = [
+            .structureSearch(generation: generation, mode: .occurrences, nameMode: .exact, query: "E\u{301}",
+                matches: 4096, sourceBytes: 67_108_864, policy: .init(caseSensitive: false, countAllMatches: true)),
+            .structureWindow(generation: generation, mode: .occurrences, nameMode: .exact, query: "E\u{301}",
+                matches: 4096, sourceBytes: 67_108_864, skipMatches: 9_007_199_254_740_993,
+                policy: .init(caseSensitive: false, countAllMatches: true))
+        ]
+        for request in lowercaseOccurrences { precondition(transport.run(owner, request) == "{}") }
+        precondition(count(24) == 2 && count(23) == 6 && count(6) == 63,
+            "lowercase whole-token queries and later windows did not reach the native ABI")
+        precondition(transport.run(owner, .structureSearch(generation: generation, mode: .occurrences,
+            nameMode: .contains, query: "E\u{301}", matches: 4096, sourceBytes: 67_108_864,
+            policy: .init(caseSensitive: false, countAllMatches: true))) == nil)
+        precondition(count(24) == 2 && count(23) == 6 && count(6) == 63,
+            "lowercase occurrence matching must still reject substring name modes")
+        for invalid in [Int32(1), 2, 3, 4] {
+            mode(invalid)
+            for request in lowercaseOccurrences { precondition(transport.run(owner, request) == nil) }
+        }
+        precondition(count(24) == 6 && count(23) == 10 && count(6) == 69,
+            "lowercase occurrence response ownership leaked or double-freed")
         print("AtlasSavedIndexBridgeTests: public-header signatures, publication/import/path/matching/window requests, native bytes, full-width IDs and offsets, and buffer ownership passed")
     }
 }

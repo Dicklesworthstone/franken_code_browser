@@ -281,7 +281,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
     }
 
     private var structurePolicy: AtlasSavedStructurePolicy {
-        .init(caseSensitive: searchMode == .occurrences || searchCaseSensitive, countAllMatches: countAllMatches)
+        .init(caseSensitive: searchCaseSensitive, countAllMatches: countAllMatches)
     }
 
     var structureIsCurrent: Bool {

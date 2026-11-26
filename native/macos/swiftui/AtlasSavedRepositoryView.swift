@@ -847,9 +847,10 @@ private final class AtlasSavedTrailArchiveAccess {
                     Picker("Name matching", selection: $model.searchNameMode) {
                         ForEach(AtlasSearchNameMode.allCases) { Text($0.label).tag($0) }
                     }.frame(maxWidth: 270).disabled(!model.canOperate)
-                    Toggle("Match case", isOn: $model.searchCaseSensitive).toggleStyle(.checkbox)
-                        .disabled(!model.canOperate)
-                } else { Text("One exact, case-sensitive identifier token").font(.caption) }
+                } else { Text("One whole identifier token").font(.caption) }
+                Toggle("Match case", isOn: $model.searchCaseSensitive).toggleStyle(.checkbox)
+                    .disabled(!model.canOperate)
+                    .help("When off, compare Unicode lowercase names while preserving original spelling and byte ranges.")
                 Toggle("Count all matches", isOn: $model.countAllMatches).toggleStyle(.checkbox)
                     .disabled(!model.canOperate)
                     .help("Continue counting after the retained result window fills, within the source limits.")
@@ -874,7 +875,7 @@ private final class AtlasSavedTrailArchiveAccess {
                             Spacer()
                             Button("Use accepted query") {
                                 model.searchMode = page.mode; model.searchNameMode = page.nameMode
-                                if page.mode.supportsNameMatching { model.searchCaseSensitive = page.policy.caseSensitive }
+                                model.searchCaseSensitive = page.policy.caseSensitive
                                 model.countAllMatches = page.policy.countAllMatches
                                 model.searchInput = page.needle; panelNotice = ""
                             }.controlSize(.small).disabled(!model.canOperate)
@@ -930,7 +931,7 @@ private final class AtlasSavedTrailArchiveAccess {
             } else {
                 VStack(alignment: .leading, spacing: 10) {
                     Text(model.busy ? "Waiting for saved archive work…" : "Navigate the structure of your saved repository.").font(.headline)
-                    Text("Search symbols, Markdown heading titles or exact identifier tokens. Open a result to read its verified captured source; that reader remains available after the archive closes.")
+                    Text("Search symbols, Markdown heading titles or whole identifier tokens. Open a result to read its verified captured source; that reader remains available after the archive closes.")
                     Text("Each result window retains up to 4,096 results within 64 MiB of source reads. Per-member limits: symbols 1 MiB, headings 256 KiB, occurrences 32 MiB. Coverage counts expose omitted and unsupported members.")
                         .font(.caption).foregroundStyle(.secondary)
                 }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).padding(.top, 12)
@@ -944,7 +945,7 @@ private final class AtlasSavedTrailArchiveAccess {
         case .headings:
             return "Markdown titles and duplicate-aware slugs come from FrankenMarkdown. Only qualified original source ranges can open a result."
         case .occurrences:
-            return "Whole-token text occurrences include comments and string literals. These are spelling matches; they do not establish a semantic reference or call graph."
+            return "Whole-token text occurrences include comments and string literals. Turn Match case off for Unicode lowercase comparison; original source spelling and byte ranges are preserved. These are spelling matches; they do not establish a semantic reference or call graph."
         case .literal, .expression: return ""
         }
     }

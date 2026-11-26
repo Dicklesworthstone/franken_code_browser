@@ -81,6 +81,9 @@ import Observation
             if !oldValue.utf8.elementsEqual(referenceName.utf8) { clearReferenceSearch() }
         }
     }
+    var referenceCaseSensitive = true {
+        didSet { if oldValue != referenceCaseSensitive { clearReferenceSearch() } }
+    }
     private(set) var referencePage: AtlasReferencePage?
     private(set) var referenceRowsAuthorized = false
     private var referenceHistory: [AtlasReferencePageRequest] = []
@@ -273,11 +276,14 @@ import Observation
     var canFindReferences: Bool {
         guard let page else { return false }
         return coordinator.supportsReferences && page.identity.capturedBytes <= AtlasReferencePage.sourceLimit
+            && (referenceCaseSensitive || coordinator.supportsReferenceMatching)
     }
     var supportsReferenceWindows: Bool { coordinator.supportsReferenceWindows }
+    var supportsReferenceMatching: Bool { coordinator.supportsReferenceMatching }
     var referencesAreCurrent: Bool {
         guard referenceRowsAuthorized, let referencePage else { return false }
         return referencePage.inventory.name.utf8.elementsEqual(referenceName.utf8)
+            && referencePage.inventory.caseSensitive == referenceCaseSensitive
             && page?.identity.matches(referencePage.inventory.identity) == true
     }
     var canReferenceBack: Bool { referencesAreCurrent && !referenceHistory.isEmpty && !busy }
@@ -663,11 +669,15 @@ import Observation
         if let target = capturedTarget {
             guard target.root.utf8.elementsEqual(root.utf8), target.path.utf8.elementsEqual(path.utf8),
                   !target.mode.isTextual || coordinator.supportsFind,
-                  target.mode != .occurrences || coordinator.supportsReferences else { throw AtlasReaderError.invalidInput }
+                  target.mode != .occurrences || (coordinator.supportsReferences
+                      && (target.caseSensitive || coordinator.supportsReferenceMatching)) else {
+                throw AtlasReaderError.invalidInput
+            }
             input = try AtlasReaderInput(captured: target)
             findOptions = .init()
             fileQuery = target.mode.isTextual ? target.needle : ""
-            referenceName = target.mode == .occurrences ? target.needle : ""
+            referenceName = target.mode == .occurrences ? (target.occurrenceQuery ?? target.needle) : ""
+            referenceCaseSensitive = target.mode != .occurrences || target.caseSensitive
         } else if let supplied = suppliedSource {
             guard supplied.matches(root: root, path: path) else { throw AtlasReaderError.invalidInput }
             guard liveTransport.openBytes != nil else { throw AtlasReaderError.unavailable }
@@ -720,7 +730,7 @@ import Observation
                     let prepareWindow: (@MainActor (String, UInt64) async throws -> AtlasReferencePage)?
                     if coordinator.supportsReferenceWindows {
                         prepareWindow = { name, offset in
-                            try await self.coordinator.prepareReferences(name,
+                            try await self.coordinator.prepareReferences(name, caseSensitive: target.caseSensitive,
                                 window: AtlasReferenceWindowRequest(offset: offset, countAllMatches: true))
                         }
                     } else {
@@ -728,14 +738,20 @@ import Observation
                     }
                     let selected = try await AtlasCapturedReader.activateOccurrence(target,
                         identity: opened.identity,
-                        prepare: { try await coordinator.prepareReferences($0) },
+                        prepare: { try await coordinator.prepareReferences($0, caseSensitive: target.caseSensitive) },
                         nextPage: { try await coordinator.referencePage($0) },
                         prepareWindow: prepareWindow,
                         read: { try await coordinator.read(.reference($0)) },
                         isCurrent: {
-                            operation == ticket && referenceName.utf8.elementsEqual(target.needle.utf8)
+                            operation == ticket && referenceName.utf8.elementsEqual((target.occurrenceQuery ?? target.needle).utf8)
+                                && referenceCaseSensitive == target.caseSensitive
                         })
                     guard operation == ticket, !Task.isCancelled else { throw AtlasReaderError.canceled }
+                    guard let witness = selected.page.referenceSelection,
+                          selected.page.text.utf8.dropFirst(Int(witness.utf8Start))
+                            .prefix(Int(witness.utf8End - witness.utf8Start)).elementsEqual(target.needle.utf8) else {
+                        throw AtlasReaderError.invalidResponse
+                    }
                     referencePage = selected.referencePage
                     referenceRowsAuthorized = true
                     referenceHistory = selected.history
@@ -1208,22 +1224,22 @@ import Observation
         catch { notice = "Enter one identifier, up to 1,024 UTF-8 bytes."; return }
         let window = supportsReferenceWindows
             ? AtlasReferenceWindowRequest(offset: 0, countAllMatches: true) : nil
-        loadReferenceWindow(name: name, request: window)
+        loadReferenceWindow(name: name, caseSensitive: referenceCaseSensitive, request: window)
     }
     func nextReferenceWindow() {
         guard canReferenceWindowNext, let inventory = referencePage?.inventory,
               let window = inventory.window, let offset = window.nextOffset else { return }
-        loadReferenceWindow(name: inventory.name,
+        loadReferenceWindow(name: inventory.name, caseSensitive: inventory.caseSensitive,
             request: .init(offset: offset, countAllMatches: window.request.countAllMatches))
     }
     func previousReferenceWindow() {
         guard canReferenceWindowBack, let inventory = referencePage?.inventory,
               let window = inventory.window else { return }
         let offset = window.request.offset > inventory.maxItems ? window.request.offset - inventory.maxItems : 0
-        loadReferenceWindow(name: inventory.name,
+        loadReferenceWindow(name: inventory.name, caseSensitive: inventory.caseSensitive,
             request: .init(offset: offset, countAllMatches: window.request.countAllMatches))
     }
-    private func loadReferenceWindow(name: String, request: AtlasReferenceWindowRequest?) {
+    private func loadReferenceWindow(name: String, caseSensitive: Bool, request: AtlasReferenceWindowRequest?) {
         // Preserve the displayed source and prior rows while replacing the
         // inventory. A response lost after foreign acceptance cannot safely
         // restore the old generation's activation authority.
@@ -1232,9 +1248,10 @@ import Observation
         notice = "Finding whole-identifier text occurrences in this capture…"
         task = Task {
             do {
-                let result = try await coordinator.prepareReferences(name, window: request)
+                let result = try await coordinator.prepareReferences(name, caseSensitive: caseSensitive, window: request)
                 guard operation == ticket, !Task.isCancelled,
-                      referenceName.utf8.elementsEqual(name.utf8) else { return }
+                      referenceName.utf8.elementsEqual(name.utf8),
+                      referenceCaseSensitive == caseSensitive else { return }
                 referencePage = result
                 referenceHistory = []
                 referenceRowsAuthorized = true
@@ -1366,6 +1383,7 @@ import Observation
         outlinePage = nil; hasOutline = false; outlineRowsAuthorized = false
         outlineHistory = []; outlineNeedle = ""; outlineMode = .contains; outlineLanguage = .automatic
         referencePage = nil; referenceRowsAuthorized = false; referenceHistory = []; referenceName = ""
+        referenceCaseSensitive = true
         busy = false; notice = ""
         offsetInput = "0"; lineInput = "1"; columnInput = "1"; columnKind = .unicodeScalar
         navigation = UUID()

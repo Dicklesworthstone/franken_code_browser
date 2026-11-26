@@ -144,14 +144,14 @@ extension AtlasSavedTransport {
             return take(savedExpressionReader(handle, reader, generation, hit))
         case .structureSearch(let generation, let mode, let nameMode, let query, let matches, let bytes, let policy):
             guard generation > 0, let structure = mode.structure, AtlasSavedSearchWire.validNeedle(query),
-                  mode != .occurrences || (nameMode == .exact && policy.caseSensitive),
+                  mode != .occurrences || nameMode == .exact,
                   (1...AtlasSavedSearchWire.maximumHits).contains(matches),
                   bytes <= AtlasSavedSearchWire.maximumSourceBytes else { return nil }
             return query.withCString { take(savedStructureSearch(handle, generation, structure.code, nameMode.code,
                 $0, policy.caseSensitive ? 1 : 0, policy.countAllMatches ? 1 : 0, matches, bytes)) }
         case .structureWindow(let generation, let mode, let nameMode, let query, let matches, let bytes, let skipped, let policy):
             guard generation > 0, let structure = mode.structure, AtlasSavedSearchWire.validNeedle(query),
-                  mode != .occurrences || (nameMode == .exact && policy.caseSensitive),
+                  mode != .occurrences || nameMode == .exact,
                   (1...AtlasSavedSearchWire.maximumHits).contains(matches),
                   bytes <= AtlasSavedSearchWire.maximumSourceBytes else { return nil }
             return query.withCString { take(savedStructureWindow(handle, generation, structure.code, nameMode.code,
