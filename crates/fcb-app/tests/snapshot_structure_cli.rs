@@ -120,7 +120,7 @@ fn insensitive_structure_keeps_original_names_and_utf16_source_bytes() {
 }
 
 #[test]
-fn count_all_never_upgrades_incomplete_coverage_and_occurrence_case_is_rejected_before_io() {
+fn count_all_never_upgrades_incomplete_coverage_and_occurrence_prefixes_fail_before_io() {
     let f = Fixture::new(&[entry(b"a.txt", b"needle"), entry(b"b.txt", b"needle")], true);
     let (exit, work) = invoke(&args(&f, "occurrences", "needle", &["--limit", "0", "--count-all", "--max-source-bytes", "6"]), || false);
     assert_eq!(exit, EXIT_PARTIAL); assert_eq!(work.get("state").text(), "work-limit");
@@ -131,7 +131,7 @@ fn count_all_never_upgrades_incomplete_coverage_and_occurrence_case_is_rejected_
     let (exit, result) = invoke(&args(&partial, "symbols", "needle", &["--limit", "0", "--count-all"]), || false);
     assert_eq!(exit, EXIT_PARTIAL); assert_eq!(result.get("matches_seen").number(), 1);
     assert!(!result.get("matches_seen_exact").flag()); assert_eq!(result.get("unavailable_files").number(), 1);
-    let mut bad = args(&f, "occurrences", "needle", &["--ignore-case", "--count-all"]);
+    let mut bad = args(&f, "occurrences", "needle", &["--name-mode", "prefix", "--ignore-case", "--count-all"]);
     bad[2] = f.root.join("missing.fcbs").into_os_string();
     let (exit, result) = invoke(&bad, || false);
     assert_eq!(exit, EXIT_ERROR); assert_eq!(result.get("error").get("code").text(), "CLI_INCOMPATIBLE_OPTIONS");
@@ -299,4 +299,76 @@ fn saved_java_and_csharp_symbols_keep_capture_ranges_and_unsupported_context_cov
     let (exit, result) = invoke(&args(&refused, "symbols", "Hidden", &[]), || false);
     assert_eq!(exit, EXIT_PARTIAL); assert_eq!(result.get("unsupported_files").number(), 1);
     assert!(!result.get("workspace_complete").flag()); assert_eq!(result.get("retained_hits").number(), 0);
+}
+
+#[test]
+fn lowercase_occurrence_cli_keeps_original_encoded_names_in_counted_later_windows() {
+    for little in [None, Some(true), Some(false)] {
+        let text = "K K k Kx _K 1K K\u{307}";
+        let bytes = match little {
+            None => text.as_bytes().to_vec(),
+            Some(little) => format!("\u{feff}{text}").encode_utf16()
+                .flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect(),
+        };
+        let f = Fixture::new(&[entry(b"a.txt", &bytes), entry(b"b.txt", &bytes)], true);
+        let (exit, page) = invoke(&args(&f, "occurrences", "k",
+            &["--ignore-case", "--count-all", "--limit", "1", "--skip-matches", "4"]), || false);
+        assert_eq!(exit, EXIT_OK);
+        assert!(!page.get("case_sensitive").flag()); assert_eq!(page.get("name_case").text(), "unicode-lowercase");
+        assert_eq!(page.get("name").text(), "k"); assert_eq!(page.get("name_mode").text(), "exact");
+        assert!(page.get("workspace_complete").flag()); assert!(page.get("matches_seen_exact").flag());
+        assert_eq!(page.get("matches_seen").number(), 6); assert_eq!(page.get("retained_hits").number(), 1);
+        assert_eq!(page.get("skipped_matches").number(), 4);
+        assert_eq!(page.get("next_match_offset").number(), 5);
+        let hit = &page.get("hits").array()[0];
+        assert_eq!(hit.get("name").text(), "K"); assert_eq!(hit.get("member").number(), 1);
+        let expected: Vec<_> = match little {
+            None => "K".as_bytes().to_vec(),
+            Some(little) => "K".encode_utf16()
+                .flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect(),
+        };
+        let range = hit.get("original_range");
+        assert_eq!(&bytes[range.get("start").number() as usize..range.get("end").number() as usize], expected);
+        assert!(!page.get("live_roots_accessed").flag());
+
+        let (exit, count) = invoke(&args(&f, "occurrences", "k",
+            &["--ignore-case", "--count-all", "--limit", "0"]), || false);
+        assert_eq!(exit, EXIT_OK); assert_eq!(count.get("matches_seen").number(), 6);
+        assert_eq!(count.get("retained_hits").number(), 0);
+        assert!(count.get("matches_seen_exact").flag()); assert!(!count.get("has_more_matches").flag());
+        assert_eq!(count.get("next_match_offset"), &Json::Null);
+        let (exit, page) = invoke(&args(&f, "occurrences", "k",
+            &["--ignore-case", "--limit", "1", "--skip-matches", "1"]), || false);
+        assert_eq!(exit, EXIT_PARTIAL); assert_eq!(page.get("matches_seen").number(), 3);
+        assert_eq!(page.get("hits").array()[0].get("name").text(), "K");
+        assert_eq!(page.get("next_match_offset").number(), 2);
+        assert!(!page.get("matches_seen_exact").flag());
+        let (exit, legacy) = invoke(&args(&f, "occurrences", "K", &[]), || false);
+        assert_eq!(exit, EXIT_OK); assert!(legacy.get("case_sensitive").flag());
+        assert_eq!(legacy.get("matches_seen").number(), 2);
+        assert!(legacy.get("hits").array().iter().all(|hit| hit.get("name").text() == "K"));
+    }
+}
+
+#[test]
+fn lowercase_occurrence_cli_rejects_partial_expansions_and_preserves_wider_source_spelling() {
+    let text = "İ i\u{307} I\u{307} i I ß ẞ ss SS ΟΣ οσ ος É é e\u{301}";
+    let f = Fixture::new(&[entry(b"tokens.txt", text.as_bytes())], true);
+    for (query, expected) in [("i", vec!["i", "I"]),
+        ("i\u{307}", vec!["İ", "i\u{307}", "I\u{307}"]),
+        ("ß", vec!["ß", "ẞ"]), ("ss", vec!["ss", "SS"]),
+        ("οσ", vec!["ΟΣ", "οσ"]), ("ος", vec!["ος"]), ("é", vec!["É", "é"])] {
+        let (exit, report) = invoke(&args(&f, "occurrences", query, &["--ignore-case", "--count-all"]), || false);
+        assert_eq!(exit, EXIT_OK); assert_eq!(report.get("matches_seen").number(), expected.len() as u64);
+        assert_eq!(report.get("hits").array().iter().map(|hit| hit.get("name").text()).collect::<Vec<_>>(), expected);
+        assert!(report.get("matches_seen_exact").flag());
+    }
+    let needle = "K".repeat(1024); let spelling = "K".repeat(1024);
+    let wide = Fixture::new(&[entry(b"wide.txt", spelling.as_bytes())], true);
+    let (exit, report) = invoke(&args(&wide, "occurrences", &needle,
+        &["--ignore-case", "--count-all"]), || false);
+    assert_eq!(exit, EXIT_OK); assert_eq!(report.get("name").text(), needle);
+    assert_eq!(report.get("hits").array()[0].get("name").text(), spelling);
+    assert_eq!(report.get("metadata_omitted").number(), 0);
+    assert_eq!(report.get("metadata_bytes").number(), spelling.len() as u64);
 }

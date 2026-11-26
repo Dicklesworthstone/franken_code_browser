@@ -31,7 +31,7 @@ const HELP: &str = "fcb snapshot save ROOT --output NEW_FILE [--json] [--respect
 fcb snapshot catalog FILE --output NEW_CATALOG [--json]\n\
 fcb snapshot inspect FILE [--json] [--limit N]\n\
 fcb snapshot search FILE (--text LITERAL | --raw-hex HEX | --query EXPRESSION) [--json] [--limit N]\n\
-Matching options: --ignore-case (text, expressions, symbols or headings), --count-all (search or structure).\n\
+Matching options: --ignore-case (text, expressions or structural names), --count-all (search or structure).\n\
 Complete --count-all exits 0 for a positive total or 1 for zero, even when rows are capped.\n\
 Incomplete saved coverage exits 3; ordinary capped searches also exit 3.\n\
 --ignore-case uses Unicode scalar lowercase, not full case folding or canonical normalization.\n\
@@ -43,13 +43,13 @@ Earlier omitted rows keep ordinary search exits partial (3); --count-all retains
 Zero-row queries never propose a nonprogressing continuation. Source/work caps still apply.\n\
 Expression counts include primary occurrences only after all whole-member predicates succeed.\n\
 Expression --ignore-case applies Unicode lowercase to every positive and excluded text term.\n\
-Structure --ignore-case applies to symbol/heading names; --count-all supports all structural modes.\n\
+Structure --ignore-case applies to symbol/heading names and whole-token occurrences; --count-all supports all structural modes.\n\
 fcb snapshot structure FILE --mode symbols|headings|occurrences --name TEXT [--json]\n\
 fcb snapshot read FILE (--member NAME | --member-hex HEX) [--json]\n\
 fcb snapshot index help  # Build/reopen pinned substring indexes\n\
 Structure options: --name-mode exact|prefix|contains --limit N --max-source-bytes N\n\
-Structural queries inspect the whole saved archive with case-sensitive names (default exact).\n\
-Occurrences require exact whole-token names; comments and string literals participate.\n\
+Structural queries inspect the whole saved archive; names are case sensitive by default.\n\
+Occurrences require whole-token names (--name-mode exact); comments and string literals participate.\n\
 Declarations are heuristic candidates; headings have qualified original-byte ranges.\n\
 Structure limits: 4096 hits; 64 MiB aggregate source; symbols 64 KiB, headings 256 KiB, occurrences 32 MiB per file.\n\
 Zero source allowance stops before a nonempty eligible member; zero hits probes existence.\n\
@@ -252,7 +252,7 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
         Mode::Structure => settings.source.is_some() && settings.structure_mode.is_some() && settings.structure_name.is_some()
             && seen & !(1 | 8 | catalog_options | 2097152 | 4194304 | 8388608 | 16777216 | 33554432 | 67108864 | 134217728) == 0
             && (settings.structure_mode != Some(StructureMode::Occurrences)
-                || (settings.name_mode == SymbolNameMode::Exact && !settings.ignore_case)),
+                || settings.name_mode == SymbolNameMode::Exact),
         Mode::Read => settings.source.is_some() && settings.member.is_some()
             && seen & !(1 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 16384 | catalog_options) == 0
             && seen & (1024 | 2048) != (1024 | 2048)
@@ -478,12 +478,17 @@ mod tests {
         assert_eq!(options.limit, 0); assert!(options.ignore_case); assert!(options.count_all_matches);
         let counted = parse(&args(&["structure", "saved", "--mode", "occurrences", "--name", "target", "--count-all"])).unwrap();
         assert!(counted.count_all_matches); assert!(!counted.ignore_case);
+        let lowercase = parse(&args(&["structure", "saved", "--mode", "occurrences", "--name", "K",
+            "--ignore-case", "--count-all", "--skip-matches", "18446744073709551615"])).unwrap();
+        assert!(lowercase.ignore_case && lowercase.count_all_matches);
+        assert_eq!(lowercase.name_mode, SymbolNameMode::Exact); assert_eq!(lowercase.skip_matches, u64::MAX);
         for values in [vec!["structure", "saved", "--mode", "symbols"],
             vec!["structure", "saved", "--name", "target"],
             vec!["structure", "saved", "--mode", "symbols", "--name", "target", "--text", "target"],
             vec!["structure", "saved", "--mode", "headings", "--name", "target", "--respect-ignores"],
             vec!["structure", "saved", "--mode", "occurrences", "--name", "target", "--name-mode", "prefix"],
-            vec!["structure", "saved", "--mode", "occurrences", "--name", "target", "--ignore-case"],
+            vec!["structure", "saved", "--mode", "occurrences", "--name", "target", "--name-mode", "prefix", "--ignore-case"],
+            vec!["structure", "saved", "--mode", "occurrences", "--name", "target", "--name-mode", "contains", "--ignore-case"],
             vec!["structure", "saved", "--mode", "symbols", "--name", "target", "--ignore-case", "--ignore-case"],
             vec!["structure", "saved", "--mode", "headings", "--name", "target", "--count-all", "--count-all"],
             vec!["structure", "saved", "--mode", "occurrences", "--name", "module::target"],
