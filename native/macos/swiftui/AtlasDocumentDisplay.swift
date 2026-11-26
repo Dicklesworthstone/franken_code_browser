@@ -15,7 +15,7 @@ import CryptoKit
 /// parsing Markdown or reshaping its strings in the native host.
 enum AtlasDocumentDisplayLimits {
     static let pageItems: UInt64 = 128
-    static let items: UInt64 = 8192
+    static let items: UInt64 = 16_384
     static let pageGlyphs = 16_384
     static let runGlyphs = 4096
     static let fonts = 6

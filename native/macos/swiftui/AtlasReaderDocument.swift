@@ -73,14 +73,15 @@ struct AtlasDocumentImageSource: Sendable, Equatable {
 }
 
 enum AtlasReaderDocumentLimits {
-    // Use the public DocumentReadOptions source allowance while retaining the
-    // default bounded flow/metadata quotas. NativeDocumentDisplay has its own
-    // smaller source allowance; a larger document still has logical navigation.
-    static let sourceBytes: UInt64 = 256 * 1024
-    static let styledSourceBytes: UInt64 = 128 * 1024
-    static let flowLines: UInt64 = 8192
-    static let flowItems: UInt64 = 8192
-    static let blocks: UInt64 = 4096
+    // Retained readers opt into the larger public document profile. Logical
+    // and Styled preparation bound original bytes and decoded UTF-8 separately;
+    // link collection keeps its independent, smaller parser allowance.
+    static let sourceBytes: UInt64 = 512 * 1024
+    static let styledSourceBytes: UInt64 = 512 * 1024
+    static let linkSourceBytes: UInt64 = 256 * 1024
+    static let flowLines: UInt64 = 16_384
+    static let flowItems: UInt64 = 16_384
+    static let blocks: UInt64 = 8192
     static let pageLines: UInt64 = 64
     static let context: UInt64 = 2048
     static let pageTextBytes: UInt64 = 256 * 1024
@@ -443,6 +444,9 @@ struct AtlasReaderDocumentJob: Sendable {
         case .copy(let target, let mode):
             json = transport.copy(handle, generation, target.rendered.start, target.rendered.end, mode.rawValue)
         case .prepareLinks:
+            guard info.identity.capturedBytes <= AtlasReaderDocumentLimits.linkSourceBytes else {
+                throw AtlasReaderError.invalidInput
+            }
             guard let prepare = transport.prepareLinks else { throw AtlasReaderError.unavailable }
             json = prepare(handle, generation, AtlasReaderDocumentLimits.links)
         case .links(let first):
@@ -730,7 +734,11 @@ struct AtlasReaderDocumentJob: Sendable {
             case .displayFromSource(let offset):
                 guard let displayInventory, displayInventory.document.matches(inventory),
                       displayInventory.qualifiedSources, inventory.admitsOriginalOffset(offset) else { throw AtlasReaderError.invalidInput }
-            case .prepareLinks, .prepare: break
+            case .prepareLinks:
+                guard info.identity.capturedBytes <= AtlasReaderDocumentLimits.linkSourceBytes else {
+                    throw AtlasReaderError.invalidInput
+                }
+            case .prepare: break
             }
         }
         if case .prepare = request {

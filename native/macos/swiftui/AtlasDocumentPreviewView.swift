@@ -233,7 +233,7 @@ import AppKit
                 Text("Links").font(.headline)
                 Spacer()
                 Button(model.links == nil ? "Load links" : "Reload", action: model.prepareLinks)
-                    .disabled(!model.canNavigate)
+                    .disabled(!model.canPrepareLinks)
                     .help("Parse link occurrences from this exact captured Markdown document")
             }
             .padding(.horizontal, 10)

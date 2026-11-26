@@ -318,6 +318,15 @@ changes or the originating index/archive closes. Source and decoded-input bounds
 apply independently; malformed documents and unqualified mappings remain explicit.
 Executable and native verification are pending.
 
+**Retained Markdown previews admit larger documentation.** Text and Styled
+preview now have a 512 KiB ceiling for both original source and decoded UTF-8.
+The reader uses bounded pages and a separate document admission budget to keep
+larger layouts and reflow candidates accountable. Exact source coordinates,
+heading navigation and copy remain tied to the retained capture. Link
+inventories keep their 256 KiB limit, and atlas parcels keep their smaller
+profile. Parser complexity and layout limits can still require fallback.
+Executable and physical-Mac verification remain pending.
+
 **Find in a Markdown preview searches the rendered document.** Literal phrases can
 cross emphasis or link markup, with a complete match count and Previous/Next navigation
 through bounded result pages. Each match opens its logical text context using the retained

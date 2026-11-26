@@ -955,9 +955,20 @@ leave incomplete stdout; the exit is nonzero and only a redacted stderr error
 follows, never a second JSON document appended to the prefix. There is no custom
 signal handler or streaming subscription protocol.
 
-All managed allocations share a 256 MiB admission ledger, including conservative
-workspace metadata/capture reservations and old/new overlap. This is not a total
-process/RSS limit; OS internals, argv and allocator overhead require headroom.
+Ordinary host managed allocations use a 256 MiB admission ledger, including
+conservative workspace metadata/capture reservations and old/new overlap.
+Retained `ReaderSession` document preparation, rich display and source
+qualification share a separate 768 MiB document ledger. Accepted logical and
+Styled layouts and their replacement candidates all charge that same document
+ledger; admission failure preserves the accepted layout. The reader's two
+ledgers have a combined 1 GiB ceiling. These are managed admission limits, not a
+total process/RSS limit; other sessions, OS internals, argv and allocator
+overhead require headroom.
+
+Retained readers can opt into 512 KiB of original and decoded document source.
+The general document defaults, link-collection bounds, atlas parcel profile and
+Desk session admission remain independent. Native retained readers request
+16,384 logical rows/items and 8,192 blocks, while page sizes stay bounded.
 
 ## Filesystem authority boundary
 

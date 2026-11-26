@@ -47,7 +47,7 @@ private func fcb_reader_document_image_chunk(_ handle: UInt64, _ generation: UIn
 
 extension AtlasReaderDocumentTransport {
     static let native = Self(prepare: { handle, generation, width in
-        // Logical preview supports the larger public source bound. Styled
+        // The retained reader opts into the larger document profile. Styled
         // display is an independently admitted optional request below.
         take(fcb_reader_document(handle, generation, width, AtlasReaderDocumentLimits.sourceBytes,
             AtlasReaderDocumentLimits.flowLines, AtlasReaderDocumentLimits.flowItems, AtlasReaderDocumentLimits.blocks))

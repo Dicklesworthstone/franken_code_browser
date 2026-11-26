@@ -388,7 +388,71 @@ import CryptoKit
         }
     }
 
+    static func expandedInventoryPages() throws {
+        // Real wire decoder coverage only: many retained display items do not
+        // grant a larger reply page, glyph array, or source identity domain.
+        for total in [UInt64(8193), 16384] {
+            var first = wire()
+            first["total_display_items"] = String(total)
+            first["display_items"] = (0..<128).map { item(index: UInt64($0)) }
+            first["next_display_item"] = "128"
+            let accepted = try decode(first)
+            precondition(accepted.inventory.totalItems == total && accepted.items.count == 128
+                && accepted.next == 128 && accepted.inventory.document.matches(document),
+                "Expanded display inventory must remain a bounded page over the original document")
+
+            let start = total - 128
+            var last = first
+            last["command"] = "document-display-page"; last["first_display_item"] = String(start)
+            last["display_items"] = (0..<128).map { item(index: start + UInt64($0)) }
+            last["next_display_item"] = NSNull()
+            let tail = try AtlasDocumentDisplayWire.page(json(last), document: document,
+                command: "document-display-page", first: start, width: 200, previous: accepted.inventory)
+            precondition(tail.first == start && tail.items.count == 128
+                && tail.items.last?.id == total - 1 && tail.next == nil,
+                "Late display pages are reachable beyond the former 8192-item ceiling")
+
+            var eof = last
+            eof["first_display_item"] = String(total); eof["display_items"] = [[String: Any]]()
+            let end = try AtlasDocumentDisplayWire.page(json(eof), document: document,
+                command: "document-display-page", first: total, width: 200, previous: accepted.inventory)
+            precondition(end.first == total && end.items.isEmpty && end.next == nil)
+
+            var changed = last
+            changed["total_display_items"] = String(total - 1)
+            do {
+                _ = try AtlasDocumentDisplayWire.page(json(changed), document: document,
+                    command: "document-display-page", first: start, width: 200, previous: accepted.inventory)
+                preconditionFailure("A later page replaced the accepted display inventory")
+            } catch AtlasReaderError.invalidResponse { }
+        }
+        do {
+            var w = wire()
+            w["total_display_items"] = "16385"; w["next_display_item"] = "1"
+            rejects(w, "display inventory beyond the inclusive 16384-item bound")
+
+            w = wire(); w["total_display_items"] = "16384"
+            w["display_items"] = (0..<129).map { item(index: UInt64($0)) }
+            w["next_display_item"] = "129"
+            rejects(w, "129 items in a page despite the enlarged inventory")
+
+            w = wire(); w["total_display_items"] = "16384"
+            w["display_items"] = (0..<4).map {
+                item(index: UInt64($0), glyphs: Array(repeating: glyph(), count: 4096))
+            }
+            w["next_display_item"] = "4"
+            let fullGlyphPage = try decode(w)
+            precondition(fullGlyphPage.items.count == 4 && fullGlyphPage.next == 4,
+                "The existing 16384-glyph page allowance remains inclusive")
+
+            var rows = w["display_items"] as! [[String: Any]]
+            rows.append(item(index: 4)); w["display_items"] = rows; w["next_display_item"] = "5"
+            rejects(w, "one glyph beyond the unchanged aggregate page allowance")
+        }
+    }
+
     static func main() throws {
+        try expandedInventoryPages()
         try utf16Documents()
         try savedImageReceipts()
         let accepted = try decode(wire())

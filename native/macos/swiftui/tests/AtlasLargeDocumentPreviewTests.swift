@@ -1,6 +1,8 @@
 // Production document decoder/admission and preview-model regressions. Fixed
 // foreign responses qualify host behavior, not Markdown parsing or Mac drawing.
-// The companion Rust host suite exercises the extended styled source allowance.
+// The companion Rust host suite exercises the extended source and layout limits.
+// Styled replies below are fixed model fixtures, not evidence of large-file
+// Markdown parsing, bundled-font shaping, or native rendering.
 import Foundation
 
 private enum LargeDocumentWire {
@@ -92,6 +94,7 @@ private enum LargeDocumentWire {
     var width: UInt64 = 96
     var styledError: AtlasReaderError?
     var hold = false
+    var holdStyled = false
     var pending: [(CheckedContinuation<AtlasReaderDocumentResult, Error>, AtlasReaderDocumentResult)] = []
     var styledCalls: Int { requests.filter { if case .prepareDisplay = $0 { true } else { false } }.count }
     init(bytes: UInt64, encoding: String = "utf8") throws { info = try LargeDocumentWire.info(bytes: bytes, encoding: encoding) }
@@ -103,17 +106,32 @@ private enum LargeDocumentWire {
         let (continuation, result) = pending.removeFirst()
         continuation.resume(returning: result)
     }
+    /// A mapped display anchor is enough to exercise the host's Styled/Text
+    /// navigation contract. It deliberately makes no font or pixel claim.
+    private func display(_ inventory: AtlasDocumentDisplayInventory, at offset: UInt64? = nil)
+        -> AtlasDocumentDisplayPage {
+        let end = offset == inventory.document.identity.capturedBytes
+        let region = LargeDocumentWire.originalRange(inventory.document.identity)
+        if let offset, !end { precondition(region.start <= offset && offset < region.end) }
+        let item = AtlasDocumentDisplayItem(id: 0, bounds: inventory.bounds, original: region,
+            content: .anchor("café-tail", heading: true, level: 2))
+        return .init(id: UUID(), inventory: inventory, first: end ? 1 : 0,
+            items: end ? [] : [item], next: nil)
+    }
     func execute(_ request: AtlasReaderDocumentRequest) async throws -> AtlasReaderDocumentResult {
         requests.append(request)
         let job = try state.admit(request, info: info)
         let result: AtlasReaderDocumentResult
         if case .prepareDisplay(let points) = request {
             if let styledError { throw styledError }
-            guard let inventory = state.inventory else { throw AtlasReaderError.invalidInput }
-            let display = AtlasDocumentDisplayInventory(document: inventory, width: points,
-                bounds: .init(x: 0, y: 0, width: Double(points), height: 20), totalItems: 0,
+            guard let document = state.inventory else { throw AtlasReaderError.invalidInput }
+            let inventory = AtlasDocumentDisplayInventory(document: document, width: points,
+                bounds: .init(x: 0, y: 0, width: Double(points), height: 20), totalItems: 1,
                 unresolvedImages: 0, qualifiedSources: true, fonts: [])
-            result = .display(.init(id: UUID(), inventory: display, first: 0, items: [], next: nil), fonts: [])
+            result = .display(display(inventory), fonts: [])
+        } else if case .displayFromSource(let offset) = request {
+            guard let inventory = state.displayInventory else { throw AtlasReaderError.invalidInput }
+            result = .display(display(inventory, at: offset), fonts: nil)
         } else {
             var wire: [String: Any]
             switch request {
@@ -138,7 +156,10 @@ private enum LargeDocumentWire {
             result = try job.decode(DocumentWireFixture.json(wire))
         }
         try state.accept(result, job: job)
-        if hold { return try await withCheckedThrowingContinuation { pending.append(($0, result)) } }
+        let shouldHold: Bool
+        if case .prepareDisplay = request { shouldHold = hold || holdStyled }
+        else { shouldHold = hold }
+        if shouldHold { return try await withCheckedThrowingContinuation { pending.append(($0, result)) } }
         return result
     }
 }
@@ -163,29 +184,33 @@ private enum LargeDocumentWire {
         do { try work(); preconditionFailure(reason) } catch { checks += 1 }
     }
     @MainActor static func main() async throws {
+        check(AtlasReaderDocumentLimits.sourceBytes == 512 * 1024
+                && AtlasReaderDocumentLimits.styledSourceBytes == 512 * 1024,
+            "Logical and Styled preview share the inclusive 512 KiB source allowance")
+        check(AtlasReaderDocumentLimits.linkSourceBytes == 256 * 1024,
+            "Preview expansion does not silently expand the independent link-parser allowance")
         for encoding in ["utf8", "utf16le", "utf16be"] {
             let step: UInt64 = encoding == "utf8" ? 1 : 2
             for bytes in [UInt64(64 * 1024), 64 * 1024 + step, 100 * 1024,
-                          128 * 1024, 128 * 1024 + step, 256 * 1024] {
+                          128 * 1024, 128 * 1024 + step, 256 * 1024,
+                          256 * 1024 + step, 384 * 1024, 512 * 1024] {
                 let fixture = try LargePreviewFixture(bytes: bytes, encoding: encoding), model = fixture.model()
                 model.bind(identity: fixture.info.identity, sourceOffset: 0)
                 check(model.canPrepare && fixture.requests.isEmpty, "Binding an admitted capture remains inert")
                 model.prepare(); await wait { !model.busy }
                 check(model.authorized && model.page != nil, "Logical preview supports the full public source range")
-                if bytes <= 128 * 1024 {
-                    check(model.showsStyled && fixture.styledCalls == 1,
-                        "Styled preview admits the extended source range through the inclusive 128 KiB boundary")
-                } else {
-                    check(!model.showsStyled && model.displayPage == nil && fixture.styledCalls == 0,
-                        "Larger Markdown skips typography and font/image work while retaining logical preview")
-                    check(model.coverage.contains("limited to 128 KiB") && model.notice.contains("Text preview"),
-                        "Automatic fallback explains the distinct presentation bound")
-                }
+                check(model.showsStyled && fixture.styledCalls == 1,
+                    "The host admits Styled preview above the former 128/256 KiB limits through 512 KiB")
+                check(model.displayPage?.inventory.document.identity.matches(fixture.info.identity) == true
+                        && model.page?.inventory.identity.matches(fixture.info.identity) == true,
+                    "Both presentations retain the exact capture identity at every admitted boundary")
+                check(model.canPrepareLinks == (bytes <= 256 * 1024),
+                    "Link discovery keeps its inclusive 256 KiB source boundary independently of preview")
             }
         }
-        for (bytes, encoding) in [(UInt64(256 * 1024 + 1), "utf8"),
-                                  (UInt64(256 * 1024 + 2), "utf16le"),
-                                  (UInt64(256 * 1024 + 2), "utf16be"),
+        for (bytes, encoding) in [(UInt64(512 * 1024 + 1), "utf8"),
+                                  (UInt64(512 * 1024 + 2), "utf16le"),
+                                  (UInt64(512 * 1024 + 2), "utf16be"),
                                   (UInt64(96 * 1024), "unsupported")] {
             let fixture = try LargePreviewFixture(bytes: bytes, encoding: encoding), model = fixture.model()
             model.bind(identity: fixture.info.identity, sourceOffset: 0); model.prepare()
@@ -195,22 +220,29 @@ private enum LargeDocumentWire {
         }
         for encoding in ["utf8", "utf16le", "utf16be"] {
             try await navigationAndCopy(encoding: encoding)
-        }
-        for bytes in [UInt64(100 * 1024), 192 * 1024] {
-            try await canceledAndReplaced(bytes: bytes)
+            try await linksKeepTheirOwnLimit(encoding: encoding)
+            try await canceledStyledPreparation(encoding: encoding)
+            for bytes in [UInt64(100 * 1024), 384 * 1024, 512 * 1024] {
+                try await canceledAndReplaced(bytes: bytes, encoding: encoding)
+            }
         }
         try await decodedLimitKeepsText()
+        try await engineRefusalsKeepText()
+        try expandedLogicalInventory()
         try malformedReplies()
         print("AtlasLargeDocumentPreviewTests: \(checks) checks passed")
     }
     @MainActor private static func navigationAndCopy(encoding: String) async throws {
-        let fixture = try LargePreviewFixture(bytes: 256 * 1024, encoding: encoding), model = fixture.model()
+        let fixture = try LargePreviewFixture(bytes: 512 * 1024, encoding: encoding), model = fixture.model()
         let original = LargeDocumentWire.originalRange(fixture.info.identity)
         let originalHex = DocumentWireFixture.hex(LargeDocumentWire.original(encoding))
         model.bind(identity: fixture.info.identity, sourceOffset: original.start)
+        model.selectStyled(false)
         model.prepare(); await wait { !model.busy }
         check(model.page?.first == 64 && model.page?.lines.count == 6 && model.headings?.rows.count == 1,
-            "Initial source navigation beyond the styled ceiling restores its bounded logical page")
+            "Initial source navigation near the 512 KiB boundary restores its bounded logical page")
+        check(fixture.styledCalls == 0 && !model.showsStyled,
+            "An explicit Text preference does not submit Styled work")
         let page = model.page!, target = page.target(at: 64)!
         var sourceAnchor: UInt64?
         model.showSource(target) { target in sourceAnchor = model.sourceOffset(for: target, reader: fixture.info.identity) }
@@ -222,51 +254,102 @@ private enum LargeDocumentWire {
         check(copied == originalHex, "Exact Markdown copy retains encoded source bytes, delimiters and CRLF")
         model.copy(target, mode: .renderedText) { copied = $0; return true }; await wait { !model.busy }
         check(copied == LargeDocumentWire.rendered, "Rendered copy remains a separate declared domain")
-        let requests = fixture.requests.count
-        model.selectStyled(true)
-        check(fixture.requests.count == requests && model.page?.id == page.id && model.authorized && !model.showsStyled,
-            "Explicit Styled keeps the accepted logical location without a doomed worker call")
-        check(model.notice.contains("limited to 128 KiB"), "Explicit fallback explains its limit")
+        model.selectStyled(true); await wait { !model.busy }
+        check(model.showsStyled && fixture.styledCalls == 1 && model.page?.id == page.id,
+            "Explicit Styled preparation preserves the accepted late logical page")
+        check(model.displayPage?.items.first?.original == original
+                && model.displayPage?.inventory.document.matches(page.inventory) == true,
+            "Styled source restoration stays in the same capture and logical generation")
         model.widthInput = "80"; model.prepare(); await wait { !model.busy }
         check(model.page?.inventory.width == 80 && model.page?.first == 64 && !model.allows(target),
             "Reflow keeps the original anchor and revokes the old page token")
-        check(fixture.styledCalls == 0 && model.coverage.contains("Text preview"), "Reflow preserves the logical fallback")
-        rejects("A direct rich request must preserve its independent source bound") {
-            _ = try fixture.state.admit(.prepareDisplay(width: 640), info: fixture.info)
-        }
-        check(fixture.state.page?.inventory.matches(model.page!.inventory) == true,
-            "A refused rich request preserves accepted logical authority")
+        check(model.showsStyled && fixture.styledCalls == 2
+                && model.displayPage?.items.first?.original == original
+                && model.displayPage?.inventory.document.matches(model.page!.inventory) == true,
+            "Reflow remaps the Styled page through the same exact source region")
+        check(model.page?.inventory.identity.matches(fixture.info.identity) == true
+                && model.page!.inventory.generation > page.inventory.generation
+                && fixture.state.page?.inventory.matches(model.page!.inventory) == true,
+            "Layout replacement changes generation while preserving original capture identity")
     }
-    @MainActor private static func canceledAndReplaced(bytes: UInt64) async throws {
-        let fixture = try LargePreviewFixture(bytes: bytes), model = fixture.model()
+    @MainActor private static func linksKeepTheirOwnLimit(encoding: String) async throws {
+        let step: UInt64 = encoding == "utf8" ? 1 : 2
+        for bytes in [UInt64(256 * 1024) + step, 512 * 1024] {
+            let fixture = try LargePreviewFixture(bytes: bytes, encoding: encoding), model = fixture.model()
+            model.bind(identity: fixture.info.identity, sourceOffset: 0)
+            model.prepare(); await wait { !model.busy }
+            let page = model.page!, display = model.displayPage!, requests = fixture.requests.count
+            check(model.canNavigate && model.showsStyled && !model.canPrepareLinks,
+                "Large retained Markdown remains navigable without admitting an oversized link inventory")
+            model.prepareLinks(); await settle()
+            check(fixture.requests.count == requests && !model.busy && model.links == nil,
+                "A direct oversized link request is explained before any foreign worker call")
+            check(model.page?.id == page.id && model.displayPage?.id == display.id
+                    && model.authorized && model.canNavigate && model.showsStyled,
+                "Link refusal preserves the accepted Text and Styled presentation authority")
+            check(model.notice.contains("256 KiB") && model.notice.lowercased().contains("link"),
+                "Link refusal explains its independent source allowance")
+            rejects("Direct state admission must preserve the independent link-source bound") {
+                _ = try fixture.state.admit(.prepareLinks, info: fixture.info)
+            }
+            check(fixture.state.page?.id == page.id
+                    && fixture.state.displayInventory?.matches(display.inventory) == true,
+                "A rejected direct link request cannot retire the accepted preview state")
+            let target = model.page!.target(at: 0)!
+            model.showSource(target); await wait { !model.busy }
+            check(model.source?.selectedHex == DocumentWireFixture.hex(LargeDocumentWire.original(encoding))
+                    && model.page?.inventory.identity.matches(fixture.info.identity) == true,
+                "Exact source navigation remains available after link-inventory refusal")
+        }
+    }
+    @MainActor private static func canceledAndReplaced(bytes: UInt64, encoding: String) async throws {
+        let fixture = try LargePreviewFixture(bytes: bytes, encoding: encoding), model = fixture.model()
         model.bind(identity: fixture.info.identity, sourceOffset: 0)
         fixture.hold = true; model.prepare(); await wait { fixture.pending.count == 1 }
         model.cancel(); fixture.release(); await settle()
         check(model.page == nil && !model.authorized && fixture.styledCalls == 0,
             "Canceled late preparation cannot publish a logical page or schedule rich work")
         fixture.hold = false; model.prepare(); await wait { !model.busy }
-        check(model.authorized && model.page != nil, "A later explicit preparation recovers after cancellation")
+        check(model.authorized && model.page?.inventory.identity.matches(fixture.info.identity) == true,
+            "A later explicit preparation recovers the original capture after cancellation")
         let styledCalls = fixture.styledCalls
-        check(styledCalls == (bytes <= 128 * 1024 ? 1 : 0),
-            "Recovery respects the independent styled source allowance")
+        check(styledCalls == 1 && model.showsStyled,
+            "Recovery admits Styled work throughout the expanded source allowance")
         fixture.hold = true; model.widthInput = "80"; model.prepare(); await wait { fixture.pending.count == 1 }
-        let replacement = try LargeDocumentWire.info(bytes: 32 * 1024, revision: 2)
+        let replacement = try LargeDocumentWire.info(bytes: 32 * 1024, encoding: encoding, revision: 2)
         model.bind(identity: replacement.identity, sourceOffset: 0)
         fixture.release(); await settle()
-        check(model.page == nil && !model.authorized && model.canPrepare && fixture.styledCalls == styledCalls,
+        check(model.page == nil && model.displayPage == nil && !model.authorized
+                && model.canPrepare && fixture.styledCalls == styledCalls,
             "Capture replacement suppresses old large-document responses and their follow-up work")
+    }
+    @MainActor private static func canceledStyledPreparation(encoding: String) async throws {
+        let fixture = try LargePreviewFixture(bytes: 512 * 1024, encoding: encoding), model = fixture.model()
+        fixture.holdStyled = true
+        model.bind(identity: fixture.info.identity, sourceOffset: 0)
+        model.prepare(); await wait { fixture.pending.count == 1 && fixture.styledCalls == 1 }
+        let logical = model.page!
+        model.cancel(); fixture.release(); await settle()
+        check(model.page?.id == logical.id && model.authorized && model.canNavigate
+                && model.displayPage == nil && !model.showsStyled,
+            "A late canceled Styled response cannot replace the accepted logical preview")
+        check(model.page?.inventory.identity.matches(fixture.info.identity) == true,
+            "Canceling typography retains the exact captured source")
+        fixture.holdStyled = false; model.selectStyled(true); await wait { !model.busy }
+        check(model.showsStyled && model.page?.id == logical.id && fixture.styledCalls == 2,
+            "An explicit Styled retry can reuse the accepted logical capture after cancellation")
     }
     @MainActor private static func decodedLimitKeepsText() async throws {
         for encoding in ["utf16le", "utf16be"] {
             // A raw-admitted UTF16 capture can exceed the decoded UTF8 allowance.
             // The foreign engine owns that decision; this only verifies its UI fallback.
-            let fixture = try LargePreviewFixture(bytes: 100 * 1024, encoding: encoding), model = fixture.model()
+            let fixture = try LargePreviewFixture(bytes: 512 * 1024, encoding: encoding), model = fixture.model()
             fixture.styledError = .engine("DOCUMENT_DISPLAY_SOURCE_LIMIT")
             model.bind(identity: fixture.info.identity, sourceOffset: 0)
             model.prepare(); await wait { !model.busy }
             check(model.authorized && model.page != nil && !model.showsStyled && fixture.styledCalls == 1,
                 "A decoded-source refusal preserves the accepted logical preview")
-            check(model.notice.contains("128 KiB") && model.notice.contains("decoded UTF-8")
+            check(model.notice.contains("512 KiB") && model.notice.contains("decoded UTF-8")
                     && model.notice.contains("Text preview"),
                 "A decoded-source refusal explains both source domains and the usable fallback")
             let target = model.page!.target(at: 0)!
@@ -276,9 +359,71 @@ private enum LargeDocumentWire {
                 "A refused styled layout leaves exact source navigation available")
         }
     }
+    @MainActor private static func engineRefusalsKeepText() async throws {
+        for encoding in ["utf8", "utf16le", "utf16be"] {
+            for code in ["DOCUMENT_DISPLAY_RESOURCE_DENIED", "DOCUMENT_DISPLAY_LIMIT",
+                         "DOCUMENT_DISPLAY_SHAPING_UNSUPPORTED"] {
+                let fixture = try LargePreviewFixture(bytes: 512 * 1024, encoding: encoding), model = fixture.model()
+                fixture.styledError = .engine(code)
+                model.bind(identity: fixture.info.identity, sourceOffset: 0)
+                model.prepare(); await wait { !model.busy }
+                let page = model.page!
+                check(model.authorized && model.canNavigate && !model.showsStyled
+                        && page.inventory.identity.matches(fixture.info.identity),
+                    "Independent resource, layout and shaping limits preserve readable captured Text")
+                check(model.notice.contains("Text preview"), "Engine refusal leaves its usable fallback visible")
+                var copied = ""
+                model.copy(page.target(at: 0)!, mode: .enclosingMarkdown) { copied = $0; return true }
+                await wait { !model.busy }
+                check(copied == DocumentWireFixture.hex(LargeDocumentWire.original(encoding)),
+                    "Engine refusal cannot disable exact original-byte copy")
+                fixture.styledError = nil
+                model.selectStyled(true); await wait { !model.busy }
+                check(model.showsStyled && model.page?.id == page.id
+                        && model.displayPage?.inventory.document.matches(page.inventory) == true,
+                    "A successful Styled retry uses the same accepted capture and logical inventory")
+            }
+        }
+    }
+    @MainActor private static func expandedLogicalInventory() throws {
+        let info = try LargeDocumentWire.info(bytes: 512 * 1024)
+        let job = AtlasReaderDocumentJob(id: UUID(), info: info, generation: 1,
+            inventory: nil, request: .prepare(width: 96))
+        var wire = LargeDocumentWire.page("document-prepare", info: info, generation: 1, width: 96)
+        wire["total_flow_lines"] = "16384"; wire["rendered_utf8_bytes"] = String(16384 * 20)
+        wire["total_headings"] = "8192"; wire["next_heading"] = "64"
+        let original = LargeDocumentWire.originalRange(info.identity)
+        wire["headings"] = (0..<64).map { index in
+            ["slug": "heading-\(index)", "title": "Retained heading",
+             "rendered_utf8_offset": String(index * 20),
+             "original_range": DocumentWireFixture.range(original.start, original.end)] as [String: Any]
+        }
+        guard case .prepared(let page, let headings) = try job.decode(DocumentWireFixture.json(wire)) else {
+            preconditionFailure("Expanded logical inventory did not prepare")
+        }
+        check(page.inventory.totalLines == 16384 && page.lines.count == 64 && page.next == 64
+                && headings.inventory.totalHeadings == 8192 && headings.rows.count == 64 && headings.next == 64,
+            "Expanded logical inventories still publish only bounded 64-row and heading pages")
+        var invalid = wire; invalid["total_flow_lines"] = "16385"
+        rejects("Expanded flow-line inventory retains its upper bound") {
+            _ = try job.decode(DocumentWireFixture.json(invalid))
+        }
+        invalid = wire; invalid["total_headings"] = "8193"
+        rejects("Expanded heading inventory retains its block bound") {
+            _ = try job.decode(DocumentWireFixture.json(invalid))
+        }
+        invalid = wire
+        var rows = invalid["flow_lines"] as! [[String: Any]]
+        var extra = rows[63]; extra["flow_line"] = "64"
+        extra["rendered_utf8_range"] = DocumentWireFixture.range(1280, 1296)
+        rows.append(extra); invalid["flow_lines"] = rows; invalid["next_flow_line"] = "65"
+        rejects("Larger total inventories cannot widen a logical page beyond 64 rows") {
+            _ = try job.decode(DocumentWireFixture.json(invalid))
+        }
+    }
     @MainActor private static func malformedReplies() throws {
         for encoding in ["utf8", "utf16le", "utf16be"] {
-            for bytes in [UInt64(100 * 1024), 128 * 1024, 256 * 1024] {
+            for bytes in [UInt64(100 * 1024), 128 * 1024, 256 * 1024, 384 * 1024, 512 * 1024] {
                 let info = try LargeDocumentWire.info(bytes: bytes, encoding: encoding)
                 let job = AtlasReaderDocumentJob(id: UUID(), info: info, generation: 1, inventory: nil, request: .prepare(width: 96))
                 let valid = LargeDocumentWire.page("document-prepare", info: info, generation: 1, width: 96)
@@ -295,11 +440,11 @@ private enum LargeDocumentWire {
                     rejects("UTF16 preview must retain its two-byte BOM source base") { _ = try job.decode(DocumentWireFixture.json(bad)) }
                 }
             }
-        }
-        let info = try LargeDocumentWire.info(bytes: 256 * 1024 + 1)
-        let job = AtlasReaderDocumentJob(id: UUID(), info: info, generation: 1, inventory: nil, request: .prepare(width: 96))
-        rejects("Wire admission retains the inclusive 256 KiB source ceiling") {
-            _ = try job.decode(DocumentWireFixture.json(LargeDocumentWire.page("document-prepare", info: info, generation: 1, width: 96)))
+            let info = try LargeDocumentWire.info(bytes: 512 * 1024 + (encoding == "utf8" ? 1 : 2), encoding: encoding)
+            let job = AtlasReaderDocumentJob(id: UUID(), info: info, generation: 1, inventory: nil, request: .prepare(width: 96))
+            rejects("Wire admission retains the inclusive 512 KiB source ceiling") {
+                _ = try job.decode(DocumentWireFixture.json(LargeDocumentWire.page("document-prepare", info: info, generation: 1, width: 96)))
+            }
         }
     }
 }

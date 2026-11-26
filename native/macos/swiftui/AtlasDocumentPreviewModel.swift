@@ -163,17 +163,23 @@ struct AtlasMarkdownPreviewPreference {
             return "Markdown preview supports UTF-8 and BOM-marked UTF-16. The source reader remains available for other encodings."
         }
         guard identity.capturedBytes <= AtlasReaderDocumentLimits.sourceBytes else {
-            return "Markdown preview admits at most 256 KiB of source. The larger retained file remains readable."
+            return "Markdown preview admits at most 512 KiB of original source and decoded UTF-8. The larger retained file remains readable."
         }
         return nil
     }
     private var styledSourceLimitReason: String? {
         guard richSupported, let identity,
               identity.capturedBytes > AtlasReaderDocumentLimits.styledSourceBytes else { return nil }
-        return "This document uses Text preview because Styled preview is limited to 128 KiB of original source and decoded UTF-8. Headings, links, and source navigation remain available."
+        return "Styled preview admits at most 512 KiB of original source and decoded UTF-8. The exact source remains available."
+    }
+    private var linkSourceLimitReason: String? {
+        guard let identity,
+              identity.capturedBytes > AtlasReaderDocumentLimits.linkSourceBytes else { return nil }
+        return "Link inventory admits at most 256 KiB of original source and decoded UTF-8. Continue reading this larger capture or navigate its headings."
     }
     var canPrepare: Bool { unavailableReason == nil }
     var canNavigate: Bool { authorized && page != nil && !busy }
+    var canPrepareLinks: Bool { canNavigate && linkSourceLimitReason == nil }
     /// A canceled navigation may have replaced the worker's logical
     /// page token. Source anchoring needs only the retained inventory, so it
     /// can recover without reflow while old row/copy actions remain read-only.
@@ -221,6 +227,7 @@ struct AtlasMarkdownPreviewPreference {
     }
 
     var linkCoverage: String {
+        if let reason = linkSourceLimitReason { return reason }
         guard let links else { return "Load the links parsed from this retained Markdown capture." }
         return "\(links.rows.count) of \(links.total) retained links shown; \(links.seen) parsed occurrences. "
             + (links.complete ? "Link inventory complete. " : "Link inventory incomplete. ")
@@ -666,6 +673,10 @@ struct AtlasMarkdownPreviewPreference {
 
     func prepareLinks() {
         guard canNavigate, let inventory = page?.inventory else { return }
+        if let reason = linkSourceLimitReason {
+            notice = reason
+            return
+        }
         links = nil; linkHistory = []
         perform(.prepareLinks, notice: "Reading links from retained Markdown…") { model, result in
             guard case .links(let links) = result, links.inventory.matches(inventory), links.first == 0 else {
@@ -985,7 +996,7 @@ struct AtlasMarkdownPreviewPreference {
                         case "DOCUMENT_DISPLAY_SHAPING_UNSUPPORTED":
                             self.notice = "Bundled typography does not support all the text in this document. Text preview and the exact source remain available."
                         case "DOCUMENT_DISPLAY_SOURCE_LIMIT":
-                            self.notice = "Styled preview admits up to 128 KiB of original source and decoded UTF-8. This capture exceeds a source limit; Text preview and source navigation remain available."
+                            self.notice = "Styled preview admits up to 512 KiB of original source and decoded UTF-8. This capture exceeds a source limit; Text preview and source navigation remain available."
                         default:
                             self.notice += " Text preview remains available."
                         }

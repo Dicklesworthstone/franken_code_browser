@@ -2728,13 +2728,12 @@ and physical-Mac visual, wheel and frame-cadence qualification.
 
 Open a retained source file and choose **Markdown**, or **Split preview** to keep
 the source alongside the document. The native reader prepares a **Styled**
-view by default when the host supplies the rich-display capability and the
-capture fits its 128 KiB source and decoded-input limits. **Text** keeps the selectable
-logical preview available for UTF-8 and BOM-marked UTF-16 captures up to **256 KiB**
-in each of those domains. Larger supported
-documents automatically use Text with an explanation; choosing Styled keeps
-that logical preview and its navigation available. The **Columns** field and
-**Reflow** control change the width without reopening the file.
+view by default when the host supplies the rich-display capability. Both Styled
+and selectable **Text** preview admit UTF-8 and BOM-marked UTF-16 captures up to
+**512 KiB of original source and 512 KiB of decoded UTF-8**, checked separately.
+Parser, layout and managed-memory limits still apply. A refused Styled request
+keeps the accepted Text preview available with an explanation. The **Columns**
+field and **Reflow** control change the width without reopening the file.
 
 UTF-16LE and UTF-16BE previews use the shared source decoder before upstream
 Markdown parsing. Heading links, source following, rendered Find, Styled source
@@ -2781,42 +2780,53 @@ Canceling, reflowing, replacing or closing the preview withdraws a pending
 handoff. URL-policy and stale-action regressions are included; executable and
 physical-Mac browser-handoff verification remain pending.
 
-Logical preparation uses the existing public 256 KiB source bound with at most
-8,192 flow rows, 8,192 flow items and 4,096 blocks; each page requests at most
-64 rows. The larger source allowance preserves heading/link navigation,
-original-byte anchors, rendered-text copy and enclosing-Markdown copy. Files
-above 256 KiB remain available in the source reader.
+The retained reader requests at most 16,384 logical flow rows, 16,384 flow items
+and 8,192 blocks; each page requests at most 64 rows. Larger admitted documents
+keep original-byte anchors, heading navigation, rendered-text copy and
+enclosing-Markdown copy. Files above the 512 KiB document ceiling remain
+available in the source reader. Link inventories retain their independent
+**256 KiB** original-source and decoded-input ceilings. For a larger original
+capture, **Load links** is disabled with an explanation; the preview and its
+heading navigation remain available. Atlas parcels retain their 64 KiB profile.
 
-Styled preparation admits up to 128 KiB in each source domain, at most 8,192 display
-elements, 131,072 glyphs, and 8 MiB of bundled font resources. It does not queue
-typography, font or image work for a document above that source bound. A page admits at most 128
-elements and 16,384 glyphs. Source, generation, layout and page identities are
-checked before accepting asynchronous results or enabling source actions.
+Styled preparation selects its resource profile by the larger of original and
+decoded source size. Documents through 128 KiB keep the existing 8,192 display
+element and 131,072 glyph limits. Larger documents admit at most 16,384 elements
+and 524,288 glyphs. Both profiles retain the 8 MiB bundled-font limit. A page
+still admits at most 128 elements and 16,384 glyphs. Source, generation, layout
+and page identities are checked before accepting asynchronous results or enabling source actions.
 Cancellation, capture replacement and failed reflow cannot reactivate stale
 pages. Each logical generation retains one rich width; reflow creates a fresh
 generation. These are admission ceilings: parser complexity, layout, glyph and
 managed-memory limits can still require Text or source fallback for a smaller
 capture, including UTF-16 whose decoded form needs more workspace.
 
-The host retires temporary source-qualification scratch before admitting the
-full rich-display parser, shaping and output envelope. This allows larger
-styled documents within the existing 256 MiB managed budget. Heading jumps,
-source following and both copy domains reuse that completed qualification only
-while the logical and styled layouts name the same immutable capture and
-generation. Successful reflow or clear retires the proof; an unqualified or
-failed display cannot authorize source actions.
+A retained reader shares a 768 MiB document admission ledger across accepted
+logical and Styled layouts, replacement candidates and source qualification.
+Its ordinary operations retain their separate 256 MiB ledger. Reflow can be
+refused when the accepted layouts and replacement candidate exceed that shared
+allowance together; the retained reader keeps the accepted document. The document
+parser allows at most 256 MiB of conservatively charged workspace, while link
+parsing keeps its existing 128 MiB limit. These are managed admission ceilings,
+not measured resident-memory use or a process-wide memory limit.
 
-`tests/test-large-document-preview.sh` covers the native size boundaries,
-fallback, late source anchors, copy domains, reflow and cancellation.
-`crates/fcb-document/tests/native_display.rs` adds exact 128 KiB styled
-pagination, bounded admission and cancellation/recovery regressions.
-`crates/fcb-app/tests/retained_reader_document_display.rs` exercises larger
-styled documents through the host, including heading/source navigation and
-exact copies after display preparation.
-`crates/fcb-app/tests/retained_reader_large_document.rs` covers Text fallback
-above the styled limit and the exact 256 KiB logical boundary with original
-BOM/CRLF offsets. These code-first additions await independent executable
-and physical-Mac qualification.
+Source qualification charges its complete syntax tree once and adds only the
+currently inspected source slice's parser workspace. The host retires that
+scratch before admitting the full rich-display parser, shaping and output
+envelope. Heading jumps, source following and both copy domains reuse completed
+qualification only while logical and Styled layouts name the same immutable
+capture and generation. Successful reflow or clear retires the proof; an
+unqualified or failed display cannot authorize source actions.
+
+`tests/test-large-document-preview.sh` contains native boundary cases through
+512 KiB, independent link admission, late source anchors, exact copy, Styled
+remapping, reflow, cancellation and engine-error fallback.
+`tests/test-document-display.sh` checks the larger inventory ceiling while
+keeping per-page item and glyph limits unchanged.
+Core and retained-reader regression sources cover larger document admission,
+original versus decoded source bounds, parser and overlapping-layout budgets,
+and exact retained-source navigation. These code-first additions await
+independent executable and physical-Mac qualification.
 
 `tests/test-document-preview.sh` and the selected-file reader cases in
 `tests/test-native-open.sh` include authored source-follow coalescing, worker
