@@ -7,7 +7,7 @@
 //! work, bracketed by cancellation, rather than a fixed-duration UI callback.
 
 use fcb::document::reader::{DocumentReadError, DocumentReadOptions, DocumentReader,
-    MAX_DOCUMENT_SOURCE_BYTES};
+    MAX_HEADING_SEARCH_SOURCE_BYTES};
 use fcb::search::{CaptureRequest, CapturedSymbols, QueryGeneration, SymbolError,
     SymbolLanguage, SymbolNameMode, MAX_SYMBOL_ITEMS, MAX_SYMBOL_SOURCE_BYTES};
 use fcb::search::symbols::{CapturedReferences, ReferenceError, MAX_REFERENCE_ITEMS,
@@ -33,7 +33,7 @@ impl AtlasStructureMode {
             Self::Occurrences => "whole-token-text-candidate" }
     }
     pub const fn source_limit(self) -> usize {
-        match self { Self::Symbols => MAX_SYMBOL_SOURCE_BYTES, Self::Headings => MAX_DOCUMENT_SOURCE_BYTES,
+        match self { Self::Symbols => MAX_SYMBOL_SOURCE_BYTES, Self::Headings => MAX_HEADING_SEARCH_SOURCE_BYTES,
             Self::Occurrences => MAX_REFERENCE_SOURCE_BYTES }
     }
 }

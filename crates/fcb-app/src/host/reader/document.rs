@@ -56,7 +56,7 @@ impl ReaderSession {
                 let generation = DocumentGeneration::new(self.owner(), 1)
                     .map_err(|_| ReaderSessionError::IdentityExhausted)?;
                 let qualified = QualifiedDocumentFragments::prepare(&self.capture, id, generation,
-                    &self.budget, [layout_id, provenance_id], &mut canceled)
+                    &self.document_budget, [layout_id, provenance_id], &mut canceled)
                     .map_err(fragment_error)?;
                 resolution = qualified.resolve(requested, &mut canceled).map_err(fragment_error)?;
             }
@@ -74,6 +74,8 @@ impl ReaderSession {
     /// limits; cancellation brackets the upstream call, not a hard deadline.
     /// Private layout AND complete first-page response precede replacement. Old
     /// preview, source, search and outline remain usable on any preparation error.
+    /// Accepted and candidate document states share the same fixed document
+    /// budget; a reflow cannot mint another allowance while old output is live.
     pub fn prepare_document(&mut self, generation: u64, options: ReaderDocumentOptions,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, ReaderSessionError> {
         self.document_attempt(generation)?;
@@ -83,7 +85,7 @@ impl ReaderSession {
         let generation = DocumentGeneration::new(self.owner(), generation)
             .map_err(|_| ReaderSessionError::IdentityExhausted)?;
         let candidate = DocumentReader::prepare(&self.capture, id, generation, options,
-            &self.budget, layout_id, &mut canceled)?.into_owned(&self.budget, source_id)?;
+            &self.document_budget, layout_id, &mut canceled)?.into_owned(&self.document_budget, source_id)?;
         check(&mut canceled)?;
         let mut out = self.output("document-prepare")?;
         summary(&mut out, &candidate)?;
@@ -253,7 +255,7 @@ impl ReaderSession {
         }
         let [qualification_id] = self.allocations()?;
         self.document_snapshot(generation)?.qualify_heading_source_ranges(
-            &self.budget, qualification_id, canceled)?;
+            &self.document_budget, qualification_id, canceled)?;
         Ok(())
     }
     pub(super) fn document_snapshot(&self, generation: u64) -> Result<&DocumentReader<'static>, ReaderSessionError> {

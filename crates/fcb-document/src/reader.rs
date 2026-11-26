@@ -18,8 +18,19 @@ mod heading_provenance;
 mod source_encoding;
 pub(crate) use source_encoding::DocumentSourceEncoding;
 
-pub const MAX_DOCUMENT_SOURCE_BYTES: usize = 256 * 1024;
+/// Opt-in ceiling for both captured bytes and decoded parser input. The
+/// ordinary read options retain their smaller 64 KiB default.
+pub const MAX_DOCUMENT_SOURCE_BYTES: usize = 512 * 1024;
+/// Automatic workspace heading extraction retains its separate source bound;
+/// admitting a larger retained preview does not expand background search work.
+pub const MAX_HEADING_SEARCH_SOURCE_BYTES: usize = 256 * 1024;
 pub const MAX_DOCUMENT_WINDOW_LINES: usize = 1024;
+const MAX_DOCUMENT_PARSE_WORKSPACE_BYTES: usize = 256 * 1024 * 1024;
+
+pub(crate) fn document_parse_workspace(source: &[u8]) -> Result<usize, DocumentReadError> {
+    crate::links::parse_workspace_with_limit(source, MAX_DOCUMENT_PARSE_WORKSPACE_BYTES)
+        .map_err(|_| DocumentReadError::EngineBudget)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DocumentReadOptions {
@@ -132,8 +143,7 @@ impl<'capture> DocumentReader<'capture> {
         let text = source_encoding.text(bytes)?;
         // Reference amplification must be measured in parser input, not raw
         // UTF-16, whose interleaved zero bytes hide the upstream "]:" gate.
-        let parse_charge = crate::links::parse_workspace(text.as_bytes())
-            .map_err(|_| DocumentReadError::EngineBudget)?;
+        let parse_charge = document_parse_workspace(text.as_bytes())?;
         let charge = fixed_charge.checked_add(parse_charge).ok_or(DocumentReadError::InvalidLimits)?;
         lease.reconcile(ByteLength::new(charge as u64)).map_err(|_| DocumentReadError::ResourceDenied)?;
         let parser_capture = CompleteCapture::new(*capture.request(),

@@ -62,6 +62,11 @@ use super::{HostError, HostResponse};
 /// from the legacy whole-text/foreign supplied-buffer limit; larger captures
 /// still return bounded windows and do not widen optional analysis/desk limits.
 pub const MAX_READER_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+/// One shared document ledger covers accepted layouts, rich output, candidate
+/// reflows and provenance scratch. The independent general reader ledger stays
+/// at 256 MiB: the two ceilings sum to 1 GiB, not per-operation allowances.
+/// These are conservative managed reservations, not measured process memory.
+pub const MAX_READER_DOCUMENT_MANAGED_BYTES: u64 = 768 * 1024 * 1024;
 pub const MAX_READER_WINDOW_BYTES: usize = 256 * 1024;
 pub const MAX_READER_MATCHES: usize = 4096;
 // Workspace queries admit 1024 UTF-8 bytes, but their actual source spelling
@@ -193,6 +198,7 @@ pub struct ReaderSession {
     last_comparison_attempt: u64,
     next_allocation: u64,
     budget: ResourceBudget,
+    document_budget: ResourceBudget,
     // Forks retain the SAME source reservation, even after its originating
     // budget handle/session closes. Private reader state is charged separately.
     _source_lease: ResourceLease,
@@ -222,6 +228,8 @@ impl ReaderSession {
         if bytes.len() > MAX_READER_SOURCE_BYTES || path.as_os_str().is_empty()
             || path.as_os_str().len() > 16_384 { return Err(ReaderSessionError::InvalidLimits); }
         let budget = ResourceBudget::new(owner, ByteLength::new(MANAGED_BYTES)).map_err(|_| AppError::Admission)?;
+        let document_budget = ResourceBudget::new(owner, ByteLength::new(MAX_READER_DOCUMENT_MANAGED_BYTES))
+            .map_err(|_| AppError::Admission)?;
         // Preserve the conservative copy/overlap envelope once per supplied
         // source, not once per pin. Every reader separately admits private state
         // and path/checkpoint capacity before either allocation is constructed.
@@ -235,7 +243,7 @@ impl ReaderSession {
         let capture_sha256 = source_sha256(bytes, &mut canceled)?;
         let capture = CompleteCapture::new(request, ByteLength::new(bytes.len() as u64), Arc::from(bytes))?;
         let encoding = detect_encoding(&bytes[..bytes.len().min(3)]);
-        let session = Self::retained(capture, capture_sha256, path, encoding, budget, source_lease, state_lease);
+        let session = Self::retained(capture, capture_sha256, path, encoding, budget, document_budget, source_lease, state_lease);
         check(&mut canceled)?;
         Ok(session)
     }
@@ -245,14 +253,15 @@ impl ReaderSession {
             ByteLength::new(charge as u64)).map_err(|_| AppError::Admission.into())
     }
     fn retained(capture: CompleteCapture, capture_sha256: Sha256Digest, path: &Path, encoding: DetectedEncoding,
-        budget: ResourceBudget, source_lease: ResourceLease, state_lease: ResourceLease) -> Self {
+        budget: ResourceBudget, document_budget: ResourceBudget,
+        source_lease: ResourceLease, state_lease: ResourceLease) -> Self {
         Self { capture, capture_sha256, path: path.to_path_buf(), encoding, highlight: None,
             line_checkpoints: std::array::from_fn(|_| None), source_bytes_read: 0, read_calls: 0,
             file_observation: false, query: None, last_query_attempt: 0,
             outline: None, last_outline_attempt: 0, references: None, last_reference_attempt: 0,
             document: None, document_display: None, document_images: None, document_links: None, last_document_attempt: 0,
             last_comparison_attempt: 0, next_allocation: 3,
-            budget, _source_lease: source_lease, _state_lease: state_lease }
+            budget, document_budget, _source_lease: source_lease, _state_lease: state_lease }
     }
     /// Fork the exact retained bytes and native path into a fresh owner. This
     /// explicitly shares immutable backing and its accounting lease without
@@ -267,12 +276,14 @@ impl ReaderSession {
         if owner == self.owner() { return Err(ReaderSessionError::InvalidLimits); }
         check(&mut canceled)?;
         let budget = ResourceBudget::new(owner, ByteLength::new(MANAGED_BYTES)).map_err(|_| AppError::Admission)?;
+        let document_budget = ResourceBudget::new(owner, ByteLength::new(MAX_READER_DOCUMENT_MANAGED_BYTES))
+            .map_err(|_| AppError::Admission)?;
         let state_lease = Self::reserve_state(owner, &budget)?;
         let request = CaptureRequest::new(FileId::new(owner, 1).map_err(|_| ReaderSessionError::IdentityExhausted)?,
             SourceRevision::new(owner, 1).map_err(|_| ReaderSessionError::IdentityExhausted)?)?;
         let capture = self.capture.share_with_request(request)?;
         let mut session = Self::retained(capture, self.capture_sha256, &self.path, self.encoding, budget,
-            self._source_lease.clone(), state_lease);
+            document_budget, self._source_lease.clone(), state_lease);
         session.highlight = self.highlight.clone();
         check(&mut canceled)?;
         Ok(session)

@@ -133,3 +133,66 @@ fn same_owner_refusal_preserves_the_existing_reader_and_allocation() {
     drop(parent);
     assert_eq!(witness.accounting().reserved().get(), 0);
 }
+
+
+#[test]
+fn large_document_reflow_shares_one_bounded_ledger_and_keeps_general_reader_capacity() {
+    let paragraph = "Retained source remains readable with bounded document layout and exact navigation.\n\n";
+    let text = format!("# Large retained document\n\n{}## Tail\n\nFinal paragraph.\n", paragraph.repeat(4000));
+    assert!(text.len() > 256 * 1024 && text.len() < 512 * 1024);
+    let mut reader = source(9331, text.as_bytes());
+    let general = reader.budget.clone();
+    let documents = reader.document_budget.clone();
+    let general_baseline = general.accounting().reserved();
+    assert_eq!(general.accounting().available().get() + general_baseline.get(), MANAGED_BYTES);
+    assert_eq!(documents.accounting().available().get(), MAX_READER_DOCUMENT_MANAGED_BYTES);
+    assert_eq!(documents.accounting().reserved().get(), 0);
+    let options = ReaderDocumentOptions { max_source_bytes: 512 * 1024,
+        max_flow_lines: 16384, max_flow_items: 16384, max_blocks: 8192, ..Default::default() };
+    reader.prepare_document(1, options, || false).unwrap();
+    reader.prepare_document_display(1, 640, || false).unwrap();
+    assert_eq!(general.accounting().reserved(), general_baseline,
+        "document layout and rich output cannot enlarge or consume the general reader allowance");
+    let accepted = documents.accounting().reserved();
+    assert!(accepted.get() > MANAGED_BYTES);
+    let accepted_items = reader.display_snapshot(1).unwrap().display().items().len();
+    let accepted_glyphs = reader.display_snapshot(1).unwrap().glyph_count();
+    let available = documents.accounting().available().get();
+    assert!(available > 4 * 1024 * 1024);
+    let pressure = documents.try_reserve_managed(reader.owner(), ResourceAllocationId::new(u64::MAX).unwrap(),
+        ByteLength::new(available - 4 * 1024 * 1024)).unwrap();
+    let before = documents.accounting();
+    let reflow = ReaderDocumentOptions { width_columns: 120, ..options };
+    assert_eq!(reader.prepare_document(2, reflow, || false).err(),
+        Some(ReaderSessionError::Document(fcb::document::reader::DocumentReadError::ResourceDenied)));
+    assert_eq!(documents.accounting().reserved(), before.reserved());
+    assert_eq!(documents.accounting().active_allocations(), before.active_allocations());
+    assert_eq!(reader.document_generation(), Some(1));
+    assert_eq!(reader.display_snapshot(1).unwrap().display().items().len(), accepted_items);
+    assert_eq!(reader.display_snapshot(1).unwrap().glyph_count(), accepted_glyphs);
+    assert_eq!(reader.prepare_document(3, reflow, || true).err(), Some(ReaderSessionError::Canceled));
+    assert_eq!(documents.accounting().reserved(), before.reserved());
+    assert!(reader.read_window(0, 128, || false).unwrap().as_str().contains("Large retained document"));
+    drop(pressure);
+    assert_eq!(documents.accounting().reserved(), accepted);
+
+    // The same ledger has room for the accepted logical+Styled output and a
+    // new logical candidate. Publication retires old output only after the
+    // complete new first page is encoded; no second document budget is minted.
+    reader.prepare_document(4, reflow, || false).unwrap();
+    assert_eq!(reader.document_generation(), Some(4));
+    assert!(reader.document_display.is_none());
+    assert!(documents.accounting().peak_reserved().get() > accepted.get());
+    assert!(documents.accounting().peak_reserved().get() <= MAX_READER_DOCUMENT_MANAGED_BYTES);
+    reader.prepare_document_display(4, 800, || false).unwrap();
+    assert!(reader.display_snapshot(4).unwrap().source_ranges_qualified());
+    assert_eq!(general.accounting().reserved(), general_baseline);
+
+    let fork = reader.fork(owner(9332), || false).unwrap();
+    assert_eq!(fork.document_generation(), None);
+    assert_eq!(fork.document_budget.accounting().reserved().get(), 0);
+    drop(reader);
+    assert_eq!(documents.accounting().reserved().get(), 0);
+    assert_eq!(documents.accounting().active_allocations(), 0);
+    assert_eq!(fork.capture().bytes(), text.as_bytes());
+}

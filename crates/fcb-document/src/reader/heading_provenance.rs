@@ -6,7 +6,8 @@
 //! below remain upstream-owned. This audit neither repairs nor guesses spans.
 
 use franken_markdown::{Block, SpannedDocument};
-use super::{ByteLength, DocumentReadError, DocumentReader, ResourceAllocationId, ResourceBudget, SourceSpan};
+use super::{ByteLength, DocumentReadError, DocumentReader, ResourceAllocationId, ResourceBudget,
+    ResourceLease, SourceSpan};
 
 impl DocumentReader<'_> {
     /// Qualify the complete heading source catalog before exact navigation.
@@ -30,13 +31,14 @@ impl DocumentReader<'_> {
         allocation: ResourceAllocationId, mut canceled: impl FnMut() -> bool) -> Result<Vec<SourceSpan>, DocumentReadError> {
         check(&mut canceled)?;
         let source = self.session.source_text();
-        let workspace = crate::links::parse_workspace(source.as_bytes()).map_err(|_| DocumentReadError::EngineBudget)?;
-        // The retained reader coexists with a fresh full AST and one reparsed
-        // slice. Disjoint slices/gaps cover at most source.len() bytes in total;
-        // their maximum transient parser workspace is bounded by the full one.
-        let charge = workspace.checked_mul(2).and_then(|n| n.checked_add(256 * 1024))
+        let workspace = super::document_parse_workspace(source.as_bytes())?;
+        // Keep the full AST admitted throughout the audit. Each isolated block
+        // or gap is reparsed separately and dies before the next slice starts;
+        // reserve that slice's actual conservative parser envelope before its
+        // parse, instead of charging a second full document for every audit.
+        let charge = workspace.checked_add(256 * 1024)
             .ok_or(DocumentReadError::EngineBudget)?;
-        let _lease = budget.try_reserve_managed(self.capture.request().file().owner(), allocation,
+        let lease = budget.try_reserve_managed(self.capture.request().file().owner(), allocation,
             ByteLength::new(charge as u64)).map_err(|_| DocumentReadError::ResourceDenied)?;
         let parsed = parse(source, &mut canceled)?;
         if parsed.blocks.len() > self.options.max_blocks { return Err(DocumentReadError::EngineBudget); }
@@ -49,13 +51,13 @@ impl DocumentReader<'_> {
             let span = block.span;
             if span.start < previous_end || span.start >= span.end { return Err(DocumentReadError::InvalidOutput); }
             let gap = source.get(previous_end..span.start).ok_or(DocumentReadError::InvalidOutput)?;
-            empty_gap(gap, &mut canceled)?;
+            empty_gap(gap, &lease, charge, &mut canceled)?;
             let slice = source.get(span.start..span.end).ok_or(DocumentReadError::InvalidOutput)?;
             // The current upstream catalog omits nested headings entirely.
             // Refuse incomplete catalogs rather than report those slugs missing.
             // Bound structural depth before invoking recursive AST equality.
             if nested_heading(&block.node, 0, &mut nodes)? { return Err(DocumentReadError::InvalidOutput); }
-            let isolated = parse(slice, &mut canceled)?;
+            let isolated = reparse(slice, &lease, charge, &mut canceled)?;
             if isolated.blocks.len() != 1 { return Err(DocumentReadError::InvalidOutput); }
             let mut slice_nodes = 0;
             if nested_heading(&isolated.blocks[0].node, 0, &mut slice_nodes)?
@@ -68,7 +70,11 @@ impl DocumentReader<'_> {
             }
             previous_end = span.end;
         }
-        empty_gap(source.get(previous_end..).ok_or(DocumentReadError::InvalidOutput)?, &mut canceled)?;
+        empty_gap(source.get(previous_end..).ok_or(DocumentReadError::InvalidOutput)?,
+            &lease, charge, &mut canceled)?;
+        // No isolated AST survives the loop or empty_gap. Only the original
+        // full AST and bounded metadata remain live during the map audit.
+        lease.reconcile(ByteLength::new(charge as u64)).map_err(|_| DocumentReadError::ResourceDenied)?;
         if headings != self.headings().len() { return Err(DocumentReadError::InvalidOutput); }
         // Enclosing-block consumers must never fall back to an element outside
         // the verified block catalog. This does not certify glyph provenance.
@@ -128,8 +134,19 @@ fn parse(source: &str, canceled: &mut impl FnMut() -> bool) -> Result<SpannedDoc
     if parsed.source_len != source.len() || !parsed.diagnostics.is_empty() { return Err(DocumentReadError::InvalidOutput); }
     Ok(parsed)
 }
-fn empty_gap(source: &str, canceled: &mut impl FnMut() -> bool) -> Result<(), DocumentReadError> {
-    if !source.is_empty() && !parse(source, canceled)?.blocks.is_empty() { return Err(DocumentReadError::InvalidOutput); }
+fn reparse(source: &str, lease: &ResourceLease, retained_charge: usize,
+    canceled: &mut impl FnMut() -> bool) -> Result<SpannedDocument, DocumentReadError> {
+    check(canceled)?;
+    let scratch = super::document_parse_workspace(source.as_bytes())?;
+    let charge = retained_charge.checked_add(scratch).ok_or(DocumentReadError::EngineBudget)?;
+    lease.reconcile(ByteLength::new(charge as u64)).map_err(|_| DocumentReadError::ResourceDenied)?;
+    parse(source, canceled)
+}
+fn empty_gap(source: &str, lease: &ResourceLease, retained_charge: usize,
+    canceled: &mut impl FnMut() -> bool) -> Result<(), DocumentReadError> {
+    if !source.is_empty() && !reparse(source, lease, retained_charge, canceled)?.blocks.is_empty() {
+        return Err(DocumentReadError::InvalidOutput);
+    }
     Ok(())
 }
 fn nested_heading(block: &Block, depth: usize, nodes: &mut usize) -> Result<bool, DocumentReadError> {

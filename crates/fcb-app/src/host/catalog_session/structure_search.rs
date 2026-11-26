@@ -15,7 +15,7 @@ mod tests;
 
 use std::{mem::size_of, path::Path, sync::Arc};
 use fcb::{ArenaOwnerId, ByteLength, ByteRange, FileId, QueryGeneration, SourceRevision};
-use fcb::document::reader::{DocumentReadError, DocumentReadOptions, DocumentReader, MAX_DOCUMENT_SOURCE_BYTES};
+use fcb::document::reader::{DocumentReadError, DocumentReadOptions, DocumentReader, MAX_HEADING_SEARCH_SOURCE_BYTES};
 use fcb::search::{CapturedSymbols, CompleteCapture, SymbolError, SymbolLanguage,
     SearchMode, SymbolNameMode, UnicodeNormalization, MAX_SYMBOL_ITEMS, MAX_SYMBOL_SOURCE_BYTES};
 use fcb::search::normalized::{NormalizedCursor, SourceScalar, matched_text_capacity};
@@ -55,7 +55,7 @@ impl CatalogStructureSearchMode {
         match self { Self::Symbols => "heuristic-outline-candidate", Self::Headings => "fmd-heading" }
     }
     pub const fn source_limit(self) -> usize {
-        match self { Self::Symbols => MAX_SYMBOL_SOURCE_BYTES, Self::Headings => MAX_DOCUMENT_SOURCE_BYTES }
+        match self { Self::Symbols => MAX_SYMBOL_SOURCE_BYTES, Self::Headings => MAX_HEADING_SEARCH_SOURCE_BYTES }
     }
 }
 

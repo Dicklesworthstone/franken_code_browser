@@ -43,7 +43,7 @@ impl StructureMode {
             Self::Occurrences => MAX_REFERENCE_SOURCE_BYTES,
             Self::Headings => {
                 #[cfg(feature = "markdown")]
-                { fcb_document::reader::MAX_DOCUMENT_SOURCE_BYTES }
+                { fcb_document::reader::MAX_HEADING_SEARCH_SOURCE_BYTES }
                 #[cfg(not(feature = "markdown"))]
                 { 0 }
             }

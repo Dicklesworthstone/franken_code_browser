@@ -16,9 +16,15 @@ use franken_markdown::fonts::BundledFlowFonts;
 use franken_markdown::text::{Direction, FontId};
 use crate::reader::{DocumentReadError, DocumentReader, DocumentSourceEncoding};
 
-pub const MAX_DISPLAY_SOURCE_BYTES: usize = 128 * 1024;
-pub const MAX_DISPLAY_ITEMS: usize = 8192;
-pub const MAX_DISPLAY_GLYPHS: usize = 131_072;
+pub const MAX_DISPLAY_SOURCE_BYTES: usize = crate::reader::MAX_DOCUMENT_SOURCE_BYTES;
+pub const MAX_DISPLAY_ITEMS: usize = 16_384;
+pub const MAX_DISPLAY_GLYPHS: usize = 524_288;
+// Preserve the ordinary embedding profile's established 256 MiB envelope.
+// Larger admitted source opts into larger output bounds and scratch, while
+// page/run/font/shape/text limits remain independent and unchanged.
+const ORDINARY_DISPLAY_SOURCE_BYTES: usize = 128 * 1024;
+const ORDINARY_DISPLAY_ITEMS: usize = 8192;
+const ORDINARY_DISPLAY_GLYPHS: usize = 131_072;
 pub const MAX_DISPLAY_RUN_GLYPHS: usize = 4096;
 pub const MAX_DISPLAY_PAGE_ITEMS: usize = 128;
 pub const MAX_DISPLAY_PAGE_GLYPHS: usize = 16_384;
@@ -103,16 +109,19 @@ impl NativeDocumentDisplay {
         if capture.bytes().len() > MAX_DISPLAY_SOURCE_BYTES { return Err(NativeDisplayError::SourceLimit); }
         let source = document.parser_text();
         if source.len() > MAX_DISPLAY_SOURCE_BYTES { return Err(NativeDisplayError::SourceLimit); }
-        let parse_charge = crate::links::parse_workspace(source.as_bytes())
+        let parse_charge = crate::reader::document_parse_workspace(source.as_bytes())
             .map_err(|_| NativeDisplayError::EngineLimit)?;
+        let large = source.len().max(capture.bytes().len()) > ORDINARY_DISPLAY_SOURCE_BYTES;
+        let item_limit = if large { MAX_DISPLAY_ITEMS } else { ORDINARY_DISPLAY_ITEMS };
+        let glyph_limit = if large { MAX_DISPLAY_GLYPHS } else { ORDINARY_DISPLAY_GLYPHS };
         // Includes simultaneous AST/projection/layout candidates, retained runs,
         // source pin and the upstream immutable bundled-font registry envelope.
         // It is managed admission, not a process-footprint or cache-eviction claim.
         let retained_charge = (24 * 1024 * 1024_usize).checked_add(source.len())
             .and_then(|n| n.checked_add(document.source_encoding().retained_charge()))
             .ok_or(NativeDisplayError::ResourceDenied)?;
-        let charge = parse_charge.checked_add(MAX_DISPLAY_GLYPHS * 256)
-            .and_then(|n| n.checked_add(MAX_DISPLAY_ITEMS * 512))
+        let charge = parse_charge.checked_add(glyph_limit * 256)
+            .and_then(|n| n.checked_add(item_limit * 512))
             .and_then(|n| n.checked_add(retained_charge))
             .ok_or(NativeDisplayError::ResourceDenied)?;
         // Qualification owns its separate full-AST/slice scratch reservation.
@@ -143,7 +152,8 @@ impl NativeDocumentDisplay {
             .map_err(|_| NativeDisplayError::ResourceDenied)?;
         let limits = FlowDisplayLimits {
             max_source_bytes: MAX_DISPLAY_SOURCE_BYTES, max_source_lines: 32_768,
-            max_ast_nodes: 32_768, max_nesting_depth: 64, max_output_blocks: 4096,
+            max_ast_nodes: 32_768, max_nesting_depth: 64,
+            max_output_blocks: if large { 8192 } else { 4096 },
             max_output_bytes: MAX_DISPLAY_TEXT_BYTES, max_asset_requests: 128,
             max_asset_bytes: 0, max_retained_asset_bytes: 0, max_image_dimension: 4096,
         };
@@ -157,7 +167,7 @@ impl NativeDocumentDisplay {
         let fonts = BundledFlowFonts::new(FontFamily::Sans).map_err(layout_error)?;
         let options = FlowLayoutOptions {
             viewport_width: width_points as f32, body_size: 14.0, code_size: 13.0,
-            line_height: 20.0, max_lines: 8192, max_items: MAX_DISPLAY_ITEMS,
+            line_height: 20.0, max_lines: item_limit, max_items: item_limit,
             max_shape_bytes: 16 * 1024, max_total_shape_bytes: 2 * 1024 * 1024,
         };
         let mut stopped = false;
@@ -173,7 +183,7 @@ impl NativeDocumentDisplay {
             source_ranges_qualified: qualified_spans.is_some(),
             qualified_spans: qualified_spans.unwrap_or_default(), display, fonts,
             font_ids: Vec::with_capacity(6), unresolved_images: 0, glyph_count: 0, _lease: lease };
-        candidate.validate(&mut canceled)?;
+        candidate.validate(item_limit, glyph_limit, &mut canceled)?;
         Ok(candidate)
     }
 
@@ -277,8 +287,9 @@ impl NativeDocumentDisplay {
         Err(NativeDisplayError::InvalidRange)
     }
 
-    fn validate(&mut self, canceled: &mut impl FnMut() -> bool) -> Result<(), NativeDisplayError> {
-        if self.display.items().len() > MAX_DISPLAY_ITEMS { return Err(NativeDisplayError::EngineLimit); }
+    fn validate(&mut self, item_limit: usize, glyph_limit: usize,
+        canceled: &mut impl FnMut() -> bool) -> Result<(), NativeDisplayError> {
+        if self.display.items().len() > item_limit { return Err(NativeDisplayError::EngineLimit); }
         let total = self.display.total_bounds();
         valid_rect(total)?;
         let source = self.source_encoding.text(self.capture.bytes())
@@ -316,7 +327,7 @@ impl NativeDocumentDisplay {
                     text_bytes = text_bytes.checked_add(text.text.len()).ok_or(NativeDisplayError::EngineLimit)?;
                     self.glyph_count = self.glyph_count.checked_add(run.glyphs.len())
                         .ok_or(NativeDisplayError::EngineLimit)?;
-                    if text_bytes > MAX_DISPLAY_TEXT_BYTES || self.glyph_count > MAX_DISPLAY_GLYPHS {
+                    if text_bytes > MAX_DISPLAY_TEXT_BYTES || self.glyph_count > glyph_limit {
                         return Err(NativeDisplayError::EngineLimit);
                     }
                     let mut x = 0.0_f32; let mut y = 0.0_f32;

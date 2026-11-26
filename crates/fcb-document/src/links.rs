@@ -254,6 +254,13 @@ fn check(canceled: &mut impl FnMut() -> bool) -> Result<(), DocumentLinkError> {
 // limits apply. Count only possible uses for conservative allocation admission;
 // this is not Markdown parsing, and false-positive syntax only reduces admission.
 pub(crate) fn parse_workspace(source: &[u8]) -> Result<usize, DocumentLinkError> {
+    parse_workspace_with_limit(source, MAX_PARSE_WORKSPACE_BYTES)
+}
+
+/// Retained document adapters can admit a larger explicit input profile. Link
+/// collection keeps its independent, smaller ceiling. Both routes use the same
+/// conservative parser/expanded-reference estimate before invoking upstream.
+pub(crate) fn parse_workspace_with_limit(source: &[u8], maximum: usize) -> Result<usize, DocumentLinkError> {
     let ordinary = source.len().checked_mul(512).ok_or(DocumentLinkError::ComplexityLimit)?;
     let reference_overlap = if source.windows(2).any(|bytes| bytes == b"]:") {
         let uses = source.iter().filter(|&&byte| byte == b'[').count();
@@ -261,6 +268,6 @@ pub(crate) fn parse_workspace(source: &[u8]) -> Result<usize, DocumentLinkError>
             .and_then(|n| n.checked_mul(8)).ok_or(DocumentLinkError::ComplexityLimit)?
     } else { 0 };
     let charge = ordinary.checked_add(reference_overlap).ok_or(DocumentLinkError::ComplexityLimit)?;
-    if charge > MAX_PARSE_WORKSPACE_BYTES { return Err(DocumentLinkError::ComplexityLimit); }
+    if charge > maximum { return Err(DocumentLinkError::ComplexityLimit); }
     Ok(charge)
 }

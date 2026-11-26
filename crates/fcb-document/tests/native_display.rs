@@ -260,37 +260,39 @@ fn utf16_styled_display_retains_exact_mapping_after_the_logical_reader_retires()
 }
 
 #[test]
-fn utf16_styled_source_limit_also_applies_to_decoded_parser_input() {
-    // It fits the original-byte display cap but exceeds its decoded UTF-8 cap.
-    let bytes: Vec<u8> = "\u{feff}".encode_utf16().chain("界".repeat(44_000).encode_utf16())
+fn expanded_preview_source_limit_also_applies_to_decoded_utf16_input() {
+    // Logical and Styled now share the 512 KiB input ceiling. UTF-16 still
+    // cannot hide a wider decoded parser input behind fewer original bytes.
+    let bytes: Vec<u8> = "\u{feff}".encode_utf16().chain("界".repeat(175_000).encode_utf16())
         .flat_map(u16::to_le_bytes).collect();
+    assert!(bytes.len() < MAX_DISPLAY_SOURCE_BYTES);
     let source = capture(&bytes); let budget = budget();
-    let reader = DocumentReader::prepare(&source, DocumentId::new(owner(), 1).unwrap(),
+    let before = budget.accounting();
+    assert_eq!(DocumentReader::prepare(&source, DocumentId::new(owner(), 1).unwrap(),
         DocumentGeneration::new(owner(), 1).unwrap(),
-        DocumentReadOptions { max_source_bytes: 256 * 1024, max_flow_lines: 32768,
-            max_flow_items: 32768, ..Default::default() },
-        &budget, allocation(1), || false).unwrap();
-    assert_eq!(NativeDocumentDisplay::prepare(&reader, 640, &budget,
-        [allocation(2), allocation(3)], || false).err(), Some(NativeDisplayError::SourceLimit));
+        DocumentReadOptions { max_source_bytes: MAX_DISPLAY_SOURCE_BYTES, ..Default::default() },
+        &budget, allocation(1), || false).err(), Some(DocumentReadError::SourceLimit));
+    assert_eq!(budget.accounting().reserved(), before.reserved());
+    assert_eq!(budget.accounting().active_allocations(), before.active_allocations());
 }
 
-fn large_styled_source() -> String {
+fn large_styled_source(limit: usize) -> String {
     let mut text = String::from("# Large document\n\n");
     let paragraph = "Ordinary text in a retained document remains readable with exact source navigation.\n\n";
     let tail = "\n\n## Final target\n\nA **bold** final paragraph.\n";
-    while text.len() + paragraph.len() + tail.len() <= MAX_DISPLAY_SOURCE_BYTES {
+    while text.len() + paragraph.len() + tail.len() <= limit {
         text.push_str(paragraph);
     }
-    text.push_str(&"x".repeat(MAX_DISPLAY_SOURCE_BYTES - text.len() - tail.len()));
+    text.push_str(&"x".repeat(limit - text.len() - tail.len()));
     text.push_str(tail);
     text
 }
 
 #[test]
-fn exact_rich_source_limit_preserves_qualified_tail_and_bounded_pages_under_256_mib() {
-    let text = large_styled_source();
+fn ordinary_128_kib_profile_preserves_qualified_tail_and_bounded_pages_under_256_mib() {
+    let text = large_styled_source(128 * 1024);
     assert!(text.len() > 100 * 1024);
-    assert_eq!(text.len(), MAX_DISPLAY_SOURCE_BYTES);
+    assert_eq!(text.len(), 128 * 1024);
     let source = capture(text.as_bytes()); let budget = budget();
     let reader = DocumentReader::prepare(&source, DocumentId::new(owner(), 1).unwrap(),
         DocumentGeneration::new(owner(), 1).unwrap(),
@@ -341,16 +343,25 @@ fn exact_rich_source_limit_preserves_qualified_tail_and_bounded_pages_under_256_
 }
 
 #[test]
-fn one_byte_above_rich_limit_keeps_the_larger_logical_preview_and_all_reservations() {
-    let mut text = large_styled_source(); text.push('\n');
+fn larger_styled_profile_requires_its_output_reservation_and_keeps_the_logical_reader() {
+    let text = large_styled_source(160 * 1024);
     let source = capture(text.as_bytes()); let budget = budget();
     let reader = DocumentReader::prepare(&source, DocumentId::new(owner(), 1).unwrap(),
         DocumentGeneration::new(owner(), 1).unwrap(),
-        DocumentReadOptions { max_source_bytes: 256 * 1024, ..Default::default() },
+        DocumentReadOptions { max_source_bytes: MAX_DISPLAY_SOURCE_BYTES, ..Default::default() },
         &budget, allocation(1), || false).unwrap();
     let before = budget.accounting();
+    let mut saw_audit = false;
+    let mut audit_retired = false;
     assert_eq!(NativeDocumentDisplay::prepare(&reader, 640, &budget,
-        [allocation(2), allocation(3)], || false).err(), Some(NativeDisplayError::SourceLimit));
+        [allocation(2), allocation(3)], || {
+            let active = budget.accounting().active_allocations();
+            if active == before.active_allocations() + 2 { saw_audit = true; }
+            if saw_audit && active == before.active_allocations() + 1 { audit_retired = true; }
+            false
+        }).err(), Some(NativeDisplayError::ResourceDenied));
+    assert!(saw_audit && audit_retired,
+        "the larger output profile must be admitted after its provenance audit, before shaping");
     assert_eq!(budget.accounting().reserved(), before.reserved());
     assert_eq!(budget.accounting().active_allocations(), before.active_allocations());
     assert!(reader.rendered_text().contains("final paragraph."));
@@ -428,4 +439,72 @@ fn denied_display_growth_preserves_prior_capture_geometry_fonts_and_resource_cha
     assert!(NativeDocumentDisplay::prepare(&reader, 320, &budget,
         [allocation(4), allocation(5)], || false).is_ok(),
         "a denied growth must release both candidate allocation identities");
+}
+
+
+#[test]
+fn exact_512_kib_styled_profile_keeps_qualified_tail_and_bounded_complete_pages() {
+    let text = large_styled_source(MAX_DISPLAY_SOURCE_BYTES);
+    let source = capture(text.as_bytes());
+    let budget = ResourceBudget::new(owner(), ByteLength::new(768 * 1024 * 1024)).unwrap();
+    let reader = DocumentReader::prepare(&source, DocumentId::new(owner(), 1).unwrap(),
+        DocumentGeneration::new(owner(), 1).unwrap(),
+        DocumentReadOptions { max_source_bytes: MAX_DISPLAY_SOURCE_BYTES,
+            max_flow_lines: 16384, max_flow_items: 16384, max_blocks: 8192, ..Default::default() },
+        &budget, allocation(1), || false).unwrap();
+    let baseline = budget.accounting();
+    let display = display(&reader, &budget, 640);
+    assert!(display.source_ranges_qualified());
+    assert!(display.glyph_count() > 131_072, "the entire large document must survive the old glyph ceiling");
+    assert!(display.glyph_count() <= fcb_document::native_display::MAX_DISPLAY_GLYPHS);
+    assert!(budget.accounting().peak_reserved().get() <= 768 * 1024 * 1024);
+    let tail = text.find("A **bold** final").unwrap() as u64;
+    let tail_item = display.first_item_at_source(tail, || false).unwrap();
+    assert_eq!(display.original_range(tail_item).unwrap().unwrap().start().get(), tail);
+    let mut first = 0;
+    let mut glyphs = 0;
+    while first < display.display().items().len() {
+        let end = display.page_end(first, MAX_DISPLAY_PAGE_ITEMS).unwrap();
+        assert!(end > first && end - first <= MAX_DISPLAY_PAGE_ITEMS);
+        let page: usize = display.display().items()[first..end].iter().map(|item| match item {
+            DisplayItem::Text(text) => text.font_run.as_ref().unwrap().glyphs.len(),
+            _ => 0,
+        }).sum();
+        assert!(page <= MAX_DISPLAY_PAGE_GLYPHS);
+        glyphs += page;
+        first = end;
+    }
+    assert_eq!(glyphs, display.glyph_count());
+    assert_eq!(display.first_item_at_source(text.len() as u64, || false).unwrap(), first);
+    drop(display);
+    assert_eq!(budget.accounting().reserved(), baseline.reserved());
+    assert_eq!(budget.accounting().active_allocations(), baseline.active_allocations());
+}
+
+#[test]
+fn large_utf16_styled_source_preserves_original_bom_and_tail_offsets() {
+    let text = large_styled_source(160 * 1024);
+    for little in [true, false] {
+        let bytes: Vec<u8> = "\u{feff}".encode_utf16().chain(text.encode_utf16())
+            .flat_map(|unit| if little { unit.to_le_bytes() } else { unit.to_be_bytes() }).collect();
+        assert!(bytes.len() > 256 * 1024 && bytes.len() < MAX_DISPLAY_SOURCE_BYTES);
+        let source = capture(&bytes);
+        let budget = ResourceBudget::new(owner(), ByteLength::new(768 * 1024 * 1024)).unwrap();
+        let reader = DocumentReader::prepare(&source, DocumentId::new(owner(), 1).unwrap(),
+            DocumentGeneration::new(owner(), 1).unwrap(),
+            DocumentReadOptions { max_source_bytes: MAX_DISPLAY_SOURCE_BYTES, ..Default::default() },
+            &budget, allocation(1), || false).unwrap();
+        let display = display(&reader, &budget, 640);
+        assert!(display.source_ranges_qualified());
+        let tail = 2 + 2 * text[..text.find("A **bold** final").unwrap()].encode_utf16().count();
+        let item = display.first_item_at_source(tail as u64, || false).unwrap();
+        let range = display.original_range(item).unwrap().unwrap();
+        assert_eq!(range.start().get(), tail as u64);
+        assert_eq!(range.end().get() % 2, 0);
+        assert!(range.end().get() <= bytes.len() as u64);
+        assert_eq!(display.first_item_at_source(tail as u64 + 1, || false).err(),
+            Some(NativeDisplayError::InvalidRange));
+        assert_eq!(reader.capture().bytes(), bytes);
+        assert!(budget.accounting().peak_reserved().get() <= 768 * 1024 * 1024);
+    }
 }

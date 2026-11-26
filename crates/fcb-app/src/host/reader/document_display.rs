@@ -29,7 +29,7 @@ impl ReaderSession {
         }
         let allocations = self.allocations()?;
         let candidate = NativeDocumentDisplay::prepare(self.document_snapshot(generation)?, width_points,
-            &self.budget, allocations, &mut canceled)?;
+            &self.document_budget, allocations, &mut canceled)?;
         check(&mut canceled)?;
         let mut out = self.output("document-display-prepare")?;
         summary(&mut out, &candidate)?;
