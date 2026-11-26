@@ -450,6 +450,8 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
     pub const fn expression_qualified(&self) -> Option<bool> { self.expression_qualified }
     pub const fn count_all_matches(&self) -> bool { self.count_all_matches }
     pub const fn generation(&self) -> QueryGeneration { self.options.generation }
+    /// Inspect host-owned input status without exposing mutable matcher state.
+    pub(crate) fn reader(&self) -> &R { &self.reader }
     pub fn cancel(&mut self) {
         self.state = StreamReadState::Canceled;
         self.expression_qualified = None;

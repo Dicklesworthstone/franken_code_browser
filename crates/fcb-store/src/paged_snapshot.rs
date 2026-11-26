@@ -14,6 +14,8 @@
 
 pub mod catalog;
 pub use catalog::{CatalogArtifact, CatalogError, PinnedCatalog};
+mod stream;
+pub use stream::{SnapshotReadSession, MemberReader, MemberReadState, VerifiedMemberIdentity};
 
 use std::{io::{self, Read, Seek, SeekFrom}, mem::size_of, ops::Range};
 use fcb_core::{ArenaOwnerId, ByteLength, ResourceAllocationId, ResourceBudget, ResourceLease};
@@ -26,7 +28,7 @@ pub const MAX_SNAPSHOT_READ_CALLS: u64 = 1_048_576;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PagedSnapshotError {
     Limits, Format, Version, Checksum, Path, Order, Member, Missing,
-    Changed, Io, ReadCallLimit, InvalidReadCount, ResourceDenied, Canceled,
+    Changed, Io, ReadCallLimit, InvalidReadCount, ResourceDenied, Canceled, Pending,
 }
 impl PagedSnapshotError {
     pub const fn code(self) -> &'static str {
@@ -38,6 +40,7 @@ impl PagedSnapshotError {
             Self::Changed => "SNAPSHOT_MEMBER_CHANGED", Self::Io => "SNAPSHOT_READ_FAILED",
             Self::ReadCallLimit => "SNAPSHOT_READ_CALL_LIMIT", Self::InvalidReadCount => "SNAPSHOT_INVALID_READ_COUNT",
             Self::ResourceDenied => "SNAPSHOT_RESOURCE_DENIED", Self::Canceled => "SNAPSHOT_CANCELED",
+            Self::Pending => "SNAPSHOT_MEMBER_PENDING",
         }
     }
 }

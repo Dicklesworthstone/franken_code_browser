@@ -137,9 +137,30 @@ fn raw_text_quotas_and_cross_file_limits_match_the_unfiltered_production_query()
                     query.step(StreamReadStep::default(), generation(1), &b, || false).unwrap();
                 }
                 let actual = query.finish().unwrap();
-                assert_eq!(actual.hits(), expected.hits()); assert_eq!(actual.is_complete(), expected.is_complete());
-                assert_eq!(actual.truncated(), expected.truncated()); assert_eq!(actual.matches_seen(), expected.matches_seen());
-                assert_eq!(actual.stats().unsupported_files, expected.stats().unsupported_files);
+                if limit == 0 {
+                    // A noncounting zero cap does no source scan. An index may
+                    // prove absence without a candidate, while direct search
+                    // leaves its first nonempty member explicitly unsearched.
+                    for report in [&actual, &expected] {
+                        assert!(report.hits().is_empty()); assert_eq!(report.matches_seen(), 0);
+                        assert_eq!(report.stats().scanned_bytes, 0);
+                        assert_eq!(report.stats().files_searched, 0);
+                        assert_eq!(report.stats().unsupported_files, 0);
+                        assert_eq!(report.unavailable_files(), 1);
+                        assert!(!report.is_complete());
+                    }
+                    assert!(expected.truncated());
+                    let has_candidate = (0..entries.len() - 1).any(|ordinal| {
+                        let decision = if text { forward.text_decision(ordinal, std::str::from_utf8(pattern).ok()) }
+                            else { forward.raw_decision(ordinal, pattern) };
+                        decision != IndexDecision::Excluded
+                    });
+                    assert_eq!(actual.truncated(), has_candidate);
+                } else {
+                    assert_eq!(actual.hits(), expected.hits()); assert_eq!(actual.is_complete(), expected.is_complete());
+                    assert_eq!(actual.truncated(), expected.truncated()); assert_eq!(actual.matches_seen(), expected.matches_seen());
+                    assert_eq!(actual.stats().unsupported_files, expected.stats().unsupported_files);
+                }
             } } }
         }
     }

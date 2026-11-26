@@ -78,7 +78,15 @@ fn exact_limit_lookahead_continues_across_files_including_zero_result_capacity()
         let report = query(&mut archive, &needle, limit, &b, 4);
         assert_eq!(report.hits().len(), limit.min(3));
         assert_eq!(report.truncated(), limit < 3);
-        assert_eq!(report.matches_seen(), (limit + 1).min(3) as u64);
+        if limit == 0 {
+            // This legacy noncounting route verifies input but does no scan;
+            // a zero-cap existence/count probe uses an explicit counted query.
+            assert_eq!(report.matches_seen(), 0);
+            assert_eq!(report.stats().scanned_bytes, 0);
+            assert_eq!(report.stats().files_searched, 0);
+        } else {
+            assert_eq!(report.matches_seen(), (limit + 1).min(3) as u64);
+        }
         assert_eq!(report.is_complete(), limit >= 3);
         if limit >= 3 { assert_eq!(report.stats().files_searched, 4); }
     }
@@ -170,7 +178,10 @@ fn at_most_one_member_payload_is_retained_while_other_members_are_pending() {
     let needle = StreamingNeedle::text(owner(), "absent", &b, id(2)).unwrap();
     let report = query(&mut archive, &needle, 100, &b, 4096);
     assert!(report.is_complete()); assert_eq!(report.stats().files_searched, 24);
-    assert_eq!(report.stats().peak_source_bytes, content.len());
+    // Each step retains only its bounded input buffer, even when the saved
+    // member is much larger. All members still require full digest verification.
+    let peak = report.stats().peak_source_bytes;
+    assert!(peak > 0 && peak <= 4096, "query retained {peak} source bytes");
     assert_eq!(report.stats().scanned_bytes, 24 * content.len() as u64);
     assert_eq!(archive.load_stats().loaded_members, 24);
     assert_eq!(archive.load_stats().bytes_read, 24 * content.len() as u64);

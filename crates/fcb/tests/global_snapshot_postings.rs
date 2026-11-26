@@ -133,10 +133,32 @@ fn all_search_routes_keep_exact_hit_identity_coverage_and_cross_file_limit_looka
         for text in [false, true] {
             for pattern in [b"a".as_slice(), b"ana", b"needle", b"abcd", b"absent"] {
                 for limit in [0, 1, 2, 3, 4, 20] {
-                    let reference = run(&mut archive, None, None, pattern, text, limit, &b).0;
-                    assert_eq!(run(&mut archive, Some(&index), None, pattern, text, limit, &b).0, reference);
-                    assert_eq!(run(&mut archive, None, Some(&inverse), pattern, text, limit, &b).0, reference,
-                        "text={text}, pattern={pattern:?}, limit={limit}");
+                    let reference = run(&mut archive, None, None, pattern, text, limit, &b);
+                    let forward = run(&mut archive, Some(&index), None, pattern, text, limit, &b);
+                    let inverted = run(&mut archive, None, Some(&inverse), pattern, text, limit, &b);
+                    if limit == 0 {
+                        // Preserve the documented no-scan policy. Exact index
+                        // negatives can finish without admitting any member;
+                        // direct search cannot infer those negatives for free.
+                        for (result, stats) in [&reference, &forward, &inverted] {
+                            assert!(result.hits.is_empty()); assert_eq!(result.seen, 0);
+                            assert_eq!(stats.scanned_bytes, 0); assert_eq!(stats.files_searched, 0);
+                            assert_eq!(result.unsupported, 0); assert_eq!(result.unavailable, 0);
+                        }
+                        assert!(reference.0.truncated); assert!(!reference.0.complete);
+                        let has_candidate = (0..entries.len()).any(|ordinal| {
+                            let decision = if text { index.text_decision(ordinal, std::str::from_utf8(pattern).ok()) }
+                                else { index.raw_decision(ordinal, pattern) };
+                            decision != IndexDecision::Excluded
+                        });
+                        assert_eq!(forward.0.truncated, has_candidate);
+                        assert_eq!(forward.0.complete, closed && !has_candidate);
+                        assert_eq!(inverted.0, forward.0);
+                    } else {
+                        assert_eq!(forward.0, reference.0);
+                        assert_eq!(inverted.0, reference.0,
+                            "text={text}, pattern={pattern:?}, limit={limit}");
+                    }
                 }
             }
         }

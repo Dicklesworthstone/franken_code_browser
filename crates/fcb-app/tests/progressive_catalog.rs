@@ -211,25 +211,50 @@ fn raw_names_utf16_and_changed_observed_length_open_exact_independent_readers() 
 }
 
 #[test]
-fn long_raw_paths_obey_the_walker_overshoot_and_retained_page_budgets() {
+fn long_raw_paths_obey_strict_walker_and_retained_page_budgets() {
     let root = new_root();
     let mut nested = root.clone();
     for _ in 0..3 { nested.push("d".repeat(200)); fs::create_dir(&nested).unwrap(); }
     let seed = nested.join(format!("{}-000.rs", "f".repeat(190)));
     fs::write(&seed, ORIGINAL).unwrap();
     for i in 1..400 { fs::hard_link(&seed, nested.join(format!("{}-{i:03}.rs", "f".repeat(190)))).unwrap(); }
+    let file_path_bytes = seed.strip_prefix(&root).unwrap().as_os_str().len();
+    let relative_parent = nested.strip_prefix(&root).unwrap().to_str().unwrap();
+    let expected_paths: std::collections::BTreeSet<_> = (0..400)
+        .map(|i| hex(format!("{relative_parent}/{}-{i:03}.rs", "f".repeat(190)).as_bytes())).collect();
+    let walker_path_budget = 64 * 1024;
     let mut session = CatalogSession::open(owner(71450), &root, || false).unwrap();
     let mut page = json(&session.page(1, || false).unwrap());
-    let mut saw_threshold_overshoot = false;
+    let mut saw_path_limited_page = false;
+    let mut observed_paths = std::collections::BTreeSet::new();
+    let mut next_file = 1;
     loop {
         limits(&page);
-        let paths: usize = page.get("files").array().iter().map(|row| row.get("path").get("hex").text().len() / 2).sum();
-        saw_threshold_overshoot |= paths > 64 * 1024;
+        let files = page.get("files").array();
+        let directories = page.get("directories").array();
+        let paths: usize = files.iter().chain(directories)
+            .map(|row| row.get("path").get("hex").text().len() / 2).sum();
+        // The walker retains an entry for the next batch before it could cross
+        // its strict byte cap. The catalog's compatibility ceiling is looser.
+        assert!(paths <= walker_path_budget);
+        if page.get("more").flag() && files.len() == walker_path_budget / file_path_bytes {
+            assert!(files.len() + directories.len() < MAX_CATALOG_PAGE_ENTRIES);
+            assert!(paths + file_path_bytes > walker_path_budget);
+            saw_path_limited_page = true;
+        }
+        for row in files {
+            assert_eq!(row.get("file_id").number(), next_file); next_file += 1;
+            assert!(observed_paths.insert(row.get("path").get("hex").text().to_owned()),
+                "deferred entries must be published exactly once");
+        }
         if !page.get("more").flag() { break; }
         page = json(&session.advance(page.get("page_id").number(), || false).unwrap());
     }
-    assert!(saw_threshold_overshoot);
+    assert!(saw_path_limited_page);
+    assert_eq!(observed_paths, expected_paths);
+    assert_eq!(next_file, 401);
     assert_eq!(page.get("catalogued_files").number(), 400);
+    assert_eq!(page.get("discovery").get("files").number(), 400);
     assert!(page.get("discovery_complete").flag());
 }
 

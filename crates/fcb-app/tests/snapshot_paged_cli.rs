@@ -105,7 +105,10 @@ fn inspect_retains_no_payload_and_read_loads_only_one_member_after_validation() 
     let (exit, search) = f.call("search", &["--text", "absent"]);
     assert_eq!(exit, EXIT_NO_MATCH); assert!(search.get("workspace_complete").flag());
     assert_eq!(search.get("engine").text(), "bounded-stream-exact");
-    assert_eq!(search.get("peak_source_bytes").number(), payload.len() as u64);
+    // Query residency is the current streamed input buffer; explicit member
+    // reading above still retains and verifies the complete selected capture.
+    let peak = search.get("peak_source_bytes").number();
+    assert!(peak > 0 && peak <= 16 * 1024, "search retained {peak} source bytes");
     assert_eq!(search.get("member_payload_bytes_loaded").number(), 3 * payload.len() as u64);
 }
 
@@ -118,7 +121,16 @@ fn exact_result_limit_does_not_invent_truncation_and_cross_file_lookahead_detect
     let (exit, truncated) = f.call("search", &["--text", "needle", "--limit", "1"]);
     assert_eq!(exit, EXIT_PARTIAL); assert!(truncated.get("truncated").flag()); assert_eq!(truncated.get("matches_seen").number(), 2);
     let (exit, zero) = f.call("search", &["--text", "absent", "--limit", "0"]);
-    assert_eq!(exit, EXIT_NO_MATCH); assert!(!zero.get("truncated").flag());
+    // A noncounting zero cap keeps the established no-scan contract. It
+    // cannot establish absence without the explicit exhaustive count request.
+    assert_eq!(exit, EXIT_PARTIAL); assert!(zero.get("truncated").flag());
+    assert_eq!(zero.get("scanned_bytes").number(), 0);
+    assert_eq!(zero.get("matches_seen").number(), 0);
+    assert!(zero.get("hits").array().is_empty());
+    let (exit, counted) = f.call("search", &["--text", "absent", "--limit", "0", "--count-all"]);
+    assert_eq!(exit, EXIT_NO_MATCH); assert!(!counted.get("truncated").flag());
+    assert!(counted.get("matches_seen_exact").flag());
+    assert_eq!(counted.get("matches_seen").number(), 0);
 }
 
 #[test]
