@@ -69,6 +69,9 @@ fn identifier_admission_is_explicit_bounded_and_distinct_from_other_modes() {
     assert_eq!(parsed.needle, Some(Needle::Identifier("$item".into())));
     assert!(parsed.whole_file && parsed.workspace && parsed.count_all && parsed.respect_ignores);
     assert_eq!(parsed.limit, 0);
+    let lowercase = args::parse(&arguments(&["search", "file", "--whole-file",
+        "--identifier", "foo", "--ignore-case"])).unwrap();
+    assert!(lowercase.ignore_case);
     for name in ["", "1foo", "foo bar", "foo-bar", "foo\n", "foo\0"] {
         assert_eq!(args::parse(&arguments(&["search", "file", "--whole-file", "--identifier", name])),
             Err(ArgumentError::InvalidNeedle), "{name:?}");
@@ -83,7 +86,6 @@ fn identifier_admission_is_explicit_bounded_and_distinct_from_other_modes() {
         vec!["search", "root", "--workspace", "--identifier", "foo"],
         vec!["search", "--stdin", "--whole-file", "--identifier", "foo"],
         vec!["read", "file", "--whole-file", "--identifier", "foo"],
-        vec!["search", "file", "--whole-file", "--identifier", "foo", "--ignore-case"],
         vec!["search", "file", "--whole-file", "--identifier", "foo", "--identifier", "bar"],
         vec!["search", "file", "--whole-file", "--identifier", "foo", "--text", "foo"],
         vec!["search", "file", "--whole-file", "--text", "foo", "--identifier", "foo"],
@@ -272,4 +274,62 @@ fn binary_route_and_inert_capabilities_expose_identifier_mode() {
     assert_eq!(whole.get("identifier_flag").text(), "--identifier");
     assert_eq!(whole.get("identifier_semantics").text(), "whole-token-text-candidate");
     assert!(whole.get("identifier_case_sensitive").flag());
+    assert!(whole.get("identifier_case_insensitive").flag());
+}
+
+
+#[test]
+fn lowercase_identifiers_preserve_original_spellings_ranges_and_later_windows() {
+    for encoding in ["utf8", "utf16le", "utf16be"] {
+        let encode = |text: &str| -> Vec<u8> { match encoding {
+            "utf16le" => text.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+            "utf16be" => text.encode_utf16().flat_map(u16::to_be_bytes).collect(),
+            _ => text.as_bytes().to_vec(),
+        } };
+        let mut source = String::from("\u{feff}");
+        let mut expected = Vec::new();
+        // Explicit token oracle: substring and adjacent-token cases must not
+        // qualify; comments and strings remain occurrence candidates.
+        for (prefix, token, suffix, accepted) in [
+            ("", "K", "", true), ("", "k", "", true), ("", "K", "", true),
+            ("", "Ko", "", false), ("_", "K", "", false), ("", "K", "_", false),
+            ("1", "k", "", false), ("// ", "K", "", true), ("\"", "k", "\"", true),
+        ] {
+            source.push_str(prefix);
+            let start = encode(&source).len() as u64;
+            source.push_str(token);
+            let end = encode(&source).len() as u64;
+            if accepted { expected.push((start, end, token)); }
+            source.push_str(suffix); source.push('\n');
+        }
+        let temp = Temp::new();
+        let bytes = encode(&source);
+        let file = temp.file("identifiers.rs", &bytes);
+        let (exit, result) = invoke(&file, &["--whole-file", "--identifier", "k", "--ignore-case"]);
+        assert_eq!(exit, EXIT_OK);
+        assert_eq!(result.get("mode").text(), "whole-token-occurrences");
+        assert!(!result.get("case_sensitive").flag());
+        assert!(result.get("whole_file_complete").flag());
+        assert_eq!(result.get("matches_seen").number(), expected.len() as u64);
+        assert_eq!(result.get("hits").array().len(), expected.len());
+        assert_eq!(result.get("literal_original_hex"), &Json::Null);
+        assert!(!result.get("compiler_resolved").flag());
+        for (hit, &(start, end, spelling)) in result.get("hits").array().iter().zip(&expected) {
+            assert_eq!(bounds(hit), (start, end));
+            assert_eq!(hit.get("matched_text").text(), spelling);
+            assert_eq!(hit.get("original_hex").text(),
+                bytes[start as usize..end as usize].iter().map(|b| format!("{b:02x}")).collect::<String>());
+        }
+        let (exit, exact) = invoke(&file, &["--whole-file", "--identifier", "k"]);
+        assert_eq!(exit, EXIT_OK);
+        assert_eq!(exact.get("matches_seen").number(), 2, "exact-case route is a negative control");
+        let (exit, page) = invoke(&file, &["--whole-file", "--identifier", "k", "--ignore-case",
+            "--count-all", "--limit", "1", "--skip-matches", "1"]);
+        assert_eq!(exit, EXIT_PARTIAL);
+        assert!(page.get("match_count_complete").flag());
+        assert_eq!(page.get("matches_seen").number(), expected.len() as u64);
+        assert_eq!(page.get("hits").array().len(), 1);
+        assert_eq!(bounds(&page.get("hits").array()[0]), (expected[1].0, expected[1].1));
+        assert_eq!(page.get("hits").array()[0].get("occurrence_id").number(), 2);
+    }
 }

@@ -216,7 +216,7 @@ fn byte_limits_do_not_supply_a_token_boundary_and_count_only_keeps_exact_totals_
 }
 
 #[test]
-fn invalid_names_and_incompatible_case_policy_spend_no_source_io_or_accepted_query() {
+fn invalid_names_and_limits_spend_no_source_io_or_accepted_query() {
     let fixture = Fixture::new(b"foo Foo foobar");
     let mut reader = fixture.reader();
     let accepted = json(&occurrences(&mut reader, 1, "foo", ObservedReaderEncoding::Utf8, false, 8, 64));
@@ -231,7 +231,7 @@ fn invalid_names_and_incompatible_case_policy_spend_no_source_io_or_accepted_que
     }
     generation += 1;
     assert_eq!(reader.find_with_kind(generation, "foo", ObservedReaderEncoding::Utf8,
-        ObservedReaderSearchKind::Occurrences, false, false, 8, 64, || false).err(),
+        ObservedReaderSearchKind::Occurrences, false, false, usize::MAX, 64, || false).err(),
         Some(ObservedReaderError::InvalidLimits));
     generation += 1;
     assert!(reader.find_with_kind(generation, "foo", ObservedReaderEncoding::Utf8,
@@ -350,4 +350,42 @@ fn malformed_suffix_invalidates_token_results_and_cancellation_preserves_an_acce
     assert_eq!(invalid.get("retained_witness_bytes").number(), 0);
     assert!(invalid.get("hits").array().is_empty());
     assert!(!invalid.get("search_complete").flag());
+}
+
+
+#[test]
+fn lowercase_occurrences_keep_distinct_witnesses_and_revalidate_current_token_boundaries() {
+    for encoding in [ObservedReaderEncoding::Utf8, ObservedReaderEncoding::Utf16Le,
+        ObservedReaderEncoding::Utf16Be] {
+        let source = "\u{feff}K k K Ko _k k_ 1K // K";
+        let bytes = encoded(source, encoding);
+        let fixture = Fixture::new(&bytes);
+        let mut reader = fixture.reader();
+        let report = json(&reader.find_page(1, "k", encoding, ObservedReaderSearchKind::Occurrences,
+            false, true, 1, 2, bytes.len() as u64, || false).unwrap());
+        assert_eq!(report.get("mode").text(), "whole-token-occurrences");
+        assert!(!report.get("case_sensitive").flag());
+        assert_eq!(report.get("matches_seen").number(), 4);
+        assert_eq!(report.get("retained_hits").number(), 2);
+        assert!(report.get("match_count_complete").flag());
+        assert_eq!(report.get("literal_original_hex"), &Json::Null);
+        let before = json(&reader.info(|| false).unwrap());
+        for (index, spelling) in ["k", "K"].iter().enumerate() {
+            let witness = json(&reader.search_hit(1, index, || false).unwrap());
+            assert_eq!(witness.get("text").text(), *spelling);
+            assert_eq!(witness.get("original_hex").text(), hex(&encoded(spelling, encoding)));
+            assert_eq!(witness.get("occurrence_id").number(), index as u64 + 2);
+        }
+        assert_eq!(json(&reader.info(|| false).unwrap()).get("payload_bytes_read"),
+            before.get("payload_bytes_read"));
+        // Keep the exact matched bytes, but turn the delimiter after the
+        // selected lowercase k into a token character. Live activation must
+        // reject the changed boundary even though case-insensitive text matches.
+        let boundary = encoded("\u{feff}K k", encoding).len() as u64;
+        fixture.file().write_at(&encoded("_", encoding), boundary).unwrap();
+        assert_eq!(reader.observe_hit(1, 0, 0, 128, || false).err(),
+            Some(ObservedReaderError::SearchHitChanged));
+        let retained = json(&reader.search_hit(1, 0, || false).unwrap());
+        assert_eq!(retained.get("original_hex").text(), hex(&encoded("k", encoding)));
+    }
 }

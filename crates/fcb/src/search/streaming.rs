@@ -70,7 +70,7 @@ impl std::error::Error for StreamReadError {}
 impl From<StreamError> for StreamReadError { fn from(error: StreamError) -> Self { Self::Matcher(error) } }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StreamingMode { OriginalBytes, ExactText, LowercaseText, Identifier }
+pub enum StreamingMode { OriginalBytes, ExactText, LowercaseText, Identifier, LowercaseIdentifier }
 
 /// Reusable immutable primary literal with optional content predicates.
 /// Pre-encoded alternatives avoid a self-referential cursor and allow reports
@@ -100,9 +100,18 @@ impl StreamingNeedle {
     /// case folding or Unicode identifier-completeness claim is introduced.
     pub fn identifier(owner: ArenaOwnerId, name: &str, budget: &ResourceBudget,
         allocation: ResourceAllocationId) -> Result<Self, StreamReadError> {
+        Self::identifier_matching(owner, name, true, budget, allocation)
+    }
+    /// Whole-token occurrences with optional Unicode scalar lowercase matching.
+    /// Token boundaries are established from the original decoded scalars. The
+    /// complete transformed token must equal the complete transformed query, so
+    /// part of a lowercase expansion cannot establish an identifier occurrence.
+    /// Each insensitive hit retains its original spelling and encoded witness.
+    pub fn identifier_matching(owner: ArenaOwnerId, name: &str, case_sensitive: bool,
+        budget: &ResourceBudget, allocation: ResourceAllocationId) -> Result<Self, StreamReadError> {
         validate_identifier(name).map_err(|_| StreamReadError::InvalidIdentifier)?;
-        let mut needle = Self::text(owner, name, budget, allocation)?;
-        needle.mode = StreamingMode::Identifier;
+        let mut needle = Self::text_matching(owner, name, case_sensitive, budget, allocation)?;
+        needle.mode = if case_sensitive { StreamingMode::Identifier } else { StreamingMode::LowercaseIdentifier };
         Ok(needle)
     }
     /// Match with the same Unicode lowercase semantics as retained text search.
@@ -241,6 +250,9 @@ struct IdentifierWork<'needle> {
     position: usize,
     token_start: u64,
     token_end: u64,
+    // Only a matching prefix is retained, bounded by the transformed query.
+    // Exact identifiers share the immutable query witness and need no spelling.
+    spelling: Option<String>,
 }
 
 /// Explicit synchronous-resumable reader operation. A step admits at most one
@@ -267,15 +279,17 @@ impl<'needle> NeedleBacking<'needle> {
     }
     fn identifier(&self) -> Result<IdentifierCursor<'needle>, StreamReadError> {
         match self {
-            Self::Borrowed(needle) => IdentifierCursor::new(needle.text_value()
-                .ok_or(StreamReadError::InvalidIdentifier)?).map_err(|_| StreamReadError::InvalidIdentifier),
+            Self::Borrowed(needle) => IdentifierCursor::new_matching(needle.text_value()
+                .ok_or(StreamReadError::InvalidIdentifier)?, needle.mode != StreamingMode::LowercaseIdentifier)
+                .map_err(|_| StreamReadError::InvalidIdentifier),
             Self::Owned(needle) => {
                 let text = needle.text_value().ok_or(StreamReadError::InvalidIdentifier)?;
                 let mut owned = String::new();
                 owned.try_reserve_exact(text.len()).map_err(|_| StreamReadError::AllocationFailed)?;
                 if owned.capacity() > text.len() { return Err(StreamReadError::AllocationFailed); }
                 owned.push_str(text);
-                IdentifierCursor::new_owned(owned).map_err(|_| StreamReadError::InvalidIdentifier)
+                IdentifierCursor::new_owned_matching(owned, needle.mode != StreamingMode::LowercaseIdentifier)
+                    .map_err(|_| StreamReadError::InvalidIdentifier)
             }
         }
     }
@@ -382,11 +396,15 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
         // Decoder vectors/strings can grow geometrically. Charge conservative
         // transient reallocation overlap, the KMP table, input, batches and hits.
         // The source length is deliberately absent from this allocation formula.
-        let lowercase_charge = if needle.mode == StreamingMode::LowercaseText {
+        let retains_spellings = matches!(needle.mode, StreamingMode::LowercaseText | StreamingMode::LowercaseIdentifier);
+        let lowercase_charge = if retains_spellings {
+            let scratch = if needle.mode == StreamingMode::LowercaseIdentifier {
+                needle.max_witness_bytes
+            } else {
+                needle.max_witness_bytes * (size_of::<char>() + size_of::<usize>() + size_of::<SourceScalar>())
+            };
             options.max_matches.checked_mul(size_of::<RetainedWitness>() + 2 * needle.max_witness_bytes)
-                .and_then(|n| n.checked_add(needle.max_witness_bytes
-                    * (size_of::<char>() + size_of::<usize>() + size_of::<SourceScalar>())))
-                .ok_or(StreamReadError::InvalidLimits)?
+                .and_then(|n| n.checked_add(scratch)).ok_or(StreamReadError::InvalidLimits)?
         } else { 0 };
         let charge = (size_of::<Self>() + size_of::<StreamReadReport<'needle>>()
             + STREAM_BUFFER_BYTES * (8 * size_of::<MappingSpan>() + 64)
@@ -411,11 +429,17 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
                 lowercase_mode()).map_err(|_| StreamReadError::AllocationFailed)?
                     .ok_or(StreamReadError::InvalidLimits)?, window: None, decoded_base: 0, position: 0, pending: None })
         } else { None };
-        let identifier = if needle.mode == StreamingMode::Identifier {
+        let identifier = if matches!(needle.mode, StreamingMode::Identifier | StreamingMode::LowercaseIdentifier) {
+            let spelling = if needle.mode == StreamingMode::LowercaseIdentifier {
+                let mut text = String::new();
+                text.try_reserve_exact(needle.max_witness_bytes).map_err(|_| StreamReadError::AllocationFailed)?;
+                if text.capacity() > needle.max_witness_bytes { return Err(StreamReadError::ResourceDenied); }
+                Some(text)
+            } else { None };
             Some(IdentifierWork { cursor: needle.identifier()?,
-                window: None, decoded_base: 0, position: 0, token_start: 0, token_end: 0 })
+                window: None, decoded_base: 0, position: 0, token_start: 0, token_end: 0, spelling })
         } else { None };
-        let witnesses = reserve(if lowercase.is_some() { options.max_matches } else { 0 })?;
+        let witnesses = reserve(if retains_spellings { options.max_matches } else { 0 })?;
         let expression_enabled = needle.is_expression();
         let mut search = Self { reader, needle, expression_enabled, request, length, options, count_all_matches, skip_matches, encoding: options.encoding,
             header: 0, initialized: cursor.is_some(), cursor, expression: None, expression_qualified: None,
@@ -610,9 +634,25 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
             self.stats.last_step_scanned = self.consumed - before;
             self.stats.scanned_bytes = self.base + self.consumed as u64;
             work.position += ch.len_utf8();
-            if !work.cursor.in_token() { work.token_start = raw_start; }
+            if !work.cursor.in_token() {
+                work.token_start = raw_start;
+                if let Some(spelling) = &mut work.spelling { spelling.clear(); }
+            }
             let matched = work.cursor.push(ch);
-            if work.cursor.in_token() { work.token_end = raw_end; }
+            if work.cursor.in_token() {
+                work.token_end = raw_end;
+                if let Some(spelling) = &mut work.spelling {
+                    if work.cursor.is_candidate() {
+                        let length = spelling.len().checked_add(ch.len_utf8()).ok_or(StreamReadError::InvalidLimits)?;
+                        if length > spelling.capacity() || length > self.needle.max_witness_bytes {
+                            return Err(StreamReadError::ResourceDenied);
+                        }
+                        spelling.push(ch);
+                    } else {
+                        spelling.clear();
+                    }
+                }
+            }
             let range = (work.token_start, work.token_end);
             if matched {
                 emitted += 1;
@@ -628,15 +668,31 @@ impl<'needle, R: Read> ReaderSearch<'needle, R> {
     fn retain_identifier(&mut self, start: u64, end: u64) -> Result<(), StreamReadError> {
         let range = ByteRange::new(ByteOffset::new(start), ByteOffset::new(end))
             .map_err(|_| StreamReadError::InvalidRange)?;
-        // Equality was established scalar-by-scalar under the qualified decoder.
-        // Exact encoding means every hit can share the immutable query witness.
-        if range.len().get() != self.needle.encoded(self.encoding).len() as u64 {
+        // Exact identifiers share the query witness. Lowercase equality may
+        // change the encoded length and therefore requires the original token.
+        if self.needle.mode == StreamingMode::Identifier
+            && range.len().get() != self.needle.encoded(self.encoding).len() as u64 {
             return Err(StreamReadError::InvalidRange);
         }
         let occurrence = self.matches_seen.checked_add(1).ok_or(StreamReadError::InvalidLimits)?;
         if occurrence <= self.skip_matches { self.matches_seen = occurrence; return Ok(()); }
         if self.hits.len() < self.options.max_matches {
+            let witness = if self.needle.mode == StreamingMode::LowercaseIdentifier {
+                let spelling = self.identifier.as_ref().and_then(|work| work.spelling.as_ref())
+                    .ok_or(StreamReadError::InvalidRange)?;
+                let mut text = String::new();
+                text.try_reserve_exact(spelling.len()).map_err(|_| StreamReadError::AllocationFailed)?;
+                if text.capacity() > self.needle.max_witness_bytes { return Err(StreamReadError::ResourceDenied); }
+                text.push_str(spelling);
+                let bytes = encode_witness(&text, self.encoding.ok_or(StreamReadError::InvalidRange)?,
+                    self.needle.max_witness_bytes)?;
+                if range.len().get() != bytes.len() as u64 { return Err(StreamReadError::InvalidRange); }
+                Some(RetainedWitness { text, bytes })
+            } else { None };
             if let Some(context) = &mut self.context { context.retain(range, self.length)?; }
+            // Keep rows, witnesses and accepted counts aligned if admission
+            // fails while preparing a later original spelling or its context.
+            if let Some(witness) = witness { self.witnesses.push(witness); }
             self.hits.push(StreamingHit { occurrence, range });
         } else if !self.count_all_matches {
             self.state = StreamReadState::Truncated;
@@ -891,7 +947,7 @@ impl StreamReadReport<'_> {
     /// each contributing source spelling. No surrounding bytes are claimed.
     pub fn witness_bytes(&self, ordinal: usize) -> Result<&[u8], StreamReadError> {
         let hit = self.hits.get(ordinal).ok_or(StreamReadError::InvalidRange)?;
-        let bytes = if self.needle.mode == StreamingMode::LowercaseText {
+        let bytes = if matches!(self.needle.mode, StreamingMode::LowercaseText | StreamingMode::LowercaseIdentifier) {
             self.witnesses.get(ordinal).ok_or(StreamReadError::InvalidRange)?.bytes.as_slice()
         } else { self.needle.encoded(self.encoding) };
         if hit.range.len().get() != bytes.len() as u64 { return Err(StreamReadError::InvalidRange); }
@@ -901,12 +957,12 @@ impl StreamReadReport<'_> {
     /// lowercase expansion still retains its complete original source scalar.
     pub fn matched_text(&self, ordinal: usize) -> Result<&str, StreamReadError> {
         self.hits.get(ordinal).ok_or(StreamReadError::InvalidRange)?;
-        if self.needle.mode == StreamingMode::LowercaseText {
+        if matches!(self.needle.mode, StreamingMode::LowercaseText | StreamingMode::LowercaseIdentifier) {
             Ok(&self.witnesses.get(ordinal).ok_or(StreamReadError::InvalidRange)?.text)
         } else { self.needle.text_value().ok_or(StreamReadError::InvalidRange) }
     }
     pub fn retained_witness_bytes(&self) -> usize {
-        if self.needle.mode == StreamingMode::LowercaseText {
+        if matches!(self.needle.mode, StreamingMode::LowercaseText | StreamingMode::LowercaseIdentifier) {
             self.witnesses.iter().map(|witness| witness.bytes.len()).sum()
         } else if self.hits.is_empty() { 0 } else { self.needle.encoded(self.encoding).len() }
     }
@@ -1017,6 +1073,47 @@ mod lowercase_failure_tests {
             assert_eq!(query.step(StreamReadStep::default(), options.generation, || false), Err(StreamReadError::ResourceDenied));
             assert_eq!(query.stats().scanned_bytes, 4);
             assert_eq!(query.stats().last_step_scanned, 4);
+            assert_eq!(query.matches_seen(), 1);
+            let (_, report) = query.finish().unwrap();
+            assert_eq!(report.state(), StreamReadState::Failed(StreamReadError::ResourceDenied));
+            assert!(!report.input_complete());
+            assert!(!report.hits_truncated());
+            assert_eq!(report.hits().len(), 1);
+            assert_eq!(report.hits()[0].occurrence_id(), 1);
+            assert_eq!(report.witness_bytes(0).unwrap(), b"K");
+            assert_eq!(report.matched_text(0).unwrap(), "K");
+        }
+    }
+}
+
+#[cfg(test)]
+mod lowercase_identifier_failure_tests {
+    use super::*;
+
+    #[test]
+    fn refused_original_token_keeps_spent_work_and_the_accepted_prefix() {
+        let owner = ArenaOwnerId::new(1518).unwrap();
+        let budget = ResourceBudget::new(owner, ByteLength::new(64 * 1024 * 1024)).unwrap();
+        let mut needle = StreamingNeedle::identifier_matching(owner, "k", false, &budget,
+            ResourceAllocationId::new(1).unwrap()).unwrap();
+        // Inject a spelling admission refusal: K fits, but the matching Kelvin
+        // token needs three original UTF-8 bytes. No allocator hooks are needed.
+        needle.max_witness_bytes = 2;
+        let request = CaptureRequest::new(FileId::new(owner, 1).unwrap(), SourceRevision::new(owner, 1).unwrap()).unwrap();
+        let mut options = StreamReadOptions::new(QueryGeneration::new(owner, 1).unwrap());
+        options.max_matches = 4;
+        for counting in [false, true] {
+            let mut query = if counting {
+                ReaderSearch::new_counting("K K ".as_bytes(), request, ByteLength::new(6), &needle,
+                    options, &budget, ResourceAllocationId::new(2).unwrap())
+            } else {
+                ReaderSearch::new("K K ".as_bytes(), request, ByteLength::new(6), &needle,
+                    options, &budget, ResourceAllocationId::new(2).unwrap())
+            }.unwrap();
+            assert_eq!(query.step(StreamReadStep::default(), options.generation, || false), Err(StreamReadError::ResourceDenied));
+            assert_eq!(query.stats().bytes_read, 6);
+            assert_eq!(query.stats().scanned_bytes, 5);
+            assert_eq!(query.stats().last_step_scanned, 5);
             assert_eq!(query.matches_seen(), 1);
             let (_, report) = query.finish().unwrap();
             assert_eq!(report.state(), StreamReadState::Failed(StreamReadError::ResourceDenied));

@@ -333,8 +333,8 @@ fn c_occurrence_mode_rejects_unknown_flags_invalid_names_and_canceled_replacemen
         let result = find_mode(handle, 2, "foo", 1, mode, case_sensitive, count_all, 16, 1024);
         assert!(result.contains("OBSERVED_READER_HANDLE_INVALID_ARGUMENT"), "{result}");
     }
-    let incompatible = find_mode(handle, 2, "foo", 1, 1, 0, 0, 16, 1024);
-    assert!(incompatible.contains("OBSERVED_READER_INVALID_LIMITS"), "{incompatible}");
+    let invalid_limits = find_mode(handle, 2, "foo", 1, 1, 0, 0, 257, 1024);
+    assert!(invalid_limits.contains("OBSERVED_READER_INVALID_LIMITS"), "{invalid_limits}");
     for (generation, name) in [(3, "foo bar"), (4, "1foo"), (5, "foo-bar")] {
         let result = find_mode(handle, generation, name, 1, 1, 1, 0, 16, 1024);
         assert!(result.contains("STREAM_READ_INVALID_IDENTIFIER"), "{result}");
@@ -558,4 +558,57 @@ fn c_expression_lowercase_utf16_witnesses_keep_primary_spelling_and_exact_bytes(
     assert!(page.contains("\"expression_revalidated\":false"), "{page}");
     assert!(page.contains("\"case_sensitive\":false"));
     assert_eq!(fcb_observed_reader_close(handle), 1);
+}
+
+#[test]
+fn c_lowercase_occurrences_support_both_case_policies_and_original_witness_pages() {
+    let _guard = FFI_TEST_LOCK.lock().unwrap();
+    for encoding in [1, 2, 3] {
+        let encode = |text: &str| -> Vec<u8> {
+            match encoding {
+                2 => text.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+                3 => text.encode_utf16().flat_map(u16::to_be_bytes).collect(),
+                _ => text.as_bytes().to_vec(),
+            }
+        };
+        let (root, croot) = root();
+        let source = encode("\u{feff}K k K Ko _k k_ 1K // K");
+        fs::write(root.join("source"), &source).unwrap();
+        let handle = open(&croot);
+        let exact = find_mode(handle, 1, "k", encoding, 1, 1, 1, 8, 1024);
+        assert!(exact.contains("\"status\":\"ok\""), "{exact}");
+        assert!(exact.contains("\"case_sensitive\":true"));
+        assert_eq!(number(&exact, "matches_seen"), 1);
+
+        let lower = find_mode(handle, 2, "k", encoding, 1, 0, 1, 8, 1024);
+        for expected in ["\"status\":\"ok\"", "\"mode\":\"whole-token-occurrences\"",
+            "\"case_sensitive\":false", "\"match_count_complete\":true",
+            "\"literal_original_hex\":null", "\"literal_sha256\":null",
+            "\"compiler_resolved\":false"] {
+            assert!(lower.contains(expected), "missing {expected}: {lower}");
+        }
+        assert_eq!(number(&lower, "matches_seen"), 4);
+        let page = find_page(handle, 3, "k", encoding, 1, 0, 1, 1, 2, 1024);
+        assert!(page.contains("\"case_sensitive\":false"), "{page}");
+        assert!(page.contains("\"match_count_complete\":true"));
+        assert_eq!(number(&page, "matches_seen"), 4);
+        assert_eq!(number(&page, "skipped_matches"), 1);
+        assert_eq!(number(&page, "retained_hits"), 2);
+
+        let before = take(fcb_observed_reader_info(handle));
+        fs::write(root.join("source"), b"replaced after the accepted scan").unwrap();
+        for (position, spelling) in ["k", "K"].iter().enumerate() {
+            let witness = take(fcb_observed_reader_search_hit(handle, 3, position as u64));
+            let original_hex: String = encode(spelling).iter().map(|byte| format!("{byte:02x}")).collect();
+            assert!(witness.contains("\"mode\":\"whole-token-occurrences\""), "{witness}");
+            assert!(witness.contains("\"case_sensitive\":false"));
+            assert!(witness.contains(format!("\"text\":\"{spelling}\"").as_str()));
+            assert!(witness.contains(format!("\"original_hex\":\"{original_hex}\"").as_str()));
+            assert_eq!(number(&witness, "occurrence_id"), position as u64 + 2);
+            assert_eq!(number(&witness, "additional_source_bytes_read"), 0);
+        }
+        let after = take(fcb_observed_reader_info(handle));
+        assert_eq!(number(&after, "payload_bytes_read"), number(&before, "payload_bytes_read"));
+        assert_eq!(fcb_observed_reader_close(handle), 1);
+    }
 }

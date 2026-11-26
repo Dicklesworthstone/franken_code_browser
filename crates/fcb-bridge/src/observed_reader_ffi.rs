@@ -250,7 +250,7 @@ pub unsafe extern "C" fn fcb_observed_reader_find_matching(handle: u64, generati
 /// Select literal text (mode 0), whole-token occurrences (mode 1), or a bounded
 /// content expression (mode 2). Expressions reject metadata filters and qualify
 /// the complete observed input before publishing primary-term witnesses. Occurrence
-/// names use the shared bounded token policy and require case_sensitive=1.
+/// names use the shared bounded token policy, with exact case or Unicode lowercase matching.
 /// Existing find entry points retain their literal-text behavior.
 /// # Safety
 /// Pointer and callback requirements match fcb_observed_reader_find.

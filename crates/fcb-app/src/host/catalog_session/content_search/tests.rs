@@ -259,3 +259,37 @@ fn a_byte_budget_never_qualifies_an_incomplete_expression_and_exclusions_spend_n
     assert!(session.complete()); assert_eq!(session.matches_seen, 1);
     assert_eq!(session.io.bytes_read, 6); assert_eq!(session.excluded, 599);
 }
+
+
+#[test]
+fn lowercase_identifier_discovery_retains_case_variants_in_later_windows() {
+    for little in [true, false] {
+        let root = fixture("lowercase-occurrences");
+        fs::write(root.join("tokens.rs"), utf16("K k K Ko _k k_ 1K // K", little)).unwrap();
+        let mut options = counted();
+        options.mode = CatalogContentSearchMode::Occurrences;
+        options.scope = AtlasSearchScope::all().with_case_sensitive(false);
+        options.start_after = 1;
+        options.limits.max_matches = 2;
+        let mut session = CatalogContentSearchSession::open(owner(if little { 78130 } else { 78131 }),
+            &root, 9, "k", options, || false).unwrap();
+        finish(&mut session);
+        assert!(session.complete());
+        assert_eq!(session.matches_seen, 4);
+        assert_eq!(session.hits.len(), 2);
+        assert_eq!(session.matched_text, "kK");
+        assert_eq!(session.hits.iter().map(|hit| hit.occurrence).collect::<Vec<_>>(), [2, 3]);
+        let mut expected = utf16("kK", little);
+        expected.drain(..2);
+        assert_eq!(session.witnesses, expected);
+        let before = session.io;
+        fs::write(root.join("tokens.rs"), b"replaced").unwrap();
+        for position in 0..2 {
+            let reply = session.hit(9, session.revision, position, || false).unwrap();
+            assert!(reply.as_str().contains("\"mode\":\"whole-token-occurrences\""));
+            assert!(reply.as_str().contains("\"case_sensitive\":false"));
+            assert!(reply.as_str().contains("\"additional_source_bytes_read\":\"0\""));
+        }
+        assert_eq!(session.io, before);
+    }
+}

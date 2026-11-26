@@ -176,7 +176,6 @@ impl FrozenScope {
     fn admit(predicate: AtlasSearchScope, occurrences: bool, expression: Option<FrozenExpression>,
         atlas: &AtlasSession, canceled: &mut impl FnMut() -> bool)
         -> Result<Self, AtlasStreamSearchError> {
-        if occurrences && !predicate.case_sensitive() { return Err(AtlasStreamSearchError::InvalidLimits); }
         let (eligible, region) = predicate.admission_counts(atlas, canceled)?;
         let excluded = atlas.atlas().file_count().checked_sub(eligible).ok_or(AtlasStreamSearchError::WrongAtlas)?;
         Ok(Self { predicate, occurrences, expression, region, eligible, excluded })
@@ -457,7 +456,8 @@ impl RetainedAtlasStreamSearch {
             StreamingNeedle::expression(self.manifest.owner(), &expression.parsed,
                 scope.predicate.case_sensitive(), &self.budget, pattern_id)
         } else if kind == QueryKind::Occurrences {
-            StreamingNeedle::identifier(self.manifest.owner(), needle, &self.budget, pattern_id)
+            StreamingNeedle::identifier_matching(self.manifest.owner(), needle,
+                scope.predicate.case_sensitive(), &self.budget, pattern_id)
         } else {
             StreamingNeedle::text_matching(self.manifest.owner(), needle,
                 scope.predicate.case_sensitive(), &self.budget, pattern_id)

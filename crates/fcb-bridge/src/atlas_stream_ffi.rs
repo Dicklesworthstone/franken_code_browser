@@ -360,7 +360,7 @@ pub unsafe extern "C" fn fcb_atlas_stream_search_scoped_occurrences_progress(han
 /// edits can change ordinal membership. Query/source revisions are fresh; all
 /// skipped source bytes and calls consume the normal global scan limits.
 /// case_sensitive, count_all_matches and occurrences must be 0 or 1. Whole
-/// identifier occurrences require case_sensitive = 1. Progress/terminal replies
+/// identifier occurrences support exact case or Unicode lowercase matching. Progress/terminal replies
 /// echo page_start_after, skipped_matches and page_has_more_matches.
 /// # Safety
 /// String, callback and return ownership requirements match
@@ -381,8 +381,7 @@ pub unsafe extern "C" fn fcb_atlas_stream_search_scoped_page_progress(handle: u6
             requested
         };
         if canceled() { return Err(AccessError::Canceled); }
-        if case_sensitive > 1 || count_all_matches > 1 || occurrences > 1
-            || (occurrences == 1 && case_sensitive == 0) {
+        if case_sensitive > 1 || count_all_matches > 1 || occurrences > 1 {
             return Err(AccessError::InvalidArgument);
         }
         let needle = unsafe { bounded_needle(needle) }?;

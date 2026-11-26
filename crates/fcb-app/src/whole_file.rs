@@ -26,7 +26,7 @@ fn needle(args: &Arguments, budget: &ResourceBudget) -> Result<StreamingNeedle, 
     match args.needle.as_ref() {
         Some(Needle::Text(text)) => Ok(StreamingNeedle::text_matching(owner(), text, !args.ignore_case, budget, allocation(40))?),
         Some(Needle::Raw(bytes)) => Ok(StreamingNeedle::raw(owner(), bytes, budget, allocation(40))?),
-        Some(Needle::Identifier(name)) => Ok(StreamingNeedle::identifier(owner(), name, budget, allocation(40))?),
+        Some(Needle::Identifier(name)) => Ok(StreamingNeedle::identifier_matching(owner(), name, !args.ignore_case, budget, allocation(40))?),
         Some(Needle::Query(query)) => Ok(StreamingNeedle::expression(owner(), query, !args.ignore_case, budget, allocation(40))?),
         _ => Err(AppError::InvalidRange),
     }
@@ -294,15 +294,15 @@ fn matching_fields(mode: StreamingMode, is_expression: bool, out: &mut Output) -
         StreamingMode::OriginalBytes => "original-bytes",
         StreamingMode::ExactText => "exact-decoded-text",
         StreamingMode::LowercaseText => "unicode-lowercase-text",
-        StreamingMode::Identifier => "whole-token-occurrences",
+        StreamingMode::Identifier | StreamingMode::LowercaseIdentifier => "whole-token-occurrences",
     } })?;
     out.literal(",\"case_sensitive\":")?;
     if mode == StreamingMode::OriginalBytes { out.literal("null")?; }
-    else { out.boolean(mode != StreamingMode::LowercaseText)?; }
+    else { out.boolean(!matches!(mode, StreamingMode::LowercaseText | StreamingMode::LowercaseIdentifier))?; }
     out.literal(",\"normalization\":")?;
     if mode == StreamingMode::OriginalBytes { out.literal("null")?; }
     else { out.quoted("exact")?; }
-    if mode == StreamingMode::Identifier {
+    if matches!(mode, StreamingMode::Identifier | StreamingMode::LowercaseIdentifier) {
         out.literal(",\"evidence_level\":\"whole-token-text-candidate\",\"includes_comments_and_literals\":true,\"compiler_resolved\":false,\"semantic_complete\":false")?;
     }
     Ok(())
@@ -372,7 +372,7 @@ fn fields(report: &FileSearchReport<'_>, out: &mut Output, budget: &ResourceBudg
     out.literal(",\"retention\":\"literal-witnesses-with-context\",\"literal_text\":")?;
     if let Some(text) = search.text_literal() { out.quoted(text)?; } else { out.literal("null")?; }
     out.literal(",\"literal_original_hex\":")?;
-    if search.hits().is_empty() || search.mode() == StreamingMode::LowercaseText {
+    if search.hits().is_empty() || matches!(search.mode(), StreamingMode::LowercaseText | StreamingMode::LowercaseIdentifier) {
         out.literal("null")?;
     } else { out.hex(search.witness_bytes(0)?)?; }
     out.literal(",\"hits\":[")?;
@@ -382,7 +382,7 @@ fn fields(report: &FileSearchReport<'_>, out: &mut Output, budget: &ResourceBudg
         out.literal("{\"occurrence_id\":")?; out.integer(hit.occurrence_id())?;
         out.literal(",\"original_range\":")?; out.range(hit.original_range())?;
         out.literal(",\"decoded_range\":null")?;
-        if search.mode() == StreamingMode::LowercaseText {
+        if matches!(search.mode(), StreamingMode::LowercaseText | StreamingMode::LowercaseIdentifier) {
             out.literal(",\"matched_text\":")?; out.quoted(search.matched_text(index)?)?;
             out.literal(",\"original_hex\":")?; out.hex(search.witness_bytes(index)?)?;
         }
@@ -402,6 +402,7 @@ fn human(report: &FileSearchReport<'_>, out: &mut Output, budget: &ResourceBudge
         StreamingMode::ExactText => "exact case-sensitive text",
         StreamingMode::LowercaseText => "Unicode lowercase text; exact normalization",
         StreamingMode::Identifier => "exact whole-token occurrences, including comments and strings; not compiler references",
+        StreamingMode::LowercaseIdentifier => "Unicode lowercase whole-token occurrences, including comments and strings; not compiler references",
     })?;
     out.literal("\n")?;
     if search.is_expression() {

@@ -243,7 +243,8 @@ char *fcb_atlas_stream_search_scoped_occurrences_progress(uint64_t handle, const
  * byte/read call consumes the same total limits. No source-sized cache is built.
  *
  * case_sensitive, count_all_matches and occurrences are exactly 0 or 1.
- * occurrences=1 selects whole-identifier text and requires case_sensitive=1.
+ * occurrences=1 selects whole-identifier text, with exact case (1) or Unicode
+ * lowercase matching (0). Lowercase hits retain each original spelling/bytes.
  * start_after + max_matches + 1 must fit uint64_t. All callbacks may be NULL.
  *
  * This is NOT a cursor into an immutable workspace snapshot. Files may change

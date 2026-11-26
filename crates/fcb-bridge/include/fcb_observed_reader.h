@@ -193,8 +193,8 @@ char *fcb_observed_reader_find_matching(uint64_t handle, uint64_t generation,
 /* Additive search mode: 0=literal text, 1=whole-token occurrences, 2=bounded
  * content expression. mode and
  * boolean flags are checked; unknown values are never coerced. Text preserves
- * the matching/count semantics above. Occurrences requires case_sensitive=1
- * and a valid shared identifier of at most 1024 UTF-8 bytes. ASCII letters,
+ * the matching/count semantics above. Occurrences supports exact case or Unicode
+ * lowercase matching and a valid shared identifier of at most 1024 UTF-8 bytes. ASCII letters,
  * digits, '_' and '$' plus conservative non-ASCII runs define token boundaries;
  * names cannot begin with an ASCII digit. No Unicode normalization, compiler
  * binding or exclusion of comments/string literals is implied.

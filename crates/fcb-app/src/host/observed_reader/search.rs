@@ -175,10 +175,10 @@ impl ObservedReaderSession {
             case_sensitive, count_all_matches, max_matches, max_scan_bytes, canceled)
     }
 
-    /// Search literal text, exact whole-token occurrences, or a bounded content
+    /// Search literal text, whole-token occurrences, or a bounded content
     /// expression with one frozen mode/count policy. Occurrences use the shared streaming token cursor,
     /// including UTF-16 and read-chunk boundaries, without retaining the file.
-    /// Only case-sensitive occurrences are supported; incompatible options and
+    /// Text and occurrences support exact case or Unicode lowercase matching;
     /// invalid token names fail before source I/O and preserve accepted results.
     /// Expressions admit phrases, conjunctions and exclusions; path/language
     /// filters are refused before I/O. Every expression qualifies the complete
@@ -219,8 +219,7 @@ impl ObservedReaderSession {
         check(&mut canceled)?;
         if (kind != ObservedReaderSearchKind::Expression
                 && (needle.is_empty() || needle.len() > MAX_OBSERVED_READER_NEEDLE_BYTES))
-            || max_matches > MAX_OBSERVED_READER_MATCHES || max_scan_bytes > MAX_OBSERVED_READER_SCAN_BYTES
-            || (kind == ObservedReaderSearchKind::Occurrences && !case_sensitive) {
+            || max_matches > MAX_OBSERVED_READER_MATCHES || max_scan_bytes > MAX_OBSERVED_READER_SCAN_BYTES {
             return Err(ObservedReaderError::InvalidLimits);
         }
         // Reserve representable cumulative accounting before any payload read.
@@ -235,7 +234,7 @@ impl ObservedReaderSession {
             ObservedReaderSearchKind::Text =>
                 StreamingNeedle::text_matching(self.owner(), needle, case_sensitive, &self.budget, pattern_id),
             ObservedReaderSearchKind::Occurrences =>
-                StreamingNeedle::identifier(self.owner(), needle, &self.budget, pattern_id),
+                StreamingNeedle::identifier_matching(self.owner(), needle, case_sensitive, &self.budget, pattern_id),
             ObservedReaderSearchKind::Expression => StreamingNeedle::expression(self.owner(),
                 &expression.as_ref().ok_or(ObservedReaderError::InvalidRange)?.parsed,
                 case_sensitive, &self.budget, pattern_id),
@@ -540,6 +539,7 @@ impl AcceptedSearch {
             StreamingMode::ExactText => (ObservedReaderSearchKind::Text, true),
             StreamingMode::LowercaseText => (ObservedReaderSearchKind::Text, false),
             StreamingMode::Identifier => (ObservedReaderSearchKind::Occurrences, true),
+            StreamingMode::LowercaseIdentifier => (ObservedReaderSearchKind::Occurrences, false),
             StreamingMode::OriginalBytes => return Err(ObservedReaderError::InvalidRange),
         };
         let kind = if expression.is_some() { ObservedReaderSearchKind::Expression } else { kind };

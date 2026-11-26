@@ -216,7 +216,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
     }
     if parsed.respect_ignores && (!parsed.workspace || parsed.include_excluded) { return Err(ArgumentError::IncompatibleOptions); }
     let allows_ignore_case = if parsed.whole_file {
-        matches!(parsed.needle.as_ref(), Some(Needle::Text(_) | Needle::Query(_)))
+        matches!(parsed.needle.as_ref(), Some(Needle::Text(_) | Needle::Query(_) | Needle::Identifier(_)))
     } else {
         matches!(parsed.needle.as_ref(), Some(Needle::Text(_)))
             || (parsed.workspace && matches!(parsed.needle.as_ref(), Some(Needle::Query(_))))

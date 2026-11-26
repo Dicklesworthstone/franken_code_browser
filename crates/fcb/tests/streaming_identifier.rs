@@ -256,3 +256,231 @@ fn captured_occurrences_and_streaming_occurrences_agree() {
         }
     }
 }
+
+
+// Independent token-at-a-time oracle. Boundaries are selected from the original
+// whole string; only complete tokens are lowercased. It does not use the shared
+// cursor, decoder maps or streaming witness reconstruction.
+fn lowercase_expected(text: &str, name: &str, encoding: usize) -> Vec<(u64, u64, String)> {
+    let boundary = |ch: char| ch.is_whitespace() || ch.is_control()
+        || (ch.is_ascii() && !ch.is_ascii_alphanumeric() && ch != '_' && ch != '$');
+    let offset = |position: usize| match encoding {
+        0 => position as u64,
+        1 => position as u64 + 3,
+        _ => text[..position].encode_utf16().count() as u64 * 2 + 2,
+    };
+    let query: String = name.chars().flat_map(char::to_lowercase).collect();
+    let mut start = None;
+    let mut hits = Vec::new();
+    for (end, ch) in text.char_indices().chain(std::iter::once((text.len(), ' '))) {
+        if boundary(ch) {
+            if let Some(begin) = start.take() {
+                let token = &text[begin..end];
+                if token.chars().flat_map(char::to_lowercase).eq(query.chars()) {
+                    hits.push((offset(begin), offset(end), token.to_owned()));
+                }
+            }
+        } else if start.is_none() {
+            start = Some(end);
+        }
+    }
+    hits
+}
+
+#[test]
+fn lowercase_whole_tokens_preserve_original_witnesses_across_encodings_and_boundaries() {
+    let text = "foo Foo FOO fOo foobar FOO_ _foo $foo 1foo // Foo\n\"fOo\"\r\n\
+        k K K Kx _K İ i I i\u{307} I\u{307} İx ß ẞ ss SS É é e\u{301} E\u{301} \
+        𐐀 𐐨 𐐀x 𐐨_ 🚀Foo 🚀foo Foo\u{feff}Foo Foo\u{2003}FOO";
+    for encoding in 0..4 {
+        let bytes = encode(text, encoding);
+        for name in ["foo", "K", "i", "İ", "i\u{307}", "ß", "é", "e\u{301}", "𐐀", "🚀foo"] {
+            let budget = budget();
+            let needle = StreamingNeedle::identifier_matching(owner(), name, false, &budget, allocation(1)).unwrap();
+            assert_eq!(needle.mode(), StreamingMode::LowercaseIdentifier);
+            let expected = lowercase_expected(text, name, encoding);
+            for chunk in [1, 2, 7, STREAM_BUFFER_BYTES] {
+                for quantum in [1, 3, STREAM_BUFFER_BYTES] {
+                    let input = Chunks { bytes: &bytes, size: chunk };
+                    let mut search = ReaderSearch::new(input, request(), ByteLength::new(bytes.len() as u64),
+                        &needle, StreamReadOptions::new(generation(1)), &budget, allocation(2)).unwrap();
+                    finish(&mut search, StreamReadStep { max_bytes: quantum, max_hits: 1, max_calls: 1 });
+                    let (_, report) = search.finish().unwrap();
+                    assert!(report.input_complete(), "{name:?}, encoding={encoding}, chunk={chunk}, quantum={quantum}");
+                    assert_eq!(report.matches_seen(), expected.len() as u64);
+                    assert_eq!(report.hits().len(), expected.len());
+                    for (index, (hit, (start, end, spelling))) in report.hits().iter().zip(&expected).enumerate() {
+                        assert_eq!((hit.original_range().start().get(), hit.original_range().end().get()), (*start, *end),
+                            "{name:?}, encoding={encoding}, chunk={chunk}, quantum={quantum}");
+                        assert_eq!(report.witness_bytes(index).unwrap(), &bytes[*start as usize..*end as usize]);
+                        assert_eq!(report.matched_text(index).unwrap(), spelling.as_str());
+                        assert_eq!(hit.occurrence_id(), index as u64 + 1);
+                    }
+                    assert_eq!(report.retained_witness_bytes(),
+                        expected.iter().map(|(start, end, _)| (end - start) as usize).sum::<usize>());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn lowercase_owned_pages_count_complete_tokens_and_retain_the_same_observation_context() {
+    let text = "K K Kx k K KK k";
+    for encoding in 0..4 {
+        let bytes = encode(text, encoding);
+        let expected = lowercase_expected(text, "K", encoding);
+        assert_eq!(expected.len(), 5);
+        let budget = budget();
+        let needle = std::sync::Arc::new(StreamingNeedle::identifier_matching(owner(), "K", false,
+            &budget, allocation(1)).unwrap());
+        for skip in [0, 2, 7] {
+            for limit in [0, 1, 3, 5] {
+                for count_all in [false, true] {
+                    let options = StreamReadOptions { max_matches: limit, ..StreamReadOptions::new(generation(1)) };
+                    let mut search = ReaderSearch::new_owned_page(Chunks { bytes: &bytes, size: 1 }, request(),
+                        ByteLength::new(bytes.len() as u64), needle.clone(), options, skip, count_all,
+                        &budget, allocation(2)).unwrap()
+                        .with_context(fcb::search::StreamContextOptions { before_bytes: 3, after_bytes: 5 },
+                            &budget, allocation(3)).unwrap();
+                    finish(&mut search, StreamReadStep { max_bytes: 3, max_hits: 1, max_calls: 1 });
+                    let (_, report) = search.finish().unwrap();
+                    let seen = if count_all { 5 } else { (skip + limit as u64 + 1).min(5) };
+                    let retained: Vec<_> = expected.iter().skip(skip as usize).take(limit).collect();
+                    assert_eq!(report.matches_seen(), seen);
+                    assert_eq!(report.hits().len(), retained.len());
+                    assert_eq!(report.input_complete(), count_all || skip + limit as u64 >= 5);
+                    assert_eq!(report.skipped_matches(), skip.min(seen));
+                    assert_eq!(report.has_more_matches(), seen.saturating_sub(skip) > retained.len() as u64);
+                    for (index, (hit, (start, end, spelling))) in report.hits().iter().zip(retained).enumerate() {
+                        assert_eq!(hit.occurrence_id(), skip + index as u64 + 1);
+                        assert_eq!(report.witness_bytes(index).unwrap(), &bytes[*start as usize..*end as usize]);
+                        assert_eq!(report.matched_text(index).unwrap(), spelling.as_str());
+                        let context = report.context(index).unwrap().unwrap();
+                        assert_eq!(context.match_range(), hit.original_range());
+                        let (left, right) = context.original_range().as_usize_bounds().unwrap();
+                        assert_eq!(context.bytes(), &bytes[left..right]);
+                        assert!(context.original_range().start() <= hit.original_range().start());
+                        assert!(context.original_range().end() >= hit.original_range().end());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn lowercase_identifier_limits_and_cancellation_do_not_supply_a_token_boundary() {
+    let budget = budget();
+    let needle = StreamingNeedle::identifier_matching(owner(), "foo", false, &budget, allocation(1)).unwrap();
+    for (bytes, length, chunk, byte_limit, call_limit, state, matches) in [
+        (b"FooBar".as_slice(), 6, 3, 3, 100, StreamReadState::ByteLimit, 0),
+        (b"FooBar".as_slice(), 6, 3, 100, 1, StreamReadState::CallLimit, 0),
+        (b"Foo rest".as_slice(), 8, 3, 3, 100, StreamReadState::ByteLimit, 0),
+        (b"Foo rest".as_slice(), 8, 4, 4, 100, StreamReadState::ByteLimit, 1),
+        (b"Foo".as_slice(), 3, 3, 3, 100, StreamReadState::Complete, 1),
+        (b"Foo".as_slice(), 4, 3, 100, 100, StreamReadState::ShortRead, 1),
+    ] {
+        let options = StreamReadOptions { max_bytes: byte_limit, max_read_calls: call_limit,
+            ..StreamReadOptions::new(generation(1)) };
+        let mut search = ReaderSearch::new(Chunks { bytes, size: chunk }, request(), ByteLength::new(length),
+            &needle, options, &budget, allocation(2)).unwrap();
+        finish(&mut search, StreamReadStep { max_bytes: 4, max_hits: 1, max_calls: 1 });
+        let (_, report) = search.finish().unwrap();
+        assert_eq!(report.state(), state);
+        assert_eq!(report.matches_seen(), matches);
+        if matches != 0 {
+            assert_eq!(report.witness_bytes(0).unwrap(), b"Foo");
+            assert_eq!(report.matched_text(0).unwrap(), "Foo");
+        }
+    }
+    for encoding in [2, 3] {
+        let bytes = encode("Foo\u{2003}rest", encoding);
+        let options = StreamReadOptions { max_bytes: 9, ..StreamReadOptions::new(generation(1)) };
+        let mut search = ReaderSearch::new(bytes.as_slice(), request(), ByteLength::new(bytes.len() as u64),
+            &needle, options, &budget, allocation(2)).unwrap();
+        finish(&mut search, StreamReadStep::default());
+        assert_eq!(search.state(), StreamReadState::ByteLimit);
+        assert_eq!(search.matches_seen(), 0);
+    }
+    let mut search = ReaderSearch::new(b"FooBar".as_slice(), request(), ByteLength::new(6),
+        &needle, StreamReadOptions::new(generation(1)), &budget, allocation(2)).unwrap();
+    search.step(StreamReadStep { max_bytes: 3, max_hits: 1, max_calls: 1 }, generation(1), || false).unwrap();
+    assert_eq!(search.matches_seen(), 0);
+    assert_eq!(search.step(StreamReadStep::default(), generation(2), || false), Err(StreamReadError::StaleGeneration));
+    let (_, report) = search.finish().unwrap();
+    assert_eq!(report.state(), StreamReadState::Canceled);
+    assert_eq!(report.matches_seen(), 0);
+    assert!(report.hits().is_empty());
+}
+
+#[test]
+fn lowercase_identifier_malformed_input_retracts_original_witnesses() {
+    let budget = budget();
+    let needle = StreamingNeedle::identifier_matching(owner(), "k", false, &budget, allocation(1)).unwrap();
+    for bytes in ["K K ".as_bytes().iter().copied().chain([0xff]).collect::<Vec<_>>(),
+        [encode("K K ", 2), vec![0x00, 0xd8]].concat(),
+        [encode("K K ", 3), vec![0xff]].concat()] {
+        let mut search = ReaderSearch::new_counting(Chunks { bytes: &bytes, size: 1 }, request(),
+            ByteLength::new(bytes.len() as u64), &needle, StreamReadOptions::new(generation(1)),
+            &budget, allocation(2)).unwrap();
+        finish(&mut search, StreamReadStep::default());
+        let (_, report) = search.finish().unwrap();
+        assert_eq!(report.state(), StreamReadState::UnsupportedText);
+        assert_eq!(report.matches_seen(), 0);
+        assert!(report.hits().is_empty());
+        assert_eq!(report.retained_witness_bytes(), 0);
+        assert!(report.witness_bytes(0).is_err());
+    }
+}
+
+#[test]
+fn lowercase_rejected_huge_tokens_do_not_grow_the_original_spelling_reservation() {
+    let bytes = format!("{} {} {}", "K".repeat(700_000), "K K k ".repeat(4_000), "𐐀").into_bytes();
+    let budget = budget();
+    let needle = StreamingNeedle::identifier_matching(owner(), "k", false, &budget, allocation(1)).unwrap();
+    for retained in [0, 1] {
+        let options = StreamReadOptions { max_matches: retained, ..StreamReadOptions::new(generation(1)) };
+        let mut search = ReaderSearch::new_counting(bytes.as_slice(), request(), ByteLength::new(bytes.len() as u64),
+            &needle, options, &budget, allocation(2)).unwrap();
+        let charge = budget.accounting().reserved().get();
+        let step = StreamReadStep { max_bytes: STREAM_BUFFER_BYTES, max_hits: 2, max_calls: 1 };
+        for _ in 0..20_000 {
+            if search.state() != StreamReadState::Pending { break; }
+            let before = search.matches_seen();
+            search.step(step, generation(1), || false).unwrap();
+            assert!(search.matches_seen() - before <= 2);
+            assert_eq!(budget.accounting().reserved().get(), charge);
+            assert!(search.hits().len() <= retained);
+        }
+        let (_, report) = search.finish().unwrap();
+        assert!(report.input_complete());
+        assert_eq!(report.matches_seen(), 12_000);
+        assert_eq!(report.retained_witness_bytes(), retained);
+        if retained != 0 {
+            assert_eq!(report.hits()[0].original_range().start().get(), 2_100_001);
+            assert_eq!(report.matched_text(0).unwrap(), "K");
+        }
+        assert!(report.stats().peak_buffer_bytes <= STREAM_BUFFER_BYTES);
+    }
+}
+
+#[test]
+fn explicit_exact_identifier_matching_preserves_validation_and_shared_witnesses() {
+    let budget = budget();
+    for case_sensitive in [false, true] {
+        for name in ["", "1foo", "foo bar", "foo-bar", "foo\0"] {
+            assert!(matches!(StreamingNeedle::identifier_matching(owner(), name, case_sensitive, &budget, allocation(1)),
+                Err(StreamReadError::InvalidIdentifier)));
+        }
+    }
+    let needle = StreamingNeedle::identifier_matching(owner(), "foo", true, &budget, allocation(1)).unwrap();
+    assert_eq!(needle.mode(), StreamingMode::Identifier);
+    let bytes = b"Foo foo FOO foo";
+    let mut search = ReaderSearch::new(bytes.as_slice(), request(), ByteLength::new(bytes.len() as u64),
+        &needle, StreamReadOptions::new(generation(1)), &budget, allocation(2)).unwrap();
+    finish(&mut search, StreamReadStep::default());
+    let (_, report) = search.finish().unwrap();
+    assert_eq!(report.matches_seen(), 2);
+    assert_eq!(report.retained_witness_bytes(), 3);
+}

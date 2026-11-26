@@ -28,7 +28,7 @@ uint64_t fcb_catalog_stream_create(void);
 /* root: NUL-terminated UTF-8. query: 1..1024 readable UTF-8 bytes, no terminating
  * NUL required. generation: nonzero. mode: 0 text, 1 identifier occurrences,
  * 2 bounded expression. case_sensitive and count_all: exactly 0 or 1.
- * Occurrences use case-sensitive identifiers; expressions use shared syntax
+ * Occurrences use exact-case or Unicode lowercase identifiers; expressions use shared syntax
  * and count all matching occurrences within the requested I/O bounds.
  *
  * Null extensions AND filenames means all types; a non-null empty list is an

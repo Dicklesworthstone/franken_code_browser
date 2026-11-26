@@ -199,7 +199,8 @@ fn whole_identifiers_beyond_capture_limits_keep_original_utf8_and_utf16_witnesse
             scope.clone(), false, || false, || false, |_| panic!("invalid input must not publish"));
         assert_eq!(invalid.err().unwrap().to_string(), "STREAM_READ_INVALID_IDENTIFIER");
         assert_eq!(service.accepted_generation(), Some(generation));
-        assert!(matches!(service.search_scoped_occurrences_with_progress(&atlas, "needle", opts(),
+        assert!(matches!(service.search_scoped_occurrences_with_progress(&atlas, "needle",
+            AtlasStreamSearchOptions { max_matches: MAX_ATLAS_STREAM_SEARCH_HITS + 1, ..opts() },
             scope.with_case_sensitive(false), false, || false, || false, |_| {}),
             Err(AtlasStreamSearchError::InvalidLimits)));
         fixture.write("large.rs", b"replaced live source");
@@ -1145,4 +1146,35 @@ fn lowercase_workspace_progress_and_partial_counts_preserve_accepted_witnesses()
     assert_eq!(witness.get("hit"), accepted.get("hit"));
     assert_eq!(witness.get("hit").get("text").text(), "K");
     assert_eq!(witness.get("hit").get("original_hex").text(), "e284aa");
+}
+
+
+#[test]
+fn lowercase_occurrence_window_retains_each_spelling_after_live_replacement() {
+    let fixture = Fixture::new();
+    fixture.write("tokens.rs", "K k K Ko _k k_ 1K // K".as_bytes());
+    let atlas = fixture.atlas(64);
+    let mut service = RetainedAtlasStreamSearch::new(&atlas).unwrap();
+    let report = json(&service.search_scoped_page_with_progress(&atlas, "k",
+        AtlasStreamSearchOptions { max_matches: 2, ..opts() },
+        AtlasSearchScope::all().with_case_sensitive(false), 1, true, true,
+        || false, || false, |_| {}).unwrap());
+    assert_eq!(report.get("mode").text(), "whole-token-occurrences");
+    assert!(!report.get("case_sensitive").flag());
+    assert_eq!(report.get("matches_seen").number(), 4);
+    assert_eq!(report.get("retained_hits").number(), 2);
+    assert!(report.get("match_count_complete").flag());
+    let generation = report.get("query_generation").number();
+    let before = (service.source_bytes_read(), service.read_calls());
+    fixture.write("tokens.rs", b"changed");
+    for (index, spelling) in ["k", "K"].iter().enumerate() {
+        let response = json(&service.hit(&atlas, generation, index).unwrap());
+        assert_eq!(response.get("mode").text(), "whole-token-occurrences");
+        assert!(!response.get("case_sensitive").flag());
+        let hit = response.get("hit");
+        assert_eq!(hit.get("text").text(), *spelling);
+        assert_eq!(hit.get("original_hex").text(), hex(spelling.as_bytes()));
+        assert_eq!(hit.get("occurrence_id").number(), index as u64 + 2);
+    }
+    assert_eq!(before, (service.source_bytes_read(), service.read_calls()));
 }

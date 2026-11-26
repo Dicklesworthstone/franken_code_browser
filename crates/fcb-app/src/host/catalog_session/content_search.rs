@@ -205,8 +205,7 @@ impl CatalogContentSearchSession {
             || !(1..=MAX_ATLAS_STREAM_SEARCH_HITS).contains(&limits.max_matches)
             || !(1..=MAX_ATLAS_STREAM_SEARCH_SCAN_BYTES).contains(&limits.max_scan_bytes)
             || !(1..=MAX_ATLAS_STREAM_SEARCH_READ_CALLS).contains(&limits.max_read_calls)
-            || options.start_after.checked_add(limits.max_matches as u64).and_then(|n| n.checked_add(1)).is_none()
-            || (options.mode == CatalogContentSearchMode::Occurrences && !options.scope.case_sensitive()) {
+            || options.start_after.checked_add(limits.max_matches as u64).and_then(|n| n.checked_add(1)).is_none() {
             return Err(CatalogContentSearchError::InvalidLimits);
         }
         let generation = QueryGeneration::new(owner, generation).map_err(|_| CatalogContentSearchError::StaleQuery)?;
@@ -225,7 +224,7 @@ impl CatalogContentSearchSession {
         let needle = Arc::new(if let Some(expression) = &expression {
             StreamingNeedle::expression(owner, expression, options.scope.case_sensitive(), &catalog.budget, id)?
         } else if options.mode == CatalogContentSearchMode::Occurrences {
-            StreamingNeedle::identifier(owner, query, &catalog.budget, id)?
+            StreamingNeedle::identifier_matching(owner, query, options.scope.case_sensitive(), &catalog.budget, id)?
         } else {
             StreamingNeedle::text_matching(owner, query, options.scope.case_sensitive(), &catalog.budget, id)?
         });
