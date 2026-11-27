@@ -18,6 +18,7 @@ use fcb::search::snapshot_structure::StructureError;
 use fcb::source::{CaptureEncodingMap, SpanKind, detect_encoding};
 use fcb_core::ResourceLease;
 pub use fcb::search::snapshot::{SnapshotLimits, Sha256Digest};
+pub use fcb::search::snapshot_scope::SnapshotScope;
 use crate::{AppError, input, MANAGED_BYTES, EXIT_OK, EXIT_PARTIAL};
 use crate::output::{Output, OutputError, MAX_RESPONSE_BYTES};
 use super::{HostResponse, reader::{ReaderSession, ReaderSessionError, MAX_READER_SOURCE_BYTES}};
@@ -84,6 +85,7 @@ impl From<OutputError> for SavedRepositoryError { fn from(e: OutputError) -> Sel
 struct AcceptedIndex { generation: u64, pin: Sha256Digest, pages: PagedPostings<File> }
 struct AcceptedQuery {
     generation: u64, needle: String, case_sensitive: bool, report: PagedReport,
+    scope_label: &'static str, scope_path: Vec<u8>,
     index_generation: Option<u64>, index_pin: Option<Sha256Digest>,
     member_bytes_read: u64, member_read_calls: u64, _label_lease: ResourceLease,
 }
@@ -284,16 +286,29 @@ impl SavedRepositorySession {
     #[allow(clippy::too_many_arguments)]
     pub fn search_matching_page(&mut self, generation: u64, needle: &str, max_matches: usize,
         case_sensitive: bool, count_all_matches: bool, skip_matches: u64,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, SavedRepositoryError> {
+        self.search_scoped_page(generation, needle, max_matches, case_sensitive,
+            count_all_matches, skip_matches, SnapshotScope::Archive, canceled)
+    }
+
+    /// Freeze an exact saved directory or member before scanning or consulting
+    /// index candidates. Accepted results retain this raw-byte scope for paging
+    /// and reader activation, independently of later index attachment.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_scoped_page(&mut self, generation: u64, needle: &str, max_matches: usize,
+        case_sensitive: bool, count_all_matches: bool, skip_matches: u64, scope: SnapshotScope<'_>,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, SavedRepositoryError> {
         query_attempt(&mut self.last_query_attempt, generation)?; check(&mut canceled)?;
+        scope.validate()?;
         if needle.is_empty() || needle.len() > MAX_SAVED_NEEDLE_BYTES
             || max_matches > MAX_SAVED_HITS || (!count_all_matches && max_matches == 0) {
             return Err(SavedRepositoryError::InvalidLimits);
         }
         let [label_id, pattern_id, result_id, member_id, scan_id] = self.allocations()?;
         let lease = self.budget.try_reserve_managed(self.owner(), label_id,
-            ByteLength::new((needle.len() + size_of::<AcceptedQuery>()) as u64)).map_err(|_| AppError::Admission)?;
+            ByteLength::new((needle.len() + scope.path().len() + size_of::<AcceptedQuery>()) as u64)).map_err(|_| AppError::Admission)?;
         let label = copy_text(needle)?;
+        let scope_path = copy_scope_path(scope)?;
         let owner = self.owner();
         let qgen = QueryGeneration::new(owner, generation).map_err(|_| SavedRepositoryError::IdentityExhausted)?;
         let opts = PagedQueryOptions { generation: qgen,
@@ -305,20 +320,21 @@ impl SavedRepositorySession {
         let report = if let Some(index) = self.index.as_mut() {
             let pattern = IndexedNeedle::text_matching(owner, needle, case_sensitive, &self.budget, pattern_id)
                 .map_err(PagedSearchError::from)?;
-            let query = PagedQuery::new_paged_page(&mut self.archive, &pattern, &mut index.pages,
-                opts, skip_matches, count_all_matches, &self.budget, ids)?;
+            let query = PagedQuery::new_paged_scoped_page(&mut self.archive, &pattern, &mut index.pages,
+                opts, scope, skip_matches, count_all_matches, &self.budget, ids)?;
             finish_query(query, qgen, &self.budget, &mut canceled)?
         } else {
             let pattern = StreamingNeedle::text_matching(owner, needle, case_sensitive, &self.budget, pattern_id)
                 .map_err(PagedSearchError::from)?;
-            let query = PagedQuery::new_page(&mut self.archive, &pattern, opts,
-                skip_matches, count_all_matches, &self.budget, ids)?;
+            let query = PagedQuery::new_scoped_page(&mut self.archive, &pattern, opts,
+                scope, skip_matches, count_all_matches, &self.budget, ids)?;
             finish_query(query, qgen, &self.budget, &mut canceled)?
         };
         check(&mut canceled)?;
         report.validate_delivery(self.archive_digest(), qgen)?;
         let after = self.archive.load_stats();
         let candidate = AcceptedQuery { generation, needle: label, case_sensitive, report,
+            scope_label: scope.label(), scope_path,
             index_generation: self.index_generation().filter(|_| used_index),
             index_pin: self.index.as_ref().filter(|_| used_index).map(|i| i.pin),
             member_bytes_read: after.bytes_read - before.bytes_read,
@@ -390,6 +406,12 @@ impl SavedRepositorySession {
         out.literal(",\"source_digest\":")?; out.quoted(&capture.source_digest().to_hex())?;
         out.literal(",\"source_observation\":\"verified-saved-member\",\"live_source_reopened\":false,\"reader_owner\":")?;
         out.integer(reader_owner.get())?;
+        if let Some((_, hit)) = selected {
+            let query = self.accepted(hit.generation().get())?;
+            scope_fields(&mut out, query.scope_label, &query.scope_path,
+                query.report.selected_members(), query.report.captured_members(),
+                query.report.membership_complete())?;
+        }
         out.literal(",\"selection\":")?;
         if let Some((id, hit)) = selected {
             let case_sensitive = self.accepted(hit.generation().get())?.case_sensitive;
@@ -436,6 +458,8 @@ impl SavedRepositorySession {
         canceled: &mut impl FnMut() -> bool) -> Result<(), SavedRepositoryError> {
         let report = &query.report; let stats = report.stats();
         out.literal(",\"query_generation\":")?; out.integer(query.generation)?;
+        scope_fields(out, query.scope_label, &query.scope_path, report.selected_members(),
+            report.captured_members(), report.membership_complete())?;
         out.literal(",\"needle\":")?; out.quoted(&query.needle)?;
         out.literal(",\"index_generation\":")?; optional(out, query.index_generation)?;
         out.literal(",\"index_pin\":")?;
@@ -548,6 +572,21 @@ fn check(canceled: &mut impl FnMut() -> bool) -> Result<(), SavedRepositoryError
 }
 fn page_limits(start: usize, limit: usize, count: usize) -> Result<(), SavedRepositoryError> {
     if !(1..=MAX_SAVED_PAGE).contains(&limit) || start > count { Err(SavedRepositoryError::InvalidLimits) } else { Ok(()) }
+}
+fn copy_scope_path(scope: SnapshotScope<'_>) -> Result<Vec<u8>, SavedRepositoryError> {
+    let path = scope.path();
+    let mut copy = Vec::new();
+    copy.try_reserve_exact(path.len()).map_err(|_| AppError::Admission)?;
+    if copy.capacity() > path.len() { return Err(AppError::Admission.into()); }
+    copy.extend_from_slice(path); Ok(copy)
+}
+fn scope_fields(out: &mut Output, label: &str, path: &[u8], members: usize,
+    captured: usize, membership_complete: bool) -> Result<(), OutputError> {
+    out.literal(",\"scope\":")?; out.quoted(label)?;
+    out.literal(",\"scope_path_hex\":")?; out.hex(path)?;
+    out.literal(",\"scope_known_members\":")?; out.integer(members as u64)?;
+    out.literal(",\"scope_captured_members\":")?; out.integer(captured as u64)?;
+    out.literal(",\"scope_membership_complete\":")?; out.boolean(membership_complete)
 }
 fn encode_matching(out: &mut Output, case_sensitive: bool) -> Result<(), OutputError> {
     out.literal(",\"case_sensitive\":")?; out.boolean(case_sensitive)?;

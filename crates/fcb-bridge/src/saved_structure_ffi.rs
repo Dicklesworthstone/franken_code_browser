@@ -4,7 +4,7 @@
 //! Extraction, archive verification and result ownership stay in the safe host.
 
 use fcb_app::host::saved_repository::structure::{StructureMode, StructureScope, SymbolNameMode};
-use super::{AccessError, Command, Selection, answer, c_char, cstr, number, reply};
+use super::{AccessError, Command, Selection, SnapshotScope, answer, c_char, cstr, number, reply, search_scope};
 
 /// Synchronous worker search over verified members of the opened archive.
 /// mode=1 symbols, 2 Markdown headings, 4 whole-token occurrences; name_mode=0
@@ -106,13 +106,10 @@ pub unsafe extern "C" fn fcb_saved_structure_search_scoped_page(handle: u64, gen
     count_all_matches: u64, max_hits: u64, max_source_bytes: u64, skip_matches: u64,
     scope_kind: u64, path: *const u8, path_bytes: u64) -> *mut c_char {
     reply(|| answer(handle, |sessions| {
-        let scope = match scope_kind {
-            0 if path.is_null() && path_bytes == 0 => StructureScope::Archive,
-            1 | 2 if !path.is_null() && (1..=16_384).contains(&path_bytes) => {
-                let path = unsafe { std::slice::from_raw_parts(path, path_bytes as usize) };
-                if scope_kind == 1 { StructureScope::Directory(path) } else { StructureScope::Member(path) }
-            }
-            _ => return Err(AccessError::InvalidArgument),
+        let scope = match unsafe { search_scope(scope_kind, path, path_bytes) }? {
+            SnapshotScope::Archive => StructureScope::Archive,
+            SnapshotScope::Directory(path) => StructureScope::Directory(path),
+            SnapshotScope::Member(path) => StructureScope::Member(path),
         };
         let mode = match mode {
             1 => StructureMode::Symbols,

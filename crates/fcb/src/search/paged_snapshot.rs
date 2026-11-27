@@ -19,6 +19,7 @@ use fcb_core::{ArenaOwnerId, ByteLength, ByteRange, FileId, QueryGeneration, Res
 use super::{CaptureRequest, StreamingNeedle, StreamingMode, StreamReadOptions, StreamReadState,
     StreamReadStep, StreamReadError, RawPath, SourceReader, ReaderLimits, ReaderError,
     ReaderIndexProgress, ReadingTarget, ReadingSeek, ReadingAnchor, ReadingWindow, ReadingWindowOptions};
+use super::snapshot_scope::{SnapshotScope, SnapshotSelection};
 use super::snapshot_index::{SnapshotIndex, SnapshotIndexError, IndexDecision,
     SnapshotPostings, PostingCandidates, PostingStep};
 use super::snapshot_index::paged::{PagedPostings, PagedPostingCandidates, PagedPostingError};
@@ -32,7 +33,7 @@ pub(crate) use member_search::MemberSearch;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PagedSearchError {
     Archive(PagedSnapshotError), Search(StreamReadError), OwnerMismatch, IdentityExhausted,
-    InvalidLimits, ResourceDenied, Pending, Canceled, StaleQuery, InvalidHit, IncompleteInput,
+    InvalidLimits, InvalidScope, ResourceDenied, Pending, Canceled, StaleQuery, InvalidHit, IncompleteInput,
     Index(SnapshotIndexError), PagedIndex(PagedPostingError),
 }
 impl std::fmt::Display for PagedSearchError {
@@ -43,6 +44,7 @@ impl std::fmt::Display for PagedSearchError {
             Self::OwnerMismatch => f.write_str("SNAPSHOT_OWNER_MISMATCH"),
             Self::IdentityExhausted => f.write_str("SNAPSHOT_IDENTITY_EXHAUSTED"),
             Self::InvalidLimits => f.write_str("SNAPSHOT_QUERY_INVALID_LIMITS"),
+            Self::InvalidScope => f.write_str("SNAPSHOT_QUERY_INVALID_SCOPE"),
             Self::ResourceDenied => f.write_str("SNAPSHOT_RESOURCE_DENIED"),
             Self::Pending => f.write_str("SNAPSHOT_QUERY_PENDING"),
             Self::Canceled => f.write_str("SNAPSHOT_CANCELED"),
@@ -149,6 +151,7 @@ pub struct PagedQuery<'archive, 'needle, R: Read + Seek> {
     postings: Option<PostingCandidates<'needle>>,
     paged_postings: Option<PagedPostingCandidates<'needle>>,
     options: PagedQueryOptions,
+    selection: SnapshotSelection,
     allocations: [ResourceAllocationId; 3],
     next: usize,
     active: Option<MemberSearch<'archive, 'needle, R>>,
@@ -179,6 +182,17 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
         options: PagedQueryOptions, skip_matches: u64, count_all_matches: bool,
         budget: &ResourceBudget, allocations: [ResourceAllocationId; 3])
         -> Result<Self, PagedSearchError> {
+        Self::new_scoped_page(archive, needle, options, SnapshotScope::Archive, skip_matches,
+            count_all_matches, budget, allocations)
+    }
+    /// Freeze raw member membership before source admission, hit offsets or
+    /// byte work. Exact witnesses retain the archive's original ordinals.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_scoped_page(archive: &'archive mut PagedSnapshot<R>, needle: &'needle StreamingNeedle,
+        options: PagedQueryOptions, scope: SnapshotScope<'_>, skip_matches: u64, count_all_matches: bool,
+        budget: &ResourceBudget, allocations: [ResourceAllocationId; 3])
+        -> Result<Self, PagedSearchError> {
+        let selection = scope.select(archive.directory())?;
         let owner = archive.directory().owner();
         if options.generation.owner() != owner || options.first_file.owner() != owner || options.first_revision.owner() != owner {
             return Err(PagedSearchError::OwnerMismatch);
@@ -187,9 +201,11 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
             || allocations[0] == allocations[1] || allocations[0] == allocations[2] || allocations[1] == allocations[2] {
             return Err(PagedSearchError::InvalidLimits);
         }
-        let last = archive.directory().len().saturating_sub(1) as u64;
-        options.first_file.get().checked_add(last).ok_or(PagedSearchError::IdentityExhausted)?;
-        options.first_revision.get().checked_add(last).ok_or(PagedSearchError::IdentityExhausted)?;
+        if !selection.members.is_empty() {
+            let last = (selection.members.end - 1) as u64;
+            options.first_file.get().checked_add(last).ok_or(PagedSearchError::IdentityExhausted)?;
+            options.first_revision.get().checked_add(last).ok_or(PagedSearchError::IdentityExhausted)?;
+        }
         let charge = options.max_matches.checked_mul(size_of::<PagedHit>()).and_then(|n| n.checked_add(size_of::<Self>()))
             .ok_or(PagedSearchError::ResourceDenied)?;
         let lease = budget.try_reserve_managed(owner, allocations[0], ByteLength::new(charge as u64))
@@ -198,7 +214,9 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
         if hits.capacity() > options.max_matches { return Err(PagedSearchError::ResourceDenied); }
         let source = archive.read_session();
         let directory = source.directory();
-        Ok(Self { directory, source: Some(source), needle, index: None, postings: None, paged_postings: None, options, allocations, next: 0,
+        let next = selection.members.start;
+        Ok(Self { directory, source: Some(source), needle, index: None, postings: None, paged_postings: None,
+            options, selection, allocations, next,
             active: None, hits, matches_seen: 0, matching_files: 0, count_all_matches, skip_matches,
             state: PagedQueryState::Pending, stats: PagedQueryStats::default(), _lease: lease })
     }
@@ -218,11 +236,8 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
     pub fn new_indexed(archive: &'archive mut PagedSnapshot<R>, needle: &'needle IndexedNeedle<'_>,
         index: &'needle SnapshotIndex, options: PagedQueryOptions, budget: &ResourceBudget,
         allocations: [ResourceAllocationId; 3]) -> Result<Self, PagedSearchError> {
-        index.validate_directory(archive.directory())?;
-        if needle.owner != archive.directory().owner() { return Err(PagedSearchError::OwnerMismatch); }
-        let mut query = Self::new(archive, &needle.inner, options, budget, allocations)?;
-        query.index = Some((index, needle.pattern));
-        Ok(query)
+        Self::new_indexed_scoped_page(archive, needle, index, options, SnapshotScope::Archive,
+            0, false, budget, allocations)
     }
     pub fn new_indexed_counting(archive: &'archive mut PagedSnapshot<R>, needle: &'needle IndexedNeedle<'_>,
         index: &'needle SnapshotIndex, options: PagedQueryOptions, budget: &ResourceBudget,
@@ -236,17 +251,8 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
     pub fn new_postings(archive: &'archive mut PagedSnapshot<R>, needle: &'needle IndexedNeedle<'_>,
         index: &'needle SnapshotPostings, options: PagedQueryOptions, budget: &ResourceBudget,
         allocations: [ResourceAllocationId; 3]) -> Result<Self, PagedSearchError> {
-        index.validate_directory(archive.directory())?;
-        if needle.owner != archive.directory().owner() { return Err(PagedSearchError::OwnerMismatch); }
-        let mut query = Self::new(archive, &needle.inner, options, budget, allocations)?;
-        if !matches!(needle.inner.mode(), StreamingMode::OriginalBytes | StreamingMode::ExactText | StreamingMode::LowercaseText) {
-            return Ok(query);
-        }
-        let candidates = index.candidates_matching(needle.pattern, needle.inner.mode() != StreamingMode::OriginalBytes,
-            needle.inner.mode() != StreamingMode::LowercaseText);
-        query.stats.posting_list_lookups = candidates.stats().list_lookups;
-        query.postings = Some(candidates);
-        Ok(query)
+        Self::new_postings_scoped_page(archive, needle, index, options, SnapshotScope::Archive,
+            0, false, budget, allocations)
     }
     pub fn new_postings_counting(archive: &'archive mut PagedSnapshot<R>, needle: &'needle IndexedNeedle<'_>,
         index: &'needle SnapshotPostings, options: PagedQueryOptions, budget: &ResourceBudget,
@@ -260,17 +266,8 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
     pub fn new_paged<I: Read + Seek>(archive: &'archive mut PagedSnapshot<R>, needle: &'needle IndexedNeedle<'_>,
         index: &'needle mut PagedPostings<I>, options: PagedQueryOptions, budget: &ResourceBudget,
         allocations: [ResourceAllocationId; 3]) -> Result<Self, PagedSearchError> {
-        index.validate_directory(archive.directory())?;
-        if needle.owner != archive.directory().owner() { return Err(PagedSearchError::OwnerMismatch); }
-        let mut query = Self::new(archive, &needle.inner, options, budget, allocations)?;
-        if !matches!(needle.inner.mode(), StreamingMode::OriginalBytes | StreamingMode::ExactText | StreamingMode::LowercaseText) {
-            return Ok(query);
-        }
-        let candidates = index.candidates_matching(needle.pattern, needle.inner.mode() != StreamingMode::OriginalBytes,
-            needle.inner.mode() != StreamingMode::LowercaseText);
-        query.stats.posting_list_lookups = candidates.stats().list_lookups;
-        query.paged_postings = Some(candidates);
-        Ok(query)
+        Self::new_paged_scoped_page(archive, needle, index, options, SnapshotScope::Archive,
+            0, false, budget, allocations)
     }
     pub fn new_paged_counting<I: Read + Seek>(archive: &'archive mut PagedSnapshot<R>, needle: &'needle IndexedNeedle<'_>,
         index: &'needle mut PagedPostings<I>, options: PagedQueryOptions, budget: &ResourceBudget,
@@ -283,8 +280,20 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
         index: &'needle SnapshotIndex, options: PagedQueryOptions, skip_matches: u64,
         count_all_matches: bool, budget: &ResourceBudget, allocations: [ResourceAllocationId; 3])
         -> Result<Self, PagedSearchError> {
-        let mut query = Self::new_indexed(archive, needle, index, options, budget, allocations)?;
-        query.skip_matches = skip_matches; query.count_all_matches = count_all_matches; Ok(query)
+        Self::new_indexed_scoped_page(archive, needle, index, options, SnapshotScope::Archive,
+            skip_matches, count_all_matches, budget, allocations)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_indexed_scoped_page(archive: &'archive mut PagedSnapshot<R>, needle: &'needle IndexedNeedle<'_>,
+        index: &'needle SnapshotIndex, options: PagedQueryOptions, scope: SnapshotScope<'_>,
+        skip_matches: u64, count_all_matches: bool, budget: &ResourceBudget,
+        allocations: [ResourceAllocationId; 3]) -> Result<Self, PagedSearchError> {
+        index.validate_directory(archive.directory())?;
+        if needle.owner != archive.directory().owner() { return Err(PagedSearchError::OwnerMismatch); }
+        let mut query = Self::new_scoped_page(archive, &needle.inner, options, scope,
+            skip_matches, count_all_matches, budget, allocations)?;
+        query.index = Some((index, needle.pattern));
+        Ok(query)
     }
     /// Global postings retain the original member order; only verified matches
     /// consume the result offset, never posting candidates or negative proofs.
@@ -292,16 +301,52 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
         index: &'needle SnapshotPostings, options: PagedQueryOptions, skip_matches: u64,
         count_all_matches: bool, budget: &ResourceBudget, allocations: [ResourceAllocationId; 3])
         -> Result<Self, PagedSearchError> {
-        let mut query = Self::new_postings(archive, needle, index, options, budget, allocations)?;
-        query.skip_matches = skip_matches; query.count_all_matches = count_all_matches; Ok(query)
+        Self::new_postings_scoped_page(archive, needle, index, options, SnapshotScope::Archive,
+            skip_matches, count_all_matches, budget, allocations)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_postings_scoped_page(archive: &'archive mut PagedSnapshot<R>, needle: &'needle IndexedNeedle<'_>,
+        index: &'needle SnapshotPostings, options: PagedQueryOptions, scope: SnapshotScope<'_>,
+        skip_matches: u64, count_all_matches: bool, budget: &ResourceBudget,
+        allocations: [ResourceAllocationId; 3]) -> Result<Self, PagedSearchError> {
+        index.validate_directory(archive.directory())?;
+        if needle.owner != archive.directory().owner() { return Err(PagedSearchError::OwnerMismatch); }
+        let mut query = Self::new_scoped_page(archive, &needle.inner, options, scope,
+            skip_matches, count_all_matches, budget, allocations)?;
+        if !matches!(needle.inner.mode(), StreamingMode::OriginalBytes | StreamingMode::ExactText | StreamingMode::LowercaseText) {
+            return Ok(query);
+        }
+        let candidates = index.candidates_matching(needle.pattern, needle.inner.mode() != StreamingMode::OriginalBytes,
+            needle.inner.mode() != StreamingMode::LowercaseText);
+        query.stats.posting_list_lookups = candidates.stats().list_lookups;
+        query.postings = Some(candidates);
+        Ok(query)
     }
     /// Demand-paged postings use the same match-offset and coverage semantics.
     pub fn new_paged_page<I: Read + Seek>(archive: &'archive mut PagedSnapshot<R>,
         needle: &'needle IndexedNeedle<'_>, index: &'needle mut PagedPostings<I>,
         options: PagedQueryOptions, skip_matches: u64, count_all_matches: bool,
         budget: &ResourceBudget, allocations: [ResourceAllocationId; 3]) -> Result<Self, PagedSearchError> {
-        let mut query = Self::new_paged(archive, needle, index, options, budget, allocations)?;
-        query.skip_matches = skip_matches; query.count_all_matches = count_all_matches; Ok(query)
+        Self::new_paged_scoped_page(archive, needle, index, options, SnapshotScope::Archive,
+            skip_matches, count_all_matches, budget, allocations)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_paged_scoped_page<I: Read + Seek>(archive: &'archive mut PagedSnapshot<R>,
+        needle: &'needle IndexedNeedle<'_>, index: &'needle mut PagedPostings<I>,
+        options: PagedQueryOptions, scope: SnapshotScope<'_>, skip_matches: u64, count_all_matches: bool,
+        budget: &ResourceBudget, allocations: [ResourceAllocationId; 3]) -> Result<Self, PagedSearchError> {
+        index.validate_directory(archive.directory())?;
+        if needle.owner != archive.directory().owner() { return Err(PagedSearchError::OwnerMismatch); }
+        let mut query = Self::new_scoped_page(archive, &needle.inner, options, scope,
+            skip_matches, count_all_matches, budget, allocations)?;
+        if !matches!(needle.inner.mode(), StreamingMode::OriginalBytes | StreamingMode::ExactText | StreamingMode::LowercaseText) {
+            return Ok(query);
+        }
+        let candidates = index.candidates_matching(needle.pattern, needle.inner.mode() != StreamingMode::OriginalBytes,
+            needle.inner.mode() != StreamingMode::LowercaseText);
+        query.stats.posting_list_lookups = candidates.stats().list_lookups;
+        query.paged_postings = Some(candidates);
+        Ok(query)
     }
     pub const fn state(&self) -> PagedQueryState { self.state }
     pub const fn generation(&self) -> QueryGeneration { self.options.generation }
@@ -331,28 +376,37 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
     fn advance(&mut self, step: StreamReadStep, budget: &ResourceBudget,
         canceled: &mut impl FnMut() -> bool) -> Result<(), PagedSearchError> {
         if self.active.is_none() {
+            if self.selection.members.is_empty() { self.state = PagedQueryState::Complete; return Ok(()); }
             let selected = if let Some(cursor) = self.paged_postings.as_mut() {
                 let result = cursor.step(&mut *canceled)?;
-                Some((result, cursor.stats(), cursor.is_finished(), cursor.excluded_files()))
+                Some((result, cursor.stats(), cursor.is_finished()))
             } else if let Some(cursor) = self.postings.as_mut() {
                 let result = cursor.step();
-                Some((result, cursor.stats(), cursor.is_finished(), cursor.excluded_files()))
+                Some((result, cursor.stats(), cursor.is_finished()))
             } else { None };
-            let (ordinal, posting_decision) = if let Some((result, stats, finished, excluded)) = selected {
+            let (ordinal, posting_decision) = if let Some((result, stats, finished)) = selected {
                 self.stats.posting_entries_visited = stats.posting_entries_visited;
                 self.stats.posting_membership_lookups = stats.membership_lookups;
                 self.stats.posting_cursor_complete = finished;
-                if let Some(excluded) = excluded { self.stats.index_eliminated_files = excluded; }
                 match result {
-                    PostingStep::Pending => return Ok(()),
-                    PostingStep::Finished => { self.state = PagedQueryState::Complete; return Ok(()); }
+                    PostingStep::Pending => { self.finish_posting_counts()?; return Ok(()); }
+                    PostingStep::Finished => {
+                        self.finish_posting_counts()?;
+                        self.state = PagedQueryState::Complete; return Ok(());
+                    }
                     PostingStep::Candidate { ordinal, decision } => (ordinal, Some(decision)),
                 }
             } else {
-                if self.next == self.directory.len() { self.state = PagedQueryState::Complete; return Ok(()); }
+                if self.next == self.selection.members.end { self.state = PagedQueryState::Complete; return Ok(()); }
                 let ordinal = self.next; self.next += 1;
                 (ordinal, None)
             };
+            // Global cursors may inspect candidates outside this selection.
+            // Such candidates consume no source admission, hit offset or count.
+            if !self.selection.members.contains(&ordinal) {
+                self.finish_posting_counts()?;
+                return Ok(());
+            }
             self.stats.members_visited += 1;
             let member = self.directory.member(ordinal).ok_or(PagedSearchError::InvalidHit)?;
             if matches!(member.data, PagedMemberData::Unavailable(_)) { return Ok(()); }
@@ -374,6 +428,7 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
                     IndexDecision::Fallback => self.stats.index_fallback_files += 1,
                 }
             }
+            self.finish_posting_counts()?;
             let file = FileId::new(self.options.first_file.owner(), self.options.first_file.get() + ordinal as u64)
                 .map_err(|_| PagedSearchError::IdentityExhausted)?;
             let revision = SourceRevision::new(file.owner(), self.options.first_revision.get() + ordinal as u64)
@@ -447,6 +502,18 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
         }
         Ok(())
     }
+    /// A global posting cursor proves negatives only when exhausted. Its own
+    /// totals describe the whole archive; derive selected negatives from the
+    /// selected captured denominator and selected emitted candidates instead.
+    fn finish_posting_counts(&mut self) -> Result<(), PagedSearchError> {
+        if self.stats.posting_cursor_complete {
+            self.stats.index_eliminated_files = self.selection.captured
+                .checked_sub(self.stats.index_candidates)
+                .and_then(|n| n.checked_sub(self.stats.index_fallback_files))
+                .ok_or(PagedSearchError::InvalidHit)?;
+        }
+        Ok(())
+    }
     /// Only terminal nonfailed output is publishable. A failed digest check or
     /// stale request cannot become an apparently complete partial result table.
     pub fn finish(self) -> Result<PagedReport, PagedSearchError> {
@@ -458,8 +525,9 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
         }
         let directory = self.directory;
         Ok(PagedReport { archive: directory.digest(), generation: self.options.generation,
-            discovery_complete: directory.discovery_complete(),
-            unavailable: directory.len() - directory.captured_files(),
+            discovery_complete: self.selection.complete,
+            selected_members: self.selection.members.len(), captured_members: self.selection.captured,
+            unavailable: self.selection.unavailable(),
             truncated: self.state == PagedQueryState::Truncated || self.matches_seen > self.hits.len() as u64,
             input_complete: self.state == PagedQueryState::Complete, count_all_matches: self.count_all_matches,
             max_matches: self.options.max_matches, skip_matches: self.skip_matches,
@@ -470,6 +538,7 @@ impl<'archive, 'needle, R: Read + Seek> PagedQuery<'archive, 'needle, R> {
 
 pub struct PagedReport {
     archive: Sha256Digest, generation: QueryGeneration, discovery_complete: bool,
+    selected_members: usize, captured_members: usize,
     unavailable: usize, truncated: bool, input_complete: bool, count_all_matches: bool,
     max_matches: usize, skip_matches: u64, matching_files: usize, hits: Vec<PagedHit>, matches_seen: u64,
     stats: PagedQueryStats, _lease: ResourceLease,
@@ -495,6 +564,9 @@ impl PagedReport {
         self.skipped_matches().checked_add(self.hits.len() as u64)
             .filter(|next| *next > self.skip_matches)
     }
+    pub const fn selected_members(&self) -> usize { self.selected_members }
+    pub const fn captured_members(&self) -> usize { self.captured_members }
+    pub const fn membership_complete(&self) -> bool { self.discovery_complete }
     pub const fn unavailable_files(&self) -> usize { self.unavailable }
     pub const fn truncated(&self) -> bool { self.truncated }
     pub const fn count_all_matches(&self) -> bool { self.count_all_matches }

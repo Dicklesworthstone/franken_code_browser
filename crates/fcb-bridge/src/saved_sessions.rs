@@ -7,7 +7,7 @@
 use std::{mem::size_of, path::Path, sync::{Arc, Mutex, MutexGuard, TryLockError,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}};
 use fcb_app::host::{HostResponse, saved_repository::{SavedRepositorySession, SavedRepositoryError,
-    SnapshotLimits, Sha256Digest}};
+    SnapshotLimits, SnapshotScope, Sha256Digest}};
 use fcb_app::host::saved_repository::relationships::{SavedRelationshipError, RelationshipDirection, RelationshipSide};
 use fcb_app::host::saved_repository::imports::{SavedImportError, SavedImportDirection, SavedImportSide};
 use fcb_app::host::saved_repository::trail::{SavedTrailError, SavedTrailWriteRequest, SavedTrailEditRequest, SavedTrailExportRequest, SavedTrailArchiveRequest};
@@ -87,6 +87,8 @@ pub(super) enum Command<'a> {
         case_sensitive: bool, count_all_matches: bool },
     SearchPage { generation: u64, needle: &'a str, limit: usize,
         case_sensitive: bool, count_all_matches: bool, skip_matches: u64 },
+    SearchScopedPage { scope: SnapshotScope<'a>, generation: u64, needle: &'a str, limit: usize,
+        case_sensitive: bool, count_all_matches: bool, skip_matches: u64 },
     Results { generation: u64, start: usize, limit: usize },
     Clear { generation: u64 },
     ExpressionSearch { generation: u64, query: &'a str, max_hits: usize, max_scan_bytes: u64 },
@@ -95,6 +97,9 @@ pub(super) enum Command<'a> {
         case_sensitive: bool, count_all_matches: bool },
     ExpressionSearchPage { generation: u64, query: &'a str, max_hits: usize, max_scan_bytes: u64,
         case_sensitive: bool, count_all_matches: bool, skip_matches: u64 },
+    ExpressionSearchScopedPage { scope: SnapshotScope<'a>, generation: u64, query: &'a str,
+        max_hits: usize, max_scan_bytes: u64, case_sensitive: bool,
+        count_all_matches: bool, skip_matches: u64 },
     ExpressionResults { generation: u64, start: usize, limit: usize },
     ClearExpression { generation: u64 },
     StructureSearch { generation: u64, mode: StructureMode, name_mode: SymbolNameMode,
@@ -220,6 +225,10 @@ impl SavedSessions {
                 case_sensitive, count_all_matches, skip_matches } =>
                 session.expression_search_matching_page(generation, query, max_hits, max_scan_bytes,
                     case_sensitive, count_all_matches, skip_matches, &mut stop).map_err(AccessError::from),
+            Command::ExpressionSearchScopedPage { scope, generation, query, max_hits, max_scan_bytes,
+                case_sensitive, count_all_matches, skip_matches } =>
+                session.expression_search_scoped_page(generation, query, max_hits, max_scan_bytes,
+                    case_sensitive, count_all_matches, skip_matches, scope, &mut stop).map_err(AccessError::from),
             Command::ExpressionResults { generation, start, limit } =>
                 session.expression_results(generation, start, limit, &mut stop).map_err(AccessError::from),
             Command::ClearExpression { generation } =>
@@ -282,6 +291,9 @@ impl SavedSessions {
             Command::SearchPage { generation, needle, limit, case_sensitive, count_all_matches, skip_matches } =>
                 session.search_matching_page(generation, needle, limit, case_sensitive, count_all_matches,
                     skip_matches, &mut stop).map_err(AccessError::from),
+            Command::SearchScopedPage { scope, generation, needle, limit, case_sensitive, count_all_matches, skip_matches } =>
+                session.search_scoped_page(generation, needle, limit, case_sensitive, count_all_matches,
+                    skip_matches, scope, &mut stop).map_err(AccessError::from),
             Command::Results { generation, start, limit } => session.results(generation, start, limit, &mut stop).map_err(AccessError::from),
             Command::Clear { generation } => session.clear_results(generation, &mut stop).map_err(AccessError::from),
         };

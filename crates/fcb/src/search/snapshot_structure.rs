@@ -16,6 +16,7 @@ use fcb_search::normalized::{NormalizedCursor, SourceScalar, matched_text_capaci
 use fcb_core::{ByteLength, ByteRange, FileId, QueryGeneration, ResourceAllocationId,
     ResourceBudget, ResourceLease, SourceRevision};
 use super::{CaptureRequest, SymbolLanguage, SymbolNameMode};
+use super::snapshot_scope::SnapshotScope;
 use super::symbols::{CapturedReferences, CapturedSymbols, ReferenceError, SymbolError,
     MAX_REFERENCE_SOURCE_BYTES, MAX_SYMBOL_ITEMS, MAX_SYMBOL_SOURCE_BYTES, validate_reference_name};
 use super::paged_snapshot::{PagedCapture, PagedMemberData, PagedSearchError,
@@ -58,12 +59,17 @@ pub enum StructureScope<'a> { Archive, Directory(&'a [u8]), Member(&'a [u8]) }
 
 impl StructureScope<'_> {
     pub fn validate(self) -> Result<(), StructureError> {
-        let path = match self { Self::Archive => return Ok(()), Self::Directory(path) | Self::Member(path) => path };
-        if path.len() > 16_384 || path.contains(&0)
-            || path.split(|&byte| byte == b'/').any(|part| part.is_empty() || part == b"." || part == b"..") {
-            return Err(StructureError::InvalidScope);
+        SnapshotScope::from(self).validate().map_err(|_| StructureError::InvalidScope)
+    }
+}
+
+impl<'a> From<StructureScope<'a>> for SnapshotScope<'a> {
+    fn from(scope: StructureScope<'a>) -> Self {
+        match scope {
+            StructureScope::Archive => Self::Archive,
+            StructureScope::Directory(path) => Self::Directory(path),
+            StructureScope::Member(path) => Self::Member(path),
         }
-        Ok(())
     }
 }
 
@@ -244,18 +250,11 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
     pub fn new_scoped_page(archive: &'archive mut PagedSnapshot<R>, needle: &str, options: StructureOptions,
         scope: StructureScope<'_>, skip_matches: u64, case_sensitive: bool, count_all_matches: bool,
         budget: &ResourceBudget, allocations: [ResourceAllocationId; 5]) -> Result<Self, StructureError> {
-        scope.validate()?;
         let directory = archive.directory();
-        let remaining = match scope {
-            StructureScope::Archive => 0..directory.len(),
-            StructureScope::Directory(prefix) => directory.descendants(prefix),
-            StructureScope::Member(path) => directory.find_path(path).map_or(0..0, |n| n..n + 1),
-        };
+        let selection = SnapshotScope::from(scope).select(directory).map_err(|_| StructureError::InvalidScope)?;
+        let remaining = selection.members;
         let selected_members = remaining.len();
-        let membership_complete = match scope {
-            StructureScope::Member(_) => selected_members == 1,
-            _ => directory.discovery_complete(),
-        };
+        let membership_complete = selection.complete;
         let owner = directory.owner();
         if options.generation.owner() != owner || options.first_file.owner() != owner
             || options.first_revision.owner() != owner { return Err(PagedSearchError::OwnerMismatch.into()); }

@@ -15,7 +15,8 @@ use fcb::source::{CaptureEncodingMap, SpanKind, detect_encoding};
 pub use fcb::search::expression::ExpressionError;
 use super::{SavedRepositorySession, SavedRepositoryError, SavedDeskError, SavedDeskOpen,
     DeskSession, HostResponse, ByteLength, RawPath, AppError, check};
-use super::super::{ReaderSession, PagedCapture, PagedSearchError, Output};
+use super::super::{ReaderSession, PagedCapture, PagedSearchError, Output,
+    SnapshotScope, copy_scope_path, scope_fields};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SavedExpressionOptions {
@@ -38,6 +39,8 @@ pub struct SavedExpression {
     generation: u64,
     plan: ExpressionPlan,
     report: ExpressionReport,
+    scope_label: &'static str,
+    scope_path: Vec<u8>,
     options: SavedExpressionOptions,
     member_bytes_read: u64,
     member_read_calls: u64,
@@ -68,8 +71,19 @@ impl SavedExpression {
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_matching_page(saved: &mut SavedRepositorySession, generation: u64, query: &str,
         options: SavedExpressionOptions, case_sensitive: bool, count_all_matches: bool, skip_matches: u64,
-        mut canceled: impl FnMut() -> bool) -> Result<Self, SavedDeskError> {
+        canceled: impl FnMut() -> bool) -> Result<Self, SavedDeskError> {
+        Self::prepare_scoped_page(saved, generation, query, options, case_sensitive,
+            count_all_matches, skip_matches, SnapshotScope::Archive, canceled)
+    }
+
+    /// Freeze raw saved-member membership before evaluating metadata or source
+    /// predicates. The accepted scope survives result paging and reader opens.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_scoped_page(saved: &mut SavedRepositorySession, generation: u64, query: &str,
+        options: SavedExpressionOptions, case_sensitive: bool, count_all_matches: bool, skip_matches: u64,
+        scope: SnapshotScope<'_>, mut canceled: impl FnMut() -> bool) -> Result<Self, SavedDeskError> {
         check(&mut canceled)?;
+        scope.validate()?;
         if options.max_hits > super::super::MAX_SAVED_HITS || query.len() > MAX_QUERY_LEN {
             return Err(SavedRepositoryError::InvalidLimits.into());
         }
@@ -80,8 +94,9 @@ impl SavedExpression {
         // rather than guessing how many IDs the parsed expression will consume.
         let pattern_ids = saved.allocations::<MAX_QUERY_TOKENS>()?;
         let allocations = saved.allocations()?;
-        let lease = saved.budget.try_reserve_managed(owner, object_id, ByteLength::new(size_of::<Self>() as u64))
+        let lease = saved.budget.try_reserve_managed(owner, object_id, ByteLength::new((size_of::<Self>() + scope.path().len()) as u64))
             .map_err(|_| AppError::Admission)?;
+        let scope_path = copy_scope_path(scope)?;
         let plan = ExpressionPlan::parse_with_matching(owner, query, case_sensitive,
             &saved.budget, plan_id, pattern_ids[0])?;
         let first_file = FileId::new(owner, 1).map_err(|_| ExpressionError::IdentityExhausted)?;
@@ -91,8 +106,8 @@ impl SavedExpression {
             generation: qgen, first_file, first_revision, max_matches: options.max_hits,
             max_scan_bytes: options.max_scan_bytes,
         };
-        let mut work = ExpressionQuery::new_page(&mut saved.archive, &plan, query_options,
-            skip_matches, count_all_matches, &saved.budget, allocations)?;
+        let mut work = ExpressionQuery::new_scoped_page(&mut saved.archive, &plan, query_options,
+            scope, skip_matches, count_all_matches, &saved.budget, allocations)?;
         while work.state() == ExpressionState::Pending {
             work.step(StreamReadStep::default(), qgen, &saved.budget, &mut canceled)?;
         }
@@ -100,6 +115,7 @@ impl SavedExpression {
         let after = saved.archive.load_stats();
         check(&mut canceled)?;
         Ok(Self { owner, generation, plan, report, options,
+            scope_label: scope.label(), scope_path,
             member_bytes_read: after.bytes_read - before.bytes_read,
             member_read_calls: after.read_calls - before.read_calls, _lease: lease })
     }
@@ -129,6 +145,8 @@ impl SavedExpression {
         out: &mut Output, canceled: &mut impl FnMut() -> bool) -> Result<(), SavedDeskError> {
         out.literal(",\"selection_namespace\":\"saved-expression\",\"expression_generation\":")?;
         out.integer(self.generation)?;
+        scope_fields(out, self.scope_label, &self.scope_path, self.report.selected_members(),
+            self.report.captured_members(), self.report.membership_complete())?;
         out.literal(",\"expression\":")?; out.quoted(&self.plan.syntax().raw_query)?;
         out.literal(",\"primary_needle\":")?; out.quoted(&self.plan.syntax().primary_needle)?;
         out.literal(",\"predicate_scope\":\"whole-captured-member\",\"case_sensitive\":")?;
@@ -211,6 +229,8 @@ impl SavedExpression {
         let selected = capture.bytes().get(start..end).ok_or(PagedSearchError::InvalidHit)?;
         out.literal(",\"selection_namespace\":\"saved-expression\",\"expression_generation\":")?;
         out.integer(self.generation)?;
+        scope_fields(out, self.scope_label, &self.scope_path, self.report.selected_members(),
+            self.report.captured_members(), self.report.membership_complete())?;
         out.literal(",\"primary_needle\":")?; out.quoted(&self.plan.syntax().primary_needle)?;
         out.literal(",\"case_sensitive\":")?; out.boolean(self.plan.case_sensitive())?;
         out.literal(",\"mode\":")?; out.quoted(self.plan.realized_mode())?;
@@ -310,12 +330,20 @@ impl SavedRepositorySession {
     #[allow(clippy::too_many_arguments)]
     pub fn expression_search_matching_page(&mut self, generation: u64, query: &str, max_hits: usize,
         max_scan_bytes: u64, case_sensitive: bool, count_all_matches: bool, skip_matches: u64,
-        mut canceled: impl FnMut() -> bool) -> Result<HostResponse, SavedDeskError> {
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, SavedDeskError> {
+        self.expression_search_scoped_page(generation, query, max_hits, max_scan_bytes,
+            case_sensitive, count_all_matches, skip_matches, SnapshotScope::Archive, canceled)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn expression_search_scoped_page(&mut self, generation: u64, query: &str, max_hits: usize,
+        max_scan_bytes: u64, case_sensitive: bool, count_all_matches: bool, skip_matches: u64,
+        scope: SnapshotScope<'_>, mut canceled: impl FnMut() -> bool) -> Result<HostResponse, SavedDeskError> {
         super::super::query_attempt(&mut self.last_expression_attempt, generation)?;
         check(&mut canceled)?;
         let options = SavedExpressionOptions { max_hits, max_scan_bytes };
-        let candidate = SavedExpression::prepare_matching_page(self, generation, query, options,
-            case_sensitive, count_all_matches, skip_matches, &mut canceled)?;
+        let candidate = SavedExpression::prepare_scoped_page(self, generation, query, options,
+            case_sensitive, count_all_matches, skip_matches, scope, &mut canceled)?;
         let response = candidate.page(self, generation, 0, 64, &mut canceled)?;
         self.expression = Some(candidate);
         Ok(response)

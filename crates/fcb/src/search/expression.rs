@@ -15,6 +15,7 @@ use super::{CaptureRequest, ParsedQuery, QueryError, ReferenceScanOracle, RawPat
 use super::paged_snapshot::{PagedSnapshot, PagedMemberData, PagedCapture,
     PagedSearchError, Sha256Digest, SnapshotDirectory, SnapshotReadSession, MemberSearch};
 use super::snapshot_index::{SnapshotIndex, IndexDecision};
+use super::snapshot_scope::{SnapshotScope, SnapshotSelection};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExpressionError {
@@ -182,6 +183,7 @@ pub struct ExpressionQuery<'archive, 'plan, R: Read + Seek> {
     plan: &'plan ExpressionPlan,
     index: Option<&'plan SnapshotIndex>,
     options: ExpressionOptions,
+    selection: SnapshotSelection,
     allocations: [ResourceAllocationId; 3],
     scope_at: usize,
     next: usize,
@@ -209,6 +211,16 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
     pub fn new_page(archive: &'archive mut PagedSnapshot<R>, plan: &'plan ExpressionPlan,
         options: ExpressionOptions, skip_matches: u64, count_all_matches: bool,
         budget: &ResourceBudget, allocations: [ResourceAllocationId; 3]) -> Result<Self, ExpressionError> {
+        Self::new_scoped_page(archive, plan, options, SnapshotScope::Archive, skip_matches,
+            count_all_matches, budget, allocations)
+    }
+    /// Intersect raw saved membership with expression metadata filters before
+    /// admitting source bytes, applying the work budget or skipping matches.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_scoped_page(archive: &'archive mut PagedSnapshot<R>, plan: &'plan ExpressionPlan,
+        options: ExpressionOptions, scope: SnapshotScope<'_>, skip_matches: u64, count_all_matches: bool,
+        budget: &ResourceBudget, allocations: [ResourceAllocationId; 3]) -> Result<Self, ExpressionError> {
+        let selection = scope.select(archive.directory())?;
         let owner = archive.directory().owner();
         if plan.owner != owner || options.generation.owner() != owner || options.first_file.owner() != owner
             || options.first_revision.owner() != owner { return Err(PagedSearchError::OwnerMismatch.into()); }
@@ -216,9 +228,11 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
             || allocations[0] == allocations[1] || allocations[0] == allocations[2] || allocations[1] == allocations[2] {
             return Err(ExpressionError::InvalidLimits);
         }
-        let last = archive.directory().len().saturating_sub(1) as u64;
-        options.first_file.get().checked_add(last).ok_or(ExpressionError::IdentityExhausted)?;
-        options.first_revision.get().checked_add(last).ok_or(ExpressionError::IdentityExhausted)?;
+        if !selection.members.is_empty() {
+            let last = (selection.members.end - 1) as u64;
+            options.first_file.get().checked_add(last).ok_or(ExpressionError::IdentityExhausted)?;
+            options.first_revision.get().checked_add(last).ok_or(ExpressionError::IdentityExhausted)?;
+        }
         let charge = options.max_matches.checked_mul(size_of::<ExpressionHit>())
             .and_then(|n| n.checked_add(size_of::<Self>() + 512 * 1024))
             .ok_or(ExpressionError::ResourceDenied)?;
@@ -228,7 +242,9 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
         if hits.capacity() > options.max_matches { return Err(ExpressionError::ResourceDenied); }
         let source = archive.read_session();
         let directory = source.directory();
-        Ok(Self { directory, source: Some(source), plan, index: None, options, allocations, scope_at: 0, next: 0,
+        let next = selection.members.start;
+        Ok(Self { directory, source: Some(source), plan, index: None, options, selection,
+            allocations, scope_at: next, next,
             active: None, hits, seen: 0, matching_files: 0, count_all_matches, skip_matches,
             state: ExpressionState::Pending, stats: ExpressionStats::default(), _lease: lease })
     }
@@ -247,9 +263,8 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
     pub fn new_indexed(archive: &'archive mut PagedSnapshot<R>, plan: &'plan ExpressionPlan,
         index: &'plan SnapshotIndex, options: ExpressionOptions, budget: &ResourceBudget,
         allocations: [ResourceAllocationId; 3]) -> Result<Self, ExpressionError> {
-        index.validate_directory(archive.directory()).map_err(PagedSearchError::from)?;
-        let mut query = Self::new(archive, plan, options, budget, allocations)?;
-        query.index = Some(index); Ok(query)
+        Self::new_indexed_scoped_page(archive, plan, index, options, SnapshotScope::Archive,
+            0, false, budget, allocations)
     }
     pub fn new_indexed_counting(archive: &'archive mut PagedSnapshot<R>, plan: &'plan ExpressionPlan,
         index: &'plan SnapshotIndex, options: ExpressionOptions, budget: &ResourceBudget,
@@ -261,8 +276,18 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
         index: &'plan SnapshotIndex, options: ExpressionOptions, skip_matches: u64,
         count_all_matches: bool, budget: &ResourceBudget, allocations: [ResourceAllocationId; 3])
         -> Result<Self, ExpressionError> {
-        let mut query = Self::new_indexed(archive, plan, index, options, budget, allocations)?;
-        query.skip_matches = skip_matches; query.count_all_matches = count_all_matches; Ok(query)
+        Self::new_indexed_scoped_page(archive, plan, index, options, SnapshotScope::Archive,
+            skip_matches, count_all_matches, budget, allocations)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_indexed_scoped_page(archive: &'archive mut PagedSnapshot<R>, plan: &'plan ExpressionPlan,
+        index: &'plan SnapshotIndex, options: ExpressionOptions, scope: SnapshotScope<'_>,
+        skip_matches: u64, count_all_matches: bool, budget: &ResourceBudget,
+        allocations: [ResourceAllocationId; 3]) -> Result<Self, ExpressionError> {
+        index.validate_directory(archive.directory()).map_err(PagedSearchError::from)?;
+        let mut query = Self::new_scoped_page(archive, plan, options, scope,
+            skip_matches, count_all_matches, budget, allocations)?;
+        query.index = Some(index); Ok(query)
     }
     pub const fn state(&self) -> ExpressionState { self.state }
     pub const fn stats(&self) -> ExpressionStats { self.stats }
@@ -287,7 +312,7 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
     }
     fn advance(&mut self, step: StreamReadStep, budget: &ResourceBudget,
         canceled: &mut impl FnMut() -> bool) -> Result<(), ExpressionError> {
-        if self.scope_at < self.directory.len() {
+        if self.scope_at < self.selection.members.end {
             let member = self.directory.member(self.scope_at).ok_or(PagedSearchError::InvalidHit)?;
             self.scope_at += 1; self.stats.metadata_examined += 1;
             if self.plan.admits(member.path) {
@@ -297,7 +322,7 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
             return Ok(());
         }
         if self.active.is_none() {
-            if self.next == self.directory.len() { self.state = ExpressionState::Complete; return Ok(()); }
+            if self.next == self.selection.members.end { self.state = ExpressionState::Complete; return Ok(()); }
             let ordinal = self.next; self.next += 1;
             let member = self.directory.member(ordinal).ok_or(PagedSearchError::InvalidHit)?;
             if !self.plan.admits(member.path) || matches!(member.data, PagedMemberData::Unavailable(_)) { return Ok(()); }
@@ -398,7 +423,8 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
             ExpressionState::Failed(error) => return Err(error), _ => {},
         }
         Ok(ExpressionReport { archive: self.directory.digest(), generation: self.options.generation,
-            discovery_complete: self.directory.discovery_complete(), state: self.state,
+            discovery_complete: self.selection.complete, state: self.state,
+            selected_members: self.selection.members.len(), captured_members: self.selection.captured,
             hits: self.hits, seen: self.seen, matching_files: self.matching_files,
             case_sensitive: self.plan.case_sensitive, count_all_matches: self.count_all_matches,
             skip_matches: self.skip_matches,
@@ -408,6 +434,7 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
 
 pub struct ExpressionReport {
     archive: Sha256Digest, generation: QueryGeneration, discovery_complete: bool,
+    selected_members: usize, captured_members: usize,
     state: ExpressionState, hits: Vec<ExpressionHit>, seen: u64, matching_files: usize,
     case_sensitive: bool, count_all_matches: bool, skip_matches: u64, stats: ExpressionStats, _lease: ResourceLease,
 }
@@ -430,6 +457,9 @@ impl ExpressionReport {
         self.skipped_matches().checked_add(self.hits.len() as u64)
             .filter(|next| *next > self.skip_matches)
     }
+    pub const fn selected_members(&self) -> usize { self.selected_members }
+    pub const fn captured_members(&self) -> usize { self.captured_members }
+    pub const fn membership_complete(&self) -> bool { self.discovery_complete }
     pub const fn case_sensitive(&self) -> bool { self.case_sensitive }
     pub const fn realized_mode(&self) -> &'static str { realized_mode(self.case_sensitive) }
     pub const fn count_all_matches(&self) -> bool { self.count_all_matches }

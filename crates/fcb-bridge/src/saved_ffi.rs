@@ -3,7 +3,7 @@
 //! Pointer conversion only. Saved-source, index and search behavior lives in
 //! fcb-app; reader activation targets the existing shared reader registry.
 use std::{ffi::c_char, path::Path, sync::OnceLock};
-use fcb_app::host::{HostResponse, saved_repository::{Sha256Digest, SnapshotLimits}};
+use fcb_app::host::{HostResponse, saved_repository::{Sha256Digest, SnapshotLimits, SnapshotScope}};
 use fcb_app::host::saved_repository::relationships::{RelationshipDirection, RelationshipSide};
 use super::{cstr, reply, string_out};
 use super::saved_sessions::{AccessError, Command, DocumentImageCommand, SavedSessions, Selection};
@@ -36,6 +36,20 @@ fn answer(handle: u64, work: impl FnOnce(&SavedSessions) -> Result<HostResponse,
     match result { Ok(response) => string_out(response.as_str()), Err(error) => string_out(&error.json(handle)) }
 }
 fn number(value: u64) -> Result<usize, AccessError> { usize::try_from(value).map_err(|_| AccessError::InvalidArgument) }
+/// Borrow an archive-relative raw path only for the duration of a foreign call.
+/// The shared engine validates components; the ABI validates framing first.
+/// # Safety
+/// A non-null path must be readable for path_bytes for the returned lifetime.
+unsafe fn search_scope<'a>(kind: u64, path: *const u8, path_bytes: u64) -> Result<SnapshotScope<'a>, AccessError> {
+    match kind {
+        0 if path.is_null() && path_bytes == 0 => Ok(SnapshotScope::Archive),
+        1 | 2 if !path.is_null() && (1..=16_384).contains(&path_bytes) => {
+            let path = unsafe { std::slice::from_raw_parts(path, path_bytes as usize) };
+            Ok(if kind == 1 { SnapshotScope::Directory(path) } else { SnapshotScope::Member(path) })
+        }
+        _ => Err(AccessError::InvalidArgument),
+    }
+}
 fn pin(text: &str) -> Result<Sha256Digest, AccessError> {
     if text.len() != 64 { return Err(AccessError::InvalidArgument); }
     fn digit(byte: u8) -> Result<u8, AccessError> {
@@ -155,6 +169,27 @@ pub unsafe extern "C" fn fcb_saved_search_page(handle: u64, generation: u64,
             count_all_matches: count_all_matches == 1, skip_matches }, || false)
     }))
 }
+/// Search only the retained directory descendants or exact member selected by
+/// raw archive path. Scope kinds 0/1/2 match the structural-search contract.
+/// Scope, matching options and window offsets are frozen with accepted rows.
+/// # Safety
+/// needle is null or readable NUL-terminated UTF-8 stable until return. For
+/// scope kinds 1/2, path is readable for path_bytes until return; kind 0 requires
+/// a null path and zero bytes. Release responses with fcb_free_string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_saved_search_scoped_page(handle: u64, generation: u64,
+    needle: *const c_char, case_sensitive: u64, count_all_matches: u64,
+    max_matches: u64, skip_matches: u64, scope_kind: u64,
+    path: *const u8, path_bytes: u64) -> *mut c_char {
+    reply(|| answer(handle, |sessions| {
+        if case_sensitive > 1 || count_all_matches > 1 { return Err(AccessError::InvalidArgument); }
+        let scope = unsafe { search_scope(scope_kind, path, path_bytes) }?;
+        let needle = unsafe { cstr(needle) }.ok_or(AccessError::InvalidArgument)?;
+        sessions.execute(handle, Command::SearchScopedPage { scope, generation, needle,
+            limit: number(max_matches)?, case_sensitive: case_sensitive == 1,
+            count_all_matches: count_all_matches == 1, skip_matches }, || false)
+    }))
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn fcb_saved_results(handle: u64, generation: u64, start: u64, limit: u64) -> *mut c_char {
     reply(|| answer(handle, |sessions| sessions.execute(handle,
@@ -224,6 +259,26 @@ pub unsafe extern "C" fn fcb_saved_expression_search_page(handle: u64, generatio
         if case_sensitive > 1 || count_all_matches > 1 { return Err(AccessError::InvalidArgument); }
         let query = unsafe { cstr(query) }.ok_or(AccessError::InvalidArgument)?;
         sessions.execute(handle, Command::ExpressionSearchPage { generation, query,
+            max_hits: number(max_hits)?, max_scan_bytes, case_sensitive: case_sensitive == 1,
+            count_all_matches: count_all_matches == 1, skip_matches }, || false)
+    }))
+}
+/// Apply whole-member expression predicates inside an exact saved-source scope.
+/// Source outside the scope consumes neither scan budget nor result offsets.
+/// # Safety
+/// query is null or readable NUL-terminated UTF-8 stable until return. For
+/// scope kinds 1/2, path is readable for path_bytes until return; kind 0 requires
+/// a null path and zero bytes. Release responses with fcb_free_string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_saved_expression_search_scoped_page(handle: u64, generation: u64,
+    query: *const c_char, case_sensitive: u64, count_all_matches: u64,
+    max_hits: u64, max_scan_bytes: u64, skip_matches: u64, scope_kind: u64,
+    path: *const u8, path_bytes: u64) -> *mut c_char {
+    reply(|| answer(handle, |sessions| {
+        if case_sensitive > 1 || count_all_matches > 1 { return Err(AccessError::InvalidArgument); }
+        let scope = unsafe { search_scope(scope_kind, path, path_bytes) }?;
+        let query = unsafe { cstr(query) }.ok_or(AccessError::InvalidArgument)?;
+        sessions.execute(handle, Command::ExpressionSearchScopedPage { scope, generation, query,
             max_hits: number(max_hits)?, max_scan_bytes, case_sensitive: case_sensitive == 1,
             count_all_matches: count_all_matches == 1, skip_matches }, || false)
     }))
@@ -374,3 +429,7 @@ mod document_images_tests;
 #[cfg(all(test, unix))]
 #[path = "saved_windows_ffi_tests.rs"]
 mod window_tests;
+
+#[cfg(all(test, unix))]
+#[path = "saved_scoped_search_ffi_tests.rs"]
+mod scoped_search_tests;

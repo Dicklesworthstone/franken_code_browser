@@ -411,6 +411,28 @@ char *fcb_saved_search_matching(uint64_t handle, uint64_t generation,
 char *fcb_saved_search_page(uint64_t handle, uint64_t generation,
     const char *needle, uint64_t case_sensitive, uint64_t count_all_matches,
     uint64_t max_matches, uint64_t skip_matches);
+/* Freeze a raw archive scope with a literal result window. scope_kind:
+ * 0 = whole archive (path MUST be null and path_bytes zero), 1 = directory
+ * descendants, 2 = exact member. Directory/member paths are 1..16384 raw bytes,
+ * without NUL, leading/trailing slash, empty, dot or parent components. Only
+ * '/' separates components; names need not be UTF-8. A directory prefix such
+ * as "src" includes "src/file.rs", never "src-old/file.rs" or the member "src".
+ * The path is borrowed, readable for path_bytes until return, never retained.
+ * No scope path is opened on the live filesystem.
+ *
+ * Selection precedes source loading and index verification. Counts, negatives,
+ * unavailable members and skipped matches describe only that selection. A
+ * known exact member closes its membership even in a partial archive; a missing
+ * exact member or directory cannot prove absence from an incomplete catalog.
+ * Every search/results/open-hit receipt freezes scope, scope_path_hex,
+ * scope_known_members and scope_membership_complete alongside the matching and
+ * window policy. Failed/canceled replacement preserves the preceding receipt.
+ * All existing entrypoints continue to search the whole archive.
+ */
+char *fcb_saved_search_scoped_page(uint64_t handle, uint64_t generation,
+    const char *needle, uint64_t case_sensitive, uint64_t count_all_matches,
+    uint64_t max_matches, uint64_t skip_matches, uint64_t scope_kind,
+    const uint8_t *path, uint64_t path_bytes);
 char *fcb_saved_results(uint64_t handle, uint64_t generation,
     uint64_t start, uint64_t limit);
 char *fcb_saved_clear_results(uint64_t handle, uint64_t generation);
@@ -473,6 +495,15 @@ char *fcb_saved_expression_search_matching(uint64_t handle, uint64_t generation,
 char *fcb_saved_expression_search_page(uint64_t handle, uint64_t generation,
     const char *query, uint64_t case_sensitive, uint64_t count_all_matches,
     uint64_t max_hits, uint64_t max_scan_bytes, uint64_t skip_matches);
+/* Same scope framing and immutable receipt contract as saved_search_scoped_page.
+ * Whole-member predicates and path:/lang: filters run only inside that scope.
+ * Out-of-scope source consumes neither max_scan_bytes nor skip_matches.
+ * Metadata result pages and exact reader activation retain the accepted scope.
+ */
+char *fcb_saved_expression_search_scoped_page(uint64_t handle, uint64_t generation,
+    const char *query, uint64_t case_sensitive, uint64_t count_all_matches,
+    uint64_t max_hits, uint64_t max_scan_bytes, uint64_t skip_matches,
+    uint64_t scope_kind, const uint8_t *path, uint64_t path_bytes);
 char *fcb_saved_expression_results(uint64_t handle, uint64_t generation,
     uint64_t start, uint64_t limit);
 char *fcb_saved_clear_expression(uint64_t handle, uint64_t generation);
