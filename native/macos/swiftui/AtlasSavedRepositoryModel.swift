@@ -198,6 +198,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
     @ObservationIgnored private var lastTrailExportAttempt: UInt64 = 0
     @ObservationIgnored private var lastQueryAttempt: UInt64 = 0
     @ObservationIgnored private var lastExpressionAttempt: UInt64 = 0
+    @ObservationIgnored private var requiresExpressionIndexReceipt = false
     @ObservationIgnored private var lastStructureAttempt: UInt64 = 0
     @ObservationIgnored private var lastIndexAttempt: UInt64 = 0
     @ObservationIgnored private var lastIndexBuildAttempt: UInt64 = 0
@@ -268,7 +269,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
         return indexBuildOutcomeKnown && request.identity == info?.identity && receipt.identity == request.identity &&
             receipt.operation == request.operation && receipt.attachEligible && receipt.pin != nil
     }
-    var canSearch: Bool { canOperate && (searchMode != .literal || indexStateKnown) }
+    var canSearch: Bool { canOperate && ((searchMode != .literal && searchMode != .expression) || indexStateKnown) }
     var searchIsCurrent: Bool {
         guard searchMode == .literal, let searchPage, info?.identity == searchPage.identity,
               queryGeneration == searchPage.generation else { return false }
@@ -335,6 +336,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
                 model.lastRelationshipAttempt = 0; model.memberOffsetInput = "0"
                 model.searchPage = nil; model.queryGeneration = nil; model.lastQueryAttempt = 0; model.searchInput = ""
                 model.expressionPage = nil; model.expressionGeneration = nil; model.lastExpressionAttempt = 0
+                model.requiresExpressionIndexReceipt = false
                 model.structurePage = nil; model.structureGeneration = nil; model.lastStructureAttempt = 0
                 model.indexStateKnown = true; model.indexPath = nil; model.lastIndexAttempt = 0; model.indexPinInput = ""
                 model.clearIndexBuild()
@@ -1496,8 +1498,16 @@ private final class AtlasSavedSession: @unchecked Sendable {
         }
     }
 
+    /// An older service may start with direct-only expression receipts. Once
+    /// this archive handle supplies modern index evidence, new generations and
+    /// recovery may not erase it; clearing results does not erase that fact.
+    private func acceptExpressionIndexReceipt(_ receipt: AtlasSavedExpressionIndexReceipt) throws {
+        guard !requiresExpressionIndexReceipt || receipt.hasReceipt else { throw AtlasSavedError.invalidResponse }
+        requiresExpressionIndexReceipt = requiresExpressionIndexReceipt || receipt.hasReceipt
+    }
+
     private func searchExpression() {
-        guard canOperate, let info else { return }
+        guard canSearch, let info else { return }
         if searchInput.isEmpty { clearExpression(); return }
         guard validSearchInput else {
             notice = "Enter 1–1024 UTF-8 bytes of expression syntax without NUL. The first positive term names matches."; return
@@ -1526,8 +1536,10 @@ private final class AtlasSavedSession: @unchecked Sendable {
                 let page = try AtlasSavedExpressionPage.decode(await model.run(lease, request, flag: flag),
                     identity: info.identity, generation: generation, expression: query, start: 0, limit: 64,
                     countAllMatches: counting, caseSensitive: caseSensitive, scope: scope)
-                guard page.counting.maximum == 4096, page.window.offset == 0 else { throw AtlasSavedError.invalidResponse }
+                guard page.counting.maximum == 4096, page.window.offset == 0,
+                      page.index.matchesSubmittedIndex(generation: info.index?.generation, pin: info.index?.pin) else { throw AtlasSavedError.invalidResponse }
                 guard model.session === lease, !model.closed else { throw AtlasSavedError.canceled }
+                try model.acceptExpressionIndexReceipt(page.index)
                 model.expressionGeneration = generation; model.expressionPage = page
                 model.notice = page.complete ? "Expression search finished over the captured scope."
                     : "Expression coverage is partial. Inspect source availability, work budget and retained-match limits."
@@ -1560,7 +1572,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
         }
     }
     func loadExpressionWindow(offset: UInt64, from page: AtlasSavedExpressionPage) {
-        guard canOperate, expressionIsCurrent, let accepted = expressionPage,
+        guard canSearch, expressionIsCurrent, let info, let accepted = expressionPage,
               page.hasSameSummary(as: accepted), page.start == accepted.start,
               page.counting.maximum > 0, offset != page.window.offset,
               offset == page.window.next || offset < page.window.offset else { return }
@@ -1580,10 +1592,12 @@ private final class AtlasSavedSession: @unchecked Sendable {
                     identity: page.identity, generation: generation, expression: page.expression, start: 0, limit: 64,
                     countAllMatches: page.counting.all, caseSensitive: page.caseSensitive, resultOffset: offset, scope: page.scope.scope)
                 guard next.scope == page.scope, next.counting.maximum == page.counting.maximum, next.scanLimit == page.scanLimit,
+                      next.index.matchesSubmittedIndex(generation: info.index?.generation, pin: info.index?.pin),
                       next.primaryNeedle.utf8.elementsEqual(page.primaryNeedle.utf8) else {
                     throw AtlasSavedError.invalidResponse
                 }
                 guard model.session === lease, !model.closed else { throw AtlasSavedError.canceled }
+                try model.acceptExpressionIndexReceipt(next.index)
                 model.expressionGeneration = generation; model.expressionPage = next
                 model.notice = next.complete ? "Loaded the expression window with complete captured-scope coverage."
                     : "Loaded an expression window with partial coverage. Skipped work uses the same scan budget."
@@ -1635,6 +1649,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
                 .expressionResults(generation: generation, start: 0, limit: 64), flag: flag),
                 identity: current.identity, generation: generation, expression: nil, start: 0, limit: 64)
             guard !closed, session === lease else { throw AtlasSavedError.canceled }
+            try acceptExpressionIndexReceipt(page.index)
             expressionPage = page; return true
         } catch {
             expressionGeneration = nil; expressionPage = nil; return false
@@ -1797,7 +1812,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
         }
         return try await openReader(saved: page.identity, ordinal: hit.member, expected: nil,
             origin: .expressionHit(generation: page.generation, expression: page.expression,
-                primaryNeedle: page.primaryNeedle, hit: hit, caseSensitive: page.caseSensitive, scope: page.scope.scope),
+                primaryNeedle: page.primaryNeedle, hit: hit, caseSensitive: page.caseSensitive, scope: page.scope.scope, index: page.index),
             readerTransport: readerTransport, search: search, outline: outline, document: document)
     }
 
@@ -2035,7 +2050,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
                             request = .openImport(reader: destination, generation: generation, importID: link.id, side: side)
                         case .hit(let generation, _, let hit, _, _):
                             request = .openHit(reader: destination, generation: generation, hit: hit.id)
-                        case .expressionHit(let generation, _, _, let hit, _, _):
+                        case .expressionHit(let generation, _, _, let hit, _, _, _):
                             request = .openExpressionHit(reader: destination, generation: generation, hit: hit.id)
                         case .structureHit(let generation, _, _, _, let item, _):
                             request = .openStructureHit(reader: destination, generation: generation, hit: item.id)
@@ -2104,7 +2119,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
         clearTrailWrite()
         clearTrailExport()
         searchPage = nil; queryGeneration = nil; lastQueryAttempt = 0; searchInput = ""
-        expressionPage = nil; expressionGeneration = nil; lastExpressionAttempt = 0
+        expressionPage = nil; expressionGeneration = nil; lastExpressionAttempt = 0; requiresExpressionIndexReceipt = false
         structurePage = nil; structureGeneration = nil; lastStructureAttempt = 0
         indexPath = nil; indexStateKnown = true; lastIndexAttempt = 0; indexPinInput = ""
         clearIndexBuild()

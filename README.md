@@ -240,6 +240,23 @@ Indexed text and original-byte searches use the same scope choices. See the
 [native saved-repository workflow](native/macos/README.md).
 This source addition awaits executable and physical-Mac verification.
 
+**Saved expression searches now use attached indexes.**
+Multi-term expressions use the same saved posting indexes as literal search to
+skip members whose required primary term is provably absent. Candidate members
+still verify every required and excluded term against the same captured bytes;
+short queries, unsupported index semantics and uncovered members retain direct
+verification. Counts, later windows and exact readers keep their query-time
+index provenance after an index is detached or replaced. The CLI also accepts
+`--query` with all three saved index layouts, including demand-paged FCBD:
+
+```sh
+fcb snapshot index search saved.fcbs --index saved.fcbd --index-digest TRUSTED_SHA256 --paged \
+  --query 'needle required -excluded lang:rust' --directory src --count-all --json
+```
+
+The public library, CLI and native Saved Repository consume the same expression
+engine. Independent executable and physical-Mac verification remain pending.
+
 **Matching brackets connects exact selections across retained source pages.**
 Select one parenthesis, square bracket or brace and choose **Go to matching
 bracket**. The reader skips comments and strings, checks the destination in the

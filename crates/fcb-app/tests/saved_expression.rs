@@ -135,14 +135,22 @@ fn utf16_quoted_primary_and_raw_names_preserve_original_selection() {
 }
 
 #[test]
-fn attached_disk_index_and_literal_query_are_not_replaced_or_misused() {
+fn attached_disk_index_accelerates_predicates_without_replacing_literal_queries() {
     let f = Fixture::new(&[entry(b"a.rs", b"needle required"), entry(b"b.rs", b"needle forbidden required")], true);
     let (path, pin) = f.index(); let mut s = f.open(66101);
     s.attach_index(9, &path, pin, || false).unwrap(); s.search(7, "needle", 10, || false).unwrap();
     let before = json(&s.info(|| false).unwrap()).get("index_page_loads").number();
     let result = query(&mut s, 7, "needle required -forbidden");
     assert_eq!(result.retained_hits(), 1); assert_eq!(s.accepted_generation(), Some(7)); assert_eq!(s.index_generation(), Some(9));
-    assert!(!json(&result.page(&mut s, 7, 0, 10, || false).unwrap()).get("index_used").flag());
+    let page = json(&result.page(&mut s, 7, 0, 10, || false).unwrap());
+    assert!(page.get("index_used").flag());
+    assert_eq!(page.get("index_generation").number(), 9);
+    assert_eq!(page.get("index_pin").text(), pin.to_hex());
+    assert_eq!(page.get("index_policy").text(), "exact-compatible-postings");
+    assert_eq!(page.get("index_candidates").number(), 2);
+    assert_eq!(page.get("index_eliminated_files").number(), 0);
+    assert_eq!(page.get("fallback_files").number(), 0);
+    assert!(page.get("posting_entries_visited").number() > 0);
     assert_eq!(json(&s.info(|| false).unwrap()).get("index_page_loads").number(), before);
     assert_eq!(json(&s.results(7, 0, 10, || false).unwrap()).get("retained_hits").number(), 2);
 }

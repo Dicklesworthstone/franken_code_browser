@@ -31,6 +31,8 @@ final class SavedRepositoryFixture: @unchecked Sendable {
         var expression: String?
         var countAllExpressionMatches = false
         var expressionCaseSensitive = true
+        var expressionIndexGeneration: UInt64?
+        var expressionIndexPin: String?
         var expressionAttempt: UInt64 = 0
         var structureGeneration: UInt64?
         var structureMode: AtlasSavedSearchMode?
@@ -50,6 +52,7 @@ final class SavedRepositoryFixture: @unchecked Sendable {
     }
     let domain = UUID()
     let searchVectors: Bool
+    var expressionIndexReceipts = false
     let expansionVectors: Bool
     let imageVectors: Bool
     let headingVectors: Bool
@@ -342,6 +345,18 @@ final class SavedRepositoryFixture: @unchecked Sendable {
         default: return "ana"
         }
     }
+    /// Fixed protocol evidence: use a source-fallback-only attached index so
+    /// existing member and predicate vectors remain unchanged. Engine tests own
+    /// posting elimination and whole-member expression evaluation.
+    func expressionIndexFields(generation: UInt64?, pin: String?, loaded: UInt64, caseSensitive: Bool) -> [String: Any] {
+        ["index_used": generation != nil, "index_generation": generation.map { String($0) as Any } ?? NSNull(),
+         "index_pin": pin.map { $0 as Any } ?? NSNull(),
+         "index_policy": generation == nil ? "direct-verified-member-scan"
+            : caseSensitive ? "exact-compatible-postings" : "ascii-case-variants-with-source-fallback",
+         "index_eliminated_files": "0", "index_candidates": "0", "fallback_files": generation == nil ? "0" : String(loaded),
+         "posting_list_lookups": "0", "posting_entries_visited": "0", "posting_membership_lookups": "0",
+         "posting_cursor_complete": generation != nil && loaded > 0]
+    }
     func expressionPage(_ owner: UInt64, generation: UInt64, query: String = "ana +banana -unsafe",
         start: UInt64 = 0, limit: UInt64 = 64, countAllMatches: Bool? = nil,
         caseSensitive: Bool = true) -> [String: Any] {
@@ -377,6 +392,11 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             out["count_all_matches"] = countAllMatches
             out["matching_files"] = String(Set(hits.prefix(Int(count)).map(\.member)).count)
             out["retained_matching_files"] = out["matching_files"]
+        }
+        if expressionIndexReceipts {
+            let session = sessions[owner]
+            out.merge(expressionIndexFields(generation: session?.expressionIndexGeneration, pin: session?.expressionIndexPin,
+                loaded: filtered ? 1 : 4, caseSensitive: caseSensitive)) { _, next in next }
         }
         return out
     }
@@ -573,6 +593,10 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             out["selection_namespace"] = "saved-expression"; out["expression_generation"] = String(expression)
             out["primary_needle"] = primary
             out["case_sensitive"] = session.expressionCaseSensitive; out["mode"] = mode; out["normalization"] = "exact"
+            if expressionIndexReceipts {
+                out.merge(expressionIndexFields(generation: session.expressionIndexGeneration, pin: session.expressionIndexPin,
+                    loaded: query == "ana path:raw" ? 1 : 4, caseSensitive: session.expressionCaseSensitive)) { _, next in next }
+            }
             out["selection"] = ["expression_generation": String(expression), "hit_id": String(hitID),
                 "case_sensitive": session.expressionCaseSensitive, "mode": mode, "normalization": "exact", "text": spelling,
                 "domain": "original-source-bytes", "original_range": ["start": String(hit.start), "end": String(hit.end)],
@@ -651,6 +675,16 @@ final class SavedRepositoryFixture: @unchecked Sendable {
             case "expression-namespace": out["selection_namespace"] = "saved-literal"
             case "expression-generation": out["expression_generation"] = String((expression ?? 0) + 1)
             case "expression-primary": out["primary_needle"] = "banana"
+            case "expression-index-generation": out["index_generation"] = "99"
+            case "expression-index-pin": out["index_pin"] = String(repeating: "b", count: 64)
+            case "expression-index-counter": out["posting_entries_visited"] = "1"
+            case "expression-index-omitted": out.removeValue(forKey: "index_candidates")
+            case "expression-index-downgrade":
+                for key in ["index_generation", "index_pin", "index_eliminated_files", "index_candidates", "fallback_files",
+                    "posting_list_lookups", "posting_entries_visited", "posting_membership_lookups", "posting_cursor_complete"] {
+                    out.removeValue(forKey: key)
+                }
+                out["index_used"] = false; out["index_policy"] = "direct-verified-member-scan"
             case "expression-reader-case": out["case_sensitive"] = true
             case "expression-reader-mode": out["mode"] = "decoded-text-expression"
             case "expression-reader-normalization": out["normalization"] = "nfc"
@@ -872,6 +906,7 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                             "error": ["code": "QUERY_SYNTAX_ERROR"]])
                     }
                     session.expressionGeneration = generation; session.expression = query
+                    session.expressionIndexGeneration = session.indexGeneration; session.expressionIndexPin = session.indexPin
                     switch request {
                     case .countedExpressionSearch:
                         session.countAllExpressionMatches = true; session.expressionCaseSensitive = true
@@ -895,6 +930,7 @@ final class SavedRepositoryFixture: @unchecked Sendable {
                     if fault == "expression-results-primary" { fault = nil; page["primary_needle"] = "banana" }
                     if fault == "expression-count-policy" { fault = nil; page["count_all_matches"] = !session.countAllExpressionMatches }
                     if fault == "expression-case-policy" { fault = nil; page["case_sensitive"] = !session.expressionCaseSensitive }
+                    if fault == "expression-index-policy" { fault = nil; page["posting_entries_visited"] = "1" }
                     return encode(page)
                 case .clearExpression(let generation):
                     guard var session = sessions[handle], generation > session.expressionAttempt else { return nil }

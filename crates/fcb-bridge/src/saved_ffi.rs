@@ -433,3 +433,7 @@ mod window_tests;
 #[cfg(all(test, unix))]
 #[path = "saved_scoped_search_ffi_tests.rs"]
 mod scoped_search_tests;
+
+#[cfg(all(test, unix))]
+#[path = "saved_indexed_expression_ffi_tests.rs"]
+mod indexed_expression_tests;

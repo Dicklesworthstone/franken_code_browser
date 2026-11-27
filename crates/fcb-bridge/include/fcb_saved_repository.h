@@ -445,11 +445,20 @@ char *fcb_saved_clear_results(uint64_t handle, uint64_t generation);
  * NUL-terminated UTF-8 until return. Invalid syntax returns a structured error.
  *
  * max_hits 0..4096 (zero probes existence). max_scan_bytes bounds aggregate
- * matching work, including each predicate scan over already loaded bytes.
- * Search uses verified archive members directly; an attached literal posting
- * index is neither used nor detached. Only bounded witness metadata is retained.
- * Inspect complete/state, discovery completeness and omission counters: a
- * work limit or unavailable/unsupported source cannot prove absence.
+ * original bytes consumed by the shared predicate/primary decoding pass.
+ * A compatible attached FCBD index may prove the primary term absent before
+ * source loading; every candidate still verifies all predicates over the same
+ * captured member. Short, Unicode-incompatible and uncovered rows use the
+ * complete source route. Exclusions never establish an index-only match.
+ * Only bounded witness metadata is retained. Inspect complete/state, discovery
+ * completeness and omission counters: a work limit or unavailable/unsupported
+ * source cannot prove absence.
+ *
+ * Results, pages and readers freeze index_used, index_generation, index_pin,
+ * index_policy, index_eliminated_files, index_candidates, fallback_files and
+ * posting work counters for that accepted query. Index changes affect later
+ * searches, not prior receipts. Elimination counts cover only captured members
+ * admitted by both raw scope and expression metadata filters.
  *
  * Expression generations are independent of literal/index/relationship state.
  * Every admitted search/clear attempt must increase, even after failure or
@@ -476,8 +485,9 @@ char *fcb_saved_expression_search_counted(uint64_t handle, uint64_t generation,
  * Both flags are exactly 0 or 1. case_sensitive=0 applies Unicode scalar
  * lowercase, not full case folding or canonical accent normalization. Original
  * byte ranges include complete contributing scalars (e.g. i may match U+0130).
- * max_hits and aggregate matching-work bounds are unchanged, including count
- * only. Attached exact-byte indexes are bypassed without detaching them.
+ * max_hits and aggregate source-work bounds are unchanged, including count
+ * only. Qualified ASCII case variants use compatible posting candidates;
+ * Unicode, legacy and uncovered representations keep source verification.
  * Receipts/pages/readers freeze case_sensitive, mode (decoded-text-expression
  * or unicode-lowercase-expression), and normalization (exact). Reader selection
  * original_hex is the verified source spelling, which may differ from the

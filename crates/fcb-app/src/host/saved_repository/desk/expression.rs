@@ -16,14 +16,14 @@ pub use fcb::search::expression::ExpressionError;
 use super::{SavedRepositorySession, SavedRepositoryError, SavedDeskError, SavedDeskOpen,
     DeskSession, HostResponse, ByteLength, RawPath, AppError, check};
 use super::super::{ReaderSession, PagedCapture, PagedSearchError, Output,
-    SnapshotScope, copy_scope_path, scope_fields};
+    SnapshotScope, Sha256Digest, copy_scope_path, scope_fields};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SavedExpressionOptions {
     /// A zero cap probes existence without retaining a result row.
     pub max_hits: usize,
-    /// Aggregate original bytes consumed by ALL predicate and primary scans,
-    /// including scans over already loaded bytes. This is not an I/O budget.
+    /// Original source bytes consumed by the shared predicate/primary pass.
+    /// Each input byte is charged once; this is not an I/O budget.
     pub max_scan_bytes: u64,
 }
 impl Default for SavedExpressionOptions {
@@ -32,8 +32,9 @@ impl Default for SavedExpressionOptions {
 
 /// Owns its syntax/patterns and bounded witness metadata, not an archive handle
 /// or matching source collection. Hosts supply fresh generations and publish a
-/// candidate only after its first response succeeds. Literal queries and FCBD
-/// indexes remain independent; this route does not use an incompatible index.
+/// candidate only after its first response succeeds. An attached FCBD index
+/// filters the mandatory primary literal before whole-member verification.
+/// Its accepted generation, pin and query counters remain frozen with this report.
 pub struct SavedExpression {
     owner: ArenaOwnerId,
     generation: u64,
@@ -41,6 +42,8 @@ pub struct SavedExpression {
     report: ExpressionReport,
     scope_label: &'static str,
     scope_path: Vec<u8>,
+    index_generation: Option<u64>,
+    index_pin: Option<Sha256Digest>,
     options: SavedExpressionOptions,
     member_bytes_read: u64,
     member_read_calls: u64,
@@ -58,8 +61,8 @@ impl SavedExpression {
     }
 
     /// Apply one matching policy to primary, required and excluded terms.
-    /// Lowercase comparison keeps original byte witnesses and does not consult
-    /// an attached exact-byte index. Existing constructors remain exact.
+    /// Lowercase comparison keeps original byte witnesses and uses compatible
+    /// ASCII index rows with conservative source fallback. Existing constructors remain exact.
     pub fn prepare_matching(saved: &mut SavedRepositorySession, generation: u64, query: &str,
         options: SavedExpressionOptions, case_sensitive: bool, count_all_matches: bool,
         canceled: impl FnMut() -> bool) -> Result<Self, SavedDeskError> {
@@ -106,8 +109,15 @@ impl SavedExpression {
             generation: qgen, first_file, first_revision, max_matches: options.max_hits,
             max_scan_bytes: options.max_scan_bytes,
         };
-        let mut work = ExpressionQuery::new_scoped_page(&mut saved.archive, &plan, query_options,
-            scope, skip_matches, count_all_matches, &saved.budget, allocations)?;
+        let index_generation = saved.index.as_ref().map(|index| index.generation);
+        let index_pin = saved.index.as_ref().map(|index| index.pin);
+        let mut work = if let Some(index) = saved.index.as_mut() {
+            ExpressionQuery::new_paged_scoped_page(&mut saved.archive, &plan, &mut index.pages,
+                query_options, scope, skip_matches, count_all_matches, &saved.budget, allocations)?
+        } else {
+            ExpressionQuery::new_scoped_page(&mut saved.archive, &plan, query_options,
+                scope, skip_matches, count_all_matches, &saved.budget, allocations)?
+        };
         while work.state() == ExpressionState::Pending {
             work.step(StreamReadStep::default(), qgen, &saved.budget, &mut canceled)?;
         }
@@ -115,7 +125,7 @@ impl SavedExpression {
         let after = saved.archive.load_stats();
         check(&mut canceled)?;
         Ok(Self { owner, generation, plan, report, options,
-            scope_label: scope.label(), scope_path,
+            scope_label: scope.label(), scope_path, index_generation, index_pin,
             member_bytes_read: after.bytes_read - before.bytes_read,
             member_read_calls: after.read_calls - before.read_calls, _lease: lease })
     }
@@ -152,7 +162,9 @@ impl SavedExpression {
         out.literal(",\"predicate_scope\":\"whole-captured-member\",\"case_sensitive\":")?;
         out.boolean(self.plan.case_sensitive())?;
         out.literal(",\"mode\":")?; out.quoted(self.plan.realized_mode())?;
-        out.literal(",\"normalization\":\"exact\",\"index_used\":false,\"index_policy\":\"direct-verified-member-scan\",\"state\":")?;
+        out.literal(",\"normalization\":\"exact\"")?;
+        self.index_fields(out)?;
+        out.literal(",\"state\":")?;
         out.quoted(match self.report.state() {
             ExpressionState::Complete => "complete", ExpressionState::Truncated => "truncated",
             ExpressionState::WorkLimit => "work-limit", _ => return Err(ExpressionError::Pending.into()),
@@ -199,6 +211,31 @@ impl SavedExpression {
         Ok(())
     }
 
+    /// Provenance belongs to the accepted query, never the session's current
+    /// index slot. Pages and exact-reader receipts remain comparable after
+    /// attachment, detachment, replacement, and failed query attempts.
+    fn index_fields(&self, out: &mut Output) -> Result<(), SavedDeskError> {
+        out.literal(",\"index_generation\":")?; super::super::optional(out, self.index_generation)?;
+        out.literal(",\"index_pin\":")?;
+        if let Some(pin) = self.index_pin { out.quoted(&pin.to_hex())?; } else { out.literal("null")?; }
+        out.literal(",\"index_used\":")?; out.boolean(self.index_generation.is_some())?;
+        out.literal(",\"index_policy\":")?;
+        out.quoted(if self.index_generation.is_none() { "direct-verified-member-scan" }
+            else if self.plan.case_sensitive() { "exact-compatible-postings" }
+            else { "ascii-case-variants-with-source-fallback" })?;
+        let stats = self.stats();
+        for (key, value) in [
+            ("index_eliminated_files", stats.index_eliminated as u64),
+            ("index_candidates", stats.index_candidates as u64),
+            ("fallback_files", stats.index_fallbacks as u64),
+            ("posting_list_lookups", stats.posting_list_lookups as u64),
+            ("posting_entries_visited", stats.posting_entries_visited as u64),
+            ("posting_membership_lookups", stats.posting_membership_lookups as u64),
+        ] { out.literal(",")?; out.quoted(key)?; out.literal(":")?; out.integer(value)?; }
+        out.literal(",\"posting_cursor_complete\":")?; out.boolean(stats.posting_cursor_complete)?;
+        Ok(())
+    }
+
     /// Activate one retained expression witness as an independently owned
     /// reader. The complete archived member is verified again before any
     /// reader or response is returned; archived paths remain labels only.
@@ -235,6 +272,7 @@ impl SavedExpression {
         out.literal(",\"case_sensitive\":")?; out.boolean(self.plan.case_sensitive())?;
         out.literal(",\"mode\":")?; out.quoted(self.plan.realized_mode())?;
         out.literal(",\"normalization\":\"exact\"")?;
+        self.index_fields(out)?;
         out.literal(",\"member\":")?; out.integer(hit.ordinal() as u64)?;
         out.literal(",\"file_id\":")?; out.integer(capture.file().get())?;
         out.literal(",\"source_revision\":")?; out.integer(capture.revision().get())?;

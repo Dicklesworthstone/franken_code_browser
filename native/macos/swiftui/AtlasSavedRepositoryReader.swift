@@ -9,19 +9,20 @@ enum AtlasSavedReaderOrigin: Sendable {
     case hit(generation: UInt64, needle: String, hit: AtlasSavedHit, caseSensitive: Bool = true,
         scope: AtlasSavedStructureScope = .archive)
     case expressionHit(generation: UInt64, expression: String, primaryNeedle: String, hit: AtlasSavedHit,
-        caseSensitive: Bool = true, scope: AtlasSavedStructureScope = .archive)
+        caseSensitive: Bool = true, scope: AtlasSavedStructureScope = .archive,
+        index: AtlasSavedExpressionIndexReceipt = .legacyDirect)
     case structureHit(generation: UInt64, mode: AtlasSavedSearchMode, nameMode: AtlasSearchNameMode,
         needle: String, hit: AtlasSavedStructureHit, policy: AtlasSavedStructurePolicy = .standard)
     var matchingCaseSensitive: Bool {
         switch self {
-        case .hit(_, _, _, let caseSensitive, _), .expressionHit(_, _, _, _, let caseSensitive, _): return caseSensitive
+        case .hit(_, _, _, let caseSensitive, _), .expressionHit(_, _, _, _, let caseSensitive, _, _): return caseSensitive
         case .structureHit(_, _, _, _, _, let policy): return policy.caseSensitive
         default: return true
         }
     }
     var searchHit: AtlasSavedHit? {
         switch self {
-        case .hit(_, _, let hit, _, _), .expressionHit(_, _, _, let hit, _, _): return hit
+        case .hit(_, _, let hit, _, _), .expressionHit(_, _, _, let hit, _, _, _): return hit
         case .structureHit(_, _, _, _, let item, _): return item.hit
         case .member, .trail, .relationship, .importLink, .pathHit: return nil
         }
@@ -117,12 +118,15 @@ struct AtlasSavedReaderReceipt: Sendable {
             let request: AtlasReaderRequest
             let match: AtlasSavedMatchEvidence?
             let selectionGeneration: String
-            if case .expressionHit(let generation, let expression, let primary, _, _, _) = origin {
+            if case .expressionHit(let generation, let expression, let primary, _, _, _, let index) = origin {
                 guard AtlasSavedSearchWire.validNeedle(expression),
                       object["selection_namespace"] as? String == "saved-expression",
                       (object["expression_generation"] as? String).flatMap(AtlasReaderWire.integer) == generation,
                       let acceptedPrimary = object["primary_needle"] as? String,
-                      acceptedPrimary.utf8.elementsEqual(primary.utf8) else { throw AtlasSavedError.invalidResponse }
+                      acceptedPrimary.utf8.elementsEqual(primary.utf8),
+                      try AtlasSavedExpressionIndexReceipt.decode(data, caseSensitive: caseSensitive) == index else {
+                    throw AtlasSavedError.invalidResponse
+                }
                 if object["case_sensitive"] != nil || object["mode"] != nil || object["normalization"] != nil || !caseSensitive {
                     struct ExpressionPolicy: Decodable { let case_sensitive: Bool; let mode, normalization: String }
                     let policy = try JSONDecoder().decode(ExpressionPolicy.self, from: data)
@@ -316,7 +320,7 @@ struct AtlasSavedReaderReceipt: Sendable {
                     } else { match = nil }
                 }
             case .hit(let generation, let needle, let hit, _, let scope),
-                .expressionHit(let generation, _, let needle, let hit, _, let scope):
+                .expressionHit(let generation, _, let needle, let hit, _, let scope, _):
                 _ = try AtlasSavedSearchScopeReceipt.decode(data, identity: saved, expected: scope)
                 guard generation > 0, AtlasSavedSearchWire.validNeedle(needle), scope.includes(hit.path.bytes),
                       member.id == hit.member, member.file == hit.file, member.file == hit.revision,
@@ -576,7 +580,7 @@ final class AtlasSavedReaderReceiptBox: @unchecked Sendable {
             return "Saved catalog candidate for \(link.destination) · \(link.resolutionBasis) · lexical relationship, not compiler resolution"
         case .hit(let generation, _, let hit, let caseSensitive, _):
             return "Saved search \(generation), occurrence \(hit.id) · \(caseSensitive ? "match case" : "Unicode lowercase matching") · original bytes \(hit.start)..<\(hit.end)"
-        case .expressionHit(let generation, _, _, let hit, let caseSensitive, _):
+        case .expressionHit(let generation, _, _, let hit, let caseSensitive, _, _):
             return "Saved expression \(generation), occurrence \(hit.id) · \(caseSensitive ? "match case" : "Unicode lowercase matching") · original bytes \(hit.start)..<\(hit.end)"
         case .structureHit(_, _, _, _, let item, _):
             return "\(item.structure.label) · original bytes \(item.hit.start)..<\(item.hit.end)"

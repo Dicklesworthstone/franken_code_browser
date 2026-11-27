@@ -1555,15 +1555,42 @@ selected raw scope. On a completed source query,
 A partial posting cursor reports zero eliminated members until its traversal
 can establish the remaining negatives. A completed expression with no eligible
 captured members can legitimately have `posting_cursor_complete: false` and
-zero posting work; FCBI uses per-member decisions rather than a posting cursor.
+zero visited postings and no posting-page I/O; FCBI uses per-member decisions
+rather than a posting cursor. Cursor construction can still perform metadata
+lookups.
 The resident/paged posting lookup counters and FCBD page I/O remain visible.
 `indexed_files`, `uncovered_files` and
 `index_unavailable_files_count` describe the whole pinned artifact.
+
+Retained `SavedRepositorySession` expressions automatically use the attached
+FCBD index. Existing Rust, C and desk-expression entrypoints therefore gain
+acceleration without a new flag; detaching selects direct verification for
+subsequent queries. This keeps literal and expression generations independent.
+An accepted expression stores its query-time `index_generation`, `index_pin`,
+`index_used` and `index_policy` together with its result counters. Metadata
+paging, exact hit-reader activation, index replacement/detachment, and failed or
+canceled query replacements preserve that original receipt. A newly submitted
+match window uses the index attached when that new generation starts.
+
+Host results and reader receipts use `fallback_files`, matching the retained
+literal protocol; the CLI uses its established `index_fallback_files` name.
+Host receipts also expose `index_eliminated_files`, `index_candidates`,
+`posting_list_lookups`, `posting_entries_visited`,
+`posting_membership_lookups` and `posting_cursor_complete`. Direct receipts
+have null generation/pin and zero index counters. Index policy labels are
+`exact-compatible-postings` or `ascii-case-variants-with-source-fallback`,
+with `direct-verified-member-scan` for direct queries. Candidate/fallback
+admission can precede a source work limit, so partial reports can have one more
+admitted member than `members_loaded`. Opening a retained hit still verifies
+the complete saved member and its primary-byte witness before returning an
+independent reader.
 
 Regressions cover direct/indexed equivalence across all layouts, raw scope and
 metadata intersections, predicates, counts and later windows, zero work
 allowances, incomplete discovery, UTF-16 and Unicode fallback, uncovered
 indexes, trusted pins, cancellation and standalone binary/human output.
+Host regressions also cover immutable provenance across index changes, failed
+replacement recovery and a corrupted negative member that must remain unread.
 These tests are authored; independent executable verification remains pending.
 
 ## Search structure in a saved repository

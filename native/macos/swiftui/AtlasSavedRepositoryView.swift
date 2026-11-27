@@ -537,6 +537,7 @@ private final class AtlasSavedTrailArchiveAccess {
                 ForEach(AtlasSavedSearchMode.allCases) { mode in Text(mode.label).tag(mode) }
             }.pickerStyle(.segmented).disabled(!model.canOperate).padding(.leading, 8)
             savedSearchScopeControl
+            if model.searchMode == .literal || model.searchMode == .expression { indexPane }
             if model.searchMode == .literal { literalSearchPane }
             else if model.searchMode == .expression { expressionSearchPane }
             else { structureSearchPane }
@@ -558,7 +559,6 @@ private final class AtlasSavedTrailArchiveAccess {
     }
     private var literalSearchPane: some View {
         VStack(alignment: .leading, spacing: 10) {
-            indexPane
             HStack {
                 TextField("Literal text in selected saved scope", text: $model.searchInput)
                     .textFieldStyle(.roundedBorder)
@@ -654,7 +654,7 @@ private final class AtlasSavedTrailArchiveAccess {
                 indexBuildPane
                 Divider()
                 if !model.indexStateKnown {
-                    Text("Index acceptance is unconfirmed. Reload status before changing the index or starting a new literal search.")
+                    Text("Index acceptance is unconfirmed. Reload status before changing the index or starting a new literal or expression search.")
                         .font(.caption).foregroundStyle(.orange)
                 }
                 if let index = model.index {
@@ -668,7 +668,7 @@ private final class AtlasSavedTrailArchiveAccess {
                     Text("Trusted page-manifest SHA-256: \(index.pin)")
                         .font(.caption2.monospaced()).textSelection(.enabled)
                 } else if model.indexStateKnown {
-                    Text("No index attached. Literal searches scan captured source directly.")
+                    Text("No index attached. Literal and expression searches scan captured source directly.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 TextField("Trusted page-manifest SHA-256 from the index build receipt", text: $model.indexPinInput)
@@ -684,7 +684,7 @@ private final class AtlasSavedTrailArchiveAccess {
                     Button("Reload index status") { panelNotice = ""; model.reloadIndex() }
                         .disabled(!model.canOperate)
                 }.controlSize(.small)
-                Text("Use the digest from a trusted index build receipt, not a whole-file checksum. Posting pages are checked when read; source verification and direct scans cover candidates, uncovered members and short literals. Unicode lowercase searches use compatible ASCII case-variant postings with source fallback; expression searches scan source directly.")
+                Text("Use the digest from a trusted index build receipt, not a whole-file checksum. Posting pages are checked when read; source verification and direct scans cover candidates, uncovered members and short literals. Unicode lowercase searches use compatible ASCII case-variant postings with source fallback. Expressions use the first positive term to narrow candidates; required and excluded terms are verified across the same captured member.")
                     .font(.caption2).foregroundStyle(.secondary)
             }.padding(.top, 5)
         }.font(.callout)
@@ -748,7 +748,7 @@ private final class AtlasSavedTrailArchiveAccess {
                     .onSubmit { panelNotice = ""; model.search() }
                     .accessibilityLabel("Expression search with required terms, exclusions, path and language filters")
                 Button { panelNotice = ""; model.search() } label: { Label("Search archive", systemImage: "magnifyingglass") }
-                    .disabled(!model.canOperate || !model.validSearchInput)
+                    .disabled(!model.canSearch || !model.validSearchInput)
                 Button("Clear") { panelNotice = ""; model.clearSearch() }
                     .disabled(!model.canOperate || (model.expressionPage == nil && model.searchInput.isEmpty))
             }
@@ -832,7 +832,7 @@ private final class AtlasSavedTrailArchiveAccess {
                     }.disabled(!model.canOperate || !model.expressionIsCurrent || page.next == nil)
                 }.controlSize(.small)
                 resultWindowControls(page.window, retained: page.retained,
-                    enabled: model.canOperate && model.expressionIsCurrent && page.counting.maximum > 0) {
+                    enabled: model.canSearch && model.expressionIsCurrent && page.counting.maximum > 0) {
                     model.loadExpressionWindow(offset: $0, from: page)
                 }
             } else {
@@ -1027,6 +1027,14 @@ private final class AtlasSavedTrailArchiveAccess {
                 .font(.caption).foregroundStyle(.secondary)
             Text("\(page.sourceBytes) source bytes read · \(page.scannedBytes) / \(page.scanLimit) matching bytes processed")
                 .font(.caption).foregroundStyle(.secondary)
+            if let generation = page.index.generation {
+                Text("Query used index generation \(generation): \(page.index.eliminatedFiles) eligible members eliminated · \(page.index.candidates) posting candidates · \(page.index.fallbackFiles) direct-scan fallbacks")
+                    .font(.caption2).foregroundStyle(.secondary)
+                Text("\(page.index.postingEntriesVisited) postings visited. Required and excluded terms were verified across each admitted captured member.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            } else {
+                Text("This expression scanned captured source without an index.").font(.caption2).foregroundStyle(.secondary)
+            }
             if page.state == "work-limit" {
                 Text("The matching-work budget was exhausted. Earlier matches remain valid; more may exist. Narrow path or language filters and search again.")
                     .font(.caption).foregroundStyle(.orange)
@@ -1770,11 +1778,15 @@ private final class AtlasSavedTrailArchiveAccess {
                 Text("Saved literal: \(needle)").font(.callout.monospaced()).lineLimit(2).textSelection(.enabled)
                 Text(scope.label).font(.caption).foregroundStyle(.secondary)
                 Text(caseSensitive ? "Match case" : "Unicode lowercase matching").font(.caption).foregroundStyle(.secondary)
-            } else if case .expressionHit(_, let expression, let primary, _, let caseSensitive, let scope) = capture.origin {
+            } else if case .expressionHit(_, let expression, let primary, _, let caseSensitive, let scope, let index) = capture.origin {
                 Text("Saved expression: \(expression)").font(.callout.monospaced()).lineLimit(2).textSelection(.enabled)
                 Text(scope.label).font(.caption).foregroundStyle(.secondary)
                 Text(caseSensitive ? "Match case" : "Unicode lowercase matching").font(.caption).foregroundStyle(.secondary)
                 Text("Primary occurrence: \(primary)").font(.caption.monospaced()).lineLimit(2).textSelection(.enabled)
+                if let generation = index.generation {
+                    Text("Accepted expression used index generation \(generation); this selection is verified against saved source.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
             } else if case .structureHit(_, _, _, _, let item, _) = capture.origin {
                 Text(item.structure.name).font(.callout.monospaced()).lineLimit(2).textSelection(.enabled)
                 Text(item.structure.label).font(.caption).foregroundStyle(.secondary)

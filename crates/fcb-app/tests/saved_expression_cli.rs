@@ -88,7 +88,17 @@ fn literal_index_and_expression_generations_are_independent() {
     assert_eq!(rows[3].get("saved_query_generation").number(), 1);
     assert_eq!(rows[3].get("saved_expression_generation").number(), 1);
     assert_eq!(rows[3].get("saved_index_generation").number(), 1);
-    assert!(!rows[3].get("result").get("index_used").flag());
+    assert!(rows[3].get("result").get("index_used").flag());
+    assert_eq!(rows[3].get("result").get("index_generation").number(), 1);
+    assert_eq!(rows[3].get("result").get("index_pin").text(), pin.to_hex());
+    assert_eq!(rows[3].get("result").get("index_candidates").number(), 2);
+    assert_eq!(rows[3].get("result").get("fallback_files").number(), 0);
+    for field in ["index_used", "index_generation", "index_pin", "index_policy",
+        "index_eliminated_files", "index_candidates", "fallback_files", "posting_list_lookups",
+        "posting_entries_visited", "posting_membership_lookups", "posting_cursor_complete"] {
+        assert_eq!(rows[5].get("result").get(field), rows[3].get("result").get(field));
+        assert_eq!(rows[7].get("result").get(field), rows[3].get("result").get(field));
+    }
     assert_eq!(rows[5].get("result").get("retained_hits").number(), 1);
     assert_eq!(rows[8].get("result").get("original_hex").text(), "6e6565646c65");
 }

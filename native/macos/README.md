@@ -1109,7 +1109,7 @@ and physical-Mac qualification remain pending.
 
 ## Saved repository search indexes
 
-In **Saved Repository → Search → Literal**, expand **Saved search index**
+In **Saved Repository → Search → Literal** or **Expression**, expand **Saved search index**
 and choose **Build and save index…** to create an FCBD index from the archive
 already open in the app. Choose a new destination in the save panel. The build
 uses the retained archive descriptor and verifies captured members; it does not
@@ -1160,19 +1160,36 @@ Case-insensitive literal searches use bounded case variants for ASCII-qualified
 rows, with exact verification of every candidate. Unicode, UTF-16, malformed,
 uncovered and legacy rows keep direct scanning. Fresh builds qualify ASCII rows;
 older indexes remain readable but need a fresh build to gain this pruning.
-Expression and structural searches retain direct source scans. The accepted
-query reports which policy actually ran.
+Expression searches now use the attached FCBD index for their first positive
+term. For example, `"pub fn" Result -unsafe path:src/ lang:rust` can discard an
+eligible indexed member that cannot contain `pub fn`; candidates still verify
+`Result` and the absence of `unsafe` across the same complete captured member.
+Raw file/folder scope and path/language filters apply before this candidate
+selection. Short or incompatible primary terms retain exact source fallback.
+Structural searches retain direct source extraction. The accepted query reports
+which policy actually ran.
 
-Each accepted literal result reports its own index generation, eliminated
-members, direct-scan fallbacks and postings visited. **Reload index status**
-refreshes cumulative page I/O without reopening either selected path. **Detach
-index** changes subsequent literal searches; existing result pages and captured
-readers remain available. A rejected replacement preserves the prior index.
-Lost or canceled replies reconcile the accepted generation on the same handle.
-If status remains unknown, new index changes and literal searches wait for a
-successful reload or archive close. Both possible index grants stay retained
-until that outcome is known, and entered work drains before closure releases
-the archive and index access.
+Each accepted literal or expression result reports its own index generation,
+eliminated members, direct-scan fallbacks and postings visited. Expression results
+also distinguish posting candidates from fallback members. Those member counters
+cover captured members admitted by the selected raw scope and expression filters;
+excluded and unavailable members do not inflate the pruning count. A completed
+expression accounts for every eligible captured member through source verification
+or compatible index elimination. An empty filtered scope can complete without
+reading posting pages, while a work-limited scan keeps its explicit partial coverage.
+
+**Reload index status** refreshes cumulative page I/O without reopening either
+selected path. **Detach index** changes subsequent literal and expression searches,
+including newly requested result windows. The expression, scope, matching and
+counting options stay fixed across those windows; each new generation uses the
+index attached when it is submitted. Existing metadata pages and exact-reader
+receipts retain their original query-time index pin, generation and diagnostics.
+A rejected replacement preserves the prior index and accepted results. Lost or
+canceled replies recover the accepted generation without repeating the scan.
+If status remains unknown, new index changes and literal/expression searches wait
+for a successful reload or archive close; retained results and readers remain
+usable. Both possible index grants stay retained until that outcome is known,
+and entered work drains before closure releases archive and index access.
 
 The native model/receipt and public-header C marshaling regressions are in
 `swiftui/tests/test-saved-search.sh` and `test-saved-index-build.sh`; actual
@@ -1180,8 +1197,14 @@ FCBS/FCBD construction, create-only publication, cancellation, receipt recovery
 and ABI cases are in `crates/fcb-app/tests/saved_repository_index_build.rs`,
 `crates/fcb-bridge/src/saved_sessions_tests.rs`, `saved_index_build_ffi_tests.rs`
 and `saved_ffi_tests.rs`.
-These additions still require the configured independent strict-RCH verifier.
-Physical-Mac picker, sandbox access and native UI qualification remain pending.
+The indexed-expression native regressions additionally cover complete additive
+receipts, legacy direct responses, filtered-scope counter bounds, a pending
+work-limited candidate, empty filtered scope, frozen metadata/reader provenance,
+detach and replacement between windows, lost/canceled replies and exact UTF-16
+activation. They reject missing, downgraded or changed index receipts before
+publishing a reader. These additions are code-first source changes and still
+require the configured independent strict-RCH verifier. Physical-Mac picker,
+sandbox access and native UI qualification remain pending.
 
 ## Following saved reading trails
 

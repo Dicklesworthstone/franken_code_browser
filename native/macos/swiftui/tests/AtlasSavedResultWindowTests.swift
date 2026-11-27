@@ -139,6 +139,9 @@ private final class SavedResultWindowFixture: @unchecked Sendable {
                 out["search_complete"] = complete
             }
         }
+        if scan.namespace == .expression, out["fallback_files"] != nil {
+            out["fallback_files"] = out["index_used"] as? Bool == true ? out["members_loaded"] as! String : "0"
+        }
         return base.encode(out)
     }
 
@@ -175,7 +178,7 @@ private final class SavedResultWindowFixture: @unchecked Sendable {
             locked { changedMetadata = changed }
             return changed
         }
-        precondition(namespace == .structure)
+        precondition(namespace == .structure || (namespace == .expression && field == "posting_entries_visited"))
         let value = UInt64(out[field] as! String)!
         out[field] = String(["max_hits", "max_source_bytes", "files_searched"].contains(field) ? value - 1 : value + 1)
         if field == "loaded_bytes" { out["member_bytes_read"] = out[field] }
@@ -202,6 +205,9 @@ private final class SavedResultWindowFixture: @unchecked Sendable {
         selection["hit_id"] = String(hit); out["selection"] = selection
         let forged = locked { let value = wrongReaderScope; wrongReaderScope = false; return value }
         if scan.scope != .archive || forged { addScope(forged ? .archive : scan.scope, to: &out) }
+        if namespace == .expression, scan.scope != .archive, out["fallback_files"] != nil {
+            out["fallback_files"] = out["index_used"] as? Bool == true ? out["scope_captured_members"] as! String : "0"
+        }
         return base.encode(out)
     }
 
@@ -307,6 +313,8 @@ enum AtlasSavedResultWindowTests {
         try await expressionAndStructureWindowsKeepIndependentAuthority()
         try await structuralMetadataCannotRewriteAcceptedCoverage()
         try await sharedScopesFreezeWindowsRecoveryAndReaders()
+        try await indexedExpressionWindowsBindEachSubmittedIndex()
+        await modernExpressionReceiptsCannotDowngradeAcrossGenerations()
     }
 
     @MainActor private static func literalWindowsKeepPoliciesAndExactReaders() async throws {
@@ -471,6 +479,116 @@ enum AtlasSavedResultWindowTests {
     }
 
 
+    @MainActor private static func indexedExpressionWindowsBindEachSubmittedIndex() async throws {
+        let f = SavedResultWindowFixture()
+        f.base.expressionIndexReceipts = true
+        let model = await opened(f), member = AtlasSavedStructureScope.member(f.base.members[2].path)
+        let pin = String(repeating: "a", count: 64), replacementPin = String(repeating: "b", count: 64)
+        model.attachIndex(path: "/saved/first.fcbd", pin: pin, accessLease: nil)
+        await wait("scoped expression index did not attach") { !model.busy }
+        model.searchMode = .expression; model.structureScope = member
+        model.searchInput = "ANA +BANANA -UNSAFE"; model.searchCaseSensitive = false; model.countAllMatches = true
+        model.search(); await wait("first indexed expression window did not finish") { !model.busy }
+        let first = model.expressionPage!
+        precondition(first.complete && first.scope.members == 1 && first.index.generation == 1
+            && first.index.fallbackFiles == 1 && first.window.next == 4096)
+        f.failNext(.lost); model.loadExpressionWindow(offset: 4096, from: first)
+        await wait("indexed expression window did not recover") { !model.busy }
+        let later = model.expressionPage!
+        precondition(later.generation == 2 && later.scope == first.scope && later.index == first.index
+            && later.window.offset == 4096 && later.hits.count == 2 && f.calls.count == 2)
+        precondition(f.metadataCalls == ["expression:2:0"])
+        model.detachIndex(); await wait("index did not detach between expression windows") { !model.busy }
+        model.loadExpressionResults(start: 1, from: later)
+        await wait("detached-index expression metadata did not load") { !model.busy }
+        let metadata = model.expressionPage!
+        precondition(metadata.start == 1 && metadata.index == first.index && model.index == nil && f.calls.count == 2)
+        let retainedReader = try await model.openExpressionHit(metadata.hits[0], from: metadata,
+            readerTransport: f.base.readerTransport())
+        precondition(retainedReader.match?.start == 410 && retainedReader.match?.end == 416
+            && retainedReader.match?.originalHex == "61006e006100")
+        if case .expressionHit(_, _, _, _, _, let scope, let index) = retainedReader.origin {
+            precondition(scope == member && index == first.index)
+        } else { preconditionFailure("scoped indexed reader lost query-time provenance") }
+        f.changeNextMetadata("posting_entries_visited")
+        model.loadExpressionResults(start: 0, from: metadata)
+        await wait("altered expression index metadata did not drain") { !model.busy }
+        precondition(model.expressionPage?.start == 1 && model.expressionPage?.index == first.index)
+
+        // Index attachment may change between bounded scans without changing
+        // the accepted expression, case policy, counting mode or raw scope.
+        model.loadExpressionWindow(offset: 0, from: metadata)
+        await wait("new direct expression window after detach did not finish") { !model.busy }
+        let direct = model.expressionPage!
+        precondition(direct.generation == 3 && direct.index.hasReceipt && direct.index.generation == nil
+            && direct.scope == first.scope && direct.window.offset == 0 && f.calls.count == 3)
+        precondition(direct.expression == first.expression && !direct.caseSensitive && direct.counting.all)
+        model.attachIndex(path: "/saved/replacement.fcbd", pin: replacementPin, accessLease: nil)
+        await wait("replacement index did not attach between expression windows") { !model.busy }
+        let replacementGeneration = model.index!.generation
+        f.failNext(.blocked); model.loadExpressionWindow(offset: 4096, from: direct)
+        await wait("indexed expression window did not enter cancelable worker") { f.entered.wait(timeout: .now()) == .success }
+        model.structureScope = .archive; model.cancel(); f.resume.signal()
+        await wait("canceled indexed expression window did not recover") { !model.busy }
+        let recovered = model.expressionPage!
+        precondition(recovered.generation == 4 && recovered.window.offset == 4096 && recovered.scope == first.scope
+            && recovered.index.generation == replacementGeneration && recovered.index.pin == replacementPin)
+        precondition(!model.expressionIsCurrent && f.calls.count == 4
+            && f.calls.filter { $0.namespace == .expression && $0.generation == 4 }.count == 1)
+        model.structureScope = member
+        let reader = try await model.openExpressionHit(recovered.hits[0], from: recovered,
+            readerTransport: f.base.readerTransport())
+        precondition(reader.match?.start == 406 && reader.match?.originalHex == "61006e006100")
+        model.closeArchive()
+        precondition(retainedReader.canUseMatch && reader.canUseMatch && !f.base.calls.contains("LIVE-OPEN"))
+        _ = try await retainedReader.withMatchReader { $0 }
+        retainedReader.reader.close(); reader.reader.close(); model.close()
+    }
+
+    @MainActor private static func modernExpressionReceiptsCannotDowngradeAcrossGenerations() async {
+        let f = SavedResultWindowFixture()
+        f.base.expressionIndexReceipts = true
+        let model = await opened(f), pin = String(repeating: "a", count: 64)
+        model.attachIndex(path: "/saved/modern.fcbd", pin: pin, accessLease: nil)
+        await wait("modern expression index did not attach") { !model.busy }
+        model.searchMode = .expression; model.searchInput = "ANA +BANANA -UNSAFE"
+        model.searchCaseSensitive = false; model.search()
+        await wait("modern expression receipt did not arrive") { !model.busy }
+        let modern = model.expressionPage!
+        precondition(modern.index.hasReceipt && modern.index.generation == 1)
+        // Strip the entire additive receipt from both the accepted scan reply
+        // and retained results. Partial-field rejection alone cannot catch this.
+        f.base.expressionIndexReceipts = false
+        model.loadExpressionWindow(offset: 4096, from: modern)
+        await wait("downgraded expression window did not drain") { !model.busy }
+        precondition(model.expressionPage == nil && model.expressionGeneration == nil && f.calls.count == 2)
+        precondition(f.metadataCalls == ["expression:2:0"])
+        model.reloadSearchResults(); await wait("downgraded recovery did not drain") { !model.busy }
+        precondition(model.expressionPage == nil && f.calls.count == 2)
+        f.base.expressionIndexReceipts = true
+        model.reloadSearchResults(); await wait("restored modern receipt did not recover") { !model.busy }
+        precondition(model.expressionGeneration == 2 && model.expressionPage?.index == modern.index
+            && model.expressionPage?.window.offset == 4096 && f.calls.count == 2)
+
+        // Clearing result rows does not let the same handle shed its known
+        // receipt contract. A genuinely newly opened legacy service still works.
+        model.clearSearch(); await wait("modern expression clear did not finish") { !model.busy }
+        f.base.expressionIndexReceipts = false
+        model.searchInput = modern.expression; model.search()
+        await wait("post-clear receipt downgrade did not drain") { !model.busy }
+        precondition(model.expressionPage == nil && model.expressionGeneration == nil && f.calls.count == 3)
+        model.open(path: "/saved/legacy.fcbs", accessLease: nil)
+        await wait("legacy archive did not open") { !model.busy }
+        model.attachIndex(path: "/saved/legacy.fcbd", pin: pin, accessLease: nil)
+        await wait("legacy archive index did not attach") { !model.busy }
+        model.searchInput = modern.expression; model.search()
+        await wait("legacy direct expression did not finish") { !model.busy }
+        precondition(model.expressionPage?.index.hasReceipt == false && model.expressionPage?.index.generation == nil
+            && model.expressionGeneration == 1 && model.expressionIsCurrent && model.index?.generation == 1)
+        precondition(!f.base.calls.contains("LIVE-OPEN"))
+        model.close()
+    }
+
     @MainActor private static func sharedScopesFreezeWindowsRecoveryAndReaders() async throws {
         let f = SavedResultWindowFixture(nested: true), model = await opened(f)
         let directory = AtlasSavedStructureScope.directory(Array("src".utf8))
@@ -542,7 +660,7 @@ enum AtlasSavedResultWindowTests {
             readerTransport: f.base.readerTransport())
         precondition(utf16Reader.match?.start == 410 && utf16Reader.match?.end == 416
             && utf16Reader.match?.originalHex == "61006e006100")
-        if case .expressionHit(_, _, _, _, _, let scope) = utf16Reader.origin { precondition(scope == member) }
+        if case .expressionHit(_, _, _, _, _, let scope, _) = utf16Reader.origin { precondition(scope == member) }
         else { preconditionFailure("expression reader lost its exact raw member scope") }
 
         f.failNext(.blocked); model.loadExpressionWindow(offset: 0, from: expression)

@@ -59,6 +59,9 @@ import Dispatch
         await closeDuringHitHandoffDrainsAndRetires()
         try expressionCoverageAndNamespaceContracts()
         try expressionMatchingPoliciesBindPagesAndOccurrences()
+        try expressionIndexReceiptsBindScopedAccounting()
+        try await indexedExpressionsFreezeReceiptsAcrossIndexChanges()
+        await forgedExpressionIndexReadersRetire()
         try await lowercaseExpressionsKeepOriginalReadersAndFrozenPolicy()
         try await lowercaseExpressionExpansionsKeepWholeOriginalScalars()
         await forgedLowercaseExpressionPoliciesRetireDestinations()
@@ -1021,6 +1024,191 @@ import Dispatch
         precondition(model.closed && model.info == nil && model.queryGeneration == nil && !f.calls.contains("LIVE-OPEN"))
     }
 
+    private static func expressionIndexReceiptsBindScopedAccounting() throws {
+        let f = SavedRepositoryFixture(searchVectors: true), pin = String(repeating: "a", count: 64)
+        let direct = f.expressionPage(40, generation: 1, countAllMatches: true)
+        let identity = try JSONDecoder().decode(AtlasSavedIdentity.self, from: Data(f.encode(direct).utf8))
+        func decode(_ object: [String: Any], matching: Bool = true) throws -> AtlasSavedExpressionPage {
+            try AtlasSavedExpressionPage.decode(f.encode(object), identity: identity, generation: 1,
+                expression: "ana +banana -unsafe", start: 0, limit: 64, countAllMatches: true, caseSensitive: matching)
+        }
+        let legacy = try decode(direct)
+        precondition(!legacy.index.hasReceipt && legacy.index.matchesSubmittedIndex(generation: 7, pin: pin))
+        var explicitDirect = direct
+        explicitDirect.merge(f.expressionIndexFields(generation: nil, pin: nil, loaded: 4, caseSensitive: true)) { _, next in next }
+        let sourceOnly = try decode(explicitDirect)
+        precondition(sourceOnly.index.hasReceipt && sourceOnly.index.generation == nil)
+        precondition(sourceOnly.index.matchesSubmittedIndex(generation: nil, pin: nil)
+            && !sourceOnly.index.matchesSubmittedIndex(generation: 7, pin: pin))
+        precondition(!sourceOnly.hasSameSummary(as: legacy), "an explicit receipt silently downgraded to legacy")
+
+        // Two eligible captures were eliminated by compatible postings. One
+        // posting candidate and one decoder fallback still ran all predicates.
+        var indexed = direct
+        indexed.merge(f.expressionIndexFields(generation: 7, pin: pin, loaded: 2, caseSensitive: true)) { _, next in next }
+        indexed["index_eliminated_files"] = "2"; indexed["index_candidates"] = "1"; indexed["fallback_files"] = "1"
+        indexed["posting_list_lookups"] = "1"; indexed["posting_entries_visited"] = "2"
+        let sourceBytes = f.searchUTF8.count + f.searchUTF16.count
+        indexed["members_loaded"] = "2"; indexed["member_read_calls"] = "2"
+        indexed["loaded_bytes"] = String(sourceBytes); indexed["member_bytes_read"] = String(sourceBytes)
+        indexed["peak_source_bytes"] = String(max(f.searchUTF8.count, f.searchUTF16.count))
+        indexed["predicate_scans"] = "4"; indexed["predicate_rejections"] = "0"; indexed["primary_scans"] = "2"
+        indexed["scanned_bytes"] = String(sourceBytes * 3)
+        let accepted = try decode(indexed)
+        precondition(accepted.state == "complete" && !accepted.complete && accepted.unavailable == 1)
+        precondition(accepted.index.generation == 7 && accepted.index.pin == pin
+            && accepted.index.eliminatedFiles == 2 && accepted.index.candidates == 1 && accepted.index.fallbackFiles == 1)
+        precondition(accepted.hits.count == 4 && accepted.required == 1 && accepted.excluded == 1)
+        precondition(accepted.index.matchesSubmittedIndex(generation: 7, pin: pin)
+            && !accepted.index.matchesSubmittedIndex(generation: 8, pin: pin))
+        var changed = indexed; changed["posting_entries_visited"] = "3"
+        let changedPage = try decode(changed)
+        precondition(!changedPage.hasSameSummary(as: accepted), "metadata rewrote frozen index diagnostics")
+        let fields = ["index_used", "index_generation", "index_pin", "index_policy", "index_eliminated_files",
+            "index_candidates", "fallback_files", "posting_list_lookups", "posting_entries_visited",
+            "posting_membership_lookups", "posting_cursor_complete"]
+        for field in fields {
+            var bad = indexed; bad.removeValue(forKey: field)
+            rejected("partial expression index receipt accepted: \(field)") { _ = try decode(bad) }
+        }
+        for (field, value) in [("index_used", false as Any), ("index_generation", "0" as Any),
+            ("index_pin", NSNull() as Any), ("index_policy", "ascii-case-variants-with-source-fallback" as Any),
+            ("index_eliminated_files", "3" as Any), ("index_candidates", "2" as Any), ("fallback_files", "2" as Any),
+            ("members_loaded", "3" as Any), ("posting_entries_visited", "02" as Any),
+            ("posting_cursor_complete", false as Any)] {
+            var bad = indexed; bad[field] = value
+            rejected("inconsistent expression index evidence accepted: \(field)") { _ = try decode(bad) }
+        }
+        var lowercase = indexed
+        lowercase["case_sensitive"] = false; lowercase["mode"] = "unicode-lowercase-expression"
+        lowercase["index_policy"] = "ascii-case-variants-with-source-fallback"
+        let lowercasePage = try decode(lowercase, matching: false)
+        precondition(lowercasePage.index.generation == 7)
+        lowercase["index_policy"] = "exact-compatible-postings"
+        rejected("lowercase expression admitted an exact-only index policy") { _ = try decode(lowercase, matching: false) }
+
+        // Path/language filters exclude every recorded member, including the
+        // unavailable one. Completion requires no source or posting-page I/O.
+        var empty = direct
+        empty.merge(f.expressionIndexFields(generation: 7, pin: pin, loaded: 0, caseSensitive: true)) { _, next in next }
+        empty["posting_list_lookups"] = "1" // Cursor construction may inspect term metadata without loading a page.
+        for key in ["scope_files", "unavailable_files", "members_loaded", "member_read_calls", "loaded_bytes",
+            "member_bytes_read", "peak_source_bytes", "predicate_scans", "predicate_rejections", "primary_scans",
+            "scanned_bytes", "retained_hits", "matches_seen", "matching_files", "retained_matching_files"] { empty[key] = "0" }
+        empty["metadata_excluded"] = "5"; empty["complete"] = true; empty["matches_seen_exact"] = true
+        empty["hits"] = [[String: Any]]()
+        let noEligible = try decode(empty)
+        precondition(noEligible.complete && noEligible.scopeFiles == 0 && noEligible.index.postingListLookups == 1
+            && noEligible.index.postingEntriesVisited == 0 && !noEligible.index.postingCursorComplete)
+        var outsideEligible = empty; outsideEligible["index_eliminated_files"] = "1"
+        rejected("raw archive membership replaced the filtered eligible denominator") { _ = try decode(outsideEligible) }
+
+        // A bounded cursor can admit one candidate before its source load is
+        // refused. It cannot count that member as scanned or prove absence.
+        var limited = empty
+        limited["scope_files"] = "5"; limited["metadata_excluded"] = "0"; limited["unavailable_files"] = "1"
+        limited["state"] = "work-limit"; limited["complete"] = false; limited["matches_seen_exact"] = false
+        limited["index_candidates"] = "1"; limited["posting_list_lookups"] = "1"
+        let pending = try decode(limited)
+        precondition(!pending.complete && pending.sourceBytes == 0 && pending.index.candidates == 1)
+        var finalCursor = limited
+        finalCursor["posting_cursor_complete"] = true; finalCursor["index_eliminated_files"] = "3"
+        let pendingSource = try decode(finalCursor)
+        precondition(!pendingSource.complete && pendingSource.index.postingCursorComplete
+            && pendingSource.index.eliminatedFiles == 3 && pendingSource.sourceBytes == 0)
+        limited["index_candidates"] = "2"
+        rejected("two pending expression candidates exceeded the single admitted source") { _ = try decode(limited) }
+        var directCounters = explicitDirect; directCounters["posting_cursor_complete"] = true
+        rejected("direct expression invented a completed posting cursor") { _ = try decode(directCounters) }
+    }
+
+    @MainActor private static func indexedExpressionsFreezeReceiptsAcrossIndexChanges() async throws {
+        let f = SavedRepositoryFixture(searchVectors: true)
+        f.expressionIndexReceipts = true
+        let model = await preparedExpression(f), direct = model.expressionPage!
+        precondition(direct.index.hasReceipt && direct.index.generation == nil)
+        let pin = String(repeating: "a", count: 64), replacementPin = String(repeating: "b", count: 64)
+        model.attachIndex(path: "/saved/expression.fcbd", pin: pin, accessLease: nil)
+        await wait("expression index did not attach") { !model.busy }
+        model.searchInput = "ANA +BANANA -UNSAFE"; model.searchCaseSensitive = false; model.search()
+        await wait("indexed lowercase expression did not finish") { !model.busy }
+        let accepted = model.expressionPage!
+        precondition(accepted.generation == 2 && accepted.index.generation == 1 && accepted.index.pin == pin)
+        precondition(accepted.index.policy == "ascii-case-variants-with-source-fallback"
+            && accepted.index.fallbackFiles == 4 && accepted.hits.count == 4 && !accepted.caseSensitive)
+        model.detachIndex(); await wait("expression index did not detach") { !model.busy }
+        precondition(model.index == nil && model.expressionIsCurrent && model.expressionPage?.index == accepted.index)
+        model.loadExpressionResults(start: 2, from: accepted)
+        await wait("indexed expression metadata did not survive detach") { !model.busy }
+        let retained = model.expressionPage!
+        precondition(retained.start == 2 && retained.index == accepted.index)
+        let utf16 = try await model.openExpressionHit(retained.hits[1], from: retained, readerTransport: f.readerTransport())
+        precondition(utf16.match?.start == 410 && utf16.match?.end == 416
+            && utf16.match?.originalHex == "61006e006100" && utf16.canUseMatch)
+        guard case .expressionHit(_, _, _, _, _, _, let readerIndex) = utf16.origin else {
+            preconditionFailure("indexed expression reader lost its accepted provenance")
+        }
+        precondition(readerIndex == accepted.index)
+        f.corruptNext("expression-index-policy"); model.loadExpressionResults(start: 0, from: retained)
+        await wait("changed indexed expression summary did not drain") { !model.busy }
+        precondition(model.expressionPage?.start == 2 && model.expressionPage?.index == accepted.index)
+
+        // A fresh query uses the current attachment, while retained rows and
+        // exact readers keep the index from their accepted generation.
+        model.search(); await wait("direct expression after detach did not finish") { !model.busy }
+        precondition(model.expressionPage?.generation == 3 && model.expressionPage?.index.generation == nil)
+        precondition(utf16.canUseMatch)
+        model.attachIndex(path: "/saved/replacement.fcbd", pin: replacementPin, accessLease: nil)
+        await wait("replacement expression index did not attach") { !model.busy }
+        let replacementGeneration = model.index!.generation
+        f.corruptNext("expression-lost"); model.search()
+        await wait("lost indexed expression did not reconcile") { !model.busy }
+        let recovered = model.expressionPage!
+        precondition(recovered.generation == 4 && recovered.index.generation == replacementGeneration
+            && recovered.index.pin == replacementPin && model.expressionIsCurrent)
+        precondition(f.calls.filter { $0 == "expression:40:4:ANA +BANANA -UNSAFE" }.count == 1)
+        model.searchInput = "\"unterminated"; f.corruptNext("expression"); model.search()
+        await wait("failed indexed expression replacement did not reconcile") { !model.busy }
+        precondition(model.expressionPage?.index == recovered.index && model.expressionGeneration == 4 && !model.expressionIsCurrent)
+        model.searchInput = recovered.expression
+        f.corruptNext("index-unknown")
+        model.attachIndex(path: "/saved/uncertain.fcbd", pin: pin, accessLease: nil)
+        await wait("unconfirmed expression index replacement did not drain") { !model.busy }
+        precondition(!model.indexStateKnown && !model.canSearch && model.expressionIsCurrent)
+        let scans = f.calls.filter { $0.hasPrefix("expression:") }.count
+        model.search()
+        precondition(!model.busy && f.calls.filter { $0.hasPrefix("expression:") }.count == scans)
+        let stillRetained = try await model.openExpressionHit(recovered.hits[0], from: recovered, readerTransport: f.readerTransport())
+        precondition(stillRetained.canUseMatch)
+        model.reloadIndex(); await wait("expression index status did not reconcile") { !model.busy }
+        precondition(model.indexStateKnown && model.canSearch && model.expressionPage?.index == recovered.index)
+        model.closeArchive()
+        precondition(utf16.canUseMatch && stillRetained.canUseMatch && !f.calls.contains("LIVE-OPEN"))
+        _ = try await utf16.withMatchReader { $0 }
+        utf16.reader.close(); stillRetained.reader.close(); model.close()
+    }
+
+    @MainActor private static func forgedExpressionIndexReadersRetire() async {
+        for fault in ["expression-index-generation", "expression-index-pin", "expression-index-counter",
+            "expression-index-omitted", "expression-index-downgrade"] {
+            let f = SavedRepositoryFixture(searchVectors: true)
+            f.expressionIndexReceipts = true
+            let model = await preparedExpression(f)
+            model.attachIndex(path: "/saved/expression.fcbd", pin: String(repeating: "a", count: 64), accessLease: nil)
+            await wait("forged-reader index did not attach") { !model.busy }
+            model.search(); await wait("indexed expression for forged reader did not finish") { !model.busy }
+            let page = model.expressionPage!
+            precondition(page.index.generation == 1)
+            f.corruptNext(fault)
+            await refused("expression reader accepted altered index provenance: \(fault)") {
+                _ = try await model.openExpressionHit(page.hits[0], from: page, readerTransport: f.readerTransport())
+            }
+            await wait("invalid index receipt did not retire reader: \(fault)") { f.calls.contains("reader-close:100") }
+            precondition(model.expressionPage?.index == page.index && !f.calls.contains("LIVE-OPEN"))
+            model.close()
+        }
+    }
+
     private static func expressionMatchingPoliciesBindPagesAndOccurrences() throws {
         let f = SavedRepositoryFixture(searchVectors: true)
         let exactObject = f.expressionPage(40, generation: 1, countAllMatches: true)
@@ -1248,7 +1436,7 @@ import Dispatch
         precondition(utf8.match?.start == 203 && utf8.match?.end == 206 && utf8.match?.originalHex == "616e61")
         precondition(utf16.match?.start == 410 && utf16.match?.end == 416 && utf16.match?.originalHex == "61006e006100")
         precondition(utf16.reader.page?.start == 278 && utf16.reader.page?.identity.encoding == "utf16le")
-        guard case .expressionHit(let generation, let query, let primary, _, _, _) = utf16.origin else {
+        guard case .expressionHit(let generation, let query, let primary, _, _, _, _) = utf16.origin else {
             preconditionFailure("expression reader lost its accepted predicate provenance")
         }
         precondition(generation == 1 && query == expression.expression && primary == "ana")

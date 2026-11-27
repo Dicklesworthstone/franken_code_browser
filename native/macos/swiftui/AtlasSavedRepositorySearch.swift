@@ -587,6 +587,114 @@ struct AtlasSavedStructurePage: Sendable {
     }
 }
 
+/// Query-time primary-literal prefilter evidence. Whole-member expression
+/// predicates are still verified against the captured source after admission.
+/// Retain this receipt with pages and reader selections, independently of the
+/// index currently attached to the saved archive.
+struct AtlasSavedExpressionIndexReceipt: Equatable, Sendable {
+    let hasReceipt: Bool
+    let generation: UInt64?
+    let pin: String?
+    let policy: String
+    let eliminatedFiles, candidates, fallbackFiles: UInt64
+    let postingListLookups, postingEntriesVisited, postingMembershipLookups: UInt64
+    let postingCursorComplete: Bool
+
+    static let legacyDirect = Self(hasReceipt: false, generation: nil, pin: nil,
+        policy: "direct-verified-member-scan", eliminatedFiles: 0, candidates: 0, fallbackFiles: 0,
+        postingListLookups: 0, postingEntriesVisited: 0, postingMembershipLookups: 0, postingCursorComplete: false)
+
+    /// Earlier expression services always scanned directly, including when an
+    /// index was attached. New receipts bind the index present at submission.
+    func matchesSubmittedIndex(generation: UInt64?, pin: String?) -> Bool {
+        !hasReceipt || (self.generation == generation && self.pin == pin)
+    }
+
+    static func decode(_ data: Data, caseSensitive: Bool) throws -> Self {
+        let receipt = try JSONDecoder().decode(Wire.self, from: data).receipt
+        let expectedPolicy = receipt.generation == nil ? "direct-verified-member-scan"
+            : caseSensitive ? "exact-compatible-postings" : "ascii-case-variants-with-source-fallback"
+        guard receipt.policy == expectedPolicy,
+              (receipt.generation == nil) == (receipt.pin == nil),
+              receipt.generation == nil || (receipt.generation! > 0 && AtlasSavedWire.digest(receipt.pin!)) else {
+            throw AtlasSavedError.invalidResponse
+        }
+        if receipt.generation == nil {
+            guard receipt.eliminatedFiles == 0, receipt.candidates == 0, receipt.fallbackFiles == 0,
+                  receipt.postingListLookups == 0, receipt.postingEntriesVisited == 0,
+                  receipt.postingMembershipLookups == 0, !receipt.postingCursorComplete else {
+                throw AtlasSavedError.invalidResponse
+            }
+        }
+        return receipt
+    }
+
+    /// Only captured members admitted by both raw scope and path/language
+    /// filters belong to these counters. A work-limited scan may have admitted
+    /// one candidate whose source load could not start.
+    func validate(eligible: UInt64, loaded: UInt64, state: String) throws {
+        guard eliminatedFiles <= eligible, candidates <= eligible - eliminatedFiles,
+              fallbackFiles <= eligible - eliminatedFiles - candidates,
+              loaded <= eligible - eliminatedFiles,
+              state != "complete" || loaded == eligible - eliminatedFiles else {
+            throw AtlasSavedError.invalidResponse
+        }
+        if generation != nil {
+            let admitted = candidates + fallbackFiles
+            // Native saved indexes use FCBD global cursors. An unfinished
+            // cursor cannot establish a negative membership total.
+            guard postingCursorComplete || eliminatedFiles == 0,
+                  loaded <= admitted, admitted - loaded <= 1,
+                  state != "complete" || admitted == loaded else { throw AtlasSavedError.invalidResponse }
+        }
+        // Empty filtered scopes finish without reading postings. An exhausted
+        // posting cursor also need not mean its last source scan has finished.
+    }
+
+    private struct Wire: Decodable {
+        let receipt: AtlasSavedExpressionIndexReceipt
+        enum CodingKeys: String, CodingKey {
+            case index_used, index_generation, index_pin, index_policy, index_eliminated_files, index_candidates
+            case fallback_files, posting_list_lookups, posting_entries_visited, posting_membership_lookups, posting_cursor_complete
+        }
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            let fields: [CodingKeys] = [.index_generation, .index_pin, .index_eliminated_files, .index_candidates,
+                .fallback_files, .posting_list_lookups, .posting_entries_visited, .posting_membership_lookups,
+                .posting_cursor_complete]
+            guard fields.contains(where: { c.contains($0) }) else {
+                if c.contains(.index_used) {
+                    guard try c.decode(Bool.self, forKey: .index_used) == false else { throw AtlasSavedError.invalidResponse }
+                }
+                if c.contains(.index_policy) {
+                    guard try c.decode(String.self, forKey: .index_policy) == "direct-verified-member-scan" else {
+                        throw AtlasSavedError.invalidResponse
+                    }
+                }
+                receipt = .legacyDirect
+                return
+            }
+            guard fields.allSatisfy({ c.contains($0) }), c.contains(.index_used), c.contains(.index_policy) else {
+                throw AtlasSavedError.invalidResponse
+            }
+            let generation = try c.decode(AtlasSavedSearchOptional<AtlasSavedNumber>.self, forKey: .index_generation).value?.value
+            let pin = try c.decode(AtlasSavedSearchOptional<String>.self, forKey: .index_pin).value
+            guard try c.decode(Bool.self, forKey: .index_used) == (generation != nil) else {
+                throw AtlasSavedError.invalidResponse
+            }
+            receipt = AtlasSavedExpressionIndexReceipt(hasReceipt: true, generation: generation, pin: pin,
+                policy: try c.decode(String.self, forKey: .index_policy),
+                eliminatedFiles: try c.decode(AtlasSavedNumber.self, forKey: .index_eliminated_files).value,
+                candidates: try c.decode(AtlasSavedNumber.self, forKey: .index_candidates).value,
+                fallbackFiles: try c.decode(AtlasSavedNumber.self, forKey: .fallback_files).value,
+                postingListLookups: try c.decode(AtlasSavedNumber.self, forKey: .posting_list_lookups).value,
+                postingEntriesVisited: try c.decode(AtlasSavedNumber.self, forKey: .posting_entries_visited).value,
+                postingMembershipLookups: try c.decode(AtlasSavedNumber.self, forKey: .posting_membership_lookups).value,
+                postingCursorComplete: try c.decode(Bool.self, forKey: .posting_cursor_complete))
+        }
+    }
+}
+
 /// The engine owns parsing and whole-member predicates. Native code validates
 /// the accepted syntax and witness namespace without interpreting query text.
 struct AtlasSavedExpressionPage: Sendable {
@@ -607,9 +715,10 @@ struct AtlasSavedExpressionPage: Sendable {
     let sourceBytes, scannedBytes, scanLimit, predicateRejections: UInt64
     let counting: AtlasSavedSearchCount
     let window: AtlasSavedResultWindow
+    let index: AtlasSavedExpressionIndexReceipt
 
     func hasSameSummary(as other: Self) -> Bool {
-        identity == other.identity && scope == other.scope && generation == other.generation
+        identity == other.identity && scope == other.scope && generation == other.generation && index == other.index
             && expression.utf8.elementsEqual(other.expression.utf8)
             && primaryNeedle.utf8.elementsEqual(other.primaryNeedle.utf8)
             && caseSensitive == other.caseSensitive
@@ -630,6 +739,7 @@ struct AtlasSavedExpressionPage: Sendable {
             let w = try JSONDecoder().decode(Wire.self, from: data)
             let membership = try AtlasSavedSearchScopeReceipt.decode(data, identity: identity, expected: expectedScope)
             let caseSensitive = w.case_sensitive
+            let index = try AtlasSavedExpressionIndexReceipt.decode(data, caseSensitive: caseSensitive)
             if w.mode != nil || w.normalization != nil || !caseSensitive {
                 guard w.mode == (caseSensitive ? "decoded-text-expression" : "unicode-lowercase-expression"),
                       w.normalization == "exact" else { throw AtlasSavedError.invalidResponse }
@@ -652,7 +762,6 @@ struct AtlasSavedExpressionPage: Sendable {
                   expected == nil || w.expression.utf8.elementsEqual(expected!.utf8),
                   w.predicate_scope == "whole-captured-member",
                   expectedCase == nil || caseSensitive == expectedCase,
-                  !w.index_used, w.index_policy == "direct-verified-member-scan",
                   ["complete", "truncated", "work-limit"].contains(w.state),
                   required <= 63, excluded <= 63 - required,
                   w.max_hits.value <= AtlasSavedSearchWire.maximumHits, retained <= w.max_hits.value,
@@ -663,7 +772,6 @@ struct AtlasSavedExpressionPage: Sendable {
                   scope <= membership.members, w.metadata_excluded.value == membership.members - scope,
                   unavailable <= scope, unavailable <= membership.members - membership.captured,
                   loaded <= scope - unavailable, unsupported <= loaded,
-                  w.state != "complete" || loaded == scope - unavailable,
                   w.complete == (w.state == "complete" && membership.complete && unavailable == 0 && unsupported == 0),
                   w.matches_seen_exact == w.complete,
                   sourceBytes <= AtlasSavedSearchWire.maximumSourceBytes, w.member_bytes_read.value == sourceBytes,
@@ -675,6 +783,7 @@ struct AtlasSavedExpressionPage: Sendable {
                   w.retained_source_payload_bytes.value == 0,
                   (1...128).contains(limit), start <= retained,
                   UInt64(w.hits.count) == min(limit, retained - start) else { throw AtlasSavedError.invalidResponse }
+            try index.validate(eligible: scope - unavailable, loaded: loaded, state: w.state)
             var previous: AtlasSavedHit?
             for (position, hit) in w.hits.enumerated() {
                 guard hit.id == start + UInt64(position) + 1, hit.member < identity.members,
@@ -700,7 +809,7 @@ struct AtlasSavedExpressionPage: Sendable {
                 retained: retained, seen: seen, required: required, excluded: excluded, scopeFiles: scope,
                 filteredFiles: w.metadata_excluded.value, unavailable: unavailable, unsupported: unsupported,
                 sourceBytes: sourceBytes, scannedBytes: w.scanned_bytes.value, scanLimit: w.max_scan_bytes.value,
-                predicateRejections: w.predicate_rejections.value, counting: counting, window: window)
+                predicateRejections: w.predicate_rejections.value, counting: counting, window: window, index: index)
         } catch let error as AtlasSavedError { throw error }
         catch { throw AtlasSavedError.invalidResponse }
     }

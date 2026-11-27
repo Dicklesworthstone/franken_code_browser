@@ -59,7 +59,14 @@ fn lowercase_predicates_preserve_paging_index_and_utf16_reader_witnesses() {
     assert_eq!(page.get("normalization").text(), "exact");
     assert_eq!(page.get("retained_hits").number(), 3);
     assert!(page.get("matches_seen_exact").flag());
-    assert!(!page.get("index_used").flag());
+    assert!(page.get("index_used").flag());
+    assert_eq!(page.get("index_generation").number(), 1);
+    assert_eq!(page.get("index_pin").text(), pin.to_hex());
+    assert_eq!(page.get("index_policy").text(), "ascii-case-variants-with-source-fallback");
+    assert_eq!(page.get("fallback_files").number(), 4);
+    assert_eq!(page.get("index_candidates").number(), 0);
+    assert_eq!(page.get("index_eliminated_files").number(), 0);
+    assert_eq!(page.get("posting_entries_visited").number(), 0);
     assert_eq!(saved.accepted_generation(), Some(1));
     assert_eq!(saved.index_generation(), Some(1));
     assert_eq!(
