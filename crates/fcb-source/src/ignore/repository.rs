@@ -13,7 +13,7 @@ use std::{fs, io::{self, Read}, mem::size_of, path::Path};
 use fcb_core::{ArenaOwnerId, ByteLength, ResourceAllocationId, ResourceBudget, ResourceLease};
 use crate::{CancelFlag, RootGrant, SourceError, safe_open_regular_file};
 use super::{IgnoreMatcher, NormalizedPath};
-use super::budget::IgnoreWorkError;
+use super::budget::{IgnoreWorkError, bounded_segments, pattern_matches};
 
 pub const RULE_POLICY_NAME: &str = "repository-rules-v1";
 const MAX_DIAGNOSTICS: usize = 32;
@@ -109,9 +109,23 @@ impl RuleObservation {
     pub fn bytes(&self) -> &[u8] { &self.bytes }
 }
 
+/// Index into the append-only rule layers of one discovery session.
+#[derive(Clone, Copy)]
+pub(crate) struct RuleScope(usize);
+
+impl RuleScope {
+    pub(crate) const DEFAULTS: Self = Self(0);
+}
+
+struct RuleLayer {
+    parent: Option<RuleScope>,
+    patterns: std::ops::Range<usize>,
+}
+
 pub struct RepositoryRules {
     limits: RuleLimits,
     matcher: IgnoreMatcher,
+    layers: Vec<RuleLayer>,
     stats: RuleStats,
     evidence: Vec<RuleObservation>,
     diagnostics: Vec<RuleDiagnostic>,
@@ -126,7 +140,7 @@ impl RepositoryRules {
         limits.validate()?;
         let charge = limits.max_compiled_bytes.checked_add(limits.max_total_bytes)
             .and_then(|n| n.checked_add(2 * limits.max_file_bytes))
-            .and_then(|n| n.checked_add(limits.max_files * (size_of::<RuleObservation>() + MAX_PATH_BYTES)))
+            .and_then(|n| n.checked_add(limits.max_files * (size_of::<RuleObservation>() + size_of::<RuleLayer>() + MAX_PATH_BYTES)))
             .and_then(|n| n.checked_add(MAX_DIAGNOSTICS * (size_of::<RuleDiagnostic>() + MAX_PATH_BYTES)))
             .and_then(|n| n.checked_add((limits.max_rules + 32) * 4 * size_of::<super::CompiledPattern>()))
             .and_then(|n| n.checked_add(size_of::<Self>() + 64 * 1024)).ok_or(RuleError::Limits)?;
@@ -134,11 +148,14 @@ impl RepositoryRules {
             .map_err(|_| RuleError::ResourceDenied)?;
         let mut matcher = IgnoreMatcher::product_defaults();
         matcher.patterns.try_reserve_exact(limits.max_rules).map_err(|_| RuleError::ResourceDenied)?;
+        let mut layers = Vec::new();
+        layers.try_reserve_exact(1 + limits.max_files).map_err(|_| RuleError::ResourceDenied)?;
+        layers.push(RuleLayer { parent: None, patterns: 0..matcher.patterns.len() });
         let mut evidence = Vec::new();
         evidence.try_reserve_exact(limits.max_files).map_err(|_| RuleError::ResourceDenied)?;
         let mut diagnostics = Vec::new();
         diagnostics.try_reserve_exact(MAX_DIAGNOSTICS).map_err(|_| RuleError::ResourceDenied)?;
-        Ok(Self { limits, matcher, stats: RuleStats::default(), evidence, diagnostics, owner, _lease: lease })
+        Ok(Self { limits, matcher, layers, stats: RuleStats::default(), evidence, diagnostics, owner, _lease: lease })
     }
     pub const fn limits(&self) -> RuleLimits { self.limits }
     pub const fn stats(&self) -> RuleStats { self.stats }
@@ -148,7 +165,8 @@ impl RepositoryRules {
     /// Run BEFORE enumerating a directory: parents precede children; .fcbignore
     /// follows .gitignore at equal depth. Excluded directories are not entered.
     pub(crate) fn load_directory(&mut self, prefix: Option<&NormalizedPath>, resolved: &Path,
-        grant: &RootGrant, cancel: &CancelFlag) -> Result<(), RuleError> {
+        grant: &RootGrant, cancel: &CancelFlag, inherited: RuleScope) -> Result<RuleScope, RuleError> {
+        let start = self.matcher.patterns.len();
         if grant.owner() != self.owner { return Err(SourceError::ForeignOwner.into()); }
         for name in [b".gitignore".as_slice(), b".fcbignore".as_slice()] {
             let relative = match prefix { Some(path) => path.join_segment(name), None => NormalizedPath::from_dirent_name(name) };
@@ -174,7 +192,10 @@ impl RepositoryRules {
         }
         grant.validate_active()?;
         if cancel.is_canceled() { return Err(SourceError::Canceled.into()); }
-        Ok(())
+        if self.matcher.patterns.len() == start { return Ok(inherited); }
+        let scope = RuleScope(self.layers.len());
+        self.layers.push(RuleLayer { parent: Some(inherited), patterns: start..self.matcher.patterns.len() });
+        Ok(scope)
     }
 
     /// Append a complete accepted rule file, never a prefix preceding an invalid
@@ -220,13 +241,29 @@ impl RepositoryRules {
         Ok(())
     }
 
-    pub(crate) fn excluded(&mut self, path: &NormalizedPath, is_dir: bool) -> Result<bool, RuleError> {
+    // A queued directory inherits its exact parent layer. Sibling rule files
+    // never spend this entry's match allowance, even across interleaved pages.
+    fn matches(&self, scope: RuleScope, path: &NormalizedPath, is_dir: bool,
+        remaining: &mut u64) -> Result<bool, IgnoreWorkError> {
+        let segments = bounded_segments(path, remaining)?;
+        let mut next = Some(scope);
+        while let Some(scope) = next {
+            let layer = &self.layers[scope.0];
+            for pattern in self.matcher.patterns[layer.patterns.clone()].iter().rev() {
+                if pattern_matches(pattern, &segments, is_dir, remaining)? { return Ok(!pattern.negated); }
+            }
+            next = layer.parent;
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn excluded(&mut self, scope: RuleScope, path: &NormalizedPath, is_dir: bool) -> Result<bool, RuleError> {
         let allowance = self.limits.max_match_steps.min(self.limits.max_total_match_steps.saturating_sub(self.stats.match_steps));
         let mut remaining = allowance;
-        let decision = self.matcher.decide_bounded(path, is_dir, &mut remaining);
+        let decision = self.matches(scope, path, is_dir, &mut remaining);
         self.stats.match_steps += allowance - remaining;
         match decision {
-            Ok(decision) => Ok(decision.is_excluded()),
+            Ok(excluded) => Ok(excluded),
             Err(error) => {
                 let error = match error { IgnoreWorkError::PathLimit => RuleError::PathLimit, IgnoreWorkError::WorkLimit => RuleError::MatchWork };
                 self.fail(path.as_bytes(), error, false); Err(error)

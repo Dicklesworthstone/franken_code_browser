@@ -18,6 +18,13 @@ fn spend(remaining: &mut u64, amount: usize) -> Result<(), IgnoreWorkError> {
     Ok(())
 }
 
+pub(super) fn bounded_segments<'a>(path: &'a NormalizedPath, remaining: &mut u64)
+    -> Result<Vec<&'a [u8]>, IgnoreWorkError> {
+    if path.as_bytes().len() > 4096 || path.segments().len() > 256 { return Err(IgnoreWorkError::PathLimit); }
+    spend(remaining, path.segments().len() + 1)?;
+    Ok(path.segments().iter().map(|segment| segment.as_bytes()).collect())
+}
+
 impl IgnoreMatcher {
     /// Decrease the caller's remaining work allowance. Exhaustion is UNKNOWN,
     /// never an Include/Exclude answer. The caller must preserve incomplete
@@ -25,9 +32,7 @@ impl IgnoreMatcher {
     /// No recursion; path scratch is bounded to 256 borrowed segment pointers.
     pub fn decide_bounded(&mut self, path: &NormalizedPath, is_dir: bool,
         remaining: &mut u64) -> Result<IgnoreDecision, IgnoreWorkError> {
-        if path.as_bytes().len() > 4096 || path.segments().len() > 256 { return Err(IgnoreWorkError::PathLimit); }
-        spend(remaining, path.segments().len() + 1)?;
-        let segments: Vec<&[u8]> = path.segments().iter().map(|segment| segment.as_bytes()).collect();
+        let segments = bounded_segments(path, remaining)?;
         let mut overridden = false;
         for prefix in &self.overrides {
             spend(remaining, 1)?;

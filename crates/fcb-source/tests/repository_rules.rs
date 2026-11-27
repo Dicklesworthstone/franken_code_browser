@@ -216,3 +216,34 @@ fn trailing_globstar_reinclusions_survive_real_paged_discovery() {
         assert_eq!(b.accounting().reserved().get(), 0);
     }
 }
+
+#[test]
+fn sibling_rules_do_not_exhaust_the_budget_for_searchable_files() {
+    let tree = Tree::new();
+    tree.file(".gitignore", b"*.tmp\n");
+    let mut local_rules = String::new();
+    for rule in 0..24 { local_rules.push_str(&format!("local-{rule:02}.rs\n")); }
+    local_rules.push_str("!keep.tmp\n");
+    for directory in 0..12 {
+        let dir = format!("pkg-{directory:02}");
+        tree.file(format!("{dir}/.gitignore"), local_rules.as_bytes());
+        tree.file(format!("{dir}/keep.tmp"), b"included by local override");
+        tree.file(format!("{dir}/src/main.rs"), b"searchable through inherited rules");
+        tree.file(format!("{dir}/src/local-07.rs"), b"excluded by inherited rules");
+        tree.file(format!("{dir}/src/drop.tmp"), b"excluded by root rule");
+    }
+    let b = budget();
+    let mut walker = discovery(&tree, RuleLimits { max_match_steps: 1_800,
+        ..Default::default() }, &b, 1);
+    let kept = included(&drain(&mut walker));
+    assert!(walker.is_complete(), "{:?}", walker.repository_rules().unwrap().stats());
+    for directory in 0..12 {
+        let dir = format!("pkg-{directory:02}");
+        for name in ["keep.tmp", "src/main.rs"] {
+            assert!(kept.contains(&format!("{dir}/{name}").into_bytes()));
+        }
+        for name in ["src/local-07.rs", "src/drop.tmp"] {
+            assert!(!kept.contains(&format!("{dir}/{name}").into_bytes()));
+        }
+    }
+}

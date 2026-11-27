@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use fcb_core::{ByteLength, ResourceAllocationId, ResourceBudget};
 use crate::confined::{validate_not_special, ConfinedSourceReader, DirectoryId, SymlinkPolicy};
 use crate::ignore::IgnoreMatcher;
-use crate::ignore::repository::{RepositoryRules, RuleError, RuleLimits, RuleStats, read_rule_file};
+use crate::ignore::repository::{RepositoryRules, RuleError, RuleLimits, RuleScope, RuleStats, read_rule_file};
 use crate::path::NormalizedPath;
 use crate::root::RootGrant;
 use crate::{CancelFlag, SourceError};
@@ -194,10 +194,12 @@ impl DiscoveryBatch {
     pub fn scan_epoch(&self) -> ScanEpoch { self.scan_epoch }
 }
 struct PendingDir {
+    rule_scope: RuleScope,
     rel: Option<NormalizedPath>, kind: DiscoveryKind, depth: u32,
     alias_hops: u32, ancestry: Vec<DirectoryId>,
 }
 struct OpenDir {
+    rule_scope: RuleScope,
     rel: Option<NormalizedPath>, depth: u32, alias_hops: u32, ancestry: Vec<DirectoryId>,
     resolved: PathBuf, iter: ReadDir, children_emitted: u64, split_across_batches: bool,
 }
@@ -339,7 +341,7 @@ impl BoundedDiscovery {
             next_stable_generation: 1, aggregate: DiscoveryAggregate::default(), peaks: DiscoveryPeaks::default(),
             status: ScanStatus::InProgress, queue_saturated: false, root_excluded: false };
         session.pending.push_back(PendingDir { rel: None, kind: DiscoveryKind::Directory,
-            depth: 0, alias_hops: 0, ancestry: Vec::new() });
+            rule_scope: RuleScope::DEFAULTS, depth: 0, alias_hops: 0, ancestry: Vec::new() });
         session.note_queue_peak();
         Ok(session)
     }
@@ -576,12 +578,18 @@ impl BoundedDiscovery {
         }
         // Load before opening the directory iterator: at most one rule descriptor
         // and no directory descriptor overlap in this explicit rule-aware route.
-        if let Some(policy) = self.repository_rules.as_mut() {
-            if policy.load_directory(pending.rel.as_ref(), &resolved, &self.grant, cancel).is_err() {
-                self.aggregate.unavailable = self.aggregate.unavailable.saturating_add(1);
-                return OpenResult::SkippedUnavailable;
+        let rule_scope = if let Some(policy) = self.repository_rules.as_mut() {
+            match policy.load_directory(pending.rel.as_ref(), &resolved, &self.grant, cancel, pending.rule_scope) {
+                Ok(scope) => scope,
+                Err(_) => {
+                    self.aggregate.unavailable = self.aggregate.unavailable.saturating_add(1);
+                    return OpenResult::SkippedUnavailable;
+                }
             }
-        } else if self.read_rule_files { self.load_rule_files(pending.rel.as_ref(), &resolved, cancel); }
+        } else {
+            if self.read_rule_files { self.load_rule_files(pending.rel.as_ref(), &resolved, cancel); }
+            pending.rule_scope
+        };
         if let Some(target) = self.scope.target()
             && pending.depth < target.segments().len() as u32 {
             if self.scope.file().is_some() && pending.depth as usize + 1 == target.segments().len() {
@@ -590,7 +598,7 @@ impl BoundedDiscovery {
                 // selected file's discovery allowance before it is reached.
                 let name = target.segments()[pending.depth as usize].to_path_buf();
                 let child_fs = resolved.join(&name);
-                let snapshot = OpenSnapshot { rel: pending.rel, depth: pending.depth,
+                let snapshot = OpenSnapshot { rule_scope, rel: pending.rel, depth: pending.depth,
                     alias_hops: pending.alias_hops, ancestry: pending.ancestry, resolved };
                 let entry = self.observe_dirent(&snapshot, name.as_os_str(), &child_fs, false);
                 if entry.as_ref().is_some_and(|entry| !matches!(entry.kind(),
@@ -616,14 +624,14 @@ impl BoundedDiscovery {
                     return OpenResult::SkippedUnavailable;
                 }
             };
-            if self.classify_exclusion(&child, true) {
+            if self.classify_exclusion(rule_scope, &child, true) {
                 self.aggregate.excluded = self.aggregate.excluded.saturating_add(1);
                 self.root_excluded = true;
                 self.status = ScanStatus::Incomplete { reason: IncompleteReason::TraversalLimited };
                 return OpenResult::SkippedUnavailable;
             }
             let mut ancestry = pending.ancestry; ancestry.push(dir_id);
-            self.pending.push_back(PendingDir { rel: Some(child), kind: DiscoveryKind::Directory,
+            self.pending.push_back(PendingDir { rule_scope, rel: Some(child), kind: DiscoveryKind::Directory,
                 depth: pending.depth + 1, alias_hops: 0, ancestry });
             self.note_queue_peak();
             return OpenResult::Opened;
@@ -633,7 +641,7 @@ impl BoundedDiscovery {
             Err(_) => { self.aggregate.unavailable = self.aggregate.unavailable.saturating_add(1); return OpenResult::SkippedUnavailable; }
         };
         let mut ancestry = pending.ancestry; ancestry.push(dir_id);
-        self.open.push_back(OpenDir { rel: pending.rel, depth: pending.depth, alias_hops: pending.alias_hops,
+        self.open.push_back(OpenDir { rule_scope, rel: pending.rel, depth: pending.depth, alias_hops: pending.alias_hops,
             ancestry, resolved, iter, children_emitted: 0, split_across_batches: false });
         self.note_descriptor_peak(); self.note_queue_peak(); OpenResult::Opened
     }
@@ -659,7 +667,7 @@ impl BoundedDiscovery {
             Some(Ok(dirent)) => {
                 let snapshot = {
                     let open = self.open.front().expect("open dir existed");
-                    OpenSnapshot { rel: open.rel.clone(), depth: open.depth, alias_hops: open.alias_hops,
+                    OpenSnapshot { rule_scope: open.rule_scope, rel: open.rel.clone(), depth: open.depth, alias_hops: open.alias_hops,
                         ancestry: open.ancestry.clone(), resolved: open.resolved.clone() }
                 };
                 let child_fs = snapshot.resolved.join(dirent.file_name());
@@ -695,19 +703,19 @@ impl BoundedDiscovery {
         if file_type.is_symlink() {
             // Refusing to follow a link is a policy boundary, not evidence that
             // descendants captured under an earlier allowed policy disappeared.
-            let excluded = self.classify_exclusion(&child_path, false)
+            let excluded = self.classify_exclusion(open.rule_scope, &child_path, false)
                 || self.own_exclusions.is_excluded(child_fs_path, None)
                 || self.reader.symlink_policy() == SymlinkPolicy::DisallowAll;
             if !excluded && descend { self.maybe_follow_symlink_dir(open, &child_path, depth, child_fs_path); }
             return Some(self.push_kind(child_path, DiscoveryKind::Symlink, depth, None, excluded));
         }
         if file_type.is_dir() {
-            let excluded = self.classify_exclusion(&child_path, true) || self.own_exclusions.is_excluded(child_fs_path, None);
+            let excluded = self.classify_exclusion(open.rule_scope, &child_path, true) || self.own_exclusions.is_excluded(child_fs_path, None);
             if !excluded && descend { self.maybe_enqueue_dir(open, child_path.clone(), depth); }
             return Some(self.push_kind(child_path, DiscoveryKind::Directory, depth, None, excluded));
         }
         if file_type.is_file() {
-            let excluded = self.classify_exclusion(&child_path, false) || self.own_exclusions.is_excluded(child_fs_path, None);
+            let excluded = self.classify_exclusion(open.rule_scope, &child_path, false) || self.own_exclusions.is_excluded(child_fs_path, None);
             return Some(self.push_kind(child_path, DiscoveryKind::File, depth, Some(meta.len()), excluded));
         }
         Some(self.push_kind(child_path, DiscoveryKind::Special, depth, None, false))
@@ -737,12 +745,12 @@ impl BoundedDiscovery {
         if queued >= self.limits.max_queue_entries {
             self.queue_saturated = true; self.aggregate.queue_refused = self.aggregate.queue_refused.saturating_add(1); return;
         }
-        self.pending.push_back(PendingDir { rel: Some(child_path), kind, depth, alias_hops, ancestry: open.ancestry.clone() });
+        self.pending.push_back(PendingDir { rule_scope: open.rule_scope, rel: Some(child_path), kind, depth, alias_hops, ancestry: open.ancestry.clone() });
         self.note_queue_peak();
     }
-    fn classify_exclusion(&mut self, path: &NormalizedPath, is_dir: bool) -> bool {
+    fn classify_exclusion(&mut self, scope: RuleScope, path: &NormalizedPath, is_dir: bool) -> bool {
         if let Some(policy) = self.repository_rules.as_mut() {
-            match policy.excluded(path, is_dir) {
+            match policy.excluded(scope, path, is_dir) {
                 Ok(excluded) => excluded,
                 Err(_) => { self.aggregate.unavailable = self.aggregate.unavailable.saturating_add(1); true }
             }
@@ -779,7 +787,8 @@ impl BoundedDiscovery {
 }
 enum OpenResult { Opened, SkippedEntry(DiscoveryEntry), SkippedUnavailable }
 enum Advance { Entry(DiscoveryEntry), FinishedUnsplit, Continue }
-struct OpenSnapshot { rel: Option<NormalizedPath>, depth: u32, alias_hops: u32, ancestry: Vec<DirectoryId>, resolved: PathBuf }
+struct OpenSnapshot {
+    rule_scope: RuleScope, rel: Option<NormalizedPath>, depth: u32, alias_hops: u32, ancestry: Vec<DirectoryId>, resolved: PathBuf }
 fn child_relative(parent: Option<&NormalizedPath>, name: &[u8]) -> Result<NormalizedPath, SourceError> {
     match parent { None => NormalizedPath::from_dirent_name(name), Some(parent) => parent.join_segment(name) }
 }
