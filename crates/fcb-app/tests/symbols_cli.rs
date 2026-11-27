@@ -502,3 +502,79 @@ fn large_symbol_files_keep_late_name_offsets_across_live_and_offline_cli_routes(
         assert_eq!(&source[range.get("start").number() as usize..range.get("end").number() as usize], expected);
     }
 }
+
+#[test]
+fn qualified_heading_search_counts_only_documents_and_preserves_source_ranges() {
+    let fixture = Fixture::new();
+    let raw = utf16("# Deploy!\r\n\r\nordinary Deploy! text\r\n\r\n# Deploy!\r\n", false);
+    fixture.file("GUIDE.MD", &raw);
+    fixture.file("main.rs", b"// # Deploy!");
+    fixture.save();
+    // The archive search must never rebind a member to this replacement.
+    let args = |mut a: Vec<OsString>| {
+        values(&mut a, &["--headings", "--name", "ploy", "--match", "contains"]); a
+    };
+    let live = invoke(&args(fixture.workspace_args()), || false);
+    fixture.file("GUIDE.MD", b"# Replaced\n");
+    let saved = invoke(&args(fixture.saved_args()), || false);
+    for (exit, output) in [live, saved] {
+        assert_eq!(exit, EXIT_OK);
+        assert!(output.get("heading_count_complete").flag());
+        assert_eq!(output.get("path_excluded_files").number(), 1);
+        assert_eq!(output.get("stats").get("member_payload_bytes_read").number(), raw.len() as u64);
+        let rows = output.get("candidates").array();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get("heading_slug").text(), "deploy");
+        assert_eq!(rows[1].get("heading_slug").text(), "deploy-2");
+        for row in rows {
+            assert_eq!(row.get("name").text(), "Deploy!");
+            assert_eq!(row.get("level").number(), 1);
+            let range = row.get("original_range");
+            let start = range.get("start").number() as usize;
+            let end = range.get("end").number() as usize;
+            assert!(raw[start..end].starts_with(&utf16("# Deploy!", false)[2..]));
+        }
+    }
+}
+
+#[test]
+fn explicit_markdown_input_and_zero_row_counts_are_independent_of_suffix_and_visibility() {
+    let fixture = Fixture::new();
+    fixture.file("NOTES", b"# Install once\n\n# Install twice\n");
+    let mut args = fixture.file_args("NOTES");
+    values(&mut args, &["--headings", "--name", "Install", "--match", "prefix", "--limit", "0"]);
+    let (exit, output) = invoke(&args, || false);
+    assert_eq!(exit, EXIT_PARTIAL);
+    assert!(output.get("heading_count_complete").flag());
+    assert!(output.get("listing_truncated").flag());
+    assert!(output.get("candidates").array().is_empty());
+    assert_eq!(output.get("stats").get("matching_candidates_seen").number(), 2);
+    let (exit, _) = invoke(&args, || true);
+    assert_eq!(exit, EXIT_CANCELED);
+    let mut other = fixture.file_args("NOTES");
+    values(&mut other, &["--headings", "--name", "absent"]);
+    assert_eq!(invoke(&other, || false).0, EXIT_NO_MATCH);
+}
+
+#[test]
+fn unqualified_markdown_and_exhausted_source_budget_remain_partial() {
+    let fixture = Fixture::new();
+    fixture.file("unqualified.md", b"> # Nested\n");
+    let mut args = fixture.file_args("unqualified.md");
+    values(&mut args, &["--headings"]);
+    let (exit, output) = invoke(&args, || false);
+    assert_eq!(exit, EXIT_PARTIAL);
+    assert!(!output.get("heading_count_complete").flag());
+    assert!(output.get("candidates").array().is_empty());
+    assert_eq!(output.get("notices").array()[0].get("reason").text(), "DOCUMENT_READ_INVALID_PROVENANCE");
+    values(&mut args, &["--max-bytes", "0"]);
+    let (exit, output) = invoke(&args, || false);
+    assert_eq!(exit, EXIT_PARTIAL);
+    assert_eq!(output.get("stats").get("member_payload_bytes_read").number(), 0);
+    assert!(!output.get("heading_count_complete").flag());
+    for invalid in [vec!["--language", "rust"], vec!["--encoding", "utf8"], vec!["--references"]] {
+        let mut flags = args.clone();
+        values(&mut flags, &invalid);
+        assert_eq!(invoke(&flags, || false).0, EXIT_ERROR);
+    }
+}

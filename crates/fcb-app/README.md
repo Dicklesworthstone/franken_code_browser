@@ -60,6 +60,29 @@ but is not a recursively authorized workspace. A directory requires explicit
 `--workspace` on `inspect` or `search`. Selecting stdin, a single file, or a
 metadata diagnostic never silently widens that authority.
 
+## Find Markdown headings from the command line
+
+```sh
+fcb symbols . --workspace --headings --name Install --match prefix --json
+fcb symbols guide.fcbs --snapshot --headings --name Deploy --json
+fcb symbols NOTES --headings
+```
+
+Use `--headings` to list FrankenMarkdown headings, or add `--name` and an
+exact, prefix or contains match on the case-sensitive title. Workspace and
+archive searches select `.md`, `.markdown`, `.mdown` and `.mkd` suffixes
+case-insensitively before spending payload bytes. Selecting an individual file
+or archive member explicitly treats it as Markdown regardless of its filename.
+
+Rows include the display title, canonical slug, level, path and original heading
+block byte range. UTF-8 and BOM-marked UTF-16 preserve original coordinates.
+Each document has a 256 KiB source and decoded-input ceiling. Unavailable input,
+unqualified heading provenance and budget exhaustion leave coverage partial.
+The `--limit` option controls displayed rows. A lower row limit still permits
+a complete count when every eligible document was qualified, including when
+`--limit 0` suppresses all rows. Check `heading_count_complete`,
+`stats.matching_candidates_seen` and `listing_truncated` for those outcomes.
+
 ## Streaming saved snapshots
 
 `snapshot save` discovers a bounded catalog, captures one member at a time and

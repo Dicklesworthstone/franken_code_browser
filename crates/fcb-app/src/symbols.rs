@@ -23,6 +23,10 @@ use crate::output::{Output, OutputError, MAX_RESPONSE_BYTES};
 use crate::{input, workspace};
 
 mod references;
+mod headings;
+
+use fcb::document::reader::MAX_HEADING_SEARCH_SOURCE_BYTES;
+use fcb::search::snapshot_structure::is_markdown_path;
 
 const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_READ_CALLS: u64 = 131_072;
@@ -30,6 +34,9 @@ const MAX_NOTICES: usize = 64;
 const HELP: &str = "fcb symbols FILE [--name TEXT] [--match exact|prefix|contains] [--json]\n\
 fcb symbols ROOT --workspace [--name TEXT] [--json]\n\
 fcb symbols SAVED.fcbs --snapshot [--member PATH | --member-hex HEX] [--name TEXT] [--json]\n\
+Markdown headings: add --headings, optionally with --name and --match.\n\
+In repositories, searches .md, .markdown, .mdown and .mkd (case-insensitive);\n\
+an explicitly selected file or archive member is read as Markdown.\n\
 Reference candidates: add --references --name IDENTIFIER to any scope above.\n\
 Options: --language rust|python|javascript|typescript|jsx|tsx|go|cpp|swift|java|csharp\n\
          --encoding utf8|utf16le|utf16be --limit N --max-files N --max-bytes N\n\
@@ -53,7 +60,7 @@ struct Settings {
     source: Option<PathBuf>, scope: Scope, name: Option<String>, mode: SymbolNameMode,
     language: Option<SymbolLanguage>, encoding: Option<DetectedEncoding>, member: Option<RawPath>,
     limit: usize, max_files: usize, max_bytes: u64, include_excluded: bool, json: bool, help: bool,
-    references: bool,
+    references: bool, headings: bool,
 }
 #[derive(Debug)]
 struct Failure { code: String, canceled: bool }
@@ -87,7 +94,7 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
     }
     let mut settings = Settings { source: None, scope: Scope::File, name: None, mode: SymbolNameMode::Exact,
         language: None, encoding: None, member: None, limit: 100, max_files: 4096, max_bytes: 8 * 1024 * 1024,
-        include_excluded: false, json: false, help: args.is_empty(), references: false };
+        include_excluded: false, json: false, help: args.is_empty(), references: false, headings: false };
     let mut seen = 0u32;
     let mut cursor = 0;
     let mut positional = false;
@@ -100,7 +107,7 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
                 "--json" => 1, "--workspace" | "--snapshot" => 2, "--name" => 4, "--match" => 8,
                 "--language" => 16, "--encoding" => 32, "--member" | "--member-hex" => 64,
                 "--limit" => 128, "--max-files" => 256, "--max-bytes" => 512,
-                "--include-excluded" => 1024, "--help" | "-h" => 2048, "--references" => 4096,
+                "--include-excluded" => 1024, "--help" | "-h" => 2048, "--references" => 4096, "--headings" => 8192,
                 _ => return Err(Failure::new("CLI_UNKNOWN_OPTION")),
             };
             if seen & bit != 0 { return Err(Failure::new("CLI_DUPLICATE_OPTION")); }
@@ -108,6 +115,7 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
             match flag {
                 "--json" => { settings.json = true; continue; }
                 "--references" => { settings.references = true; continue; }
+                "--headings" => { settings.headings = true; continue; }
                 "--workspace" => { settings.scope = Scope::Workspace; continue; }
                 "--snapshot" => { settings.scope = Scope::Snapshot; continue; }
                 "--include-excluded" => { settings.include_excluded = true; continue; }
@@ -152,6 +160,9 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
     } else if settings.source.is_none() || (settings.member.is_some() && settings.scope != Scope::Snapshot)
         || (settings.include_excluded && settings.scope != Scope::Workspace)
         || (seen & 8 != 0 && settings.name.is_none()) {
+        return Err(Failure::new("CLI_INCOMPATIBLE_OPTIONS"));
+    }
+    if settings.headings && (settings.references || settings.language.is_some() || settings.encoding.is_some()) {
         return Err(Failure::new("CLI_INCOMPATIBLE_OPTIONS"));
     }
     if settings.references {
@@ -210,12 +221,12 @@ pub(crate) fn run(args: &[OsString], stdout: &mut impl Write, stderr: &mut impl 
 }
 
 #[derive(Clone, Copy, Debug)]
-enum AnalysisRoute { Outline(SymbolLanguage), References(Option<SymbolLanguage>) }
+enum AnalysisRoute { Outline(SymbolLanguage), References(Option<SymbolLanguage>), Headings }
 
 struct Notice { file: FileId, path: RawPath, code: &'static str }
 #[derive(Default)]
 struct Stats {
-    known: usize, visited: usize, analyzed: usize, unsupported: usize, unavailable: usize,
+    known: usize, visited: usize, path_excluded: usize, analyzed: usize, unsupported: usize, unavailable: usize,
     refused: usize, limited: usize, unrecognized: usize, matches: usize, emitted: usize,
     analysis_bytes: u64, read_bytes: u64, read_calls: u64, validation_bytes: u64,
     peak_source: usize, notices_omitted: usize,
@@ -236,11 +247,21 @@ impl RunState {
     }
     fn admit(&mut self, settings: &Settings, file: FileId, path: &[u8], size: u64) -> Option<AnalysisRoute> {
         let language = settings.language.or_else(|| SymbolLanguage::from_path(path));
-        let route = if settings.references { AnalysisRoute::References(language) }
-            else if let Some(language) = language { AnalysisRoute::Outline(language) }
-            else { self.stats.unsupported += 1; self.notice(file, path, "SYMBOL_UNSUPPORTED_LANGUAGE"); return None; };
-        let (max_source, limit_code) = if settings.references { (MAX_REFERENCE_SOURCE_BYTES, "REFERENCE_SOURCE_LIMIT") }
-            else { (MAX_SYMBOL_SOURCE_BYTES, "SYMBOL_SOURCE_LIMIT") };
+        let (route, max_source, limit_code) = if settings.headings {
+            if settings.scope != Scope::File && settings.member.is_none() && !is_markdown_path(path) {
+                self.stats.path_excluded += 1;
+                return None;
+            }
+            (AnalysisRoute::Headings, MAX_HEADING_SEARCH_SOURCE_BYTES, "DOCUMENT_READ_SOURCE_LIMIT")
+        } else if settings.references {
+            (AnalysisRoute::References(language), MAX_REFERENCE_SOURCE_BYTES, "REFERENCE_SOURCE_LIMIT")
+        } else if let Some(language) = language {
+            (AnalysisRoute::Outline(language), MAX_SYMBOL_SOURCE_BYTES, "SYMBOL_SOURCE_LIMIT")
+        } else {
+            self.stats.unsupported += 1;
+            self.notice(file, path, "SYMBOL_UNSUPPORTED_LANGUAGE");
+            return None;
+        };
         let reason = if size > max_source as u64 { Some(limit_code) }
             else if size > settings.max_bytes.saturating_sub(self.stats.read_bytes) { Some("SYMBOL_TOTAL_SOURCE_LIMIT") }
             else if self.stats.read_calls >= MAX_READ_CALLS { Some("SYMBOL_READ_CALL_LIMIT") } else { None };
@@ -260,7 +281,9 @@ fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBudget,
     if settings.json {
         out.literal("{\"schema\":")?; out.quoted(SCHEMA)?;
         out.literal(",\"status\":\"ok\",\"command\":\"symbols\",\"scope\":")?; out.quoted(settings.scope.name())?;
-        if settings.references {
+        if settings.headings {
+            out.literal(",\"operation\":\"headings\",\"identity_scope\":\"response-local-file-and-heading\",\"evidence\":\"fmd-heading\",\"live_roots_accessed\":")?;
+        } else if settings.references {
             out.literal(",\"operation\":\"references\",\"identity_scope\":\"response-local-file-and-occurrence\",\"evidence\":\"whole-token-text-candidate\",\"compiler_resolved\":false,\"reference_inventory_complete\":false,\"token_policy\":\"conservative-unicode-whole-token-v1\",\"comments_and_literals_included\":true,\"language_policy\":\"all-admitted-text-files\",\"line_coordinates\":\"lf-delimited-decoded-lines\",\"live_roots_accessed\":")?;
         } else {
             out.literal(",\"identity_scope\":\"response-local-file-and-outline\",\"evidence\":\"heuristic-outline-candidate\",\"compiler_resolved\":false,\"symbol_inventory_complete\":false,\"line_coordinates\":\"lf-delimited-decoded-lines\",\"live_roots_accessed\":")?;
@@ -272,7 +295,9 @@ fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBudget,
         out.quoted(match settings.mode { SymbolNameMode::Exact => "exact", SymbolNameMode::Prefix => "prefix", SymbolNameMode::Contains => "contains" })?;
         out.literal(",\"candidates\":[")?;
     } else {
-        out.literal(if settings.references {
+        out.literal(if settings.headings {
+            "Markdown headings with qualified original source ranges.\n"
+        } else if settings.references {
             "Whole-token text candidates, including comments/literals; NOT compiler-resolved references.\n"
         } else { "Declaration candidates only; not compiler definitions or a complete symbol inventory.\n" })?;
     }
@@ -369,7 +394,7 @@ fn saved_workspace(settings: &Settings, source: &Path, state: &mut RunState, out
     budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool) -> Result<bool, Failure> {
     let native = input::absolute(source)?;
     let (file, _) = input::open_regular(&native)?;
-    let limits = if settings.references { SnapshotLimits::paged() } else { SnapshotLimits::default() };
+    let limits = if settings.references || settings.headings { SnapshotLimits::paged() } else { SnapshotLimits::default() };
     let mut archive = PagedSnapshot::open(file, owner(), limits, budget, allocation(202), &mut *canceled)
         .map_err(|error| if canceled() { Failure::canceled() } else { Failure::new(error.code()) })?;
     state.stats.validation_bytes = archive.directory().validation_stats().bytes_read;
@@ -414,6 +439,7 @@ fn analyze(settings: &Settings, request: CaptureRequest, path: &[u8], route: Ana
     bytes: &[u8], state: &mut RunState, out: &mut Output, budget: &ResourceBudget,
     canceled: &mut impl FnMut() -> bool) -> Result<(), Failure> {
     let language = match route {
+        AnalysisRoute::Headings => return headings::analyze(settings, request, path, bytes, state, out, budget, canceled),
         AnalysisRoute::Outline(language) => language,
         AnalysisRoute::References(language) => return references::analyze(settings, request, path,
             language, bytes, state, out, budget, canceled),
@@ -474,6 +500,10 @@ fn finish(settings: &Settings, discovery_complete: bool, state: RunState, out: &
             out.literal(",\"text_candidates_complete\":")?; out.boolean(processing_complete && !truncated)?;
             out.literal(",\"candidate_count_complete\":")?; out.boolean(processing_complete)?;
         }
+        if settings.headings {
+            out.literal(",\"heading_count_complete\":")?; out.boolean(processing_complete)?;
+            out.literal(",\"path_excluded_files\":")?; out.integer(stats.path_excluded as u64)?;
+        }
         out.literal(",\"stats\":{")?;
         for (i, (name, value)) in [("known_files", stats.known as u64), ("visited_files", stats.visited as u64),
             ("analyzed_files", stats.analyzed as u64), ("unsupported_language_files", stats.unsupported as u64),
@@ -498,7 +528,7 @@ fn finish(settings: &Settings, discovery_complete: bool, state: RunState, out: &
         }
         out.literal(if processing_complete && !truncated { "Candidate processing finished.\n" } else { "PARTIAL candidate processing or listing.\n" })?;
         out.literal("Matching candidates seen: ")?; out.literal(&stats.matches.to_string())?;
-        out.literal(if settings.references { ". These are text candidates, not compiler bindings.\n" }
+        out.literal(if settings.headings { ".\n" } else if settings.references { ". These are text candidates, not compiler bindings.\n" }
             else { ". Absence is not proof that no compiler definition exists.\n" })?;
     }
     Ok(if !processing_complete || truncated { EXIT_PARTIAL } else if stats.matches == 0 { EXIT_NO_MATCH } else { EXIT_OK })

@@ -298,7 +298,7 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
         let language = SymbolLanguage::from_path(member.path);
         let supported = match self.options.mode {
             StructureMode::Symbols => language.is_some(),
-            StructureMode::Headings => is_markdown(member.path),
+            StructureMode::Headings => is_markdown_path(member.path),
             StructureMode::Occurrences => true,
         };
         if !supported { self.stats.unsupported_files += 1; return Ok(()); }
@@ -579,7 +579,8 @@ fn matches_name(name: &str, needle: &str, mode: SymbolNameMode, case_sensitive: 
     }
     Ok(false)
 }
-fn is_markdown(path: &[u8]) -> bool {
+/// Filename eligibility for Markdown heading searches over repository membership.
+pub fn is_markdown_path(path: &[u8]) -> bool {
     let name = path.rsplit(|&byte| byte == b'/').next().unwrap_or(path);
     let Some(dot) = name.iter().rposition(|&byte| byte == b'.') else { return false; };
     [b"md".as_slice(), b"markdown", b"mdown", b"mkd"].iter().any(|ext| name[dot + 1..].eq_ignore_ascii_case(ext))
