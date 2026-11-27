@@ -13,7 +13,7 @@ impl From<PagedPostingError> for Failure {
     }
 }
 
-pub(super) fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget,
+pub(super) fn execute(options: &Options, expression_plan: Option<&ExpressionPlan>, out: &mut Output, budget: &ResourceBudget,
     effect: &mut Effect, canceled: &mut impl FnMut() -> bool) -> Result<u8, Failure> {
     let source = options.archive.as_deref().ok_or_else(|| Failure::new("CLI_MISSING_SOURCE"))?;
     let mut archive = catalog::open(source, options.catalog.as_deref(), options.catalog_pin,
@@ -61,6 +61,19 @@ pub(super) fn execute(options: &Options, out: &mut Output, budget: &ResourceBudg
         return Ok(if !archive.directory().discovery_complete() || index.stats().unavailable_files > 0 || index.stats().uncovered_files > 0 {
             EXIT_PARTIAL
         } else { EXIT_OK });
+    }
+    if let Some(plan) = expression_plan {
+        let opts = ExpressionOptions { generation: generation(), first_file: file_id(),
+            first_revision: revision(), max_matches: options.limit, max_scan_bytes: options.max_scan_bytes };
+        let ids = [allocation(158), allocation(159), allocation(160)];
+        let query = ExpressionQuery::new_paged_scoped_page(&mut archive, plan, &mut index, opts,
+            options.search_scope(), options.skip_matches, options.count_all_matches, budget, ids)?;
+        let report = expression::finish(query, budget, canceled)?;
+        return expression::render(expression_presentation(options), &archive, plan, &report, out, canceled, |out| {
+            expression_index_fields(out, index.stats(), pin)?;
+            search_fields(out, options.ignore_case)?;
+            io_fields(out, index.io_stats(), index.file_bytes(), index.cache_capacity_bytes())
+        });
     }
     let report = {
         let needle = match (&options.text, &options.raw) {

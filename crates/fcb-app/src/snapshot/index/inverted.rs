@@ -36,6 +36,19 @@ impl QueryIndex {
                 options, scope, skip_matches, count_all_matches, budget, allocations)?,
         })
     }
+    pub(super) fn expression_query<'archive, 'plan, R: Read + Seek>(&'plan self,
+        archive: &'archive mut PagedSnapshot<R>, plan: &'plan ExpressionPlan,
+        options: ExpressionOptions, scope: SnapshotScope<'_>, skip_matches: u64,
+        count_all_matches: bool, budget: &ResourceBudget)
+        -> Result<ExpressionQuery<'archive, 'plan, R>, Failure> {
+        let allocations = [allocation(158), allocation(159), allocation(160)];
+        Ok(match self {
+            Self::Segments(index) => ExpressionQuery::new_indexed_scoped_page(archive, plan, index,
+                options, scope, skip_matches, count_all_matches, budget, allocations)?,
+            Self::Postings(index) => ExpressionQuery::new_postings_scoped_page(archive, plan, index,
+                options, scope, skip_matches, count_all_matches, budget, allocations)?,
+        })
+    }
 }
 
 pub(super) fn encode(index: &SnapshotIndex, inverted: bool, budget: &ResourceBudget,

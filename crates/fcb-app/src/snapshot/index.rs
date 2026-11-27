@@ -12,6 +12,7 @@ use std::{ffi::OsString, fs, io::{self, Read, Seek, Write}, path::{Path, PathBuf
 use fcb::ByteLength;
 use fcb::search::{IndexLimits, RawPath, ResourceBudget};
 use fcb::search::snapshot_scope::SnapshotScope;
+use fcb::search::expression::{ExpressionPlan, ExpressionOptions, ExpressionQuery};
 use fcb::search::paged_snapshot::{PagedQuery, PagedQueryOptions,
     IndexedNeedle, SnapshotDirectory, PagedSnapshotError};
 use fcb::search::snapshot::Sha256Digest;
@@ -20,7 +21,7 @@ use fcb_core::ResourceLease;
 use crate::{allocation, file_id, generation, owner, revision, input};
 use crate::output::{Output, MAX_RESPONSE_BYTES};
 use super::{Failure, Effect, begin, failure_output, write_new, hex, decimal, catalog, matching,
-    MAX_ARGUMENTS, MAX_ARGUMENT_BYTES, MAX_SINGLE_ARGUMENT, MANAGED_BYTES,
+    MAX_ARGUMENTS, MAX_ARGUMENT_BYTES, MAX_SINGLE_ARGUMENT, MANAGED_BYTES, expression,
     EXIT_OK, EXIT_NO_MATCH, EXIT_ERROR, EXIT_PARTIAL, EXIT_CANCELED};
 
 const HELP: &str = "fcb snapshot index build SNAPSHOT --output NEW_INDEX [--inverted | --paged] [--json]\n\
@@ -28,8 +29,11 @@ fcb snapshot index refresh NEW_SNAPSHOT --base OLD_SNAPSHOT --index OLD_INDEX\n\
     --index-digest TRUSTED_OLD_SHA256 --output NEW_INDEX [--inverted] [--json]\n\
 fcb snapshot index inspect SNAPSHOT --index INDEX --index-digest TRUSTED_SHA256 [--paged] [--json]\n\
 fcb snapshot index search SNAPSHOT --index INDEX --index-digest TRUSTED_SHA256\n\
-    (--text LITERAL | --raw-hex HEX) [--paged] [--limit N] [--json]\n\
-Search options: --ignore-case (text only), --count-all (text or raw bytes), --skip-matches N.\n\
+    (--text LITERAL | --raw-hex HEX | --query EXPRESSION) [--paged] [--limit N] [--json]\n\
+Search options: --ignore-case (text or expression), --count-all, --skip-matches N.\n\
+Expression work: --max-scan-bytes N, default 256 MiB of original source bytes in the shared predicate/primary pass.\n\
+Expressions support the ordinary snapshot search grammar and all three index layouts.\n\
+Only the mandatory primary literal prefilters candidates; every predicate uses the same verified member.\n\
 Search scope: whole archive by default, or --directory PATH | --directory-hex HEX | --member NAME | --member-hex HEX.\n\
 Match offsets consume verified matches, not index candidates; all index layouts share result order.\n\
 Repeat the same archive digest, query and options with next_match_offset for later rows.\n\
@@ -38,7 +42,7 @@ Zero retained rows never propose a nonprogressing continuation.\n\
 Complete --count-all exits 0 for a positive total or 1 for zero, even when rows are capped.\n\
 Incomplete saved coverage exits 3; ordinary capped searches also exit 3.\n\
 --ignore-case uses Unicode scalar lowercase, not full case folding or canonical normalization.\n\
-Exact indexes are validated but bypassed for this mode; saved members are scanned directly.\n\
+Compatible ASCII index rows prune case variants; Unicode, legacy and uncovered members retain direct verification.\n\
 --count-all completes the saved scope, retaining at most --limit N hits; --limit 0 counts only.\n\
 Build/refresh options: --max-grams N --max-file-bytes N --max-source-bytes N\n\
 --inverted persists resident global postings for rarest-list intersection.\n\
@@ -59,11 +63,11 @@ Ordinary snapshot search needs no index or pin and remains the full-scan fallbac
 enum Action { Help, Build, Refresh, Inspect, Search }
 struct Options {
     action: Action, archive: Option<PathBuf>, output: Option<PathBuf>, index: Option<PathBuf>,
-    pin: Option<Sha256Digest>, text: Option<String>, raw: Option<Vec<u8>>, json: bool,
+    pin: Option<Sha256Digest>, text: Option<String>, raw: Option<Vec<u8>>, expression: Option<String>, json: bool,
     limit: usize, build: IndexLimits, catalog: Option<PathBuf>, catalog_pin: Option<Sha256Digest>,
     base: Option<PathBuf>, base_catalog: Option<PathBuf>, base_catalog_pin: Option<Sha256Digest>,
     inverted: bool, paged: bool, ignore_case: bool, count_all_matches: bool, skip_matches: u64,
-    member: Option<Vec<u8>>, directory: Option<Vec<u8>>,
+    member: Option<Vec<u8>>, directory: Option<Vec<u8>>, max_scan_bytes: u64,
 }
 impl Options {
     fn search_scope(&self) -> SnapshotScope<'_> {
@@ -83,7 +87,7 @@ fn takes_value(arg: &str) -> bool {
     matches!(arg, "--output" | "--index" | "--index-digest" | "--text" | "--raw-hex" | "--limit"
         | "--max-grams" | "--max-file-bytes" | "--max-source-bytes" | "--catalog" | "--catalog-digest"
         | "--base" | "--base-catalog" | "--base-catalog-digest" | "--skip-matches"
-        | "--directory" | "--directory-hex" | "--member" | "--member-hex")
+        | "--directory" | "--directory-hex" | "--member" | "--member-hex" | "--query" | "--max-scan-bytes")
 }
 fn wants_json(args: &[OsString]) -> bool {
     let mut i = 0;
@@ -109,9 +113,9 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
         _ => return Err(Failure::new("SAVED_INDEX_UNKNOWN_COMMAND")),
     };
     let mut out = Options { action, archive: None, output: None, index: None, pin: None, text: None,
-        raw: None, json: false, limit: 100, build: IndexLimits::default(), catalog: None, catalog_pin: None,
+        raw: None, expression: None, json: false, limit: 100, build: IndexLimits::default(), catalog: None, catalog_pin: None,
         base: None, base_catalog: None, base_catalog_pin: None, inverted: false, paged: false,
-        ignore_case: false, count_all_matches: false, skip_matches: 0, member: None, directory: None };
+        ignore_case: false, count_all_matches: false, skip_matches: 0, member: None, directory: None, max_scan_bytes: 256 * 1024 * 1024 };
     let mut seen = 0u32;
     let mut cursor = usize::from(!args.is_empty());
     let mut positional = false;
@@ -130,6 +134,7 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
             "--base" => 4096, "--base-catalog" => 8192, "--base-catalog-digest" => 16384,
             "--inverted" => 32768, "--paged" => 65536, "--ignore-case" => 131072, "--count-all" => 262144, "--skip-matches" => 524288,
             "--directory" | "--directory-hex" => 1048576, "--member" | "--member-hex" => 2097152,
+            "--query" => 4194304, "--max-scan-bytes" => 8388608,
             _ => return Err(Failure::new("CLI_UNKNOWN_OPTION")),
         };
         if seen & bit != 0 { return Err(Failure::new("CLI_DUPLICATE_OPTION")); }
@@ -159,9 +164,11 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
             out.pin = Some(Sha256Digest::new(hex(text, 32)?.try_into().map_err(|_| Failure::new("SAVED_INDEX_INVALID_PIN"))?));
             continue;
         }
-        if option == "--text" {
+        if option == "--text" || option == "--query" {
             if text.len() > 1024 { return Err(Failure::new("CLI_INVALID_NEEDLE")); }
-            out.text = Some(text.to_owned()); continue;
+            if option == "--query" { out.expression = Some(text.to_owned()); }
+            else { out.text = Some(text.to_owned()); }
+            continue;
         }
         if option == "--raw-hex" { out.raw = Some(hex(text, 1024)?); continue; }
         if option == "--directory-hex" { out.directory = Some(hex(text, 16_384)?); continue; }
@@ -170,6 +177,7 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
         match option {
             "--limit" if number <= 4096 => out.limit = number as usize,
             "--skip-matches" => out.skip_matches = number,
+            "--max-scan-bytes" if number <= crate::args::MAX_SCAN_BYTES => out.max_scan_bytes = number,
             "--max-grams" if number <= MAX_INDEX_GRAMS as u64 => out.build.max_total_grams = number as usize,
             "--max-file-bytes" if number <= 256 * 1024 => out.build.max_source_bytes_per_file = number as usize,
             "--max-source-bytes" if number <= 64 * 1024 * 1024 => out.build.max_source_bytes_total = number,
@@ -187,9 +195,11 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
             && seen & !(1 | 2 | 4 | 8 | 128 | 256 | 512 | catalog_options | 4096 | 8192 | 16384 | 32768) == 0,
         Action::Inspect => out.archive.is_some() && out.index.is_some() && out.pin.is_some() && seen & !(1 | 4 | 8 | catalog_options | 65536) == 0,
         Action::Search => out.archive.is_some() && out.index.is_some() && out.pin.is_some()
-            && (out.text.is_some() != out.raw.is_some()) && (!out.ignore_case || out.text.is_some())
+            && usize::from(out.text.is_some()) + usize::from(out.raw.is_some()) + usize::from(out.expression.is_some()) == 1
+            && (!out.ignore_case || out.text.is_some() || out.expression.is_some())
+            && (seen & 8388608 == 0 || out.expression.is_some())
             && !(out.member.is_some() && out.directory.is_some())
-            && seen & !(1 | 4 | 8 | 16 | 32 | 64 | catalog_options | 65536 | 131072 | 262144 | 524288 | 1048576 | 2097152) == 0,
+            && seen & !(1 | 4 | 8 | 16 | 32 | 64 | catalog_options | 65536 | 131072 | 262144 | 524288 | 1048576 | 2097152 | 4194304 | 8388608) == 0,
     };
     if !valid || (out.inverted && out.paged) { return Err(Failure::new("CLI_INCOMPATIBLE_OPTIONS")); }
     if action == Action::Search { out.search_scope().validate()?; }
@@ -240,6 +250,10 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget, effect:
         else { out.literal(HELP)?; }
         return Ok(EXIT_OK);
     }
+    // Reject invalid syntax and admit all patterns before opening any source or index.
+    let expression_plan = options.expression.as_deref().map(|raw|
+        ExpressionPlan::parse_with_matching(owner(), raw, !options.ignore_case,
+            budget, allocation(157), allocation(1000))).transpose()?;
     let source = input::absolute(options.archive.as_deref().ok_or_else(|| Failure::new("CLI_MISSING_SOURCE"))?)?;
     // Refuse an existing output before paying source/index build work.
     let destination = options.output.as_ref().map(|path| input::absolute(path)).transpose()?;
@@ -251,7 +265,7 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget, effect:
         }
     }
     if options.action == Action::Refresh { return refresh::execute(options, out, budget, effect, canceled); }
-    if options.paged { return paging::execute(options, out, budget, effect, canceled); }
+    if options.paged { return paging::execute(options, expression_plan.as_ref(), out, budget, effect, canceled); }
     let mut archive = catalog::open(&source, options.catalog.as_deref(), options.catalog_pin,
         budget, [allocation(151), allocation(161)], canceled)?;
     if !options.json && !archive.directory().fully_verified_on_open() {
@@ -298,6 +312,19 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget, effect:
         return Ok(if index.stats().uncovered_files > 0 || index.stats().unavailable_files > 0
             || !archive.directory().discovery_complete() { EXIT_PARTIAL } else { EXIT_OK });
     }
+    if let Some(plan) = &expression_plan {
+        let opts = ExpressionOptions { generation: generation(), first_file: file_id(),
+            first_revision: revision(), max_matches: options.limit, max_scan_bytes: options.max_scan_bytes };
+        let query = index.expression_query(&mut archive, plan, opts, options.search_scope(),
+            options.skip_matches, options.count_all_matches, budget)?;
+        let report = expression::finish(query, budget, canceled)?;
+        return expression::render(expression_presentation(options), &archive, plan, &report, out, canceled, |out| {
+            expression_index_fields(out, index.stats(), pin)?;
+            inverted::search_fields(out, index.inverted(), options.ignore_case)?;
+            out.literal(",\"index_bytes\":")?; out.integer(index_bytes as u64)?;
+            Ok(())
+        });
+    }
     let report = {
         let needle = match (&options.text, &options.raw) {
             (Some(text), None) => IndexedNeedle::text_matching(owner(), text, !options.ignore_case, budget, allocation(157)),
@@ -334,6 +361,25 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget, effect:
     matching::hits(&mut archive, &report, options.raw.is_some(), options.json, out, budget, canceled)?;
     if options.json { out.literal("}\n")?; }
     Ok(matching::exit(&report))
+}
+fn expression_presentation(options: &Options) -> expression::Presentation<'_> {
+    expression::Presentation { command: "snapshot-index-search", scope: options.search_scope(),
+        max_matches: options.limit, max_scan_bytes: options.max_scan_bytes,
+        json: options.json, index_available: true }
+}
+/// These counts describe the whole pinned index, while expression result
+/// counters describe the selected raw scope after its metadata predicates.
+fn expression_index_fields(out: &mut Output, stats: SavedIndexStats, pin: Sha256Digest) -> Result<(), Failure> {
+    out.literal(",\"index_digest\":")?; out.quoted(&pin.to_hex())?;
+    out.literal(",\"pin_policy\":\"separately-retained-trusted-build-digest\"")?;
+    for (name, count) in [
+        ("indexed_files", stats.indexed_files as u64), ("uncovered_files", stats.uncovered_files as u64),
+        ("index_unavailable_files_count", stats.unavailable_files as u64), ("unique_grams", stats.unique_grams as u64),
+        ("index_build_source_bytes", stats.build_source_bytes),
+    ] {
+        out.literal(",")?; out.quoted(name)?; out.literal(":")?; out.integer(count)?;
+    }
+    Ok(())
 }
 fn summary(out: &mut Output, directory: &SnapshotDirectory, stats: SavedIndexStats, pin: Sha256Digest) -> Result<(), Failure> {
     out.literal(",\"source_scope\":\"saved-observations-only\",\"live_roots_accessed\":false,\"snapshot_digest\":")?;
@@ -394,6 +440,8 @@ mod tests {
     fn query_values_and_native_names_do_not_enable_json() {
         assert!(!wants_json(&args(&["build", "saved", "--output", "--json"])));
         assert!(!wants_json(&args(&["search", "saved", "--text", "--json"])));
+        assert!(!wants_json(&args(&["search", "saved", "--query", "--json"])));
+        assert!(!wants_json(&args(&["search", "saved", "--max-scan-bytes", "--json"])));
         assert!(wants_json(&args(&["search", "saved", "--text", "--json", "--json"])));
         assert!(!wants_json(&args(&["inspect", "--", "--json"])));
     }

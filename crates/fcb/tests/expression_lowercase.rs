@@ -342,6 +342,7 @@ fn exact_index_negative_is_not_a_lowercase_negative_and_counting_keeps_its_bound
         index.text_decision(0, Some("needle")),
         IndexDecision::Excluded
     );
+    assert_eq!(index.text_decision_matching(0, Some("needle"), false), IndexDecision::Verify);
     for (limit, counting) in [(1, false), (10, false), (0, true), (1, true)] {
         let direct = run(
             &mut archive,
@@ -371,12 +372,14 @@ fn exact_index_negative_is_not_a_lowercase_negative_and_counting_keeps_its_bound
             ),
             expected
         );
-        assert_eq!(indexed.stats().index_eliminated, 0);
-        assert_eq!(indexed.stats().index_candidates, 0);
-        assert_eq!(
-            indexed.stats().index_fallbacks,
-            indexed.stats().members_loaded
-        );
+        // ASCII-qualified rows now use compatible case-variant probes. The
+        // mandatory primary still reaches required/NOT verification, while the
+        // unrelated final source can be skipped once the scan reaches it.
+        let complete = counting || limit == 10;
+        assert_eq!(indexed.stats().index_eliminated, usize::from(complete));
+        assert_eq!(indexed.stats().index_candidates, if complete { 3 } else { 2 });
+        assert_eq!(indexed.stats().index_candidates, indexed.stats().members_loaded);
+        assert_eq!(indexed.stats().index_fallbacks, 0);
         if counting {
             assert!(indexed.is_complete());
             assert_eq!(indexed.matches_seen(), 3);

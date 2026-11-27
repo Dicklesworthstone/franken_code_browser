@@ -5,7 +5,10 @@
 //! Each step evaluates one metadata record or one bounded source/matcher quantum.
 //! One observed member stream feeds every predicate and the primary matcher in
 //! one decoding pass. Results remain private until that entire stream matches its
-//! saved digest. No runtime, source grant, or filesystem path is inferred.
+//! saved digest. Indexes may exclude only complete compatible negatives for the
+//! mandatory primary literal; other predicates still use that same verified pass.
+//! Global posting cursors inspect bounded candidates, and disk cursors load at
+//! most one index page per step. No runtime, source grant, or filesystem path is inferred.
 
 use std::{io::{Read, Seek}, mem::size_of};
 use fcb_core::{ArenaOwnerId, ByteLength, ByteRange, FileId, QueryGeneration,
@@ -14,7 +17,8 @@ use super::{CaptureRequest, ParsedQuery, QueryError, ReferenceScanOracle, RawPat
     StreamingNeedle, StreamReadError, StreamReadOptions, StreamReadState, StreamReadStep};
 use super::paged_snapshot::{PagedSnapshot, PagedMemberData, PagedCapture,
     PagedSearchError, Sha256Digest, SnapshotDirectory, SnapshotReadSession, MemberSearch};
-use super::snapshot_index::{SnapshotIndex, IndexDecision};
+use super::snapshot_index::{SnapshotIndex, SnapshotPostings, PostingCandidates, PostingStep, IndexDecision};
+use super::snapshot_index::paged::{PagedPostings, PagedPostingCandidates};
 use super::snapshot_scope::{SnapshotScope, SnapshotSelection};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -139,9 +143,20 @@ pub struct ExpressionStats {
     pub unsupported_files: usize,
     pub scanned_bytes: u64,
     pub last_step_scanned_bytes: u64,
+    /// Captured members admitted by both raw scope and metadata filters that
+    /// the primary literal's compatible index proves negative. Global posting
+    /// cursors leave this zero until exhausted; it is not a pending total.
     pub index_eliminated: usize,
+    /// Selected primary candidates and fallbacks admitted before source work.
+    /// A work-limit stop can leave one admitted member not yet loaded.
     pub index_candidates: usize,
     pub index_fallbacks: usize,
+    pub posting_list_lookups: usize,
+    pub posting_entries_visited: usize,
+    pub posting_membership_lookups: usize,
+    /// Describes candidate enumeration, not completion of source verification.
+    /// False also describes per-member indexes or an empty metadata scope.
+    pub posting_cursor_complete: bool,
 }
 
 /// An immutable exact occurrence. Only the query can create these values.
@@ -182,6 +197,8 @@ pub struct ExpressionQuery<'archive, 'plan, R: Read + Seek> {
     source: Option<SnapshotReadSession<'archive, R>>,
     plan: &'plan ExpressionPlan,
     index: Option<&'plan SnapshotIndex>,
+    postings: Option<PostingCandidates<'plan>>,
+    paged_postings: Option<PagedPostingCandidates<'plan>>,
     options: ExpressionOptions,
     selection: SnapshotSelection,
     allocations: [ResourceAllocationId; 3],
@@ -243,8 +260,8 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
         let source = archive.read_session();
         let directory = source.directory();
         let next = selection.members.start;
-        Ok(Self { directory, source: Some(source), plan, index: None, options, selection,
-            allocations, scope_at: next, next,
+        Ok(Self { directory, source: Some(source), plan, index: None, postings: None, paged_postings: None,
+            options, selection, allocations, scope_at: next, next,
             active: None, hits, seen: 0, matching_files: 0, count_all_matches, skip_matches,
             state: ExpressionState::Pending, stats: ExpressionStats::default(), _lease: lease })
     }
@@ -289,6 +306,76 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
             skip_matches, count_all_matches, budget, allocations)?;
         query.index = Some(index); Ok(query)
     }
+    /// Intersect the mandatory primary literal's global posting candidates,
+    /// then verify every surviving member with the shared expression matcher.
+    /// Required and excluded terms never manufacture index-negative evidence.
+    pub fn new_postings(archive: &'archive mut PagedSnapshot<R>, plan: &'plan ExpressionPlan,
+        index: &'plan SnapshotPostings, options: ExpressionOptions, budget: &ResourceBudget,
+        allocations: [ResourceAllocationId; 3]) -> Result<Self, ExpressionError> {
+        Self::new_postings_scoped_page(archive, plan, index, options, SnapshotScope::Archive,
+            0, false, budget, allocations)
+    }
+    pub fn new_postings_counting(archive: &'archive mut PagedSnapshot<R>, plan: &'plan ExpressionPlan,
+        index: &'plan SnapshotPostings, options: ExpressionOptions, budget: &ResourceBudget,
+        allocations: [ResourceAllocationId; 3]) -> Result<Self, ExpressionError> {
+        Self::new_postings_scoped_page(archive, plan, index, options, SnapshotScope::Archive,
+            0, true, budget, allocations)
+    }
+    pub fn new_postings_page(archive: &'archive mut PagedSnapshot<R>, plan: &'plan ExpressionPlan,
+        index: &'plan SnapshotPostings, options: ExpressionOptions, skip_matches: u64,
+        count_all_matches: bool, budget: &ResourceBudget, allocations: [ResourceAllocationId; 3])
+        -> Result<Self, ExpressionError> {
+        Self::new_postings_scoped_page(archive, plan, index, options, SnapshotScope::Archive,
+            skip_matches, count_all_matches, budget, allocations)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_postings_scoped_page(archive: &'archive mut PagedSnapshot<R>, plan: &'plan ExpressionPlan,
+        index: &'plan SnapshotPostings, options: ExpressionOptions, scope: SnapshotScope<'_>,
+        skip_matches: u64, count_all_matches: bool, budget: &ResourceBudget,
+        allocations: [ResourceAllocationId; 3]) -> Result<Self, ExpressionError> {
+        index.validate_directory(archive.directory()).map_err(PagedSearchError::from)?;
+        let mut query = Self::new_scoped_page(archive, plan, options, scope,
+            skip_matches, count_all_matches, budget, allocations)?;
+        let candidates = index.candidates_matching(plan.syntax.primary_needle.as_bytes(), true, plan.case_sensitive);
+        query.stats.posting_list_lookups = candidates.stats().list_lookups;
+        query.postings = Some(candidates);
+        Ok(query)
+    }
+    /// Demand-paged index variant of the same expression verification pipeline.
+    /// Construction does no index-page I/O. Metadata filters finish before the
+    /// cursor starts; each cursor step loads at most one verified index page.
+    pub fn new_paged<I: Read + Seek>(archive: &'archive mut PagedSnapshot<R>, plan: &'plan ExpressionPlan,
+        index: &'plan mut PagedPostings<I>, options: ExpressionOptions, budget: &ResourceBudget,
+        allocations: [ResourceAllocationId; 3]) -> Result<Self, ExpressionError> {
+        Self::new_paged_scoped_page(archive, plan, index, options, SnapshotScope::Archive,
+            0, false, budget, allocations)
+    }
+    pub fn new_paged_counting<I: Read + Seek>(archive: &'archive mut PagedSnapshot<R>, plan: &'plan ExpressionPlan,
+        index: &'plan mut PagedPostings<I>, options: ExpressionOptions, budget: &ResourceBudget,
+        allocations: [ResourceAllocationId; 3]) -> Result<Self, ExpressionError> {
+        Self::new_paged_scoped_page(archive, plan, index, options, SnapshotScope::Archive,
+            0, true, budget, allocations)
+    }
+    pub fn new_paged_page<I: Read + Seek>(archive: &'archive mut PagedSnapshot<R>, plan: &'plan ExpressionPlan,
+        index: &'plan mut PagedPostings<I>, options: ExpressionOptions, skip_matches: u64,
+        count_all_matches: bool, budget: &ResourceBudget, allocations: [ResourceAllocationId; 3])
+        -> Result<Self, ExpressionError> {
+        Self::new_paged_scoped_page(archive, plan, index, options, SnapshotScope::Archive,
+            skip_matches, count_all_matches, budget, allocations)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_paged_scoped_page<I: Read + Seek>(archive: &'archive mut PagedSnapshot<R>, plan: &'plan ExpressionPlan,
+        index: &'plan mut PagedPostings<I>, options: ExpressionOptions, scope: SnapshotScope<'_>,
+        skip_matches: u64, count_all_matches: bool, budget: &ResourceBudget,
+        allocations: [ResourceAllocationId; 3]) -> Result<Self, ExpressionError> {
+        index.validate_directory(archive.directory()).map_err(PagedSearchError::from)?;
+        let mut query = Self::new_scoped_page(archive, plan, options, scope,
+            skip_matches, count_all_matches, budget, allocations)?;
+        let candidates = index.candidates_matching(plan.syntax.primary_needle.as_bytes(), true, plan.case_sensitive);
+        query.stats.posting_list_lookups = candidates.stats().list_lookups;
+        query.paged_postings = Some(candidates);
+        Ok(query)
+    }
     pub const fn state(&self) -> ExpressionState { self.state }
     pub const fn stats(&self) -> ExpressionStats { self.stats }
     pub fn cancel(&mut self) { self.active = None; self.source = None; self.state = ExpressionState::Canceled; }
@@ -322,21 +409,64 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
             return Ok(());
         }
         if self.active.is_none() {
-            if self.next == self.selection.members.end { self.state = ExpressionState::Complete; return Ok(()); }
-            let ordinal = self.next; self.next += 1;
+            // Metadata alone settles a scope with no eligible captured source.
+            // Do not fetch unrelated posting pages to establish that same fact.
+            if self.stats.scope_files == self.stats.unavailable_files {
+                self.state = ExpressionState::Complete; return Ok(());
+            }
+            let selected = if let Some(cursor) = self.paged_postings.as_mut() {
+                let result = cursor.step(&mut *canceled).map_err(PagedSearchError::from)
+                    .map_err(|error| match error {
+                        PagedSearchError::Canceled => ExpressionError::Canceled,
+                        _ => ExpressionError::Search(error),
+                    })?;
+                Some((result, cursor.stats(), cursor.is_finished()))
+            } else if let Some(cursor) = self.postings.as_mut() {
+                let result = cursor.step();
+                Some((result, cursor.stats(), cursor.is_finished()))
+            } else { None };
+            let (ordinal, posting_decision) = if let Some((result, stats, finished)) = selected {
+                self.stats.posting_entries_visited = stats.posting_entries_visited;
+                self.stats.posting_membership_lookups = stats.membership_lookups;
+                self.stats.posting_cursor_complete = finished;
+                match result {
+                    PostingStep::Pending => { self.finish_posting_counts()?; return Ok(()); }
+                    PostingStep::Finished => {
+                        self.finish_posting_counts()?;
+                        self.state = ExpressionState::Complete; return Ok(());
+                    }
+                    PostingStep::Candidate { ordinal, decision } => (ordinal, Some(decision)),
+                }
+            } else {
+                if self.next == self.selection.members.end { self.state = ExpressionState::Complete; return Ok(()); }
+                let ordinal = self.next; self.next += 1;
+                (ordinal, None)
+            };
+            // A global cursor's metadata work may cross the selected interval.
+            // Only eligible captured members consume query counters or work.
+            if !self.selection.members.contains(&ordinal) {
+                self.finish_posting_counts()?;
+                return Ok(());
+            }
             let member = self.directory.member(ordinal).ok_or(PagedSearchError::InvalidHit)?;
-            if !self.plan.admits(member.path) || matches!(member.data, PagedMemberData::Unavailable(_)) { return Ok(()); }
-            if let Some(index) = self.index {
-                // The saved index certifies absence of exact UTF-8 grams only.
-                // Lowercase matching can find different bytes (even different
-                // byte lengths), so exact negatives must never skip a member.
-                let exact = self.plan.case_sensitive.then_some(self.plan.syntax.primary_needle.as_str());
-                match index.text_decision(ordinal, exact) {
+            if !self.plan.admits(member.path) || matches!(member.data, PagedMemberData::Unavailable(_)) {
+                self.finish_posting_counts()?;
+                return Ok(());
+            }
+            let decision = match (posting_decision, self.index) {
+                (Some(decision), _) => Some(decision),
+                (None, Some(index)) => Some(index.text_decision_matching(ordinal,
+                    Some(self.plan.syntax.primary_needle.as_str()), self.plan.case_sensitive)),
+                _ => None,
+            };
+            if let Some(decision) = decision {
+                match decision {
                     IndexDecision::Excluded => { self.stats.index_eliminated += 1; return Ok(()); }
                     IndexDecision::Verify => self.stats.index_candidates += 1,
                     IndexDecision::Fallback => self.stats.index_fallbacks += 1,
                 }
             }
+            self.finish_posting_counts()?;
             if member.observed_bytes > 0 && self.stats.scanned_bytes == self.options.max_scan_bytes {
                 self.state = ExpressionState::WorkLimit; return Ok(());
             }
@@ -394,6 +524,19 @@ impl<'archive, 'plan, R: Read + Seek> ExpressionQuery<'archive, 'plan, R> {
         }
         if report.state() == StreamReadState::ByteLimit { self.state = ExpressionState::WorkLimit; }
         else if !self.count_all_matches && report.has_more_matches() { self.state = ExpressionState::Truncated; }
+        Ok(())
+    }
+    /// Global cursor totals describe the entire archive. Derive negatives from
+    /// metadata-qualified captured membership and only its emitted candidates.
+    /// Exhaustion proves candidate absence, not successful source verification.
+    fn finish_posting_counts(&mut self) -> Result<(), ExpressionError> {
+        if self.stats.posting_cursor_complete {
+            self.stats.index_eliminated = self.stats.scope_files
+                .checked_sub(self.stats.unavailable_files)
+                .and_then(|n| n.checked_sub(self.stats.index_candidates))
+                .and_then(|n| n.checked_sub(self.stats.index_fallbacks))
+                .ok_or(PagedSearchError::InvalidHit)?;
+        }
         Ok(())
     }
     fn start(&mut self, ordinal: usize, budget: &ResourceBudget) -> Result<(), ExpressionError> {

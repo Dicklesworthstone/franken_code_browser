@@ -1462,9 +1462,9 @@ verification remains pending.
 ## Limit saved text and expression searches to a folder or file
 
 Saved literal, original-byte and expression searches accept the same raw path
-scope as structural searches. Literal and original-byte searches also accept
-these scopes with all three saved substring-index layouts (FCBI, FCBO and FCBD).
-The CLI expression route continues to scan verified members directly:
+scope as structural searches. These searches also accept the same scopes with
+all three saved substring-index layouts (FCBI, FCBO and FCBD). Direct expression
+search remains available when no index is supplied:
 
 ```sh
 fcb snapshot search saved.fcbs --text needle --directory src --count-all --json
@@ -1509,6 +1509,62 @@ The public engine exposes scoped direct, per-member-index, postings and paged
 postings constructors, with identical original-byte witnesses across routes.
 Scoped host and CLI regression fixtures have been added; independent executable
 verification remains pending.
+
+## Accelerate saved expressions with a pinned substring index
+
+All three saved index layouts support the ordinary expression grammar through
+`snapshot index search --query`. For example:
+
+```sh
+fcb snapshot index search saved.fcbs --index saved.fcbd --index-digest TRUSTED_SHA256 --paged \
+  --query 'needle required -forbidden lang:rust' --directory src --count-all --json
+fcb snapshot index search saved.fcbs --index saved.fcbi --index-digest TRUSTED_SHA256 \
+  --query 'ana required' --ignore-case --skip-matches 10 --limit 20 --count-all --json
+```
+
+Use `--paged` for FCBD; FCBI per-member grams and FCBO resident postings are
+recognized under their full-artifact pins. The existing catalog and separately
+retained index trust requirements apply. The query is parsed and its patterns
+admitted before any archive or index is opened. `--query` is exclusive with
+`--text` and `--raw-hex`; `--max-scan-bytes` applies only to expressions.
+
+Only the mandatory primary literal can prove an indexed member irrelevant.
+Required and excluded terms still run against the same digest-verified source
+observation, so index candidates are never reported as hits. Raw folder/member
+selection and expression path/language filters intersect before source reads.
+Case-insensitive queries use compatible ASCII index rows and retain direct
+verification for Unicode, UTF-16, short terms, legacy rows and uncovered
+members. A partial or zero-coverage index therefore changes the amount of work,
+not which captured occurrences qualify.
+
+Expression `--max-scan-bytes` defaults to 256 MiB and charges each original
+source byte once in the shared predicate/primary pass. It is a matching-work
+allowance, not an I/O budget: a selected member can still need an integrity drain
+to verify its saved digest. Indexed negatives spend no source-scan allowance;
+a positive candidate or fallback member that cannot finish retains an explicit
+partial result. `--count-all`, zero-row counts, later match windows and exit
+codes use the same contracts as direct expressions. A trusted index cannot
+close unknown archive membership or an unavailable selected source.
+
+JSON adds `index_used`, `index_policy` and
+`index_prefilter: "mandatory-primary-literal-only"` alongside the pinned
+artifact and layout. `index_eliminated_files`, `index_candidates` and
+`index_fallback_files` count metadata-qualified captured members of the
+selected raw scope. On a completed source query,
+`members_loaded + index_eliminated_files = scope_files - unavailable_files_count`.
+A partial posting cursor reports zero eliminated members until its traversal
+can establish the remaining negatives. A completed expression with no eligible
+captured members can legitimately have `posting_cursor_complete: false` and
+zero posting work; FCBI uses per-member decisions rather than a posting cursor.
+The resident/paged posting lookup counters and FCBD page I/O remain visible.
+`indexed_files`, `uncovered_files` and
+`index_unavailable_files_count` describe the whole pinned artifact.
+
+Regressions cover direct/indexed equivalence across all layouts, raw scope and
+metadata intersections, predicates, counts and later windows, zero work
+allowances, incomplete discovery, UTF-16 and Unicode fallback, uncovered
+indexes, trusted pins, cancellation and standalone binary/human output.
+These tests are authored; independent executable verification remains pending.
 
 ## Search structure in a saved repository
 
