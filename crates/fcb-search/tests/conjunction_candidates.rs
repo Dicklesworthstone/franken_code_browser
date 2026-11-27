@@ -161,8 +161,8 @@ fn incompatible_decoders_normalization_and_malformed_sources_remain_candidates()
     let folded = SearchMode::DecodedText { case_sensitive: false, normalization: UnicodeNormalization::CaseFold };
     let canonical = SearchMode::DecodedText { case_sensitive: true, normalization: UnicodeNormalization::Canonical };
     let cases = [
-        (utf16("banana allow", true, true), "ana allow", exact, None, 2, true, 1),
-        (utf16("banana allow", false, true), "ana allow", exact, None, 2, true, 1),
+        (utf16("banana allow", true, true), "ana allow", exact, None, 2, true, 0),
+        (utf16("banana allow", false, true), "ana allow", exact, None, 2, true, 0),
         // BOM-less ASCII UTF-16 is also valid UTF-8 bytes. The declared decoder
         // must prevent using missing UTF-8 grams as a negative certificate.
         (utf16("banana allow", true, false), "ana allow", exact, Some(DetectedEncoding::Utf16Le), 2, true, 1),

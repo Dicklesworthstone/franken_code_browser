@@ -160,7 +160,7 @@ impl QuerySource for OwnedEphemeralIndex {
         let segment = self.segments.get(ordinal).ok_or(IndexError::InvalidManifest)?;
         may_match_segment(segment, &self.grams, query, options)
     }
-    fn fallback(&self, ordinal: usize, options: &QueryOptions, needle: &[u8]) -> bool {
+    fn fallback(&self, ordinal: usize, options: &QueryOptions, needle: &str) -> bool {
         segment_uses_fallback(&self.segments[ordinal], options, needle)
     }
 }

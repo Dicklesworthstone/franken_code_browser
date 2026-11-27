@@ -194,12 +194,11 @@ fn native_paths_and_hex_utf8_needles_select_exact_utf16_bytes_from_an_index() {
     s.push("repo-begin-indexed-text-hex\t1\t1\t2\t10\t1000\tf09f9880", false);
     let completed = s.push("repo-step\t1\t2\t0", false); let hit = s.push("repo-hit\t1\t2\t1", true);
     let copy = s.push("copy\t1", false); s.push("quit", false);
-    // UTF-16 is captured but uses exact-scan fallback, so index preparation
-    // is explicitly partial even though the decoded literal query completes.
+    // The interactive begin replies indicate pending work before the final step.
     let (exit, rows) = invoke(&s.text); assert_eq!(exit, EXIT_PARTIAL);
     assert_eq!(rows[completed].get("exit_code").number(), EXIT_OK as u64);
     assert!(rows[completed].get("result").get("search_complete").flag());
-    assert_eq!(rows[completed].get("result").get("fallback_files").number(), 1);
+    assert_eq!(rows[completed].get("result").get("fallback_files").number(), 0);
     assert_eq!(rows[hit].get("result").get("original_range").get("start").number(), 8);
     assert_eq!(rows[copy].get("result").get("original_hex").text(), "3dd800de");
 }

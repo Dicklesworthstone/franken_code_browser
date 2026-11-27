@@ -97,7 +97,7 @@ fn utf16_hits_keep_original_bytes_after_live_replacement_and_index_drop() {
     let index = source.index(IndexLimits::default(), &budget, allocation(4), || false).unwrap();
     let overlay = index.search("needle", generation(1), AtlasTextLimits::default(), &budget, allocs(5), || false).unwrap();
     assert!(overlay.is_complete()); assert_eq!(overlay.hits().len(), 2);
-    assert!(overlay.report().fallback_attempts() > 0, "UTF-8 prefilter cannot reject a UTF-16 text query");
+    assert_eq!(overlay.report().fallback_attempts(), 0);
     drop(index);
     fs::write(root.join("wide.txt"), b"completely different current source").unwrap();
     let selection = overlay.select_hit(&source, 0, generation(1)).unwrap();

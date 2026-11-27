@@ -71,7 +71,7 @@ fn utf16_is_text_not_a_utf8_byte_prefilter_and_retains_original_ranges() {
     let report = text_report(&output);
     assert!(report.contains("\"original_range\":{\"start\":\"14\",\"end\":\"26\"}"));
     assert!(report.contains("\"original_hex\":\"6e006500650064006c006500\""));
-    assert!(report.contains("\"fallback_scans\":\"1\""));
+    assert!(report.contains("\"fallback_scans\":\"0\""));
     assert_eq!(fs::read(root.join("wide.txt")).unwrap(), bytes);
 }
 

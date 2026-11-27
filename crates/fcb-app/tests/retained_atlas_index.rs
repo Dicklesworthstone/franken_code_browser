@@ -70,13 +70,13 @@ fn negative_certificates_skip_verification_but_not_source_membership() {
 }
 
 #[test]
-fn utf16_and_overlapping_short_queries_take_sound_fallback_and_keep_original_bytes() {
+fn utf16_index_checks_encoded_terms_and_keeps_original_bytes() {
     for little in [true, false] {
         let bytes: Vec<u8> = "\u{feff}🦀 banana needle".encode_utf16()
             .flat_map(|u| if little { u.to_le_bytes() } else { u.to_be_bytes() }).collect();
         let mut f = Fixture::new(&[("utf16.rs", &bytes)]); f.build(1);
         let result = f.query(2, 1, "ana");
-        assert!(result.contains("\"fallback_files\":\"1\""));
+        assert!(result.contains("\"fallback_files\":\"0\""));
         assert_eq!(f.search.progress(&f.atlas, 2).unwrap().retained_hits, 2);
         for id in 1..=2 {
             let hit = f.search.hit(&f.atlas, 2, id).unwrap();
@@ -87,7 +87,8 @@ fn utf16_and_overlapping_short_queries_take_sound_fallback_and_keep_original_byt
             assert_eq!(&bytes[a..b], expected);
         }
         assert!(f.search.progress(&f.atlas, 2).unwrap().complete);
-        assert!(f.query(3, 1, "an").contains("\"fallback_files\":\"1\""));
+        assert!(f.query(3, 1, "an").contains("\"fallback_files\":\"0\""));
+        assert!(f.query(4, 1, "a").contains("\"fallback_files\":\"1\""));
     }
 }
 

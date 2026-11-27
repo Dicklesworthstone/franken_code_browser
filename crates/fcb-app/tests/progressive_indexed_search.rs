@@ -166,7 +166,7 @@ fn index_replacement_and_clear_retire_paused_work_but_preserve_accepted_source_p
 }
 
 #[test]
-fn utf16_fallback_and_search_after_rename_keep_original_byte_ranges() {
+fn utf16_indexed_search_after_rename_keeps_original_byte_ranges() {
     let bytes: Vec<u8> = "\u{feff}a🦀 needle".encode_utf16().flat_map(u16::to_be_bytes).collect();
     let fixture = Fixture::new(&[("a.rs", &bytes), ("b.rs", b"needle")]);
     let atlas = fixture.open(); let mut search = RetainedAtlasSearch::new(&atlas).unwrap();
@@ -180,7 +180,7 @@ fn utf16_fallback_and_search_after_rename_keep_original_byte_ranges() {
     assert_eq!(reader.capture().bytes(), bytes);
     finish(&mut search, &atlas, 2);
     let page = search.page(&atlas, 2, 0, 100, || false).unwrap();
-    assert!(page.as_str().contains("\"fallback_files\":\"1\""));
+    assert!(page.as_str().contains("\"fallback_files\":\"0\""));
     assert_eq!(search.progress(&atlas, 2).unwrap().source_bytes_read, 0);
 }
 

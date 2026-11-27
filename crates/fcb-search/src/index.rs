@@ -21,7 +21,7 @@ use fcb_core::{
     ArenaOwnerId, ByteLength, FileId, ResourceAllocationId,
     ResourceBudget, ResourceLease,
 };
-use fcb_source::DetectedEncoding;
+use fcb_source::{DetectedEncoding, detect_encoding};
 
 use crate::{
     ParsedQuery, QueryError, QueryOptions, SearchDocument,
@@ -190,6 +190,7 @@ struct Segment {
     len: usize,
     utf8: bool,
     ascii: bool,
+    valid_utf16: Option<DetectedEncoding>,
     coverage: SegmentCoverage,
 }
 
@@ -205,8 +206,8 @@ pub struct IndexStatistics {
 }
 
 /// A capture-bound collection of immutable per-file substring segments.
-/// Query preparation allocates no repository-sized candidate list. Up to three
-/// trigrams per required positive term are probed per file, capped at the query
+/// Query preparation allocates no repository-sized candidate list. A bounded sample of
+/// trigrams per required positive term is probed per file, capped at the query
 /// token limit. Exact verification eliminates false positives. The metadata
 /// traversal is O(files), not a claimed global inverted index.
 #[derive(Debug)]
@@ -268,7 +269,7 @@ impl<'a> EphemeralIndex<'a> {
                 refusal = Some(UncoveredReason::BuildByteLimit);
             }
             let mut segment = Segment {
-                start: grams.len(), len: 0, utf8: false, ascii: false,
+                start: grams.len(), len: 0, utf8: false, ascii: false, valid_utf16: None,
                 coverage: SegmentCoverage::Indexed,
             };
             if refusal.is_none() {
@@ -292,6 +293,7 @@ impl<'a> EphemeralIndex<'a> {
                     // normalized matches whose raw grams are different.
                     segment.ascii = bytes.is_ascii();
                     segment.utf8 = segment.ascii || std::str::from_utf8(bytes).is_ok();
+                    segment.valid_utf16 = validated_utf16(bytes, &mut canceled)?;
                     segment.len = scratch.len();
                     grams.extend_from_slice(&scratch);
                 }
@@ -325,6 +327,8 @@ impl<'a> EphemeralIndex<'a> {
     /// True means "verify", never "there is a match". Unknown encodings,
     /// non-ASCII normalization and uncovered segments cannot borrow byte-index
     /// negatives. ASCII normalization uses bounded case variants of raw grams.
+    /// Exact UTF-16 terms probe their encoded bytes when the entire capture
+    /// proves the matching byte order and valid surrogate structure.
     /// Short terms need verification, but do not disable probes for other terms.
     /// Exclusions and metadata filters never become required source trigrams.
     pub fn may_match(
@@ -335,7 +339,7 @@ impl<'a> EphemeralIndex<'a> {
         may_match_segment(segment, &self.grams, query, options)
     }
 
-    pub(crate) fn uses_fallback(&self, document_index: usize, options: &QueryOptions, needle: &[u8]) -> bool {
+    pub(crate) fn uses_fallback(&self, document_index: usize, options: &QueryOptions, needle: &str) -> bool {
         segment_uses_fallback(&self.segments[document_index], options, needle)
     }
 
@@ -349,9 +353,10 @@ impl<'a> EphemeralIndex<'a> {
 // This is a negative certificate only; the existing exact verifier owns hits.
 fn may_match_segment(segment: &Segment, grams: &[u32], query: &ParsedQuery,
     options: &QueryOptions) -> Result<bool, IndexError> {
-    let needle = query.primary_needle.as_bytes();
+    let needle = query.primary_needle.as_str();
     if needle.is_empty() { return Err(QueryError::EmptyNeedle.into()); }
-    if !compatible_segment(segment, options) { return Ok(true); }
+    let utf16 = utf16_query_encoding(segment, options);
+    if utf16.is_none() && !compatible_segment(segment, options) { return Ok(true); }
     let keys = &grams[segment.start..segment.start + segment.len];
     // Required terms are independent necessary conditions. Missing a trigram
     // from ANY positive term can avoid decoding a file with a common primary
@@ -362,8 +367,13 @@ fn may_match_segment(segment: &Segment, grams: &[u32], query: &ParsedQuery,
     // token limit even for such a value; ignoring excess terms only admits extra
     // candidates. Query constructors separately reject malformed/oversized ASTs.
     for needle in std::iter::once(needle)
-        .chain(query.conjunction_terms.iter().map(|term| term.as_bytes()))
+        .chain(query.conjunction_terms.iter().map(String::as_str))
         .take(crate::MAX_QUERY_TOKENS) {
+        if let Some(encoding) = utf16 {
+            if !utf16_prefix_present(keys, needle, encoding) { return Ok(false); }
+            continue;
+        }
+        let needle = needle.as_bytes();
         if !compatible_needle(needle, options.mode) { continue; }
         let last = needle.len() - 3;
         for offset in [0, last / 2, last] {
@@ -372,6 +382,45 @@ fn may_match_segment(segment: &Segment, grams: &[u32], query: &ParsedQuery,
     }
     Ok(true)
 }
+// A malformed member must reach the exact scanner even for an absent term:
+// it contributes an unsupported file to the coverage report.
+fn validated_utf16(bytes: &[u8], canceled: &mut impl FnMut() -> bool)
+    -> Result<Option<DetectedEncoding>, IndexError> {
+    let encoding = detect_encoding(bytes);
+    if !encoding.is_utf16() || bytes.len() % 2 != 0 { return Ok(None); }
+    let units = bytes.chunks_exact(2).map(|pair| {
+        let bytes = [pair[0], pair[1]];
+        if encoding == DetectedEncoding::Utf16Le { u16::from_le_bytes(bytes) }
+        else { u16::from_be_bytes(bytes) }
+    });
+    for (i, scalar) in char::decode_utf16(units).enumerate() {
+        if i % 8192 == 0 && canceled() { return Err(IndexError::Canceled); }
+        if scalar.is_err() { return Ok(None); }
+    }
+    Ok(Some(encoding))
+}
+
+fn utf16_query_encoding(segment: &Segment, options: &QueryOptions) -> Option<DetectedEncoding> {
+    let encoding = segment.valid_utf16?;
+    (options.mode == SearchMode::default()
+        && options.declared_encoding.is_none_or(|declared| declared == encoding)).then_some(encoding)
+}
+
+// Only the first four UTF-16 units are needed. Each of their raw trigrams
+// must occur in the file if this term occurs; incidental unaligned grams
+// merely admit extra candidates. A single BMP scalar yields no certificate.
+fn utf16_prefix_present(keys: &[u32], needle: &str, encoding: DetectedEncoding) -> bool {
+    let mut prefix = [0u8; 8];
+    let mut len = 0;
+    for unit in needle.encode_utf16().take(4) {
+        let bytes = if encoding == DetectedEncoding::Utf16Le { unit.to_le_bytes() }
+            else { unit.to_be_bytes() };
+        prefix[len..len + 2].copy_from_slice(&bytes);
+        len += 2;
+    }
+    prefix[..len].windows(3).all(|triple| keys.binary_search(&gram(triple)).is_ok())
+}
+
 fn compatible_segment(segment: &Segment, options: &QueryOptions) -> bool {
     if segment.coverage != SegmentCoverage::Indexed { return false; }
     match options.mode {
@@ -393,8 +442,9 @@ fn compatible_needle(needle: &[u8], mode: SearchMode) -> bool {
         SearchMode::DecodedText { .. } => needle.is_ascii(),
     }
 }
-fn segment_uses_fallback(segment: &Segment, options: &QueryOptions, needle: &[u8]) -> bool {
-    !compatible_segment(segment, options) || !compatible_needle(needle, options.mode)
+fn segment_uses_fallback(segment: &Segment, options: &QueryOptions, needle: &str) -> bool {
+    if utf16_query_encoding(segment, options).is_some() { return needle.encode_utf16().nth(1).is_none(); }
+    !compatible_segment(segment, options) || !compatible_needle(needle.as_bytes(), options.mode)
 }
 fn contains_gram(keys: &[u32], bytes: &[u8], mode: SearchMode) -> bool {
     let insensitive = matches!(mode, SearchMode::DecodedText { case_sensitive: false, .. }

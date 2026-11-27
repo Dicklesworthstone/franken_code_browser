@@ -107,7 +107,7 @@ fn utf16_exact_verification_matches_the_reference_oracle_after_transfer() {
         .into_owned(Default::default(), &budget, allocation(2), || false).unwrap();
     let result = index.with_index(&budget, allocation(3), || false, |view| {
         let report = view.search(&parsed, options, &budget, allocation(4), || false).unwrap();
-        assert!(report.is_complete()); assert_eq!(report.fallback_attempts(), 1);
+        assert!(report.is_complete()); assert_eq!(report.fallback_attempts(), 0);
         report.capture_results().clone()
     }).unwrap();
     assert_eq!(result, oracle);

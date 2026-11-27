@@ -52,7 +52,7 @@ fn recursive_literal_search_verifies_mixed_encodings_and_original_byte_ranges() 
     assert!(result.get("workspace_complete").flag()); assert!(result.get("discovery_complete").flag());
     assert_eq!(result.get("matches_seen").number(), 3);
     assert!(result.get("index_skipped_files").number() >= 1);
-    assert_eq!(result.get("fallback_scans").number(), 2);
+    assert_eq!(result.get("fallback_scans").number(), 0);
     for hit in result.get("hits").array() {
         let path = unhex(hit.get("path").get("hex").text());
         let bytes = fs::read(tree.0.join(OsStr::from_bytes(&path))).unwrap();

@@ -193,7 +193,7 @@ fn high_entropy_quota_failure_does_not_publish_a_partial_negative_certificate() 
 }
 
 #[test]
-fn utf16_surrogate_and_window_boundaries_fall_back_to_exact_capture_verification() {
+fn utf16_surrogate_and_window_boundaries_keep_exact_capture_ranges() {
     let text = format!("{}\u{1f680}needle", "x".repeat(8190));
     for le in [false, true] {
         for bom in [false, true] {
@@ -207,7 +207,7 @@ fn utf16_surrogate_and_window_boundaries_fall_back_to_exact_capture_verification
             let oracle = ReferenceScanOracle::scan_collection(&docs, &query, &options).unwrap();
             let result = index.search(&query, options, &budget, allocation(2), || false).unwrap();
             assert!(result.is_complete());
-            assert_eq!(result.fallback_attempts(), 1);
+            assert_eq!(result.fallback_attempts(), usize::from(!bom));
             ReferenceScanOracle::verify_oracle_match(result.capture_results(), &oracle).unwrap();
             let hit = &result.capture_results().matches[0];
             let (start, end) = hit.original_byte_range.as_usize_bounds().unwrap();
@@ -423,4 +423,49 @@ fn independent_negative_control_detects_a_hit_relabelled_as_new_source() {
     let mut corrupted = result.capture_results().clone();
     corrupted.matches[0].revision = SourceRevision::new(owner(), 2).unwrap();
     assert!(ReferenceScanOracle::verify_oracle_match(&corrupted, &oracle).is_err());
+}
+
+#[test]
+fn utf16_required_terms_eliminate_noise_before_spending_the_source_byte_budget() {
+    for le in [false, true] {
+        let noise = utf16(&"章 noise ".repeat(96), le, true);
+        let target = utf16("章 🙂 章𐐷", le, true);
+        let captures = [capture(1, 1, &noise), capture(2, 1, &target)];
+        let docs = [document("noise.txt", &captures[0]), document("target.txt", &captures[1])];
+        let budget = budget();
+        let index = index(&docs, IndexLimits::default(), &budget);
+        // The one-unit primary has no trigram. The required supplementary
+        // scalar has two UTF-16 units and can exclude the large first file.
+        let query = ParsedQuery::parse("章 🙂").unwrap();
+        let expected = ReferenceScanOracle::scan_collection(&docs, &query, &options()).unwrap();
+        let mut limits = options();
+        limits.max_bytes_scanned = Some(target.len() as u64);
+        let report = index.search(&query, limits, &budget, allocation(2), || false).unwrap();
+        assert!(report.is_complete());
+        assert_eq!(report.skipped_by_index(), 1);
+        assert_eq!(report.capture_results().scanned_bytes, target.len() as u64);
+        assert_eq!(report.capture_results().match_count(), 2);
+        ReferenceScanOracle::verify_oracle_match(report.capture_results(), &expected).unwrap();
+    }
+}
+
+#[test]
+fn invalid_utf16_tails_cannot_supply_a_negative_certificate() {
+    for le in [false, true] {
+        let high = if le { [0, 0xd8] } else { [0xd8, 0] };
+        let low = if le { [0, 0xdc] } else { [0xdc, 0] };
+        for suffix in [&high[..], &low[..], &[0x20][..]] {
+            let mut bytes = utf16("valid prefix", le, true);
+            bytes.extend_from_slice(suffix);
+            let c = capture(1, 1, &bytes);
+            let docs = [document("malformed.txt", &c)];
+            let budget = budget();
+            let index = index(&docs, IndexLimits::default(), &budget);
+            let query = ParsedQuery::parse("absent").unwrap();
+            let report = index.search(&query, options(), &budget, allocation(2), || false).unwrap();
+            assert_eq!(report.fallback_attempts(), 1);
+            assert_eq!(report.capture_results().unsupported_files, [c.request().file()]);
+            assert!(!report.is_complete());
+        }
+    }
 }
