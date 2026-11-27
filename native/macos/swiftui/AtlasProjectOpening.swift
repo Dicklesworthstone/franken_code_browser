@@ -49,7 +49,7 @@ struct AtlasProjectOpening {
         guard accepts(ticket), phase == .discovering else { return false }
         catalog = report
         catalogRevision = UUID()
-        hasOpenableFiles = report.entries.contains { $0.sourcePath != nil }
+        hasOpenableFiles = report.openableCount > 0
         active = nil; phase = .ready
         return true
     }
@@ -62,7 +62,7 @@ struct AtlasProjectOpening {
     @discardableResult mutating func acceptPreviewCatalog(_ report: AtlasProjectCatalog, for ticket: Ticket) -> Bool {
         guard accepts(ticket), phase == .preparing, progressiveReady, !hasAtlas else { return false }
         catalog = report; catalogRevision = UUID()
-        hasOpenableFiles = report.entries.contains { $0.sourcePath != nil }
+        hasOpenableFiles = report.openableCount > 0
         return true
     }
     @discardableResult mutating func finishPreviews(_ ticket: Ticket, available: Bool) -> Bool {

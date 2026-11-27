@@ -51,15 +51,16 @@ import SwiftUI
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 List(entries) { entry in
+                    let route = entry.readerRoute(captureLimit: AtlasReaderLimits.captureBytes)
                     Button { open(entry.id) } label: {
                         HStack(alignment: .top, spacing: 10) {
-                            Image(systemName: entry.sourcePath == nil ? "exclamationmark.triangle" : "doc.text")
+                            Image(systemName: route == .observed ? "text.magnifyingglass" : "doc.text")
                                 .accessibilityHidden(true)
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(verbatim: entry.displayPath)
                                     .font(.system(size: 12, design: .monospaced)).lineLimit(2)
-                                if entry.sourcePath == nil {
-                                    Text("Filename is not UTF-8; retained in the catalog but unavailable to this native opener.")
+                                if route == .observed {
+                                    Text("Read in bounded ranges.")
                                         .font(.caption2).foregroundStyle(.secondary)
                                 }
                             }
@@ -70,10 +71,10 @@ import SwiftUI
                         .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .disabled(entry.sourcePath == nil)
+                    .disabled(route == nil)
                     .accessibilityLabel("Open " + entry.displayPath)
-                    .help(entry.sourcePath == nil ? "Raw filename cannot be opened by the UTF-8 host"
-                        : "Open a new retained source capture; preview preparation is not required")
+                    .help(route == .observed ? "Read ranges of the current file using its original path bytes"
+                        : "Open a new retained source capture")
                 }
                 .listStyle(.inset)
             }

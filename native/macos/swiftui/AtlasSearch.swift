@@ -1153,6 +1153,12 @@ struct AtlasSearchFileScope: Equatable, Sendable {
         return extensions.split(separator: ",").contains { $0.utf8.elementsEqual(name[(dot + 1)...]) }
     }
 
+    /// Use the same byte predicate for discovery rows and atlas parcels as for
+    /// search results. The All case shares the existing array's storage.
+    func matchingFiles<File>(_ files: [File], path: KeyPath<File, [UInt8]>) -> [File] {
+        isAll ? files : files.filter { admitsRawPath($0[keyPath: path]) }
+    }
+
     /// Legacy all-files envelopes may omit this additive scope metadata. A
     /// scoped request requires the exact echoed predicate on every page.
     func eligibleFiles(kind: String?, extensions: String?, filenames: String?,

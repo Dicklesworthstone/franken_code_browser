@@ -106,7 +106,8 @@ private final class CityFixture: @unchecked Sendable {
 
 @MainActor @main struct AtlasCityTests {
     static var entries: [AtlasProjectCatalog.Entry] {
-        [entry(91, "first.rs", x: 0, bytes: 1024), entry(92, "second.rs", x: 200, bytes: 2048)]
+        [entry(91, "first.rs", x: 0, bytes: 1024), .init(id: 92, rawPath: [255, 46, 114, 115], displayPath: "\\xff.rs", sourcePath: nil,
+            observedBytes: 2048, x: 200, y: 0, width: 100, height: 100)]
     }
     static func entry(_ id: UInt64, _ path: String, x: Double, bytes: UInt64) -> AtlasProjectCatalog.Entry {
         .init(id: id, rawPath: Array(path.utf8), displayPath: path, sourcePath: path,
@@ -179,7 +180,7 @@ private final class CityFixture: @unchecked Sendable {
         try await until { model?.frame?.generation == 1 && model?.busy == false }
         precondition(fixture.counts.opens == 1 && fixture.counts.infos == 1)
         var selected: UInt64?
-        model?.onSelect = { selected = $0.id }
+        model?.onSelect = { selected = $0.id; return true }
         model?.click(x: 50, y: 50)
         precondition(fixture.counts.picks == 0 && model?.canPick == false)
         try await acknowledge(model!, frame: 1)
@@ -188,7 +189,12 @@ private final class CityFixture: @unchecked Sendable {
         try await until { selected == 91 && model?.busy == false }
         precondition(fixture.counts.picks == 1)
         model?.selectPath("first.rs"); model?.readAdjacent(1)
-        precondition(selected == 92, "keyboard navigation opens the same retained metadata IDs")
+        precondition(selected == 92, "keyboard navigation admits the original non-UTF-8 member")
+        model?.readAdjacent(1)
+        precondition(selected == 91, "navigation resumes after opening the range-reader sheet")
+        model?.onSelect = { selected = $0.id; return false }
+        model?.readAdjacent(1); model?.readAdjacent(1)
+        precondition(selected == 92, "a refused open cannot advance the navigation cursor")
         try await finish(&model)
         try await until { fixture.counts.closes == 1 }
     }
@@ -213,7 +219,7 @@ private final class CityFixture: @unchecked Sendable {
         precondition(model?.canPick == false, "late duplicate old drawable cannot become current")
         try await acknowledge(model!, frame: 3)
         var selected: UInt64?
-        model?.onSelect = { selected = $0.id }; model?.click(x: 50, y: 50)
+        model?.onSelect = { selected = $0.id; return true }; model?.click(x: 50, y: 50)
         try await until { selected == 91 }
         try await finish(&model)
     }

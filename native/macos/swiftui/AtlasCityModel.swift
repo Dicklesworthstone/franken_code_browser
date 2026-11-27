@@ -181,6 +181,9 @@ enum AtlasCityMotion: Sendable, Equatable {
     private var workerStarted = false
     private var files: [UInt64: AtlasProjectCatalog.Entry] = [:]
     private var indices: [[UInt8]: UInt32] = [:]
+    // Observed-range readers open in a separate sheet. Keep their admitted
+    // navigation position without advertising an unconfirmed source selection.
+    private var lastActivatedIndex: UInt32?
     private var selectedPath: [UInt8]?
     private var operation = UUID()
     private var task: Task<Void, Never>?
@@ -196,7 +199,7 @@ enum AtlasCityMotion: Sendable, Equatable {
     private var pendingMotion: AtlasCityMotion?
     private struct Click { let receipt: AtlasCityReceipt; let x, y: Double }
     private var pendingClick: Click?
-    var onSelect: ((AtlasProjectCatalog.Entry) -> Void)?
+    var onSelect: ((AtlasProjectCatalog.Entry) -> Bool)?
     var onPresentedCamera: ((AtlasCityCamera) -> Void)?
 
     init(revision: UUID, entries: [AtlasProjectCatalog.Entry], complete: Bool, seed: AtlasCitySeed? = nil,
@@ -262,20 +265,20 @@ enum AtlasCityMotion: Sendable, Equatable {
     }
     func selectPath(_ path: String?) {
         selectedPath = path.map { Array($0.utf8) }
+        lastActivatedIndex = nil
         updateSelectedIndex()
     }
     func readAdjacent(_ direction: Int) {
         guard ready, let scene, !scene.instances.isEmpty else { return }
         let count = scene.instances.count
-        let current = Int(selectedIndex) < count ? Int(selectedIndex) : (direction < 0 ? 0 : count - 1)
-        var next = current
-        for _ in 0..<count {
-            next = (next + (direction < 0 ? count - 1 : 1)) % count
-            guard let file = files[scene.instances[next].id], file.sourcePath != nil else { continue }
-            // The shared source opener publishes the selection. A failed or
-            // stale activation must not manufacture a different City selection.
-            onSelect?(file); return
-        }
+        let cursor = Int(lastActivatedIndex ?? selectedIndex)
+        let current = cursor < count ? cursor : (direction < 0 ? 0 : count - 1)
+        let next = (current + (direction < 0 ? count - 1 : 1)) % count
+        guard let file = files[scene.instances[next].id] else { return }
+        activate(file)
+    }
+    private func activate(_ file: AtlasProjectCatalog.Entry) {
+        if onSelect?(file) == true { lastActivatedIndex = indices[file.rawPath] }
     }
     func click(x: Double, y: Double) {
         guard canPick, let actual, actual.display == display,
@@ -363,7 +366,7 @@ enum AtlasCityMotion: Sendable, Equatable {
                     guard let self, self.operation == ticket, !self.closed else { return }
                     if self.actual == click.receipt && self.accepted == click.receipt && self.frame == click.receipt.view, let id {
                         guard let file = self.files[id] else { throw AtlasCityError.invalidResponse }
-                        self.onSelect?(file)
+                        self.activate(file)
                     }
                     self.finishOperation()
                 } catch {

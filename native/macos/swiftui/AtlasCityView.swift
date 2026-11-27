@@ -6,13 +6,13 @@ import SwiftUI
     @State private var model: AtlasCityModel
     let selectedPath: String?
     let scopeLabel: String
-    let onSelect: (AtlasProjectCatalog.Entry) -> Void
+    let onSelect: (AtlasProjectCatalog.Entry) -> Bool
     let returnTo2D: () -> Void
     let onPresentedCamera: (AtlasCityCamera) -> Void
 
     init(revision: UUID, entries: [AtlasProjectCatalog.Entry], complete: Bool,
          seed: AtlasCitySeed, selectedPath: String?, scopeLabel: String,
-         onSelect: @escaping (AtlasProjectCatalog.Entry) -> Void, returnTo2D: @escaping () -> Void,
+         onSelect: @escaping (AtlasProjectCatalog.Entry) -> Bool, returnTo2D: @escaping () -> Void,
          onPresentedCamera: @escaping (AtlasCityCamera) -> Void = { _ in }) {
         _model = State(initialValue: AtlasCityModel(revision: revision, entries: entries, complete: complete, seed: seed))
         self.selectedPath = selectedPath; self.scopeLabel = scopeLabel

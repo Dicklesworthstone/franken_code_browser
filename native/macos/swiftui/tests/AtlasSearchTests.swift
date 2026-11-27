@@ -311,7 +311,13 @@ import Foundation
         for path in ["lib.rs.bak", "src/rs/file.py", ".rs", "file.rs.", "Cargo.toml.backup"] {
             check(!rustScope.admitsRawPath(Array(path.utf8)), "Extension is the final native component suffix")
         }
-        check(rustScope.admitsRawPath([255, 46, 82, 83]), "Non-UTF8 basename retains its ASCII extension")
+        struct Row { let path: [UInt8] }
+        let rows = [Row(path: [255, 46, 82, 83]), Row(path: [255, 47] + Array("Cargo.toml".utf8)),
+                    Row(path: [255, 46, 112, 121])]
+        let rustFiles = try AtlasFileScope.rust.searchScope()
+        check(rustFiles.matchingFiles(rows, path: \.path).map(\.path) == [rows[0].path, rows[1].path],
+              "Atlas and discovery select original bytes for non-UTF-8 basenames and parent folders")
+        check(emptyScope.matchingFiles(rows, path: \.path).isEmpty, "Empty raw-path scope stays empty")
         check(!emptyScope.admitsRawPath(Array("lib.rs".utf8)), "Empty scope excludes real files")
         let displayCases: [(AtlasFileScope, String, String, Bool)] = [
             (.all, "", "README", true), (.markdown, "", "docs/README.MD", true),

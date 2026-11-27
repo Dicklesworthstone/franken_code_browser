@@ -131,6 +131,7 @@ struct AtlasProjectCatalog: Sendable {
         }
     }
     let entries: [Entry]
+    let openableCount: Int
     let discoveryComplete: Bool
     let policy: String
     /// Supplied by the requesting worker, NOT decoded from the response. This
@@ -146,9 +147,11 @@ struct AtlasProjectCatalog: Sendable {
     init(entries: [Entry], discoveryComplete: Bool, policy: String, requestedRoot: String? = nil,
         requestedTarget: AtlasCatalogTarget) {
         self.entries = entries; self.discoveryComplete = discoveryComplete
+        openableCount = entries.reduce(into: 0) { count, entry in
+            if entry.readerRoute(captureLimit: .max) != nil { count += 1 }
+        }
         self.policy = policy; self.requestedRoot = requestedRoot; self.requestedTarget = requestedTarget
     }
-    var openableCount: Int { entries.reduce(0) { $0 + ($1.sourcePath == nil ? 0 : 1) } }
     var summary: String {
         let unavailable = entries.count - openableCount
         var text = discoveryComplete ? "\(entries.count) catalogued files." : "Partial catalog: \(entries.count) known files; more may exist."
@@ -156,7 +159,7 @@ struct AtlasProjectCatalog: Sendable {
             text = discoveryComplete ? "Single-file scope: \(entries.count) catalogued file."
                 : "Single-file scope: discovery is incomplete; \(entries.count) known file."
         }
-        if unavailable > 0 { text += " \(unavailable) filenames cannot be opened by this UTF-8 host." }
+        if unavailable > 0 { text += " \(unavailable) paths cannot be opened by the available readers." }
         return text + " Source previews are separate; files can be opened now."
     }
 

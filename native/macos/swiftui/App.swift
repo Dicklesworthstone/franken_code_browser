@@ -235,13 +235,11 @@ private struct AtlasPreparedProjectRefresh: Sendable {
 
     static func prepare(root: String, target: AtlasCatalogTarget, discoveryPolicy: AtlasDiscoveryPolicy,
         previous: [AtlasProjectCatalog.Entry], previousBounds: CGRect, retainingPreviousMembership: Bool,
-        scope: AtlasSearchFileScope, includesUnsupportedNames: Bool,
+        scope: AtlasSearchFileScope,
         cancellation: AtlasSearchCancellation) throws -> Self {
         let catalog = try AtlasProjectWorker.catalogReport(root: root, target: target, discoveryPolicy: discoveryPolicy,
             cancellation: cancellation)
-        let visible = catalog.entries.filter {
-            $0.sourcePath == nil ? includesUnsupportedNames : scope.admitsRawPath($0.rawPath)
-        }
+        let visible = scope.matchingFiles(catalog.entries, path: \.rawPath)
         guard !cancellation.isCanceled else { throw AtlasProjectIOError.canceled }
         guard let reconciled = AtlasRefreshLayout.reconcile(previous: previous, observed: visible,
             complete: catalog.discoveryComplete, retainingPreviousMembership: retainingPreviousMembership,
@@ -2023,7 +2021,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                             selectedPath: selectedPath,
                             contentBounds: contentBounds,
                             onSelect: { entry in
-                                openAtlasEntry(entry, layout: acceptedLayout)
+                                _ = openAtlasEntry(entry, layout: acceptedLayout)
                             },
                             onViewport: updateAtlasViewport,
                             residencySummary: hasRetainedAtlas
@@ -2078,11 +2076,16 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         }
     }
 
-    private func openAtlasEntry(_ entry: AtlasProjectCatalog.Entry, layout: UUID) {
+    @discardableResult private func openAtlasEntry(_ entry: AtlasProjectCatalog.Entry, layout: UUID) -> Bool {
         guard layout == atlasRevision, hasMetadataAtlas, !atlasLayoutPending,
-              let member = atlasResidency.file(rawPath: entry.rawPath, revision: layout), member.id == entry.id,
-              member.sourcePath.map({ fileScope.includes($0, custom: customExtensions) }) ?? (fileScope == .all),
-              let route = member.readerRoute(captureLimit: AtlasReaderLimits.captureBytes) else { return }
+              let member = atlasResidency.file(rawPath: entry.rawPath, revision: layout), member.id == entry.id else { return false }
+        return openCatalogEntry(member)
+    }
+
+    @discardableResult private func openCatalogEntry(_ member: AtlasProjectCatalog.Entry) -> Bool {
+        guard let scope = try? fileScope.searchScope(custom: customExtensions),
+              scope.admitsRawPath(member.rawPath),
+              let route = member.readerRoute(captureLimit: AtlasReaderLimits.captureBytes) else { return false }
         switch route {
         case .retained(let path):
             selectedHit = nil; openFile(path); showsReader = true
@@ -2090,17 +2093,18 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             guard let authority = snapshotExportSource,
                   projectBrowser.rootAccessIdentity == authority.access.map(ObjectIdentifier.init) else {
                 status = "Choose the project folder again to read this file in bounded ranges."
-                return
+                return false
             }
             guard let input = try? AtlasObservedReaderInput(root: authority.root, relativePath: member.rawPath) else {
                 status = "This project path exceeds the range reader’s path limits."
-                return
+                return false
             }
             let source = AtlasObservedReaderSource(input: input, project: authority.identity.project, access: authority.access)
             closeObservedReader()
             selectedHit = nil
             observedReader = AtlasObservedReaderPresentation(source: source, transport: .native)
         }
+        return true
     }
 
     private func catalogView(_ catalog: AtlasProjectCatalog) -> some View {
@@ -2118,10 +2122,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     private var progressiveProjectView: some View {
         let browser = projectBrowser, project = loadGeneration, rangeAuthority = snapshotExportSource
         let browserOwner = browser.info?.owner, browsedDirectory = browser.directory
-        let visible = projectBrowser.page?.files.filter { file in
-            String(bytes: file.rawPath, encoding: .utf8).map { fileScope.includes($0, custom: customExtensions) }
-                ?? (fileScope == .all)
-        } ?? []
+        let scope = try? fileScope.searchScope(custom: customExtensions)
+        let visible = scope?.matchingFiles(projectBrowser.page?.files ?? [], path: \.rawPath) ?? []
         return AtlasProjectBrowserView(model: projectBrowser, entries: visible,
             scopeLabel: fileScope == .custom ? customExtensions : fileScope.rawValue,
             preparing: projectOpening.isPreparing, canPrepare: projectOpening.canPrepare,
@@ -2203,18 +2205,16 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     }
 
     private func openCatalogFile(_ id: UInt64, project: UUID, catalogRevision: UUID) {
-        guard !loadingProject, let entry = projectOpening.file(id, in: project, catalogRevision: catalogRevision),
-              let path = entry.sourcePath, fileScope.includes(path, custom: customExtensions) else { return }
+        guard !loadingProject, let entry = projectOpening.file(id, in: project, catalogRevision: catalogRevision) else { return }
 #if FCB_APP_STORE
         guard rootAccess?.url.path.utf8.elementsEqual(root.utf8) == true else { return }
 #endif
-        selectedHit = nil; openFile(path); showsReader = true
+        openCatalogEntry(entry)
     }
 
     private func updateCatalogFilter() {
-        catalogEntries = projectOpening.catalog?.entries.filter { entry in
-            entry.sourcePath.map { fileScope.includes($0, custom: customExtensions) } ?? (fileScope == .all)
-        } ?? []
+        let scope = try? fileScope.searchScope(custom: customExtensions)
+        catalogEntries = scope?.matchingFiles(projectOpening.catalog?.entries ?? [], path: \.rawPath) ?? []
     }
 
     private var inspector: some View {
@@ -2613,7 +2613,6 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             status = "Choose a valid file scope before refreshing the atlas."
             return false
         }
-        let includesUnsupportedNames = fileScope == .all
         let previousEntries = atlasEntries, previousBounds = contentBounds, refreshAtlas = hasMetadataAtlas
         var stagedAtlas: AtlasPreparedProjectRefresh?
         let accessLease: AnyObject?
@@ -2637,7 +2636,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                         discoveryPolicy: requestedDiscoveryPolicy,
                         previous: previousEntries, previousBounds: previousBounds,
                         retainingPreviousMembership: retainingPreviousMembership, scope: scope,
-                        includesUnsupportedNames: includesUnsupportedNames, cancellation: cancellation)
+                        cancellation: cancellation)
                 }
             },
             accepted: { candidate in
@@ -2696,7 +2695,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                   atlas.catalog.requestedTarget == atlasCatalogTarget,
                   atlas.catalog.matchesDiscoveryPolicy(candidate.browser.discoveryPolicy.wireName),
                   replacementOpening.acceptPreparedAtlas(atlas.catalog, in: candidate.project,
-                    hasOpenableFiles: !atlas.files.isEmpty),
+                    hasOpenableFiles: atlas.catalog.openableCount > 0),
                   atlasResidency.install(atlas.layout, accessLease: accessLease,
                     sourceCacheHandle: projectCache?.sourceHandle ?? 0, cacheLease: projectCache) else { return false }
         }
@@ -3190,15 +3189,14 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             catalogTarget: catalog.requestedTarget, fileScope: requestedScope,
             customExtensions: requestedExtensions)), destination.catalogTarget == catalog.requestedTarget else { return false }
         let scopeLabel = requestedScope == .custom ? requestedExtensions : requestedScope.rawValue
-        let entries = catalog.entries.filter { entry in
-            entry.sourcePath.map { requestedScope.includes($0, custom: requestedExtensions) } ?? (requestedScope == .all)
-        }
+        guard let predicate = try? requestedScope.searchScope(custom: requestedExtensions) else { return false }
         let revision = UUID()
         let prepared: (entries: [AtlasProjectCatalog.Entry], layout: AtlasViewportLayout)
         do {
             prepared = try await atlasLayoutIO.perform(cancellation: cancellation,
                 keepingAlive: accessLease.map { [$0] } ?? []) {
                 guard !cancellation.isCanceled else { throw AtlasProjectIOError.canceled }
+                let entries = predicate.matchingFiles(catalog.entries, path: \.rawPath)
                 guard let placed = AtlasParcelLayout.compact(entries) else { throw AtlasProjectIOError.invalidResponse }
                 guard !cancellation.isCanceled else { throw AtlasProjectIOError.canceled }
                 guard let layout = AtlasViewportLayout.prepare(root: requestedRoot, entries: placed, revision: revision) else {

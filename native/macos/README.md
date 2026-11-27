@@ -198,9 +198,10 @@ project discovery is needed to browse this list.
 A replacement layout resets the page and focus. Source-preview replacement
 keeps them while disabling file actions until the matching atlas content has
 been displayed. Actions retain the original file ID and path bytes, so a stale
-row or escaped display label cannot select a replacement file. Non-UTF-8 names
-remain visible and can be revealed; this atlas reader still requires a UTF-8
-filename to open source.
+row or escaped display label cannot select a replacement file. Files with non-UTF-8 names can be revealed and read using their original
+path bytes. The bounded range reader also handles files beyond the complete
+capture limit. Project Files and the atlas apply file-type filters to the raw
+filename, including ASCII extensions such as `.rs` under a non-UTF-8 folder.
 
 This supplies a conventional native list for keyboard and screen-reader use.
 The catalog regression harness covers bounded pages, focus, replacement
@@ -235,8 +236,9 @@ claim that every project file has been discovered.
 
 Camera changes and projection switches are direct, including reduced-motion
 use. City keeps reading frontal instead of putting text on oblique faces.
-Filenames unsupported by the ordinary UTF-8 opener remain available through
-**Project Files** or **Quick Open**. Workspace, directory, file and saved-capture
+Clicking a building or using **Read previous/next file** opens files with
+non-UTF-8 names and oversized files in the bounded range reader. Keyboard
+navigation resumes at that building after an admitted open. Workspace, directory, file and saved-capture
 search remain available; choosing a new visible-file search scope requires 2D.
 
 The Rust scene owns the checked camera matrix and CPU hierarchical picking.

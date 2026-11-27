@@ -241,8 +241,9 @@ import Foundation
             for paths: [String] in [[], ["ff2e7273"]] {
                 let next = opening.begin()
                 opening.acceptCatalog(try catalog(paths: paths), for: next)
-                check(opening.canBrowse && !opening.canPrepare && opening.beginPreviews() == nil,
-                      "Empty or entirely unsupported catalog is informative without useless preview work")
+                check(opening.canBrowse && opening.canPrepare == !paths.isEmpty,
+                      "A raw-only project admits a metadata atlas; an empty project has no parcels")
+                check((opening.beginPreviews() != nil) == !paths.isEmpty, "Initial atlas preparation follows real readable membership")
             }
         }
         do {

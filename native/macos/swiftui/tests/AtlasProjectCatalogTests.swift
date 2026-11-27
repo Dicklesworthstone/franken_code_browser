@@ -233,9 +233,9 @@ import Foundation
         let unknown = try decode(wire([], complete: false))
         check(!unknown.discoveryComplete && unknown.summary.contains("Partial catalog"), "Unknown membership is not empty success")
         let raw = try decode(wire([file("1"), file("2", hex: "ff2e7273")]))
-        check(raw.entries.count == 2 && raw.openableCount == 1, "Non-UTF-8 row is preserved without blocking other files")
+        check(raw.entries.count == 2 && raw.openableCount == 2, "Both retained and observed-range files are openable")
         check(raw.entries[1].sourcePath == nil && raw.entries[1].rawPath == [255, 46, 114, 115], "Never synthesize UTF-8 from raw filename")
-        check(raw.summary.contains("1 filenames cannot be opened"), "Native opener limitation is visible")
+        check(raw.entries[1].readerRoute(captureLimit: .max) == .observed, "Non-UTF-8 member routes to the byte-path reader")
         let unicode = try decode(wire([file("1", hex: "c3a92e7273"), file("2", hex: "65cc812e7273")]))
         check(unicode.entries.count == 2 && unicode.entries[0].rawPath != unicode.entries[1].rawPath,
               "Canonical-equivalent Unicode filenames remain distinct")
