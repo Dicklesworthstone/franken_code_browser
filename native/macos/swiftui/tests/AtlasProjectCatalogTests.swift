@@ -172,6 +172,24 @@ import Foundation
               && navigation.entry(for: rows[2].id, expected: frame, action: .read)?.rawPath == special[2].rawPath
               && special[2].readerRoute(captureLimit: .max) == .observed,
               "Non-UTF-8 rows open the range reader using their exact path bytes")
+        let raw: [UInt8] = [0xff, 47, 0xfe, 46, 114, 115]
+        let nested = member(8, path: raw)
+        check(nested.focusTarget(.file)?.file?.rawPath == raw
+              && nested.focusTarget(.folder)?.directory.rawPath == [0xff],
+              "File and enclosing-folder focus preserve original bytes despite an unrelated display label")
+        let rootFile = navigation.entry(for: rows[2].id, expected: frame, action: .reveal)
+        check(rootFile?.focusTarget(.folder) == .project && rootFile?.focusTarget(.file)?.file?.rawPath == special[2].rawPath,
+              "A presented root file can open either its exact atlas or the project overview")
+        check(navigation.entry(for: rows[2].id, expected: wrongContent, action: .reveal)?.focusTarget(.file) == nil,
+              "Old content cannot lend a parcel to a newly focused atlas")
+        let tooLong = member(9, path: [UInt8](repeating: 97, count: AtlasFileFocus.maximumPathBytes + 1))
+        check(tooLong.focusTarget(.file) == nil && tooLong.focusTarget(.folder) == .project,
+              "A bounded containing folder can still be opened for a file beyond exact-file admission")
+        check(special[4].focusTarget(.file) == nil && special[4].focusTarget(.folder) == nil,
+              "A traversal component cannot be promoted into an atlas scope")
+        let deep = member(10, path: Array((String(repeating: "d/", count: AtlasFileFocus.maximumComponents) + "x").utf8))
+        check(deep.focusTarget(.file) == nil && deep.focusTarget(.folder) == nil,
+              "Scope promotion respects the focused catalog's path depth")
         let small = special[0]
         check(small.readerRoute(captureLimit: small.observedBytes) == .retained("é.rs"),
               "A UTF-8 path at the capture limit keeps the ordinary reader")

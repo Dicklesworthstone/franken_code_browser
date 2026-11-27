@@ -39,6 +39,13 @@ final class AtlasPresentedFrame {
         self.scale = scale; self.offset = offset
     }
 
+    /// Use the displayed pose for the limit test and hit, even when the camera
+    /// has already requested a different scale or layout for its next frame.
+    func zoomLimitPoint(at point: CGPoint, by factor: Double, revision: UUID, contentRevision: UUID) -> CGPoint? {
+        guard factor.isFinite, factor > 1, scale >= AtlasCamera.maximumScale * (1 - 0.000001) else { return nil }
+        return worldPoint(at: point, revision: revision, contentRevision: contentRevision)
+    }
+
     func worldPoint(at point: CGPoint, revision: UUID, contentRevision: UUID? = nil) -> CGPoint? {
         guard self.revision == revision, self.contentRevision == contentRevision,
               point.x.isFinite, point.y.isFinite else { return nil }
@@ -50,6 +57,16 @@ final class AtlasPresentedFrame {
 /// Screen-space interaction state. Native momentum is applied directly; only
 /// pointer drags generate our own glide. No I/O or content work belongs here.
 @Observable final class AtlasCamera {
+    static let maximumScale = 4096.0
+
+    /// Repack a file if even its shorter side at the camera ceiling would
+    /// span less than one 16-point text row.
+    static func needsFileFocus(_ bounds: CGRect) -> Bool {
+        guard !bounds.isNull, !bounds.isInfinite, bounds.size.width.isFinite, bounds.size.height.isFinite,
+              bounds.size.width > 0, bounds.size.height > 0 else { return false }
+        return min(bounds.size.width, bounds.size.height) < 16 / maximumScale
+    }
+
     /// World centers survive viewport resizing; pixel offsets do not. These
     /// positions belong only to the bound atlas layout, never to source bytes.
     private struct Location: Equatable {
@@ -187,7 +204,7 @@ final class AtlasPresentedFrame {
             let fitScale = min(viewport.width / bounds.width, viewport.height / bounds.height)
             let requestedScale = fitScale * anchor.zoomFactor
             guard fitScale.isFinite, fitScale > 0, requestedScale.isFinite, requestedScale > 0 else { return false }
-            let restoredScale = max(minimumScale(viewport: viewport), min(4096, requestedScale))
+            let restoredScale = max(minimumScale(viewport: viewport), min(Self.maximumScale, requestedScale))
             if fillsViewport {
                 guard Self.validPresentationBounds(contentBounds) else { return false }
                 let halfWidth = viewport.width / (2 * restoredScale), halfHeight = viewport.height / (2 * restoredScale)
@@ -367,7 +384,7 @@ final class AtlasPresentedFrame {
               bounds.width > 0, bounds.height > 0,
               viewport.width.isFinite, viewport.height.isFinite,
               viewport.width > 1, viewport.height > 1 else { return false }
-        let fittedScale = max(minimumScale(viewport: viewport), min(4096,
+        let fittedScale = max(minimumScale(viewport: viewport), min(Self.maximumScale,
             min(viewport.width / bounds.width, viewport.height / bounds.height) * 0.88))
         var destination = CGPoint(x: bounds.midX, y: bounds.midY)
         if fillsViewport {
@@ -473,7 +490,7 @@ final class AtlasPresentedFrame {
         panVelocity = .zero
         anchorScreen = point
         anchorWorld = worldPoint(at: point)
-        targetScale = max(minimumScale, min(4096, targetScale * factor))
+        targetScale = max(minimumScale, min(Self.maximumScale, targetScale * factor))
         if immediate || reducedMotion {
             scale = targetScale
             offsetX = point.x - anchorWorld.x * scale

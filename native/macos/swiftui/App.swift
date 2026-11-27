@@ -2023,6 +2023,9 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                             onSelect: { entry in
                                 _ = openAtlasEntry(entry, layout: acceptedLayout)
                             },
+                            canFocusParcel: canChangeAtlasDirectory && !hasRetainedAtlas,
+                            inFileAtlas: atlasCatalogTarget.file != nil,
+                            onFocusParcel: focusDisplayedParcel,
                             onViewport: updateAtlasViewport,
                             residencySummary: hasRetainedAtlas
                                 ? "Earlier source previews retained. Rebuild atlas to load refreshed previews."
@@ -2104,6 +2107,20 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             selectedHit = nil
             observedReader = AtlasObservedReaderPresentation(source: source, transport: .native)
         }
+        return true
+    }
+
+    private func focusDisplayedParcel(_ entry: AtlasProjectCatalog.Entry, _ kind: AtlasParcelFocus,
+        _ frame: AtlasCatalogNavigation.Frame) -> Bool {
+        guard canChangeAtlasDirectory, hasMetadataAtlas, !hasRetainedAtlas, !showsCity,
+              frame.layout == atlasRevision, frame.content == atlasResidency.contentRevision,
+              let member = atlasResidency.file(rawPath: entry.rawPath, revision: frame.layout),
+              member.id == entry.id, let target = member.focusTarget(kind),
+              let anchor = AtlasParcelCameraAnchor(relativeX: 0.5, relativeY: 0.5, zoomFactor: 0.88),
+              let destination = try? AtlasFolderDestination(catalogTarget: target, fileScope: fileScope,
+                  customExtensions: customExtensions, anchorRawPath: member.rawPath, cameraAnchor: anchor) else { return false }
+        let move = atlasFolderNavigation.visit(destination, from: currentAtlasDestination())
+        requestAtlasDestination(destination, project: loadGeneration, move: move, requiresAnchor: true)
         return true
     }
 
@@ -3074,7 +3091,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     /// History and landmarks use the same transaction as explicit folder focus.
     /// The proposed origin is recorded only when the destination is published.
     private func requestAtlasDestination(_ destination: AtlasFolderDestination, project: UUID,
-        move: AtlasFolderNavigation.Move, readerSource: AtlasReaderAtlasNavigation? = nil) {
+        move: AtlasFolderNavigation.Move, readerSource: AtlasReaderAtlasNavigation? = nil, requiresAnchor: Bool = false) {
         guard project == loadGeneration, canChangeAtlasDirectory,
               atlasFolderNavigation.accepts(move),
               readerSource?.isCurrent(workspaceReaderAtlasNavigation) != false else { return }
@@ -3085,6 +3102,10 @@ private struct AtlasPreparedProjectRefresh: Sendable {
            atlasFolderNavigation.current?.matchesScope(fileScope: destination.fileScope,
                 customExtensions: destination.customExtensions) == true {
             let resolved = resolvedAtlasDestination(destination, entries: atlasEntries)
+            guard !requiresAnchor || resolved.anchorRawPath != nil else {
+                status = "The selected file is no longer in this atlas."
+                return
+            }
             var acceptedNavigation = atlasFolderNavigation
             guard acceptedNavigation.commit(move, resolved: resolved), restoreAtlasPresentation(resolved) else { return }
             atlasFolderNavigation = acceptedNavigation
@@ -3150,7 +3171,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 let installed = await installAtlasScope(root: requestedRoot, project: project, request: request,
                     cancellation: cancellation, accessLease: accessLease,
                     preservingCaptures: target == previousTarget,
-                    replacementCatalog: catalog, folderMove: move, readerSource: readerSource)
+                    replacementCatalog: catalog, folderMove: move, readerSource: readerSource, requiresAnchor: requiresAnchor)
                 guard installed, atlasLayoutRequest == request,
                       readerSource?.isCurrent(workspaceReaderAtlasNavigation) != false else { return }
                 // Keep Project Files mounted: a reader may have opened while
@@ -3174,7 +3195,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         cancellation: AtlasSearchCancellation, accessLease: AnyObject?, preservingCaptures: Bool,
         replacementCatalog: AtlasProjectCatalog? = nil,
         folderMove: AtlasFolderNavigation.Move? = nil,
-        readerSource: AtlasReaderAtlasNavigation? = nil) async -> Bool {
+        readerSource: AtlasReaderAtlasNavigation? = nil, requiresAnchor: Bool = false) async -> Bool {
         let browser = projectBrowser, requestedDiscoveryPolicy = browser.discoveryPolicy
         let previousTarget = atlasCatalogTarget, previousCatalogRevision = projectOpening.catalogRevision
         guard let catalog = replacementCatalog ?? projectOpening.catalog,
@@ -3234,6 +3255,10 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         }
         let compacted = prepared.entries
         let resolvedDestination = resolvedAtlasDestination(destination, entries: compacted)
+        guard !requiresAnchor || resolvedDestination.anchorRawPath != nil else {
+            status = "The selected file is missing from the new atlas. The current view is still open."
+            return false
+        }
         var acceptedNavigation = atlasFolderNavigation
         if let folderMove {
             guard acceptedNavigation.commit(folderMove, resolved: resolvedDestination) else { return false }
@@ -4136,6 +4161,9 @@ struct AtlasCanvas: View {
     let selectedPath: String?
     let contentBounds: CGRect
     let onSelect: (AtlasProjectCatalog.Entry) -> Void
+    let canFocusParcel: Bool
+    let inFileAtlas: Bool
+    let onFocusParcel: (AtlasProjectCatalog.Entry, AtlasParcelFocus, AtlasCatalogNavigation.Frame) -> Bool
     let onViewport: (CGRect, Double) -> Void
     let residencySummary: String
     let retryPreviews: () -> Void
@@ -4194,6 +4222,8 @@ struct AtlasCanvas: View {
                 SpatialTapGesture(count: 2)
                     .onEnded { value in
                         guard active, camera.acceptsNavigation(revision: revision) else { return }
+                        guard !NSEvent.modifierFlags.contains(.option),
+                              !focusBeyondCameraLimit(by: 2.2, at: value.location) else { return }
                         camera.steerZoom(by: 2.2, at: value.location)
                     }
             )
@@ -4206,16 +4236,24 @@ struct AtlasCanvas: View {
                               let file = residency.file(at: point, revision: revision) else {
                             return
                         }
-                        onSelect(file)
+                        let modifiers = NSEvent.modifierFlags
+                        if modifiers.contains(.option) {
+                            if canFocusParcel {
+                                _ = onFocusParcel(file, modifiers.contains(.shift) ? .folder : .file, navigationFrame)
+                            }
+                        } else { onSelect(file) }
                     }
             )
             .overlay {
                 if active {
                 AtlasInputOverlay(onZoom: { factor, point, immediate in
                     guard camera.acceptsNavigation(revision: revision) else { return }
+                    guard !focusBeyondCameraLimit(by: factor, at: point) else { return }
                     camera.steerZoom(by: factor, at: point, immediate: immediate)
                 }, onWheel: { delta, point, precise in
                     guard camera.acceptsNavigation(revision: revision) else { return }
+                    guard !focusBeyondCameraLimit(by: AtlasCamera.wheelZoomFactor(delta: delta, precise: precise),
+                        at: point) else { return }
                     camera.steerWheelZoom(delta: delta, precise: precise, at: point)
                 })
                 }
@@ -4352,6 +4390,7 @@ struct AtlasCanvas: View {
             let rows = fileNavigation.rows
             let ready = fileNavigationReady(frame)
             let focused = fileNavigation.focusedRow
+            let entry = focused.flatMap { fileNavigation.entry(for: $0.id, expected: frame, action: .reveal) }
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     Text("Atlas files").font(.headline)
@@ -4437,6 +4476,14 @@ struct AtlasCanvas: View {
                     Button("Read source") {
                         if let focused { readNavigationFile(focused.id, expected: frame) }
                     }.disabled(!ready || focused?.canRead != true)
+                    Menu("Focus") {
+                        Button("File in its own atlas") {
+                            if let focused { focusNavigationFile(focused.id, kind: .file, expected: frame) }
+                        }.disabled(entry?.focusTarget(.file) == nil)
+                        Button("Containing folder") {
+                            if let focused { focusNavigationFile(focused.id, kind: .folder, expected: frame) }
+                        }.disabled(entry?.focusTarget(.folder) == nil)
+                    }.disabled(!ready || !canFocusParcel || focused?.canReveal != true)
                 }
             }
             .controlSize(.small)
@@ -4478,9 +4525,28 @@ struct AtlasCanvas: View {
         guard fileNavigationReady(expected),
               let entry = fileNavigation.entry(for: identity, expected: expected, action: .reveal) else { return }
         let parcel = CGRect(x: entry.x, y: entry.y, width: entry.width, height: entry.height)
+        if !inFileAtlas, canFocusParcel, AtlasCamera.needsFileFocus(parcel), onFocusParcel(entry, .file, expected) { return }
         guard camera.navigateFocus(bounds: parcel, viewport: viewport, revision: revision) else { return }
         fileNavigation.focus(identity, expected: expected)
     }
+    private func focusNavigationFile(_ identity: AtlasCatalogNavigation.Identity, kind: AtlasParcelFocus,
+                                     expected: AtlasCatalogNavigation.Frame) {
+        guard canFocusParcel, fileNavigationReady(expected),
+              let entry = fileNavigation.entry(for: identity, expected: expected, action: .reveal) else { return }
+        _ = onFocusParcel(entry, kind, expected)
+    }
+
+    private func focusBeyondCameraLimit(by factor: Double, at point: CGPoint) -> Bool {
+        guard !inFileAtlas, canFocusParcel,
+              let world = presentedFrame.zoomLimitPoint(at: point, by: factor, revision: revision,
+                  contentRevision: contentRevision),
+              let entry = residency.file(at: world, revision: revision),
+              AtlasCamera.needsFileFocus(CGRect(x: entry.x, y: entry.y, width: entry.width, height: entry.height)) else {
+            return false
+        }
+        return onFocusParcel(entry, .file, navigationFrame)
+    }
+
     private func readNavigationFile(_ identity: AtlasCatalogNavigation.Identity,
                                     expected: AtlasCatalogNavigation.Frame) {
         guard fileNavigationReady(expected),

@@ -103,6 +103,8 @@ enum AtlasCatalogTarget: Hashable, Sendable {
     }
 }
 
+enum AtlasParcelFocus { case file, folder }
+
 /// First-use metadata from the shared Rust catalog. Source payload, syntax,
 /// line counts and text previews are deliberately absent from this protocol.
 struct AtlasProjectCatalog: Sendable {
@@ -114,6 +116,20 @@ struct AtlasProjectCatalog: Sendable {
         let sourcePath: String?
         let observedBytes: UInt64
         let x, y, width, height: Double
+
+        /// A file and its folder have independent path limits. Both must be
+        /// resolved from the admitted raw identity, including non-UTF-8 bytes.
+        func focusTarget(_ focus: AtlasParcelFocus) -> AtlasCatalogTarget? {
+            switch focus {
+            case .file:
+                guard let file = try? AtlasFileFocus(rawPath: rawPath) else { return nil }
+                return .file(file)
+            case .folder:
+                guard let directory = try? AtlasDirectoryFocus.containingFile(rawPath: rawPath),
+                      directory.rawPath.split(separator: 47).count < AtlasFileFocus.maximumComponents else { return nil }
+                return .directory(directory)
+            }
+        }
 
         enum ReaderRoute: Equatable { case retained(String), observed }
 

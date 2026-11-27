@@ -125,7 +125,26 @@ import CoreGraphics
         precondition(AtlasParcelCameraAnchor(relativeX: 0, relativeY: 0, zoomFactor: 1_000_001) == nil)
     }
 
+    static func fileFocusAtZoomLimit() {
+        let span = 16 / AtlasCamera.maximumScale
+        precondition(AtlasCamera.needsFileFocus(CGRect(x: 2, y: 3, width: span / 2, height: 4)))
+        precondition(AtlasCamera.needsFileFocus(CGRect(x: 2, y: 3, width: 4, height: span / 2)))
+        precondition(!AtlasCamera.needsFileFocus(CGRect(x: 2, y: 3, width: span, height: span)))
+        precondition(!AtlasCamera.needsFileFocus(.zero) && !AtlasCamera.needsFileFocus(.infinite))
+        let frame = AtlasPresentedFrame(), layout = UUID(), content = UUID(), point = CGPoint(x: 12, y: 8)
+        func hit(_ factor: Double) -> CGPoint? {
+            frame.zoomLimitPoint(at: point, by: factor, revision: layout, contentRevision: content)
+        }
+        frame.record(revision: layout, scale: AtlasCamera.maximumScale / 2, offset: .zero, contentRevision: content)
+        precondition(hit(2) == nil, "A projected next scale cannot promote the parcel under an earlier frame")
+        frame.record(revision: layout, scale: AtlasCamera.maximumScale, offset: point, contentRevision: content)
+        precondition(hit(1.01) == .zero && hit(1) == nil && hit(0.5) == nil && hit(.nan) == nil)
+        precondition(frame.zoomLimitPoint(at: point, by: 2, revision: layout, contentRevision: UUID()) == nil)
+        precondition(frame.zoomLimitPoint(at: point, by: 2, revision: UUID(), contentRevision: content) == nil)
+    }
+
     static func main() {
+        fileFocusAtZoomLimit()
         semanticFolderPlaces()
         let receipt = AtlasPresentedFrame()
         let revision = UUID(), replacement = UUID()

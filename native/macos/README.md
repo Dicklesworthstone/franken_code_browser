@@ -177,8 +177,8 @@ The production regression sources are in `AtlasFolderNavigationTests.swift`,
 `AtlasFolderPersistenceTests.swift` and `AtlasCameraTests.swift`, with
 `test_swiftui_folder_navigation.sh`, `test_swiftui_folder_persistence.sh` and
 `test_swiftui_camera.sh` entry points. Independent executable and physical-Mac
-verification remain pending. Automatic precision-triggered focus islands and
-complete multi-pane workspace restoration remain separate work.
+verification remain pending. Continuous precision rebasing across a hierarchy
+and complete multi-pane workspace restoration remain separate work.
 
 ## Browse the 2D atlas with the keyboard
 
@@ -188,6 +188,20 @@ list. Tab reaches the navigator and its buttons. Up and Down focus files;
 or Return opens it through the existing project reader. Escape or **Close**
 returns keyboard focus to the Atlas files button. Focusing a row by itself
 does not replace the source you are reading.
+
+In a live metadata atlas, select a row and choose **Focus → File in its own
+atlas** or **Focus → Containing folder** to repack that scope around the file.
+On the map, **Option-click** a parcel to focus its file or **Option-Shift-click**
+to focus its folder. Both preserve the file-type filter and use the displayed
+file's original path bytes. Use the folder navigation **Back** and **Forward**
+controls to move between these scopes and recover your map position.
+
+When a parcel's shorter side would still be under 16 points at the 4,096×
+camera ceiling, **Reveal in atlas** opens the single-file atlas directly.
+Continuing to zoom in over such a parcel at the displayed ceiling does the
+same. The existing map stays visible while the scoped catalog is prepared.
+If the file has disappeared from the new catalog, the map and history stay
+at the previous location.
 
 The navigator shows at most 32 rows at once. **Previous files** and **Next files**
 move through the known atlas catalog, and arrow navigation crosses page
