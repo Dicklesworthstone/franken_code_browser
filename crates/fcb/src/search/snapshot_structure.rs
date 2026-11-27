@@ -270,9 +270,11 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
         }
         #[cfg(not(feature = "markdown"))]
         if options.mode == StructureMode::Headings { return Err(StructureError::CapabilityUnavailable); }
-        let last = remaining.end.saturating_sub(1) as u64;
-        options.first_file.get().checked_add(last).ok_or(StructureError::IdentityExhausted)?;
-        options.first_revision.get().checked_add(last).ok_or(StructureError::IdentityExhausted)?;
+        if !remaining.is_empty() {
+            let last = (remaining.end - 1) as u64;
+            options.first_file.get().checked_add(last).ok_or(StructureError::IdentityExhausted)?;
+            options.first_revision.get().checked_add(last).ok_or(StructureError::IdentityExhausted)?;
+        }
         let metadata_limit = options.max_matches.checked_mul(MAX_STRUCTURE_NAME_BYTES * 2)
             .ok_or(StructureError::ResourceDenied)?.min(MAX_STRUCTURE_METADATA_BYTES);
         // Lowercase equality can match a wider source spelling (K versus K).

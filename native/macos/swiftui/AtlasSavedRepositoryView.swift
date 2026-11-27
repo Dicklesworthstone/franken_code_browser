@@ -832,11 +832,21 @@ private final class AtlasSavedTrailArchiveAccess {
     }
     private var structureSearchPane: some View {
         VStack(alignment: .leading, spacing: 10) {
+            Menu {
+                Button("Whole archive") { model.structureScope = .archive }
+                if let member = model.selectedMember {
+                    Button("Selected file") { model.structureScope = .member(member.path.bytes) }
+                    if let slash = member.path.bytes.lastIndex(of: 47) {
+                        Button("Selected file’s folder") { model.structureScope = .directory(Array(member.path.bytes[..<slash])) }
+                    }
+                }
+            } label: { Label(model.structureScope.label, systemImage: "scope").lineLimit(1) }
+                .disabled(!model.canOperate).accessibilityLabel("Search scope, " + model.structureScope.label)
             HStack {
                 TextField(model.searchMode == .headings ? "Heading title in captured Markdown" : "Name in captured source",
                     text: $model.searchInput)
                     .textFieldStyle(.roundedBorder).onSubmit { panelNotice = ""; model.search() }
-                    .accessibilityLabel("\(model.searchMode.label) search across the saved archive")
+                    .accessibilityLabel("\(model.searchMode.label) search in the selected saved scope")
                 Button { panelNotice = ""; model.search() } label: { Label("Search archive", systemImage: "magnifyingglass") }
                     .disabled(!model.canOperate || !model.validSearchInput)
                 Button("Clear") { panelNotice = ""; model.clearSearch() }
@@ -875,6 +885,7 @@ private final class AtlasSavedTrailArchiveAccess {
                             Spacer()
                             Button("Use accepted query") {
                                 model.searchMode = page.mode; model.searchNameMode = page.nameMode
+                                model.structureScope = page.policy.scope
                                 model.searchCaseSensitive = page.policy.caseSensitive
                                 model.countAllMatches = page.policy.countAllMatches
                                 model.searchInput = page.needle; panelNotice = ""
@@ -977,7 +988,8 @@ private final class AtlasSavedTrailArchiveAccess {
                 .font(.caption.weight(.semibold)).foregroundStyle(page.complete ? Color.secondary : Color.orange)
             Text("\(page.matchesSeenExact ? "" : "At least ")\(page.seen) matches · \(page.retained) retained")
                 .font(.caption)
-            Text("\(page.visited) / \(page.identity.members) members visited · \(page.searched) extracted")
+            Text(page.policy.scope.label).font(.caption).textSelection(.enabled)
+            Text("\(page.visited) / \(page.scopeMembers) members visited · \(page.searched) extracted")
                 .font(.caption)
             Text("Unavailable: \(page.unavailable) · Unsupported language or decoding: \(page.unsupported) · Source size limit: \(page.sourceLimited)")
                 .font(.caption).foregroundStyle(.secondary)

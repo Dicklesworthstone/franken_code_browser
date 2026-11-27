@@ -3,7 +3,7 @@
 //! Pointer conversion for saved declaration, heading and identifier searches.
 //! Extraction, archive verification and result ownership stay in the safe host.
 
-use fcb_app::host::saved_repository::structure::{StructureMode, SymbolNameMode};
+use fcb_app::host::saved_repository::structure::{StructureMode, StructureScope, SymbolNameMode};
 use super::{AccessError, Command, Selection, answer, c_char, cstr, number, reply};
 
 /// Synchronous worker search over verified members of the opened archive.
@@ -91,7 +91,29 @@ pub unsafe extern "C" fn fcb_saved_structure_search_matching(handle: u64, genera
 pub unsafe extern "C" fn fcb_saved_structure_search_matching_page(handle: u64, generation: u64,
     mode: u64, name_mode: u64, needle: *const c_char, case_sensitive: u64,
     count_all_matches: u64, max_hits: u64, max_source_bytes: u64, skip_matches: u64) -> *mut c_char {
+    unsafe { fcb_saved_structure_search_scoped_page(handle, generation, mode, name_mode, needle,
+        case_sensitive, count_all_matches, max_hits, max_source_bytes, skip_matches, 0, std::ptr::null(), 0) }
+}
+
+/// Search an immutable archive scope. Kinds 1 and 2 select directory
+/// descendants or an exact member by raw FCBS path. Kind 0 requires no path.
+/// # Safety
+/// needle is null or readable NUL-terminated UTF-8. A nonempty path is
+/// readable for path_bytes until return. Release responses with fcb_free_string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fcb_saved_structure_search_scoped_page(handle: u64, generation: u64,
+    mode: u64, name_mode: u64, needle: *const c_char, case_sensitive: u64,
+    count_all_matches: u64, max_hits: u64, max_source_bytes: u64, skip_matches: u64,
+    scope_kind: u64, path: *const u8, path_bytes: u64) -> *mut c_char {
     reply(|| answer(handle, |sessions| {
+        let scope = match scope_kind {
+            0 if path.is_null() && path_bytes == 0 => StructureScope::Archive,
+            1 | 2 if !path.is_null() && (1..=16_384).contains(&path_bytes) => {
+                let path = unsafe { std::slice::from_raw_parts(path, path_bytes as usize) };
+                if scope_kind == 1 { StructureScope::Directory(path) } else { StructureScope::Member(path) }
+            }
+            _ => return Err(AccessError::InvalidArgument),
+        };
         let mode = match mode {
             1 => StructureMode::Symbols,
             2 => StructureMode::Headings,
@@ -111,7 +133,7 @@ pub unsafe extern "C" fn fcb_saved_structure_search_matching_page(handle: u64, g
             0 => false, 1 => true, _ => return Err(AccessError::InvalidArgument),
         };
         let needle = unsafe { cstr(needle) }.ok_or(AccessError::InvalidArgument)?;
-        sessions.execute(handle, Command::StructureSearchMatching { generation, mode, name_mode,
+        sessions.execute(handle, Command::StructureSearchMatching { scope, generation, mode, name_mode,
             needle, max_hits: number(max_hits)?, max_source_bytes, skip_matches,
             case_sensitive, count_all_matches }, || false)
     }))

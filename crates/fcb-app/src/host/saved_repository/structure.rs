@@ -9,7 +9,7 @@ use std::mem::size_of;
 use fcb_core::ResourceLease;
 use fcb::{ArenaOwnerId, ByteLength, ByteRange, FileId, QueryGeneration, SourceRevision};
 pub use fcb::search::SymbolNameMode;
-pub use fcb::search::snapshot_structure::StructureMode;
+pub use fcb::search::snapshot_structure::{StructureMode, StructureScope};
 use fcb::search::snapshot_structure::{StructureError, StructureHit, StructureOptions,
     StructureQuery, StructureReport, StructureState};
 use super::{AppError, HostResponse, Output, PagedCapture, RawPath, ReaderSession,
@@ -24,6 +24,8 @@ const INITIAL_WINDOW_BYTES: usize = 16 * 1024;
 
 pub(super) struct AcceptedStructure {
     generation: u64,
+    scope_label: &'static str,
+    scope_path: Vec<u8>,
     report: StructureReport,
     max_hits: usize,
     max_source_bytes: u64,
@@ -35,28 +37,38 @@ impl AcceptedStructure {
     #[allow(clippy::too_many_arguments)]
     fn prepare(saved: &mut SavedRepositorySession, generation: u64, mode: StructureMode,
         name_mode: SymbolNameMode, needle: &str, max_hits: usize, max_source_bytes: u64, skip_matches: u64,
-        case_sensitive: bool, count_all_matches: bool, canceled: &mut impl FnMut() -> bool) -> Result<Self, SavedRepositoryError> {
+        case_sensitive: bool, count_all_matches: bool, scope: StructureScope<'_>, canceled: &mut impl FnMut() -> bool) -> Result<Self, SavedRepositoryError> {
         check(canceled)?;
         let owner = saved.owner();
         let qgen = QueryGeneration::new(owner, generation).map_err(|_| SavedRepositoryError::StaleQuery)?;
         let [object_id] = saved.allocations()?;
         let allocations = saved.allocations()?;
+        scope.validate()?;
+        let (scope_label, path) = match scope {
+            StructureScope::Archive => ("whole-saved-archive", &[][..]),
+            StructureScope::Directory(path) => ("saved-directory", path),
+            StructureScope::Member(path) => ("saved-member", path),
+        };
         let lease = saved.budget.try_reserve_managed(owner, object_id,
-            ByteLength::new(size_of::<Self>() as u64)).map_err(|_| AppError::Admission)?;
+            ByteLength::new((size_of::<Self>() + path.len()) as u64)).map_err(|_| AppError::Admission)?;
+        let mut scope_path = Vec::new();
+        scope_path.try_reserve_exact(path.len()).map_err(|_| AppError::Admission)?;
+        if scope_path.capacity() > path.len() { return Err(AppError::Admission.into()); }
+        scope_path.extend_from_slice(path);
         let first_file = FileId::new(owner, 1).map_err(|_| SavedRepositoryError::IdentityExhausted)?;
         let first_revision = SourceRevision::new(owner, 1).map_err(|_| SavedRepositoryError::IdentityExhausted)?;
         let before = saved.archive.load_stats();
-        let mut work = StructureQuery::new_matching_page(&mut saved.archive, needle, StructureOptions {
+        let mut work = StructureQuery::new_scoped_page(&mut saved.archive, needle, StructureOptions {
             generation: qgen, first_file, first_revision, mode, name_mode,
             max_matches: max_hits, max_source_bytes,
-        }, skip_matches, case_sensitive, count_all_matches, &saved.budget, allocations)?;
+        }, scope, skip_matches, case_sensitive, count_all_matches, &saved.budget, allocations)?;
         while work.state() == StructureState::Pending {
             work.step(qgen, &saved.budget, &mut *canceled)?;
         }
         let report = work.finish()?;
         let after = saved.archive.load_stats();
         check(canceled)?;
-        Ok(Self { generation, report, max_hits, max_source_bytes,
+        Ok(Self { generation, scope_label, scope_path, report, max_hits, max_source_bytes,
             member_bytes_read: after.bytes_read - before.bytes_read,
             member_read_calls: after.read_calls - before.read_calls, _lease: lease })
     }
@@ -93,6 +105,10 @@ impl AcceptedStructure {
         })?;
         out.literal(",\"case_sensitive\":")?; out.boolean(self.report.case_sensitive())?;
         out.literal(",\"count_all_matches\":")?; out.boolean(self.report.count_all_matches())?;
+        out.literal(",\"scope\":")?; out.quoted(self.scope_label)?;
+        out.literal(",\"scope_path_hex\":")?; out.hex(&self.scope_path)?;
+        out.literal(",\"scope_known_members\":")?; out.integer(self.report.selected_members() as u64)?;
+        out.literal(",\"scope_membership_complete\":")?; out.boolean(self.report.membership_complete())?;
         out.literal(",\"name_case\":")?;
         out.quoted(if self.report.case_sensitive() { "sensitive" } else { "unicode-lowercase" })?;
         Ok(())
@@ -108,7 +124,7 @@ impl AcceptedStructure {
         })?;
         out.literal(",\"realized_mode\":")?; out.quoted(mode.realized())?;
         out.literal(",\"evidence_level\":")?; out.quoted(mode.realized())?;
-        out.literal(",\"semantic_complete\":false,\"scope\":\"whole-saved-archive\",\"completeness_basis\":\"admitted-extraction-processing\",\"index_used\":false,\"index_policy\":\"direct-verified-member-extraction\"")?;
+        out.literal(",\"semantic_complete\":false,\"completeness_basis\":\"admitted-extraction-processing\",\"index_used\":false,\"index_policy\":\"direct-verified-member-extraction\"")?;
         if mode == StructureMode::Occurrences {
             out.literal(",\"includes_comments_and_literals\":true,\"compiler_resolved\":false,\"token_policy\":\"ascii-alphanumeric-underscore-dollar-plus-nonascii-nonwhitespace-noncontrol-v1\",\"name_syntax\":\"single-token-no-leading-ascii-digit\",\"unicode_normalization\":\"none\"")?;
         }
@@ -256,11 +272,20 @@ impl SavedRepositorySession {
     pub fn structure_search_matching_page(&mut self, generation: u64, mode: StructureMode,
         name_mode: SymbolNameMode, needle: &str, max_hits: usize, max_source_bytes: u64,
         case_sensitive: bool, count_all_matches: bool, skip_matches: u64,
+        canceled: impl FnMut() -> bool) -> Result<HostResponse, SavedRepositoryError> {
+        self.structure_search_scoped_page(generation, mode, name_mode, needle, max_hits, max_source_bytes,
+            case_sensitive, count_all_matches, skip_matches, StructureScope::Archive, canceled)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn structure_search_scoped_page(&mut self, generation: u64, mode: StructureMode,
+        name_mode: SymbolNameMode, needle: &str, max_hits: usize, max_source_bytes: u64,
+        case_sensitive: bool, count_all_matches: bool, skip_matches: u64, scope: StructureScope<'_>,
         mut canceled: impl FnMut() -> bool) -> Result<HostResponse, SavedRepositoryError> {
         query_attempt(&mut self.last_structure_attempt, generation)?;
         check(&mut canceled)?;
         let candidate = AcceptedStructure::prepare(self, generation, mode, name_mode, needle,
-            max_hits, max_source_bytes, skip_matches, case_sensitive, count_all_matches, &mut canceled)?;
+            max_hits, max_source_bytes, skip_matches, case_sensitive, count_all_matches, scope, &mut canceled)?;
         let response = candidate.page(self, generation, 0, 64, &mut canceled)?;
         self.structure = Some(candidate);
         Ok(response)

@@ -714,3 +714,18 @@ fn scoped_windows_freeze_archive_ordinals_before_limits_and_activation() {
         [allocation(80), allocation(81)], || false).unwrap();
     assert_eq!(capture.bytes(), b"needle");
 }
+
+#[test]
+fn empty_scope_after_last_file_requires_no_file_or_revision_ids() {
+    use fcb::search::snapshot_structure::StructureScope;
+    let budget = budget();
+    let mut saved = archive(&[entry(b"a", b"x"), entry(b"b", b"x")], true, &budget);
+    let mut opts = options(StructureMode::Occurrences, 1);
+    opts.first_file = FileId::new(owner(), u64::MAX).unwrap();
+    opts.first_revision = SourceRevision::new(owner(), u64::MAX).unwrap();
+    let mut query = StructureQuery::new_scoped_page(&mut saved, "x", opts, StructureScope::Directory(b"z"),
+        0, true, false, &budget, allocations()).unwrap();
+    assert_eq!(query.step(opts.generation, &budget, || false).unwrap(), StructureState::Complete);
+    let report = query.finish().unwrap();
+    assert!(report.is_complete()); assert_eq!(report.selected_members(), 0);
+}

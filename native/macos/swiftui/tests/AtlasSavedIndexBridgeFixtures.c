@@ -5,10 +5,10 @@
 
 /* Public-header-checked foreign boundary. These responses test Swift marshaling
  * and ownership; real archive/posting behavior is exercised in saved_sessions_tests. */
-static uint64_t calls[25];
+static uint64_t calls[26];
 static int result_mode;
 void fixture_saved_index_mode(int mode) { result_mode = mode; }
-uint64_t fixture_saved_index_count(uint64_t index) { assert(index < 25); return calls[index]; }
+uint64_t fixture_saved_index_count(uint64_t index) { assert(index < 26); return calls[index]; }
 static char *reply(void) {
     if (result_mode == 1) return NULL;
     if (result_mode == 2) { char *p = malloc(2); assert(p); p[0] = (char)0xff; p[1] = 0; return p; }
@@ -176,4 +176,15 @@ char *fcb_saved_structure_search_matching_page(uint64_t handle, uint64_t generat
     assert(count_all_matches == 1);
     assert(matches == 4096 && bytes == 67108864 && skipped == UINT64_C(9007199254740993));
     calls[23]++; return reply();
+}
+
+char *fcb_saved_structure_search_scoped_page(uint64_t handle, uint64_t generation, uint64_t mode,
+    uint64_t name_mode, const char *needle, uint64_t match_case, uint64_t count_all, uint64_t matches,
+    uint64_t bytes, uint64_t skip, uint64_t scope, const uint8_t *path, uint64_t length) {
+    assert(handle == UINT64_MAX - 10 && generation == UINT64_MAX - 9);
+    assert(mode == 4 && name_mode == 0 && strcmp(needle, "target") == 0);
+    assert(match_case == 0 && count_all == 1 && matches == 100 && bytes == 200);
+    assert(path && length == 2 && path[0] == 's' && path[1] == 0xff);
+    assert((scope == 2 && skip == 0) || (scope == 1 && skip == UINT64_MAX));
+    calls[25]++; return reply();
 }

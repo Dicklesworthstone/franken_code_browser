@@ -237,6 +237,14 @@ extension AtlasReaderTransport {
         }
         precondition(count(24) == 6 && count(23) == 10 && count(6) == 69,
             "lowercase occurrence response ownership leaked or double-freed")
+        mode(0)
+        precondition(transport.run(owner, .structureSearch(generation: generation, mode: .occurrences,
+            nameMode: .exact, query: "target", matches: 100, sourceBytes: 200,
+            policy: .init(caseSensitive: false, countAllMatches: true, scope: .member([115, 255])))) == "{}")
+        precondition(transport.run(owner, .structureWindow(generation: generation, mode: .occurrences,
+            nameMode: .exact, query: "target", matches: 100, sourceBytes: 200, skipMatches: UInt64.max,
+            policy: .init(caseSensitive: false, countAllMatches: true, scope: .directory([115, 255])))) == "{}")
+        precondition(count(25) == 2 && count(6) == 71)
         print("AtlasSavedIndexBridgeTests: public-header signatures, publication/import/path/matching/window requests, native bytes, full-width IDs and offsets, and buffer ownership passed")
     }
 }

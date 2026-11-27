@@ -177,6 +177,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
     var pathCaseSensitive = false
     var searchInput = ""
     var searchMode: AtlasSavedSearchMode = .literal
+    var structureScope: AtlasSavedStructureScope = .archive
     var searchNameMode: AtlasSearchNameMode = .contains
     var countAllMatches = true
     var searchCaseSensitive = true
@@ -281,7 +282,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
     }
 
     private var structurePolicy: AtlasSavedStructurePolicy {
-        .init(caseSensitive: searchCaseSensitive, countAllMatches: countAllMatches)
+        .init(caseSensitive: searchCaseSensitive, countAllMatches: countAllMatches, scope: structureScope)
     }
 
     var structureIsCurrent: Bool {
@@ -322,7 +323,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
                 guard !flag.isCanceled, !model.closed, model.pending === candidate else { throw AtlasSavedError.canceled }
                 model.session?.revokeDocumentImages()
                 model.session = candidate; model.pending = nil
-                model.info = opened; model.members = page; model.selectedMember = page.items.first
+                model.structureScope = .archive; model.info = opened; model.members = page; model.selectedMember = page.items.first
                 model.relationships = nil; model.relationshipGeneration = nil; model.direction = .all
                 model.imports = nil; model.importGeneration = nil; model.importDirection = .all; model.lastImportAttempt = 0
                 model.pathPage = nil; model.pathGeneration = nil; model.lastPathAttempt = 0; model.pathInput = ""
@@ -1647,7 +1648,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
                       page.sourceLimit == AtlasSavedSearchWire.maximumSourceBytes else { throw AtlasSavedError.invalidResponse }
                 guard model.session === lease, !model.closed else { throw AtlasSavedError.canceled }
                 model.structureGeneration = generation; model.structurePage = page
-                model.notice = page.complete ? "Finished extraction across the captured manifest. Results retain their stated evidence level."
+                model.notice = page.complete ? "Finished extraction in the selected saved scope. Results retain their stated evidence level."
                     : "Extraction coverage is partial. Inspect unsupported members, limits and omitted metadata."
             } catch {
                 let failure = Self.message(error)

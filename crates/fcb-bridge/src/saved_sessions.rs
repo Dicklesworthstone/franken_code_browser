@@ -14,7 +14,7 @@ use fcb_app::host::saved_repository::trail::{SavedTrailError, SavedTrailWriteReq
 use fcb_app::host::saved_repository::paths::SavedPathOptions;
 use fcb_app::host::saved_repository::index_build::SavedIndexBuildLimits;
 use fcb_app::host::saved_repository::desk::SavedDeskError;
-use fcb_app::host::saved_repository::structure::{StructureMode, SymbolNameMode};
+use fcb_app::host::saved_repository::structure::{StructureMode, StructureScope, SymbolNameMode};
 use fcb_core::{ArenaOwnerId, ByteLength, ResourceAllocationId, ResourceBudget, ResourceLease};
 use super::reader_sessions::{self, ReaderSessions};
 
@@ -101,7 +101,7 @@ pub(super) enum Command<'a> {
         needle: &'a str, max_hits: usize, max_source_bytes: u64 },
     StructureSearchPage { generation: u64, mode: StructureMode, name_mode: SymbolNameMode,
         needle: &'a str, max_hits: usize, max_source_bytes: u64, skip_matches: u64 },
-    StructureSearchMatching { generation: u64, mode: StructureMode, name_mode: SymbolNameMode,
+    StructureSearchMatching { scope: StructureScope<'a>, generation: u64, mode: StructureMode, name_mode: SymbolNameMode,
         needle: &'a str, max_hits: usize, max_source_bytes: u64, skip_matches: u64,
         case_sensitive: bool, count_all_matches: bool },
     StructureResults { generation: u64, start: usize, limit: usize },
@@ -231,10 +231,10 @@ impl SavedSessions {
                 max_hits, max_source_bytes, skip_matches } =>
                 session.structure_search_page(generation, mode, name_mode, needle, max_hits,
                     max_source_bytes, skip_matches, &mut stop).map_err(AccessError::from),
-            Command::StructureSearchMatching { generation, mode, name_mode, needle,
+            Command::StructureSearchMatching { scope, generation, mode, name_mode, needle,
                 max_hits, max_source_bytes, skip_matches, case_sensitive, count_all_matches } =>
-                session.structure_search_matching_page(generation, mode, name_mode, needle, max_hits,
-                    max_source_bytes, case_sensitive, count_all_matches, skip_matches, &mut stop)
+                session.structure_search_scoped_page(generation, mode, name_mode, needle, max_hits,
+                    max_source_bytes, case_sensitive, count_all_matches, skip_matches, scope, &mut stop)
                     .map_err(AccessError::from),
             Command::StructureResults { generation, start, limit } =>
                 session.structure_results(generation, start, limit, &mut stop).map_err(AccessError::from),

@@ -256,11 +256,12 @@ struct AtlasSavedReaderReceipt: Sendable {
                 try item.validate(mode: mode, needle: needle, caseSensitive: policy.caseSensitive)
                 struct Receipt: Decodable {
                     let case_sensitive, count_all_matches: Bool?
-                    let name_case: String?
+                    let name_case, scope, scope_path_hex: String?
                 }
                 let receipt = try JSONDecoder().decode(Receipt.self, from: data)
                 guard try AtlasSavedStructurePolicy.admit(caseSensitive: receipt.case_sensitive,
-                        countAll: receipt.count_all_matches, nameCase: receipt.name_case, mode: mode) == policy,
+                        countAll: receipt.count_all_matches, nameCase: receipt.name_case, mode: mode,
+                        scope: receipt.scope, pathHex: receipt.scope_path_hex) == policy, policy.scope.includes(hit.path.bytes),
                       generation > 0, AtlasSavedSearchWire.validNeedle(needle),
                       mode != .occurrences || nameMode == .exact,
                       object["selection_namespace"] as? String == "saved-structure",

@@ -553,6 +553,13 @@ char *fcb_saved_structure_search_matching_page(uint64_t handle, uint64_t generat
     uint64_t mode, uint64_t name_mode, const char *needle,
     uint64_t case_sensitive, uint64_t count_all_matches,
     uint64_t max_hits, uint64_t max_source_bytes, uint64_t skip_matches);
+/* Scope kind 0: NULL path and zero bytes. Kind 1: directory. Kind 2: exact
+ * member. A nonempty raw path is borrowed until return (up to 16384 bytes). */
+char *fcb_saved_structure_search_scoped_page(uint64_t handle, uint64_t generation,
+    uint64_t mode, uint64_t name_mode, const char *needle,
+    uint64_t case_sensitive, uint64_t count_all_matches,
+    uint64_t max_hits, uint64_t max_source_bytes, uint64_t skip_matches,
+    uint64_t scope_kind, const uint8_t *path, uint64_t path_bytes);
 char *fcb_saved_structure_results(uint64_t handle, uint64_t generation,
     uint64_t start, uint64_t limit);
 char *fcb_saved_clear_structure(uint64_t handle, uint64_t generation);

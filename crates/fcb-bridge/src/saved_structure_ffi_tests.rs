@@ -298,3 +298,30 @@ fn c_lowercase_occurrence_windows_preserve_original_utf16_and_independent_reader
         .contains("\"original_hex\":\"2a21\""));
     assert_eq!(crate::reader_ffi::fcb_reader_close(reader), 1);
 }
+
+#[test]
+fn c_scoped_structure_search_preserves_windows_and_reader_path_provenance() {
+    let _guard = crate::reader_ffi::FFI_TEST_LOCK.lock().unwrap();
+    let saved = archive(&[(b"b.rs", b"needle"), (b"src-extra.rs", b"needle"),
+        (b"src/\xff.rs", b"needle needle"), (b"src2/b.rs", b"needle")]);
+    let handle = fcb_saved_create();
+    assert!(take(unsafe { fcb_saved_open(handle, saved.as_ptr()) }).contains("\"status\":\"ok\""));
+    let needle = CString::new("needle").unwrap();
+    let run = |generation, scope, label: &[u8]| take(unsafe {
+        fcb_saved_structure_search_scoped_page(handle, generation, 4, 0, needle.as_ptr(), 1, 1,
+            1, 13, 1, scope, label.as_ptr(), label.len() as u64)
+    });
+    let folder = run(1, 1, b"src");
+    for field in ["\"scope\":\"saved-directory\"", "\"scope_path_hex\":\"737263\"",
+        "\"scope_known_members\":\"1\"", "\"matches_seen\":\"2\"", "\"skipped_matches\":\"1\"",
+        "\"members_visited\":\"1\"", "\"member\":\"2\""] { assert!(folder.contains(field), "{folder}"); }
+    let file = run(2, 2, b"src/\xff.rs");
+    assert!(file.contains("\"scope_path_hex\":\"7372632fff2e7273\""));
+    assert!(run(3, 1, b"../src").contains("\"status\":\"error\""));
+    let reader = crate::reader_ffi::fcb_reader_create();
+    let opened = take(fcb_saved_open_structure_hit_reader(handle, reader, 2, 1));
+    for field in ["\"scope\":\"saved-member\"", "\"scope_path_hex\":\"7372632fff2e7273\"",
+        "\"scope_membership_complete\":true", "\"member\":\"2\""] { assert!(opened.contains(field), "{opened}"); }
+    assert_eq!(fcb_saved_close(handle), 1);
+    assert_eq!(crate::reader_ffi::fcb_reader_close(reader), 1);
+}

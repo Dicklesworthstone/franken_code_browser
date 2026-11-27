@@ -38,13 +38,56 @@ enum AtlasSavedSearchWire {
     }
 }
 
+enum AtlasSavedStructureScope: Equatable, Sendable {
+    case archive, directory([UInt8]), member([UInt8])
+
+    var path: [UInt8] {
+        switch self { case .archive: return []; case .directory(let path), .member(let path): return path }
+    }
+    var code: UInt64 {
+        switch self { case .archive: return 0; case .directory: return 1; case .member: return 2 }
+    }
+    var label: String {
+        switch self {
+        case .archive: return "Whole archive"
+        case .directory, .member:
+            let name = path.map { byte in
+                (32...126).contains(byte) && byte != 92 ? String(UnicodeScalar(byte)) : String(format: "\\x%02X", byte)
+            }.joined()
+            return self.code == 1 ? "Folder: " + name : "File: " + name
+        }
+    }
+    func includes(_ candidate: [UInt8]) -> Bool {
+        switch self {
+        case .archive: return true
+        case .member(let path): return candidate == path
+        case .directory(let path): return candidate.count > path.count && candidate.starts(with: path) && candidate[path.count] == 47
+        }
+    }
+    static func admit(_ label: String?, pathHex: String?) throws -> Self {
+        if label == nil || label == "whole-saved-archive" {
+            guard pathHex == nil || pathHex == "" else { throw AtlasSavedError.invalidResponse }
+            return .archive
+        }
+        guard let pathHex, !pathHex.isEmpty, pathHex.utf8.count <= 4096 else { throw AtlasSavedError.invalidResponse }
+        let path = try AtlasReaderWire.pathBytes(pathHex)
+        guard !path.contains(0), !path.split(separator: 47, omittingEmptySubsequences: false).contains(where: {
+            $0.isEmpty || $0.elementsEqual([46]) || $0.elementsEqual([46, 46])
+        }) else { throw AtlasSavedError.invalidResponse }
+        switch label { case "saved-directory": return .directory(path); case "saved-member": return .member(path)
+        default: throw AtlasSavedError.invalidResponse }
+    }
+}
+
 struct AtlasSavedStructurePolicy: Equatable, Sendable {
     let caseSensitive, countAllMatches: Bool
+    var scope: AtlasSavedStructureScope = .archive
     static let standard = Self(caseSensitive: true, countAllMatches: false)
 
     /// Older pages carry only name_case; older reader receipts omit it.
-    static func admit(caseSensitive: Bool?, countAll: Bool?, nameCase: String?, mode: AtlasSavedSearchMode) throws -> Self {
-        let policy = Self(caseSensitive: caseSensitive ?? true, countAllMatches: countAll ?? false)
+    static func admit(caseSensitive: Bool?, countAll: Bool?, nameCase: String?, mode: AtlasSavedSearchMode, scope: String? = nil, pathHex: String? = nil) throws -> Self {
+        let policy = try Self(caseSensitive: caseSensitive ?? true, countAllMatches: countAll ?? false,
+            scope: AtlasSavedStructureScope.admit(scope, pathHex: pathHex))
         guard mode.structure != nil, (caseSensitive == nil) == (countAll == nil) else {
             throw AtlasSavedError.invalidResponse
         }
@@ -304,6 +347,7 @@ struct AtlasSavedStructurePage: Sendable {
     let state: String
     let complete, truncated, matchesSeenExact: Bool
     let policy: AtlasSavedStructurePolicy
+    let scopeMembers: UInt64
     let maximum: UInt64
     let retained, seen, visited, loaded, searched, unavailable, unsupported: UInt64
     let sourceLimited, extractionLimited, metadataOmitted, sourceBytes, sourceLimit, metadataBytes: UInt64
@@ -315,7 +359,7 @@ struct AtlasSavedStructurePage: Sendable {
     func hasSameSummary(as other: Self) -> Bool {
         identity == other.identity && generation == other.generation
             && needle.utf8.elementsEqual(other.needle.utf8) && mode == other.mode && nameMode == other.nameMode
-            && policy == other.policy && maximum == other.maximum
+            && policy == other.policy && scopeMembers == other.scopeMembers && maximum == other.maximum
             && window == other.window && state == other.state && complete == other.complete
             && truncated == other.truncated && matchesSeenExact == other.matchesSeenExact
             && retained == other.retained && seen == other.seen
@@ -341,7 +385,7 @@ struct AtlasSavedStructurePage: Sendable {
                   generation > 0, w.structure_generation.value == generation,
                   w.selection_namespace == "saved-structure", w.mode == engine.wireMode,
                   w.realized_mode == engine.evidence, w.evidence_level == engine.evidence,
-                  !w.semantic_complete, w.scope == "whole-saved-archive",
+                  !w.semantic_complete,
                   w.completeness_basis == "admitted-extraction-processing", !w.index_used,
                   w.index_policy == "direct-verified-member-extraction",
                   AtlasSavedSearchWire.validNeedle(w.needle),
@@ -349,7 +393,7 @@ struct AtlasSavedStructurePage: Sendable {
                 throw AtlasSavedError.invalidResponse
             }
             let policy = try AtlasSavedStructurePolicy.admit(caseSensitive: w.case_sensitive, countAll: w.count_all_matches,
-                nameCase: w.name_case, mode: mode)
+                nameCase: w.name_case, mode: mode, scope: w.scope, pathHex: w.scope_path_hex)
             guard expectedPolicy.map({ $0 == policy }) ?? true else { throw AtlasSavedError.invalidResponse }
             if mode == .occurrences {
                 guard w.includes_comments_and_literals == true, w.compiler_resolved == false,
@@ -367,7 +411,22 @@ struct AtlasSavedStructurePage: Sendable {
             let unsupported = w.unsupported_files.value, limited = w.source_limited_files.value
             let extractionLimited = w.extraction_limited_files.value
             let bytes = w.loaded_bytes.value, calls = w.member_read_calls.value
-            let coverage = w.state == "complete" && identity.discoveryComplete && unavailable == 0 &&
+            let scopeMembers = w.scope_known_members?.value ?? identity.members
+            let closed: Bool
+            switch policy.scope {
+            case .archive:
+                guard scopeMembers == identity.members else { throw AtlasSavedError.invalidResponse }
+                closed = identity.discoveryComplete
+            case .directory:
+                guard w.scope_known_members != nil, scopeMembers <= identity.members else { throw AtlasSavedError.invalidResponse }
+                closed = identity.discoveryComplete
+            case .member:
+                guard w.scope_known_members != nil, scopeMembers <= min(1, identity.members) else { throw AtlasSavedError.invalidResponse }
+                closed = scopeMembers == 1
+            }
+            guard w.scope_membership_complete == closed || (policy.scope == .archive && w.scope_membership_complete == nil)
+                else { throw AtlasSavedError.invalidResponse }
+            let coverage = w.state == "complete" && closed && unavailable == 0 &&
                 unsupported == 0 && limited == 0 && extractionLimited == 0
             // Legacy producers treated omitted row metadata as an inexact count.
             let expectedExact = w.case_sensitive == nil ? coverage && omitted == 0 : coverage
@@ -380,12 +439,12 @@ struct AtlasSavedStructurePage: Sendable {
                   (w.state == "truncated") == (w.truncated && !policy.countAllMatches),
                   policy.countAllMatches || w.matches_seen.value - window.skipped == retained + omitted + (w.truncated ? 1 : 0),
                   !policy.countAllMatches || w.matches_seen.value <= bytes,
-                  visited <= identity.members, loaded <= visited, loaded <= identity.captured,
+                  visited <= scopeMembers, loaded <= visited, loaded <= identity.captured,
                   searched <= loaded, unavailable <= visited, unavailable <= identity.members - identity.captured,
                   unsupported <= visited - unavailable, limited <= visited - unavailable - unsupported,
                   searched <= visited - unavailable - unsupported - limited,
                   extractionLimited <= loaded,
-                  w.state != "complete" || visited == identity.members,
+                  w.state != "complete" || visited == scopeMembers,
                   w.matches_seen_exact == expectedExact, w.complete == (coverage && omitted == 0),
                   w.member_bytes_read.value == bytes,
                   w.peak_source_bytes.value <= engine.structureFileByteLimit, w.peak_source_bytes.value <= bytes,
@@ -397,7 +456,7 @@ struct AtlasSavedStructurePage: Sendable {
             var pageMetadata: UInt64 = 0
             for (position, item) in w.hits.values.enumerated() {
                 let hit = item.hit
-                guard hit.id == start + UInt64(position) + 1, hit.member < identity.members else {
+                guard hit.id == start + UInt64(position) + 1, hit.member < identity.members, policy.scope.includes(hit.path.bytes) else {
                     throw AtlasSavedError.invalidResponse
                 }
                 try item.validate(mode: mode, needle: w.needle, caseSensitive: policy.caseSensitive)
@@ -419,7 +478,7 @@ struct AtlasSavedStructurePage: Sendable {
             }
             return Self(identity: identity, generation: generation, needle: w.needle, mode: mode, nameMode: nameMode,
                 hits: w.hits.values, start: start, next: next, state: w.state, complete: w.complete, truncated: w.truncated,
-                matchesSeenExact: w.matches_seen_exact, policy: policy, maximum: w.max_hits.value,
+                matchesSeenExact: w.matches_seen_exact, policy: policy, scopeMembers: scopeMembers, maximum: w.max_hits.value,
                 retained: retained, seen: w.matches_seen.value, visited: visited, loaded: loaded, searched: searched,
                 unavailable: unavailable, unsupported: unsupported, sourceLimited: limited, extractionLimited: extractionLimited,
                 metadataOmitted: omitted, sourceBytes: bytes, sourceLimit: w.max_source_bytes.value, metadataBytes: w.metadata_bytes.value,
@@ -460,6 +519,9 @@ struct AtlasSavedStructurePage: Sendable {
     }
     private struct Wire: Decodable {
         let selection_namespace, needle, mode, requested_mode, realized_mode, evidence_level, name_case, name_mode: String
+        let scope_path_hex: String?
+        let scope_known_members: AtlasSavedNumber?
+        let scope_membership_complete: Bool?
         let scope, completeness_basis, state, index_policy: String
         let case_sensitive, count_all_matches: Bool?
         let includes_comments_and_literals, compiler_resolved: Bool?

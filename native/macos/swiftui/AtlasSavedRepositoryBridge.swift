@@ -36,6 +36,10 @@ import Foundation
 @_silgen_name("fcb_saved_structure_search_matching_page") private func savedStructureWindow(_ h: UInt64, _ generation: UInt64,
     _ mode: UInt64, _ nameMode: UInt64, _ query: UnsafePointer<CChar>?, _ caseSensitive: UInt64,
     _ countAllMatches: UInt64, _ matches: UInt64, _ sourceBytes: UInt64, _ skipMatches: UInt64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("fcb_saved_structure_search_scoped_page") private func savedScopedStructure(
+    _ h: UInt64, _ generation: UInt64, _ mode: UInt64, _ nameMode: UInt64, _ query: UnsafePointer<CChar>?,
+    _ caseSensitive: UInt64, _ countAll: UInt64, _ matches: UInt64, _ bytes: UInt64, _ skip: UInt64,
+    _ scope: UInt64, _ path: UnsafePointer<UInt8>?, _ pathBytes: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_structure_results") private func savedStructureResults(_ h: UInt64, _ generation: UInt64, _ start: UInt64, _ limit: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_clear_structure") private func savedClearStructure(_ h: UInt64, _ generation: UInt64) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("fcb_saved_open_structure_hit_reader") private func savedStructureReader(_ h: UInt64, _ reader: UInt64, _ generation: UInt64, _ hit: UInt64) -> UnsafeMutablePointer<CChar>?
@@ -71,6 +75,17 @@ import Foundation
 @_silgen_name("fcb_free_string") private func savedFree(_ pointer: UnsafeMutablePointer<CChar>?)
 
 extension AtlasSavedTransport {
+    private static func scopedStructure(_ handle: UInt64, _ generation: UInt64, _ mode: UInt64, _ nameMode: UInt64,
+        _ query: String, _ matches: UInt64, _ bytes: UInt64, _ skip: UInt64, _ policy: AtlasSavedStructurePolicy) -> String? {
+        let path = policy.scope.path
+        guard !path.isEmpty, path.count <= 2048 else { return nil }
+        return query.withCString { needle in path.withUnsafeBufferPointer { buffer in
+            take(savedScopedStructure(handle, generation, mode, nameMode, needle, policy.caseSensitive ? 1 : 0,
+                policy.countAllMatches ? 1 : 0, matches, bytes, skip, policy.scope.code,
+                buffer.baseAddress, UInt64(buffer.count)))
+        } }
+    }
+
     static let native = Self(create: { savedCreate() }, run: { handle, request in
         switch request {
         case .open(let path):
@@ -147,6 +162,9 @@ extension AtlasSavedTransport {
                   mode != .occurrences || nameMode == .exact,
                   (1...AtlasSavedSearchWire.maximumHits).contains(matches),
                   bytes <= AtlasSavedSearchWire.maximumSourceBytes else { return nil }
+            if policy.scope != .archive {
+                return scopedStructure(handle, generation, structure.code, nameMode.code, query, matches, bytes, 0, policy)
+            }
             return query.withCString { take(savedStructureSearch(handle, generation, structure.code, nameMode.code,
                 $0, policy.caseSensitive ? 1 : 0, policy.countAllMatches ? 1 : 0, matches, bytes)) }
         case .structureWindow(let generation, let mode, let nameMode, let query, let matches, let bytes, let skipped, let policy):
@@ -154,6 +172,9 @@ extension AtlasSavedTransport {
                   mode != .occurrences || nameMode == .exact,
                   (1...AtlasSavedSearchWire.maximumHits).contains(matches),
                   bytes <= AtlasSavedSearchWire.maximumSourceBytes else { return nil }
+            if policy.scope != .archive {
+                return scopedStructure(handle, generation, structure.code, nameMode.code, query, matches, bytes, skipped, policy)
+            }
             return query.withCString { take(savedStructureWindow(handle, generation, structure.code, nameMode.code,
                 $0, policy.caseSensitive ? 1 : 0, policy.countAllMatches ? 1 : 0, matches, bytes, skipped)) }
         case .structureResults(let generation, let start, let limit):

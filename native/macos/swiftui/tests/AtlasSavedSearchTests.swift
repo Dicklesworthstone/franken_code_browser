@@ -1256,6 +1256,20 @@ import Dispatch
         precondition(page.hits[0].hit.start == 202 && page.hits[0].hit.end == 208)
         precondition(page.hits[0].structure.evidenceEnd == 209 && page.unsupported == 3 && page.unavailable == 1)
         precondition(!page.complete && !page.truncated && page.seen == 1 && page.loaded == 1 && page.searched == 1)
+        var scoped = f.structurePage(40, generation: 1)
+        let file = page.hits[0].hit.path.bytes
+        scoped["scope"] = "saved-member"; scoped["scope_path_hex"] = f.hex(file)
+        scoped["scope_known_members"] = "1"; scoped["scope_membership_complete"] = true
+        scoped["members_visited"] = "1"; scoped["unavailable_files"] = "0"; scoped["unsupported_files"] = "0"
+        scoped["complete"] = true; scoped["matches_seen_exact"] = true
+        let singleton = try decode(scoped)
+        precondition(singleton.scopeMembers == 1 && singleton.complete && singleton.policy.scope == .member(file))
+        scoped["scope_path_hex"] = f.hex(file + [120])
+        rejected("saved structural hit escaped the accepted member") { _ = try decode(scoped) }
+        scoped["scope"] = "saved-directory"; scoped["scope_path_hex"] = f.hex(file)
+        rejected("file is not its own directory descendant") { _ = try decode(scoped) }
+        scoped["scope"] = "saved-member"; scoped["scope_membership_complete"] = false
+        rejected("singleton reported inconsistent membership") { _ = try decode(scoped) }
         let heading = try decode(f.structurePage(40, generation: 1, mode: .headings, needle: "Café"),
             mode: .headings, needle: "Café")
         precondition(heading.hits[0].structure.headingSlug == "caf-details" && heading.hits[0].hit.start == 207)
