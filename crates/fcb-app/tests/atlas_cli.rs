@@ -261,3 +261,27 @@ fn zoomed_out_search_counts_and_selection_stay_on_the_correct_sibling_group() {
         assert_eq!(parcels.matches(expected).count(), 1);
     }
 }
+
+#[test]
+fn retained_hit_reveal_uses_the_same_file_and_preserves_original_byte_witnesses() {
+    let root = fixture();
+    fs::write(root.join("docs/needle.md"), b"x needle").unwrap();
+    for search in [vec!["--path", "needle.md"], vec!["--text", "needle"], vec!["--whole-file", "--text", "needle"]] {
+        let mut options = vec!["--json", "--reveal-hit", "0"];
+        options.extend(search.iter().copied());
+        let (code, json, err) = run(&arguments(&root, &options));
+        assert_eq!(code, EXIT_OK, "{json} {err}");
+        let focus = json.split_once("\"focus\":").unwrap().1.split_once(",\"selection\":").unwrap().0;
+        assert!(focus.contains("docs/needle.md"), "{focus}");
+        assert_eq!(json.matches("\"contains_selection\":true").count(), 1);
+        assert_eq!(json.matches("\"detail\":\"file\"").count(), 1);
+        if search.contains(&"--text") { assert!(json.contains("\"original_hex\":\"6e6565646c65\"")); }
+        options[2] = "1";
+        let (code, json, _) = run(&arguments(&root, &options));
+        assert_eq!(code, EXIT_ERROR);
+        assert!(json.contains("CLI_ATLAS_HIT_NOT_RETAINED"));
+    }
+    let (code, json, _) = run(&arguments(&root, &["--json", "--focus", "docs", "--reveal-hit", "0", "--path", "needle"]));
+    assert_eq!(code, EXIT_ERROR);
+    assert!(json.contains("CLI_INCOMPATIBLE_OPTIONS"));
+}

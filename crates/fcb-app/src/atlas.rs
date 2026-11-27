@@ -42,6 +42,7 @@ const HELP: &str = "Repository atlas plans\n\n\
   --whole-file                Stream --text through large files, without full captures\n\
   --max-read-calls N           Whole-file global call allowance (default/max 16777216)\n\
   Whole-file --max-scan-bytes is actual GLOBAL source I/O (default 256 MiB, max 1 TiB).\n\
+  --reveal-hit N              Focus and select the file of a zero-based retained search hit\n\
   --preview-hit N             Read context around a zero-based retained text hit\n\
   --context-bytes N           Context per side (default 256, maximum 16384)\n\
   --markdown-hit N            Open the hit's mapped Markdown region (UTF-8, 64 KiB cap)\n\
@@ -78,14 +79,14 @@ struct Options {
     path_query: Option<OsString>, text_query: Option<String>, match_limit: usize,
     text_scan_bytes: u64,
     whole_file: bool, stream_max_calls: u64,
-    preview_hit: Option<usize>, context_bytes: usize,
+    reveal_hit: Option<usize>, preview_hit: Option<usize>, context_bytes: usize,
     markdown_hit: Option<usize>, markdown_view: crate::markdown::ViewOptions,
     width: f64, height: f64, scale: f64, zoom: f64, pan_x: f64, pan_y: f64,
     detail_pixels: f64, max_visits: usize,
 }
 #[derive(Clone, Copy, Debug)]
 enum Error { App(AppError), Atlas(WorkspaceAtlasError), Text(WorkspaceTextError), Stream(AtlasStreamError),
-    Preview(AtlasTextPreviewError), Document(crate::markdown::Error), FocusMissing, SelectionMissing }
+    Preview(AtlasTextPreviewError), Document(crate::markdown::Error), FocusMissing, SelectionMissing, HitMissing }
 impl From<AppError> for Error { fn from(e: AppError) -> Self { Self::App(e) } }
 impl From<ArgumentError> for Error { fn from(e: ArgumentError) -> Self { Self::App(e.into()) } }
 impl From<OutputError> for Error { fn from(e: OutputError) -> Self { Self::App(e.into()) } }
@@ -101,6 +102,7 @@ impl Error {
             Self::App(e) => e.code(), Self::Atlas(e) => e.to_string(), Self::Text(e) => e.to_string(),
             Self::Stream(e) => e.to_string(),
             Self::Preview(e) => e.to_string(), Self::Document(e) => e.code(),
+            Self::HitMissing => "CLI_ATLAS_HIT_NOT_RETAINED".to_owned(),
             Self::FocusMissing => "CLI_ATLAS_FOCUS_NOT_CATALOGUED".to_owned(),
             Self::SelectionMissing => "CLI_ATLAS_SELECTION_NOT_CATALOGUED".to_owned(),
         }
@@ -125,7 +127,7 @@ fn takes_value(option: &str) -> bool {
     matches!(option, "--focus" | "--select" | "--width" | "--height" | "--scale" | "--zoom"
         | "--pan-x" | "--pan-y" | "--detail-pixels" | "--limit" | "--max-visits" | "--max-files"
         | "--path" | "--match-limit" | "--text" | "--max-file-bytes" | "--max-total-bytes" | "--max-scan-bytes"
-        | "--preview-hit" | "--context-bytes" | "--markdown-hit" | "--markdown-heading" | "--markdown-lines"
+        | "--reveal-hit" | "--preview-hit" | "--context-bytes" | "--markdown-hit" | "--markdown-heading" | "--markdown-lines"
         | "--max-read-calls")
 }
 fn json_requested(arguments: &[OsString]) -> bool {
@@ -160,6 +162,7 @@ fn parse(arguments: &[OsString]) -> Result<Options, Error> {
     let mut text_scan_bytes = 32 * 1024 * 1024u64;
     let (mut whole_file, mut stream_max_calls) = (false, MAX_ATLAS_STREAM_CALLS);
     let (mut preview_hit, mut context_bytes) = (None, 256usize);
+    let mut reveal_hit = None;
     let mut markdown_hit = None;
     let mut markdown_view = crate::markdown::ViewOptions::default();
     let (mut text_settings, mut capture_settings) = (false, false);
@@ -194,7 +197,7 @@ fn parse(arguments: &[OsString]) -> Result<Options, Error> {
             "--path" => 1024, "--match-limit" => 2048, "--text" => 4096, "--max-scan-bytes" => 8192,
             "--preview-hit" => 16384, "--context-bytes" => 32768,
             "--markdown-hit" => 65536, "--markdown-heading" => 131072, "--markdown-lines" => 262144,
-            "--max-read-calls" => 1048576,
+            "--max-read-calls" => 1048576, "--reveal-hit" => 2097152,
             _ => return Err(ArgumentError::UnknownOption.into()),
         };
         if seen & bit != 0 { return Err(ArgumentError::DuplicateOption.into()); } seen |= bit;
@@ -245,10 +248,10 @@ fn parse(arguments: &[OsString]) -> Result<Options, Error> {
                 stream_max_calls = args::decimal(value)?;
                 if stream_max_calls > MAX_ATLAS_STREAM_CALLS { return Err(ArgumentError::Limit.into()); }
             }
-            "--preview-hit" => {
+            "--preview-hit" | "--reveal-hit" => {
                 let n = args::decimal(value)?;
                 if n >= 4096 { return Err(ArgumentError::Limit.into()); }
-                preview_hit = Some(n as usize);
+                if option == "--reveal-hit" { reveal_hit = Some(n as usize); } else { preview_hit = Some(n as usize); }
             }
             "--markdown-hit" => {
                 let n = args::decimal(value)?;
@@ -275,6 +278,8 @@ fn parse(arguments: &[OsString]) -> Result<Options, Error> {
     }
     if (path_query.is_some() && text_query.is_some()) || (text_settings && text_query.is_none())
         || (seen & 2048 != 0 && path_query.is_none() && text_query.is_none())
+        || reveal_hit.is_some_and(|i| i >= match_limit || focus.is_some() || select.is_some()
+            || (path_query.is_none() && text_query.is_none()))
         || preview_hit.is_some_and(|i| text_query.is_none() || i >= match_limit)
         || (seen & 32768 != 0 && preview_hit.is_none())
         || markdown_hit.is_some_and(|i| text_query.is_none() || i >= match_limit)
@@ -288,7 +293,7 @@ fn parse(arguments: &[OsString]) -> Result<Options, Error> {
     if !limit_seen { forwarded.splice(2..2, [OsString::from("--limit"), OsString::from("1024")]); }
     let workspace = args::parse(&forwarded)?;
     if workspace.limit == 0 { return Err(ArgumentError::Limit.into()); }
-    Ok(Options { workspace, focus, select, path_query, text_query, match_limit, text_scan_bytes,
+    Ok(Options { workspace, focus, select, reveal_hit, path_query, text_query, match_limit, text_scan_bytes,
         whole_file, stream_max_calls, preview_hit, context_bytes, markdown_hit, markdown_view,
         width, height, scale, zoom, pan_x, pan_y, detail_pixels, max_visits })
 }
@@ -373,19 +378,6 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget,
         }
         None => None,
     };
-    let display = DisplayMetrics::new(options.scale, size, DisplayColorConfig::Srgb,
-        DisplayGeneration::new(owner(), 1).map_err(|_| AppError::InvalidRange)?).map_err(|_| AppError::InvalidRange)?;
-    let camera = index.focus_camera(focus, CameraGeneration::new(owner(), 1).map_err(|_| AppError::InvalidRange)?, display, 12.0)?
-        .zoom_at(Point2D::new(options.width / 2.0, options.height / 2.0).map_err(|_| AppError::InvalidRange)?, options.zoom)?
-        .pan(Point2D::new(options.pan_x, options.pan_y).map_err(|_| AppError::InvalidRange)?)?;
-    let mut query = VisibleQuery::new(&index, focus, camera, generation(),
-        LodThresholds::new(options.detail_pixels, options.detail_pixels * 2.0 / 3.0)?,
-        VisibleLimits { max_items: args.limit, max_visits: options.max_visits }, None, budget, allocation(62))?;
-    while query.state() == VisibleState::Pending {
-        catalog.validate_active()?;
-        query.step(256, generation(), &mut *canceled)?;
-    }
-    let plan = query.finish()?;
     let overlay = match options.path_query.as_deref() {
         Some(needle) => Some(path_overlay::build(&atlas, needle, options.match_limit, budget, canceled)?),
         None => None,
@@ -403,6 +395,31 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget,
         (Some(source), Some(needle)) => Some(text_overlay::search(source, needle, options, budget, canceled)?),
         _ => None,
     };
+    // Resolve against this invocation's frozen results before fitting the camera.
+    // Original file IDs and byte witnesses survive the change of coordinate origin.
+    let (focus, selected) = if let Some(row) = options.reveal_hit {
+        let node = if let Some(paths) = &overlay {
+            paths.hits().get(row).map(|hit| hit.node)
+        } else if let Some(text) = &text_hits {
+            text.hits().get(row).map(|hit| hit.node())
+        } else {
+            stream_hits.as_ref().and_then(|stream| stream.hits().get(row)).map(|hit| hit.node())
+        }.ok_or(Error::HitMissing)?;
+        (node, Some(node))
+    } else { (focus, selected) };
+    let display = DisplayMetrics::new(options.scale, size, DisplayColorConfig::Srgb,
+        DisplayGeneration::new(owner(), 1).map_err(|_| AppError::InvalidRange)?).map_err(|_| AppError::InvalidRange)?;
+    let camera = index.focus_camera(focus, CameraGeneration::new(owner(), 1).map_err(|_| AppError::InvalidRange)?, display, 12.0)?
+        .zoom_at(Point2D::new(options.width / 2.0, options.height / 2.0).map_err(|_| AppError::InvalidRange)?, options.zoom)?
+        .pan(Point2D::new(options.pan_x, options.pan_y).map_err(|_| AppError::InvalidRange)?)?;
+    let mut query = VisibleQuery::new(&index, focus, camera, generation(),
+        LodThresholds::new(options.detail_pixels, options.detail_pixels * 2.0 / 3.0)?,
+        VisibleLimits { max_items: args.limit, max_visits: options.max_visits }, None, budget, allocation(62))?;
+    while query.state() == VisibleState::Pending {
+        catalog.validate_active()?;
+        query.step(256, generation(), &mut *canceled)?;
+    }
+    let plan = query.finish()?;
     let text_preview = match (text_hits.as_ref(), options.preview_hit) {
         (Some(hits), Some(position)) => Some(hits.preview_hit(hits.source(), position, generation(),
             AtlasTextPreviewOptions { context_bytes: options.context_bytes }, budget,
@@ -530,7 +547,7 @@ fn projected_selection(index: &AtlasIndex<'_>, node: AtlasNodeId, focus: AtlasNo
     camera: Camera2D) -> Result<Option<Rect2D>, Error> {
     match index.bounds_in(node, focus) {
         Ok(bounds) => Ok(camera.project_clipped(bounds)?),
-        Err(AtlasError::NotDescendant) => Ok(None),
+        Err(AtlasError::NotDescendant | AtlasError::Camera(CameraError::PrecisionLost)) => Ok(None),
         Err(error) => Err(error.into()),
     }
 }
