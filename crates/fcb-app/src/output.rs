@@ -98,6 +98,14 @@ impl Output {
     pub(crate) fn boolean(&mut self, value: bool) -> Result<(), OutputError> {
         self.literal(if value { "true" } else { "false" })
     }
+    /// Optional text alongside a lossless hex identity. Never replace or
+    /// normalize invalid UTF-8 into a different filename.
+    pub(crate) fn utf8_or_null(&mut self, bytes: &[u8]) -> Result<(), OutputError> {
+        match std::str::from_utf8(bytes) {
+            Ok(text) => self.quoted(text),
+            Err(_) => self.literal("null"),
+        }
+    }
     pub(crate) fn hex(&mut self, bytes: &[u8]) -> Result<(), OutputError> {
         self.append(b"\"")?;
         for &byte in bytes { self.append(&[HEX[(byte >> 4) as usize], HEX[(byte & 15) as usize]])?; }

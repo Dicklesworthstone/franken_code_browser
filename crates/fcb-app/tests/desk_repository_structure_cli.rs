@@ -202,3 +202,22 @@ fn pending_structural_work_and_terminal_limits_keep_distinct_exit_states() {
     assert!(!result(&rows[2]).get("search_complete").flag());
     assert!(result(&rows[2]).get("truncated").flag());
 }
+
+#[cfg(unix)]
+#[test]
+fn desk_structure_file_scope_uses_exact_hex_path_through_retained_activation() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+    let root = fixture(&[("decoy.rs", b"fn target() {}\n")]);
+    let raw = b"source-\xff.rs"; fs::write(root.join(OsStr::from_bytes(raw)), b"fn target() {}\n").unwrap();
+    let mut s = Script::default();
+    s.push(&format!("repo-open\t{}", root.display()), false);
+    s.push(&format!("repo-begin-structure\t1\t1\tsymbols\texact\t10\t1000\tfile\t{}\ttarget", hex(raw)), false);
+    let done = s.push("repo-step\t1\t1\t0", false);
+    s.push("repo-hit\t1\t1\t1", true); s.push("repo-close\t1", false);
+    let copy = s.push("copy\t1", false); s.push("quit", false);
+    let (exit, rows) = invoke(&s.text); assert_eq!(exit, EXIT_OK);
+    let page = result(&rows[done]);
+    assert_eq!(page.get("scope_path"), &Json::Null); assert_eq!(page.get("scope_path_hex").text(), hex(raw));
+    assert_eq!(page.get("eligible_files").number(), 1); assert!(page.get("search_complete").flag());
+    assert_eq!(result(&rows[copy]).get("original_hex").text(), hex(b"target"));
+}

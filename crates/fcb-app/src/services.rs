@@ -84,7 +84,7 @@ Whole-file mode starts at byte zero, requires named files, and does not accept\n
 window offsets, stdin, path queries or indexed-capture byte-limit switches.\n\n\
 Progressive whole-project content search without a frozen catalog:\n\
   fcb search ROOT --workspace --whole-file --progressive\n\
-      (--respect-ignores | --include-excluded) [--directory DIR | --file FILE]\n\
+      (--respect-ignores | --include-excluded) [--directory DIR | --directory-hex HEX | --file FILE | --file-hex HEX]\n\
       --text TEXT [--ignore-case] [--count-all] [--json | --stream]\n\
   DIR and FILE are relative to ROOT. Their ancestor ignore rules still apply.\n\
   --identifier NAME and --query EXPRESSION also use this shared native service.\n\

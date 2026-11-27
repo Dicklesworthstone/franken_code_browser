@@ -4,7 +4,7 @@
 //! traversal and repository rule-file reads each require explicit switches.
 
 use std::{ffi::OsString, path::PathBuf};
-use crate::host::atlas_search::AtlasSearchPathKind;
+use crate::host::atlas_search::{AtlasSearchPathKind, MAX_SEARCH_SCOPE_PATH_BYTES};
 use fcb::search::{ParsedQuery, QueryError, QueryGeneration, QueryOptions, SearchMode, UnicodeNormalization};
 
 pub const MAX_ARGUMENTS: usize = 64;
@@ -28,8 +28,10 @@ pub struct Arguments {
     /// Opt into bounded discovery interleaved with content search. This route
     /// has its own schema and explicit policy/options, not a frozen manifest.
     pub progressive: bool,
-    /// Optional project-relative target for progressive discovery.
+    /// UTF-8 project-relative target, retained for callers of the original parser.
     pub progressive_target: Option<(AtlasSearchPathKind, String)>,
+    /// Only populated when the selected scope label cannot be expressed in UTF-8.
+    pub progressive_raw_target: Option<(AtlasSearchPathKind, Vec<u8>)>,
     pub offset: u64, pub bytes: usize, pub limit: usize, pub encoding: Encoding,
     pub needle: Option<Needle>, pub workspace: bool, pub include_excluded: bool,
     pub respect_ignores: bool,
@@ -40,10 +42,17 @@ pub struct Arguments {
     /// Skip observed matches before retaining a bounded whole-file result window.
     pub skip_matches: u64,
 }
+impl Arguments {
+    /// The one admitted directory/file target, regardless of its argument spelling.
+    pub fn progressive_target_bytes(&self) -> Option<(AtlasSearchPathKind, &[u8])> {
+        self.progressive_raw_target.as_ref().map(|(kind, path)| (*kind, path.as_slice()))
+            .or_else(|| self.progressive_target.as_ref().map(|(kind, path)| (*kind, path.as_bytes())))
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArgumentError { Limit, UnknownCommand, UnknownOption, DuplicateOption, MissingValue,
     MissingSource, MultipleSources, InvalidNumber, InvalidEncoding, InvalidNeedle, IncompatibleOptions,
-    Query(QueryError), ProgressivePolicy, ProgressiveOptions, ProgressiveLimits }
+    Query(QueryError), InvalidScopeHex, ProgressivePolicy, ProgressiveOptions, ProgressiveLimits }
 impl ArgumentError {
     pub const fn code(self) -> &'static str {
         match self {
@@ -53,6 +62,7 @@ impl ArgumentError {
             Self::MultipleSources => "CLI_MULTIPLE_SOURCES", Self::InvalidNumber => "CLI_INVALID_NUMBER",
             Self::InvalidEncoding => "CLI_INVALID_ENCODING", Self::InvalidNeedle => "CLI_INVALID_NEEDLE",
             Self::IncompatibleOptions => "CLI_INCOMPATIBLE_OPTIONS", Self::Query(error) => error.code(),
+            Self::InvalidScopeHex => "CLI_INVALID_SCOPE_HEX",
             Self::ProgressivePolicy => "CLI_PROGRESSIVE_REQUIRES_DISCOVERY_POLICY",
             Self::ProgressiveOptions => "CLI_PROGRESSIVE_UNSUPPORTED_OPTIONS",
             Self::ProgressiveLimits => "CLI_PROGRESSIVE_LIMITS",
@@ -76,7 +86,7 @@ fn output_flag_requested(args: &[OsString], flag: &str) -> bool {
         if argument == "--" { break; }
         if argument == flag { return true; }
         if matches!(argument.to_str(), Some("--offset" | "--bytes" | "--limit" | "--encoding" | "--text" | "--raw-hex"
-            | "--query" | "--identifier" | "--directory" | "--file" | "--skip-matches" | "--path" | "--max-files" | "--max-file-bytes" | "--max-total-bytes" | "--max-scan-bytes")) { cursor += 1; }
+            | "--query" | "--identifier" | "--directory" | "--file" | "--directory-hex" | "--file-hex" | "--skip-matches" | "--path" | "--max-files" | "--max-file-bytes" | "--max-total-bytes" | "--max-scan-bytes")) { cursor += 1; }
     }
     false
 }
@@ -91,7 +101,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
         if total > MAX_ARGUMENT_BYTES { return Err(ArgumentError::Limit); }
     }
     let mut parsed = Arguments { command: Command::Launch, json: false, file: None,
-        stdin: false, stream: false, progressive: false, progressive_target: None, offset: 0, bytes: 64 * 1024, limit: 100, encoding: Encoding::Auto, needle: None,
+        stdin: false, stream: false, progressive: false, progressive_target: None, progressive_raw_target: None, offset: 0, bytes: 64 * 1024, limit: 100, encoding: Encoding::Auto, needle: None,
         workspace: false, include_excluded: false, respect_ignores: false, max_files: 4096,
         max_file_bytes: 1024 * 1024, max_total_bytes: 32 * 1024 * 1024,
         whole_file: false, max_scan_bytes: 256 * 1024 * 1024, ignore_case: false, count_all: false, skip_matches: 0 };
@@ -126,7 +136,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
                 "--query" => 131072, "--ignore-case" => 262144, "--count-all" => 524288,
                 "--identifier" => 1048576, "--stream" => 2097152, "--skip-matches" => 4194304,
                 "--progressive" => 8388608,
-                "--directory" | "--file" => 16777216,
+                "--directory" | "--file" | "--directory-hex" | "--file-hex" => 16777216,
                 _ => return Err(ArgumentError::UnknownOption),
             };
             if seen & bit != 0 { return Err(ArgumentError::DuplicateOption); }
@@ -142,12 +152,25 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
             if option == "--ignore-case" { parsed.ignore_case = true; continue; }
             if option == "--count-all" { parsed.count_all = true; continue; }
             let value = args.get(cursor).ok_or(ArgumentError::MissingValue)?; cursor += 1;
+            if matches!(option, "--directory" | "--file" | "--directory-hex" | "--file-hex") {
+                let kind = if matches!(option, "--directory" | "--directory-hex") {
+                    AtlasSearchPathKind::Directory
+                } else { AtlasSearchPathKind::File };
+                let path = if option.ends_with("-hex") {
+                    if value.len() > 2 * MAX_SEARCH_SCOPE_PATH_BYTES { return Err(ArgumentError::Limit); }
+                    hex_bytes(value.to_str().ok_or(ArgumentError::InvalidScopeHex)?, ArgumentError::InvalidScopeHex)?
+                } else {
+                    if value.len() > MAX_SEARCH_SCOPE_PATH_BYTES { return Err(ArgumentError::Limit); }
+                    value.as_encoded_bytes().to_vec()
+                };
+                match String::from_utf8(path) {
+                    Ok(text) => parsed.progressive_target = Some((kind, text)),
+                    Err(error) => parsed.progressive_raw_target = Some((kind, error.into_bytes())),
+                }
+                continue;
+            }
             let value = value.to_str().ok_or(ArgumentError::MissingValue)?;
             match option {
-                "--directory" | "--file" => {
-                    let kind = if option == "--directory" { AtlasSearchPathKind::Directory } else { AtlasSearchPathKind::File };
-                    parsed.progressive_target = Some((kind, value.to_owned()));
-                }
                 "--offset" => parsed.offset = decimal(value)?,
                 "--skip-matches" => parsed.skip_matches = decimal(value)?,
                 "--bytes" => {
@@ -195,7 +218,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
                 }
                 "--raw-hex" => {
                     if parsed.needle.is_some() { return Err(ArgumentError::InvalidNeedle); }
-                    parsed.needle = Some(Needle::Raw(hex_bytes(value)?));
+                    parsed.needle = Some(Needle::Raw(hex_bytes(value, ArgumentError::InvalidNeedle)?));
                 }
                 _ => return Err(ArgumentError::UnknownOption),
             }
@@ -232,7 +255,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
     if parsed.ignore_case && (parsed.command != Command::Search || !allows_ignore_case) {
         return Err(ArgumentError::IncompatibleOptions);
     }
-    if parsed.progressive_target.is_some() && !parsed.progressive { return Err(ArgumentError::ProgressiveOptions); }
+    if parsed.progressive_target_bytes().is_some() && !parsed.progressive { return Err(ArgumentError::ProgressiveOptions); }
     if parsed.progressive {
         if parsed.command != Command::Search || !parsed.workspace || !parsed.whole_file
             || seen & (32 | 1024 | 128) != 0 {
@@ -324,13 +347,13 @@ pub fn decimal(text: &str) -> Result<u64, ArgumentError> {
     }
     Ok(result)
 }
-fn hex_bytes(text: &str) -> Result<Vec<u8>, ArgumentError> {
-    if text.is_empty() || text.len() % 2 != 0 { return Err(ArgumentError::InvalidNeedle); }
+fn hex_bytes(text: &str, invalid: ArgumentError) -> Result<Vec<u8>, ArgumentError> {
+    if text.is_empty() || text.len() % 2 != 0 { return Err(invalid); }
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(text.len() / 2).map_err(|_| ArgumentError::Limit)?;
     let digit = |c: u8| match c {
         b'0'..=b'9' => Ok(c - b'0'), b'a'..=b'f' => Ok(c - b'a' + 10),
-        b'A'..=b'F' => Ok(c - b'A' + 10), _ => Err(ArgumentError::InvalidNeedle),
+        b'A'..=b'F' => Ok(c - b'A' + 10), _ => Err(invalid),
     };
     for pair in text.as_bytes().chunks_exact(2) { bytes.push((digit(pair[0])? << 4) | digit(pair[1])?); }
     Ok(bytes)

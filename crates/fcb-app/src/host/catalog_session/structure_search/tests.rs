@@ -438,3 +438,34 @@ fn progressive_symbols_retain_large_late_line_evidence_after_source_and_query_cl
         assert!(copied.as_str().contains(&expected_hex));
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn raw_file_and_folder_targets_retire_the_walker_with_exact_search_and_reader_identity() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+    let root = fixture("raw-scope");
+    let directory = b"src-\xff"; let file = b"src-\xff/\xfe.rs";
+    let bytes = utf16("fn target() {}\n", false);
+    fs::create_dir(root.join(OsStr::from_bytes(directory))).unwrap();
+    fs::write(root.join(OsStr::from_bytes(file)), &bytes).unwrap();
+    fs::write(root.join("decoy.rs"), b"fn target() {}\n").unwrap();
+    for (i, (kind, target, echo)) in [
+        (AtlasSearchPathKind::Directory, directory.as_slice(), "7372632dff"),
+        (AtlasSearchPathKind::File, file.as_slice(), "7372632dff2ffe2e7273"),
+    ].into_iter().enumerate() {
+        let mut options = symbols();
+        options.scope = AtlasSearchScope::all().with_raw_path(kind, target).unwrap();
+        options.max_scan_bytes = bytes.len() as u64;
+        let mut session = CatalogStructureSearchSession::open(owner(79500 + i as u64), &root,
+            1, "target", options, || false).unwrap();
+        drain(&mut session);
+        assert!(session.complete());
+        assert_eq!(session.catalog.catalogued_files, 1); assert_eq!(session.matches_seen, 1);
+        let page = session.info(|| false).unwrap();
+        assert!(page.as_str().contains("\"scope_path\":null"));
+        assert!(page.as_str().contains(&format!("\"scope_path_hex\":\"{echo}\"")));
+        assert_eq!(selected_bytes(&session.hits[0]), b"\0t\0a\0r\0g\0e\0t");
+        let (reader, _) = session.open_hit_reader(owner(79550 + i as u64), 1, session.revision, 0, || false).unwrap();
+        assert_eq!(reader.capture().bytes(), bytes);
+    }
+}

@@ -480,3 +480,61 @@ fn file_and_folder_targets_retain_project_paths_and_visit_only_selected_members(
         assert_eq!(invoke(&tree.0, &args).0, EXIT_ERROR);
     }
 }
+
+#[test]
+fn raw_scope_paths_survive_argv_discovery_match_witnesses_and_stream_framing() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+    let tree = Tree::new("raw-scope");
+    let directory = b"src-\xff";
+    let file = b"src-\xff/\xfe.rs";
+    let spell = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let bytes = utf16("needle done", true);
+    tree.file(OsStr::from_bytes(file), &bytes);
+    tree.file(OsStr::from_bytes(b"src-\xff-copy/\xfe.rs"), b"needle");
+    tree.file("src-\u{fffd}/\u{fffd}.rs", b"needle");
+    tree.file("outside/other", b"needle");
+    let (code, directory_page) = invoke(&tree.0, &["--directory-hex", &spell(directory), "--text", "needle"]);
+    assert_eq!(code, EXIT_OK);
+    assert_eq!(directory_page.get("scope_path"), &Json::Null);
+    assert_eq!(directory_page.get("scope_path_hex").text(), spell(directory));
+    assert_eq!(directory_page.get("discovery_directory").get("hex").text(), spell(directory));
+    assert_eq!(directory_page.get("summary").get("catalogued_files").number(), 1);
+    assert_eq!(directory_page.get("hits").array()[0].get("path").get("hex").text(), spell(file));
+    assert_eq!(bounds(&directory_page.get("hits").array()[0]), (2, 14));
+    let mut argv = arguments(&tree.0, &["--text", "needle", "--directory"], None);
+    argv.push(OsStr::from_bytes(directory).to_owned()); argv.push("--json".into());
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    assert_eq!(run(&argv, &mut NoStdin, &mut out, &mut err, || false), EXIT_OK);
+    let native = parse(&out).unwrap();
+    assert_eq!(native.get("scope_path_hex"), directory_page.get("scope_path_hex"));
+    assert_eq!(native.get("hits"), directory_page.get("hits")); assert!(err.is_empty());
+    let (code, rows) = stream(&tree.0, &["--file-hex", &spell(file), "--identifier", "needle"]);
+    assert_eq!(code, EXIT_OK);
+    assert_eq!(rows[0].get("requested_scope_path"), &Json::Null);
+    assert_eq!(rows[0].get("requested_scope_path_hex").text(), spell(file));
+    let progress = rows.iter().find(|r| r.get("type").text() == "progress").unwrap().get("search");
+    assert_eq!(progress.get("discovery_file").get("hex").text(), spell(file));
+    assert_eq!(progress.get("scope_path_hex").text(), spell(file));
+    let hit = rows.iter().find(|r| r.get("type").text() == "match").unwrap().get("match");
+    assert_eq!(hit.get("path").get("hex").text(), spell(file));
+    assert_eq!(bounds(hit), (2, 14));
+    let terminal = rows.last().unwrap();
+    assert_eq!(terminal.get("files_examined").number(), 1);
+    assert_eq!(terminal.get("matches_seen").number(), 1);
+    assert_eq!(terminal.get("payload_bytes_read").number(), bytes.len() as u64);
+    assert!(terminal.get("scan_complete").flag());
+}
+
+#[test]
+fn malformed_raw_scope_cannot_widen_discovery_or_consume_other_content() {
+    let tree = Tree::new("bad-raw-target"); tree.file("decoy", b"needle");
+    for flags in [vec!["--directory-hex", "ff2f2e2e"], vec!["--file-hex", "610062"],
+        vec!["--file-hex", "xyz"], vec!["--file-hex", "f"], vec!["--directory-hex", ""],
+        vec!["--directory-hex", "2f61"], vec!["--directory-hex", "61", "--file", "decoy"]] {
+        let mut query = vec!["--text", "needle"]; query.extend(flags);
+        let (code, page) = invoke(&tree.0, &query);
+        assert_eq!(code, EXIT_ERROR);
+        assert!(page.get("hits").array().is_empty());
+        assert_eq!(page.get("summary").get("payload_bytes_read").number(), 0);
+    }
+}

@@ -490,10 +490,9 @@ fn query_scope(kind: &str, value: &str, invalid: &'static str) -> Result<AtlasSe
         "visible" => scope.with_path(AtlasSearchPathKind::Visible, if value == "-" { "" } else { value })
             .map_err(DeskRepositoryError::from).map_err(Failure::from),
         "directory" | "file" => {
-            let path = String::from_utf8(hex(value, MAX_SEARCH_SCOPE_PATH_BYTES)?)
-                .map_err(|_| Failure::Protocol("DESK_INVALID_TEXT"))?;
+            let path = hex(value, MAX_SEARCH_SCOPE_PATH_BYTES)?;
             let kind = if kind == "directory" { AtlasSearchPathKind::Directory } else { AtlasSearchPathKind::File };
-            scope.with_path(kind, &path).map_err(DeskRepositoryError::from).map_err(Failure::from)
+            scope.with_raw_path(kind, &path).map_err(DeskRepositoryError::from).map_err(Failure::from)
         }
         _ => Err(Failure::Protocol(invalid)),
     }

@@ -403,6 +403,17 @@ fcb search /path/to/repository --workspace --whole-file --progressive --include-
   --query 'generated_token path:target/ lang:rust' --stream
 ```
 
+Pass `--directory PATH` to start discovery inside a project folder or `--file PATH`
+to search a single file. On Unix both accept the original filename bytes.
+`--directory-hex HEX` and `--file-hex HEX` take the same project-relative
+paths from scripts that cannot pass non-UTF-8 arguments. For example,
+`--directory-hex 7372632dff` selects the folder with the five bytes
+`73 72 63 2d ff`. Scope matching is byte-exact and respects slash boundaries.
+Traversal retains the selected discovery policy and reports project-relative
+hit paths. JSON records carry the exact `scope_path_hex` and set `scope_path`
+to null when UTF-8 decoding fails. The NDJSON start record uses
+`requested_scope_path_hex` and `requested_scope_path` for the same pair.
+
 This route uses the same progressive catalog service and continuous file matcher
 as native large-project search. It has **no aggregate file-count or cumulative
 path-storage limit**: old catalog pages are evicted after examination while exact
@@ -1196,8 +1207,8 @@ Scopes use the same encoding as structural queries:
 | `SCOPE` | `SCOPE_VALUE` |
 | --- | --- |
 | `workspace` | `-` for the attached authorized catalog. |
-| `directory` | Hex UTF-8 relative directory path, with exact component boundaries. |
-| `file` | Hex UTF-8 relative file path. |
+| `directory` | Hex-encoded raw project-relative directory path, with exact component boundaries. |
+| `file` | Hex-encoded raw project-relative file path. |
 | `visible` | Sorted unique lowercase raw-path hex CSV; `-` explicitly selects no files. |
 
 Scope and expression metadata predicates narrow the attached catalog before
@@ -1302,8 +1313,8 @@ The scope is frozen at admission, before file, byte and match quotas:
 | Scope | `SCOPE_VALUE` |
 | --- | --- |
 | `workspace` | `-`, meaning the existing authorized catalog. |
-| `directory` | Hex-encoded UTF-8 relative directory path; component boundaries are respected. |
-| `file` | Hex-encoded UTF-8 relative file path. |
+| `directory` | Hex-encoded raw project-relative directory path with exact component boundaries. |
+| `file` | Hex-encoded raw project-relative file path. |
 | `visible` | Sorted unique lowercase raw-path hex values separated by commas; `-` means an explicitly empty set. |
 
 Visible membership is supplied by the host and does not prove that a native

@@ -56,8 +56,8 @@ struct PathScope {
 impl PathScope {
     const WORKSPACE: Self = Self { kind: AtlasSearchPathKind::Workspace, length: 0,
         bytes: [0; MAX_SEARCH_SCOPE_PATH_BYTES] };
-    fn parse(kind: AtlasSearchPathKind, path: &str) -> Result<Self, AtlasSearchError> {
-        if kind == AtlasSearchPathKind::Visible || path.len() > MAX_SEARCH_SCOPE_PATH_BYTES || path.as_bytes().contains(&0) {
+    fn parse(kind: AtlasSearchPathKind, path: &[u8]) -> Result<Self, AtlasSearchError> {
+        if kind == AtlasSearchPathKind::Visible || path.len() > MAX_SEARCH_SCOPE_PATH_BYTES || path.contains(&0) {
             return Err(AtlasSearchError::InvalidScope);
         }
         if kind == AtlasSearchPathKind::Workspace {
@@ -66,12 +66,12 @@ impl PathScope {
         // Leading/trailing/repeated separators and dot components have no
         // alternate interpretation. Backslash is an ordinary native filename
         // byte on this Unix catalog, not an invented Windows path separator.
-        if path.split('/').any(|component| matches!(component, "" | "." | "..")) {
+        if path.split(|&byte| byte == b'/').any(|component| matches!(component, b"" | b"." | b"..")) {
             return Err(AtlasSearchError::InvalidScope);
         }
         let mut result = Self::WORKSPACE;
         result.kind = kind; result.length = path.len();
-        result.bytes[..path.len()].copy_from_slice(path.as_bytes());
+        result.bytes[..path.len()].copy_from_slice(path);
         Ok(result)
     }
     fn path(&self) -> &[u8] { &self.bytes[..self.length] }
@@ -86,7 +86,7 @@ impl PathScope {
     fn encode(&self, out: &mut Output, prefix: &str) -> Result<(), AtlasSearchError> {
         field(out, prefix, "scope_path_kind")?; out.quoted(self.kind.name())?;
         field(out, prefix, "scope_path")?;
-        out.quoted(std::str::from_utf8(self.path()).map_err(|_| AtlasSearchError::InvalidScope)?)?;
+        out.utf8_or_null(self.path())?;
         field(out, prefix, "scope_path_hex")?; out.hex(self.path())?;
         Ok(())
     }
@@ -193,14 +193,19 @@ impl AtlasSearchScope {
     /// Its bounded immutable allocation is leased before decoding and shared by
     /// cloned scopes. This host-declared membership is not native frame proof.
     pub fn with_path(mut self, kind: AtlasSearchPathKind, path: &str) -> Result<Self, AtlasSearchError> {
-        if kind == AtlasSearchPathKind::Visible {
-            let region = VisibleRegion::parse(path)?;
-            self.path = PathScope { kind, ..PathScope::WORKSPACE };
-            self.region = Some(region);
-        } else {
-            self.path = PathScope::parse(kind, path)?;
-            self.region = None;
-        }
+        if kind != AtlasSearchPathKind::Visible { return self.with_raw_path(kind, path.as_bytes()); }
+        let region = VisibleRegion::parse(path)?;
+        self.path = PathScope { kind, ..PathScope::WORKSPACE };
+        self.region = Some(region);
+        Ok(self)
+    }
+
+    /// Freeze an exact native file or directory label, or select workspace
+    /// with an empty path. Only slash separates components. Visible membership
+    /// uses the separate validated CSV representation accepted by `with_path`.
+    pub fn with_raw_path(mut self, kind: AtlasSearchPathKind, path: &[u8]) -> Result<Self, AtlasSearchError> {
+        self.path = PathScope::parse(kind, path)?;
+        self.region = None;
         Ok(self)
     }
     pub(crate) fn path_predicate(&self) -> (AtlasSearchPathKind, &[u8]) {
