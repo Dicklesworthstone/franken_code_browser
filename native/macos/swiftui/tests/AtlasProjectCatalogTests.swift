@@ -168,10 +168,17 @@ import Foundation
               && navigation.entry(for: rows[0].id, expected: frame, action: .read)?.rawPath == special[0].rawPath
               && navigation.entry(for: rows[1].id, expected: frame, action: .read)?.rawPath == special[1].rawPath,
               "Canonically equivalent Unicode names retain distinct exact identities")
-        check(rows[2].canReveal && !rows[2].canRead && rows[2].limitation != nil
-              && navigation.entry(for: rows[2].id, expected: frame, action: .reveal) != nil
-              && navigation.entry(for: rows[2].id, expected: frame, action: .read) == nil,
-              "Non-UTF-8 rows can be revealed without inventing an openable path")
+        check(rows[2].canReveal && rows[2].canRead && rows[2].limitation == nil
+              && navigation.entry(for: rows[2].id, expected: frame, action: .read)?.rawPath == special[2].rawPath
+              && special[2].readerRoute(captureLimit: .max) == .observed,
+              "Non-UTF-8 rows open the range reader using their exact path bytes")
+        let small = special[0]
+        check(small.readerRoute(captureLimit: small.observedBytes) == .retained("é.rs"),
+              "A UTF-8 path at the capture limit keeps the ordinary reader")
+        check(small.readerRoute(captureLimit: small.observedBytes - 1) == .observed,
+              "An over-limit file opens in bounded ranges")
+        check(special[4].readerRoute(captureLimit: 0) == nil,
+              "Changing reader mode cannot admit a traversal path")
         check(rows[3].label == "a\\u{a}b.rs" && !rows[3].label.contains("\n")
               && navigation.entry(for: rows[3].id, expected: frame, action: .read)?.rawPath.contains(10) == true,
               "Control characters are escaped only for display; original identity survives")

@@ -114,6 +114,21 @@ struct AtlasProjectCatalog: Sendable {
         let sourcePath: String?
         let observedBytes: UInt64
         let x, y, width, height: Double
+
+        enum ReaderRoute: Equatable { case retained(String), observed }
+
+        /// Catalog size selects the initial reading mode only. The opener still
+        /// checks the live regular file and enforces its own byte limits.
+        func readerRoute(captureLimit: UInt64) -> ReaderRoute? {
+            guard !rawPath.isEmpty, rawPath.count <= 16_384,
+                  AtlasDirectoryFocus.isRelativePath(rawPath) else { return nil }
+            if let sourcePath {
+                guard sourcePath.utf8.elementsEqual(rawPath) else { return nil }
+                return observedBytes <= captureLimit ? .retained(sourcePath) : .observed
+            }
+            guard String(bytes: rawPath, encoding: .utf8) == nil else { return nil }
+            return .observed
+        }
     }
     let entries: [Entry]
     let discoveryComplete: Bool
@@ -529,11 +544,11 @@ struct AtlasCatalogNavigation {
             && [entry.x, entry.y, entry.width, entry.height, entry.x + entry.width, entry.y + entry.height]
                 .allSatisfy { $0.isFinite && abs($0) <= 1e12 }
         let canReveal = pathValid && geometryValid
-        let canRead = canReveal && (entry.sourcePath.map { $0.utf8.elementsEqual(raw) } == true)
+        let canRead = canReveal && entry.readerRoute(captureLimit: .max) != nil
         let limitation: String?
         if !pathValid { limitation = "Invalid native path; this atlas row cannot be activated." }
         else if !geometryValid { limitation = "Atlas geometry is unavailable; this row cannot be activated." }
-        else if !canRead { limitation = "This filename can be revealed in the atlas, but this reader requires a UTF-8 filename." }
+        else if !canRead { limitation = "This row’s source spelling differs from its original filename." }
         else { limitation = nil }
         return Row(id: Identity(layout: frame.layout, ordinal: ordinal, file: entry.id, rawPath: raw),
             label: pathValid ? AtlasDirectoryFocus.display(rawPath: raw) : "Invalid file path",

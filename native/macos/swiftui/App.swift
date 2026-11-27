@@ -2079,12 +2079,28 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     }
 
     private func openAtlasEntry(_ entry: AtlasProjectCatalog.Entry, layout: UUID) {
-        guard layout == atlasRevision, hasMetadataAtlas, !atlasLayoutPending else { return }
-        guard let path = entry.sourcePath, fileScope.includes(path, custom: customExtensions) else {
-            status = "This filename is available through Project Files or Quick Open."
-            return
+        guard layout == atlasRevision, hasMetadataAtlas, !atlasLayoutPending,
+              let member = atlasResidency.file(rawPath: entry.rawPath, revision: layout), member.id == entry.id,
+              member.sourcePath.map({ fileScope.includes($0, custom: customExtensions) }) ?? (fileScope == .all),
+              let route = member.readerRoute(captureLimit: AtlasReaderLimits.captureBytes) else { return }
+        switch route {
+        case .retained(let path):
+            selectedHit = nil; openFile(path); showsReader = true
+        case .observed:
+            guard let authority = snapshotExportSource,
+                  projectBrowser.rootAccessIdentity == authority.access.map(ObjectIdentifier.init) else {
+                status = "Choose the project folder again to read this file in bounded ranges."
+                return
+            }
+            guard let input = try? AtlasObservedReaderInput(root: authority.root, relativePath: member.rawPath) else {
+                status = "This project path exceeds the range reader’s path limits."
+                return
+            }
+            let source = AtlasObservedReaderSource(input: input, project: authority.identity.project, access: authority.access)
+            closeObservedReader()
+            selectedHit = nil
+            observedReader = AtlasObservedReaderPresentation(source: source, transport: .native)
         }
-        selectedHit = nil; openFile(path); showsReader = true
     }
 
     private func catalogView(_ catalog: AtlasProjectCatalog) -> some View {
