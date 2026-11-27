@@ -1640,7 +1640,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         var anchorPath: [UInt8]?
         var anchor: AtlasParcelCameraAnchor?
         if hasMetadataAtlas, !hasRetainedAtlas, let accepted, accepted.catalogTarget == atlasCatalogTarget,
-           let path = accepted.anchorRawPath, let entry = atlasEntries.first(where: { $0.rawPath == path }),
+           let path = accepted.anchorRawPath, let entry = atlasResidency.file(rawPath: path, revision: atlasRevision),
            let position = camera.pendingPresentationAnchor(relativeTo: CGRect(x: entry.x, y: entry.y,
                 width: entry.width, height: entry.height), revision: atlasRevision) {
             // Keep a pending hidden view relative to its original parcel even
@@ -1658,18 +1658,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         }
         if hasMetadataAtlas, !hasRetainedAtlas,
            let center = camera.presentationCenter(revision: atlasRevision) {
-            var nearest: AtlasProjectCatalog.Entry?
-            var distance = Double.infinity
-            for entry in atlasEntries where entry.width > 0 && entry.height > 0 {
-                let dx = max(0, max(entry.x - center.x, center.x - entry.x - entry.width))
-                let dy = max(0, max(entry.y - center.y, center.y - entry.y - entry.height))
-                let candidate = hypot(dx, dy)
-                if candidate < distance {
-                    nearest = entry; distance = candidate
-                    if candidate == 0 { break }
-                }
-            }
-            if let entry = nearest,
+            if let entry = atlasResidency.file(at: center, nearest: true, revision: atlasRevision),
                let position = camera.presentationAnchor(relativeTo: CGRect(x: entry.x, y: entry.y,
                     width: entry.width, height: entry.height), revision: atlasRevision) {
                 anchorPath = entry.rawPath; anchor = position
@@ -1694,7 +1683,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     @discardableResult
     private func restoreAtlasPresentation(_ destination: AtlasFolderDestination) -> Bool {
         if let path = destination.anchorRawPath, let anchor = destination.cameraAnchor,
-           let entry = atlasEntries.first(where: { $0.rawPath == path }) {
+           let entry = atlasResidency.file(rawPath: path, revision: atlasRevision) {
             if camera.restorePresentationAnchor(anchor, relativeTo: CGRect(x: entry.x, y: entry.y,
                 width: entry.width, height: entry.height), revision: atlasRevision) { return true }
         }
@@ -2028,6 +2017,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                             scopeLabel: atlasScopeLabel,
                             files: displayedFiles,
                             metadata: atlasEntries,
+                            residency: atlasResidency,
                             camera: camera,
                             hitPaths: overlayIsCurrent ? searchPaths : [],
                             selectedPath: selectedPath,
@@ -4126,6 +4116,7 @@ struct AtlasCanvas: View {
     let scopeLabel: String
     let files: [AtlasFile]
     let metadata: [AtlasProjectCatalog.Entry]
+    let residency: AtlasViewportResidency
     let camera: AtlasCamera
     let hitPaths: Set<String>
     let selectedPath: String?
@@ -4198,9 +4189,7 @@ struct AtlasCanvas: View {
                         guard active, camera.acceptsNavigation(revision: revision), dragDelta == .zero,
                               let point = presentedFrame.worldPoint(at: value.location, revision: revision,
                                   contentRevision: contentRevision),
-                              let file = metadata.last(where: {
-                                  CGRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height).contains(point)
-                              }) else {
+                              let file = residency.file(at: point, revision: revision) else {
                             return
                         }
                         onSelect(file)
@@ -4240,7 +4229,7 @@ struct AtlasCanvas: View {
             }
             .onChange(of: focusRequest) { _, _ in
                 guard active, let path = selectedPath,
-                      let file = metadata.first(where: { $0.rawPath.elementsEqual(path.utf8) }) else { return }
+                      let file = residency.file(rawPath: Array(path.utf8), revision: revision) else { return }
                 let parcel = CGRect(x: file.x, y: file.y, width: file.width, height: file.height)
                 camera.navigateFocus(bounds: selectedMatch?.focusRect ?? parcel, viewport: size, revision: revision)
             }

@@ -135,6 +135,7 @@ private final class ReleaseProbe {
         precondition(model.document(forRawPath: entry.rawPath)?.source.path.utf8.elementsEqual(entry.rawPath) == true)
     }
     static func main() async throws {
+        navigationUsesAllMetadata()
         try await coldOverviewAndLateParcel()
         try await denseRegionHasNoPrefixStarvation()
         try await readerOnlyMetadataDoesNotCrowdOutSource()
@@ -167,7 +168,46 @@ private final class ReleaseProbe {
         try await pressureRecoveryRestoresStationaryDemandInStages()
         try await pressureRecoveryRetriesCapacityWithUnchangedDemand()
         try await pressureRespectsHiddenClosedAndReinstalledViews()
-        print("AtlasViewportResidency: 32 real worker/demand/placement/lifetime/cache/pressure scenarios passed")
+        print("AtlasViewportResidency: 33 real worker/demand/placement/lifetime/cache/pressure scenarios passed")
+    }
+
+    static func navigationUsesAllMetadata() {
+        let fixture = ViewportFixture(), model = residency(transport: fixture.transport)
+        let revision = UUID()
+        // Overlaps, edge contacts and equal distances must resolve by paint order,
+        // not ID, tree visit order, preview eligibility or path normalization.
+        let oversized = UInt64(AtlasViewportLimits.sourceFileBytes) + 1
+        var files = (0..<80).map {
+            entry(UInt64(100 - $0), "file-\($0)", x: Double($0 % 9) * 12,
+                y: Double($0 / 9) * 11, width: 16, height: 13, bytes: $0.isMultiple(of: 3) ? oversized : 32)
+        }
+        files.append(entry(101, "caf\u{e9}", x: 5, y: 5))
+        files.append(entry(102, "cafe\u{301}", x: 5, y: 5))
+        precondition(model.install(root: "/fixture", entries: files, layoutRevision: revision, accessLease: nil))
+        for y in stride(from: -2, through: 130, by: 3) {
+            for x in stride(from: -2, through: 170, by: 3) {
+                let point = CGPoint(x: x, y: y)
+                let hit = files.last { rect($0).contains(point) }
+                var nearest: UInt64?, best = CGFloat.infinity
+                for file in files {
+                    let r = rect(file)
+                    let d = hypot(max(0, max(r.minX - point.x, point.x - r.maxX)),
+                                  max(0, max(r.minY - point.y, point.y - r.maxY)))
+                    if d < best { best = d; nearest = file.id }
+                }
+                precondition(model.file(at: point, revision: revision)?.id == hit?.id)
+                precondition(model.file(at: point, nearest: true, revision: revision)?.id == nearest)
+            }
+        }
+        for file in files {
+            precondition(model.file(rawPath: file.rawPath, revision: revision)?.id == file.id)
+        }
+        precondition(model.file(at: CGPoint(x: CGFloat.nan, y: 0), revision: revision) == nil)
+        precondition(model.file(at: .zero, revision: UUID()) == nil)
+        precondition(model.file(rawPath: files[0].rawPath, revision: UUID()) == nil)
+        precondition(fixture.snapshot.paths.isEmpty)
+        model.close()
+        precondition(model.file(at: .zero, nearest: true, revision: revision) == nil)
     }
 
     static func coldOverviewAndLateParcel() async throws {

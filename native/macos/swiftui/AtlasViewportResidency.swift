@@ -110,44 +110,100 @@ import Dispatch
 /// leaf candidates consume the bounded query allowance, so a late small parcel
 /// in a dense region remains reachable when the camera zooms into that region.
 fileprivate struct AtlasViewportIndex: Sendable {
-    private struct Leaf: Sendable { let id: UInt64; let rect: CGRect }
+    private struct Leaf: Sendable {
+        let id: UInt64
+        let ordinal: Int  // Paint order is independent of response-local file IDs.
+        let rect: CGRect
+    }
     private struct Node: Sendable {
         let bounds: CGRect
+        let first, last: Int
         let children: [Int]
         let leaves: [Leaf]
     }
     private let nodes: [Node]
-    init(entries: [AtlasProjectCatalog.Entry]) {
+    private let previewRoot, readerOnlyRoot: Int?
+
+    init(entries: [AtlasProjectCatalog.Entry], readerOnly: Set<UInt64> = []) {
         var result: [Node] = []
         result.reserveCapacity(entries.count * 2)
-        func build(_ members: [AtlasProjectCatalog.Entry]) -> Int {
-            let bounds = members.reduce(CGRect.null) { $0.union(Self.rect($1)) }
-            let index = result.count
-            result.append(Node(bounds: bounds, children: [], leaves: []))
+        func build(_ members: [Leaf]) -> Int {
+            // Roots are nonempty; internal nodes split at least nine leaves.
+            let first = members[0]
+            var bounds = first.rect, lowest = first.ordinal, highest = first.ordinal
+            for leaf in members.dropFirst() {
+                bounds = bounds.union(leaf.rect)
+                lowest = min(lowest, leaf.ordinal); highest = max(highest, leaf.ordinal)
+            }
+            let children: [Int], leaves: [Leaf]
             if members.count <= 8 {
-                result[index] = Node(bounds: bounds, children: [], leaves: members.map { Leaf(id: $0.id, rect: Self.rect($0)) })
+                children = []; leaves = members
             } else {
                 let horizontal = bounds.width >= bounds.height
                 let ordered = members.sorted {
-                    let left = horizontal ? $0.x + $0.width / 2 : $0.y + $0.height / 2
-                    let right = horizontal ? $1.x + $1.width / 2 : $1.y + $1.height / 2
+                    let left = horizontal ? $0.rect.midX : $0.rect.midY
+                    let right = horizontal ? $1.rect.midX : $1.rect.midY
                     return left == right ? $0.id < $1.id : left < right
                 }
                 let middle = ordered.count / 2
-                let left = build(Array(ordered[..<middle])), right = build(Array(ordered[middle...]))
-                result[index] = Node(bounds: bounds, children: [left, right], leaves: [])
+                children = [build(Array(ordered[..<middle])), build(Array(ordered[middle...]))]
+                leaves = []
             }
-            return index
+            result.append(Node(bounds: bounds, first: lowest, last: highest, children: children, leaves: leaves))
+            return result.count - 1
         }
-        if !entries.isEmpty { _ = build(entries) }
+        var preview: [Leaf] = [], metadataOnly: [Leaf] = []
+        for (ordinal, entry) in entries.enumerated() {
+            let leaf = Leaf(id: entry.id, ordinal: ordinal, rect: Self.rect(entry))
+            if readerOnly.contains(entry.id) { metadataOnly.append(leaf) }
+            else { preview.append(leaf) }
+        }
+        previewRoot = preview.isEmpty ? nil : build(preview)
+        readerOnlyRoot = metadataOnly.isEmpty ? nil : build(metadataOnly)
         nodes = result
     }
     static func rect(_ entry: AtlasProjectCatalog.Entry) -> CGRect {
         CGRect(x: entry.x, y: entry.y, width: entry.width, height: entry.height)
     }
+    /// Both queries use metadata even before source previews load. Taps select
+    /// the last painted parcel containing the point. A bookmark in a gutter
+    /// chooses the nearest closed rectangle, with the first ordinal breaking ties.
+    enum PointQuery { case hit, nearest }
+    func file(at point: CGPoint, query: PointQuery) -> UInt64? {
+        guard point.x.isFinite, point.y.isFinite else { return nil }
+        typealias Score = (CGFloat, Int)
+        var best: Score = (.infinity, .max)
+        var file: UInt64?
+        func distance(to rect: CGRect) -> CGFloat {
+            if query == .hit { return rect.contains(point) ? 0 : .infinity }
+            let dx = max(0, max(rect.minX - point.x, point.x - rect.maxX))
+            let dy = max(0, max(rect.minY - point.y, point.y - rect.maxY))
+            return hypot(dx, dy)
+        }
+        func lowerBound(_ node: Node) -> Score {
+            (distance(to: node.bounds), query == .hit ? -node.last : node.first)
+        }
+        func visit(_ index: Int) {
+            let node = nodes[index], bound = lowerBound(node)
+            guard bound.0.isFinite, bound < best else { return }
+            if node.children.isEmpty {
+                for leaf in node.leaves {
+                    let score = (distance(to: leaf.rect), query == .hit ? -leaf.ordinal : leaf.ordinal)
+                    if score.0.isFinite, score < best { best = score; file = leaf.id }
+                }
+            } else {
+                let a = node.children[0], b = node.children[1]
+                if lowerBound(nodes[a]) < lowerBound(nodes[b]) { visit(a); visit(b) }
+                else { visit(b); visit(a) }
+            }
+        }
+        if let previewRoot { visit(previewRoot) }
+        if let readerOnlyRoot { visit(readerOnlyRoot) }
+        return file
+    }
     func candidates(in viewport: CGRect, scale: Double, eligible: (UInt64) -> Bool) -> [UInt64] {
-        guard !nodes.isEmpty else { return [] }
-        var stack = [0], result: [UInt64] = [], visits = 0
+        guard let previewRoot else { return [] }
+        var stack = [previewRoot], result: [UInt64] = [], visits = 0
         while let index = stack.popLast(), visits < 16_384, result.count < 4096 {
             visits += 1
             let node = nodes[index], bounds = node.bounds
@@ -218,7 +274,7 @@ struct AtlasViewportLayout: Sendable {
             states[entry.id] = .readerOnly
         }
         return Self(root: root, revision: revision, entries: entries, rawIDs: rawIDs,
-            index: AtlasViewportIndex(entries: next.filter { states[$0.id] == nil }), previewStates: states)
+            index: AtlasViewportIndex(entries: next, readerOnly: Set(states.keys)), previewStates: states)
     }
 }
 
@@ -330,6 +386,17 @@ struct AtlasViewportLayout: Sendable {
     func hasInstalledLayout(root: String, layoutRevision: UUID) -> Bool {
         isInstalled && self.layoutRevision == layoutRevision
             && self.root.utf8.elementsEqual(root.utf8)
+    }
+
+    func file(at point: CGPoint, nearest: Bool = false, revision: UUID) -> AtlasProjectCatalog.Entry? {
+        guard isInstalled, revision == layoutRevision,
+              let id = index.file(at: point, query: nearest ? .nearest : .hit) else { return nil }
+        return entries[id]
+    }
+
+    func file(rawPath: [UInt8], revision: UUID) -> AtlasProjectCatalog.Entry? {
+        guard isInstalled, revision == layoutRevision, let id = rawIDs[rawPath] else { return nil }
+        return entries[id]
     }
 
     var summary: String {
