@@ -86,6 +86,85 @@ import Foundation
             }
         }
     }
+    @MainActor private static func relationshipHistory() async {
+        let fixture = ProjectLinksFixture(includesImports: true)
+        let docs = Array("docs.md".utf8), guide = Array("guide.md".utf8), lib = Array("src/lib.rs".utf8)
+        let model = AtlasProjectLinksModel(root: "/project", transport: fixture.transport)
+        // A byte-limited first window. The actual next offset is 7, not 64.
+        fixture.patch { phase, receipt in
+            guard phase == "step" || phase == "page", receipt["offset"] as? String == "0",
+                  let rows = receipt["links"] as? [[String: Any]], rows.count > 7 else { return receipt }
+            var shortened = receipt
+            shortened["links"] = Array(rows.prefix(7)); shortened["next_offset"] = "7"
+            return shortened
+        }
+        model.prepare(); await settled(model)
+        precondition(model.page?.next == 7 && !model.canGoBack && !model.canGoForward)
+        model.loadPage(start: 7); await settled(model)
+        precondition(!model.canGoBack && model.previousPageStart == 0)
+        model.selectPath(docs, direction: .outgoing); await settled(model)
+        model.selectProjection(.imports); await settled(model)
+        precondition(model.page?.total == 0 && model.projection == .imports && model.selectedPath == docs)
+        model.selectPath(lib, direction: .outgoing); await settled(model)
+        precondition(model.page?.total == 70 && model.selectedPath == lib && !model.canGoForward)
+
+        model.goBack(); await settled(model)
+        precondition(model.selectedPath == docs && model.direction == .outgoing && model.page?.total == 0)
+        let emptyPage = model.page!.id
+        // Even a correctly scoped receipt may lie about an empty filter's file ID.
+        model.goForward(); await settled(model)
+        fixture.patch { phase, value in
+            var value = value
+            if phase == "imports-page", value["matching_links"] as? String == "0" {
+                value["filter_file_id"] = "2"
+            }
+            return value
+        }
+        let beforeFailure = model.page!.id
+        model.goBack(); await settled(model)
+        precondition(model.page?.id == beforeFailure && model.canGoBack && !model.canGoForward)
+        fixture.patch { _, value in value }
+        fixture.pause("imports-page"); model.goBack()
+        await until { fixture.isBlocked }
+        model.cancel(); fixture.gate.signal(); await settled(model)
+        precondition(model.page?.id == beforeFailure && model.canGoBack && !model.canGoForward,
+            "A canceled restore consumes neither the visible location nor its Back target")
+        model.goBack(); await settled(model)
+        precondition(model.page?.id != emptyPage && model.selectedPath == docs && model.page?.total == 0)
+        model.goBack(); await settled(model)
+        precondition(model.projection == .documentation && model.direction == .outgoing && model.selectedPath == docs)
+        model.goBack(); await settled(model)
+        precondition(model.projection == .documentation && model.direction == .all && model.selectedPath == nil
+            && model.page?.start == 7 && model.previousPageStart == 0 && !model.canGoBack && model.canGoForward,
+            "Back restores the exact result offset plus the actual previous-page start")
+        model.loadPage(start: 0); await settled(model)
+        precondition(model.canGoForward && !model.canGoBack && model.previousPageStart == nil)
+        model.selectPath(Array("absent.rs".utf8)); await settled(model)
+        precondition(model.canGoForward && model.selectedPath == nil)
+        model.goForward(); await settled(model)
+        precondition(model.selectedPath == docs && model.direction == .outgoing && model.canGoForward)
+        model.selectPath(guide, direction: .incoming); await settled(model)
+        precondition(model.selectedPath == guide && model.canGoBack && !model.canGoForward)
+        precondition(fixture.index.count("create:") == 1 && fixture.log.filter { $0 == "begin" }.count == 1
+            && fixture.log.filter { $0 == "imports-begin" }.count == 1,
+            "History loads retained inventory pages without recapture or relationship extraction")
+
+        let original = model.page!.basis
+        fixture.pause("step"); model.prepare(refresh: true)
+        await until { fixture.isBlocked }
+        model.cancel(); fixture.gate.signal(); await settled(model)
+        precondition(model.canGoBack && model.page?.basis == original)
+        model.prepare(refresh: true); await settled(model)
+        precondition(model.page?.basis != original && model.selectedPath == guide
+            && !model.canGoBack && !model.canGoForward && model.previousPageStart == nil,
+            "An accepted recapture starts a new history even when the filter and generation numbers repeat")
+        model.selectPath(docs, direction: .outgoing); await settled(model)
+        fixture.pause("page"); model.goBack()
+        await until { fixture.isBlocked }
+        model.close(); fixture.gate.signal(); await settled(model)
+        precondition(model.page == nil && !model.canGoBack && !model.canGoForward)
+    }
+
     @MainActor private static func replacementLifecycle() async throws {
         let fixture = ProjectLinksFixture(), selected = Array("guide.md".utf8)
         let model = AtlasProjectLinksModel(root: "/project", initialPath: selected,
@@ -409,6 +488,7 @@ import Foundation
         retiringModel.close(); retiring.gate.signal(); await settled(retiringModel)
         precondition(retiringModel.closed && retiringModel.page == nil && !retiringModel.hasPreparedSources,
             "Project/grant replacement revokes the surface before late foreign work can publish")
+        await relationshipHistory()
         try await replacementLifecycle()
         print("AtlasProjectLinksTests: prepare-only, bounded pages, retained navigation and transactional refresh passed")
     }

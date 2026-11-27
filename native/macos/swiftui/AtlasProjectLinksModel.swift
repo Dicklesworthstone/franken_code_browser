@@ -26,6 +26,35 @@ import Observation
     var selectedPathDisplay: String {
         selectedPath.flatMap { try? AtlasProjectLinkPath(bytes: $0).display } ?? "Whole project"
     }
+    private struct Scope: Equatable {
+        let basis: AtlasIndexedBasis
+        let generation: UInt64
+        let projection: AtlasProjectRelationshipProjection
+        let direction: AtlasProjectLinkDirection
+        let path: [UInt8]?
+        let filterFile: UInt64?
+        let total: UInt64
+
+        init(_ page: AtlasProjectLinksPage) {
+            basis = page.basis; generation = page.generation; projection = page.projection
+            direction = page.direction; path = page.path?.bytes; filterFile = page.filterFile
+            total = page.total
+        }
+    }
+
+    private struct Location: Equatable {
+        let scope: Scope
+        let start: UInt64
+        // Wire-byte limits can shorten a page. Only accepted offsets can
+        // restore Previous on a later page; subtracting 64 loses evidence.
+        let previousStarts: [UInt64]
+    }
+
+    private var locations = AtlasNavigationHistory<Location>(capacity: 32)
+    var canGoBack: Bool { canOperate && locations.canBack }
+    var canGoForward: Bool { canOperate && locations.canForward }
+    var previousPageStart: UInt64? { locations.current?.previousStarts.last }
+
     @ObservationIgnored private let transport: AtlasProjectLinksTransport
     @ObservationIgnored private let access: AtlasSearchAccessLease
     @ObservationIgnored private let io = AtlasProjectIO()
@@ -132,9 +161,8 @@ import Observation
                 model.lastGenerations = [projection: generation]
             }
             model.indexWorker = worker; model.prepared = index
-            model.acceptedPages[projection] = current
-            model.projection = projection; model.direction = direction; model.selectedPath = path
-            model.page = current; model.relationshipProgress = nil
+            model.record(current, refreshed: refresh)
+            model.relationshipProgress = nil
             model.notice = current.summary
         }
     }
@@ -157,8 +185,7 @@ import Observation
             let next = try await model.fetch(index, generation: retained.generation, coverage: retained.coverage,
                 direction: direction, path: path, start: start, flag: flag)
             try model.accept(flag)
-            model.page = next; model.acceptedPages[projection] = next
-            model.projection = projection
+            model.record(next)
             model.notice = "Retained view reloaded. Use Refresh sources to include file edits. " + next.summary
         }
     }
@@ -182,8 +209,7 @@ import Observation
             let next = try await model.fetch(prepared, generation: page.generation, coverage: page.coverage,
                 direction: direction, path: path, start: 0, flag: flag)
             try model.accept(flag)
-            model.page = next; model.acceptedPages[next.projection] = next
-            model.direction = direction; model.selectedPath = path
+            model.record(next)
             model.notice = "Showing \(next.total) retained \(next.projection.noun) in this exact file and direction filter. " + next.summary
         }
     }
@@ -193,10 +219,61 @@ import Observation
             let next = try await model.fetch(prepared, generation: page.generation, coverage: page.coverage,
                 direction: page.direction, path: page.path?.bytes, start: start, flag: flag)
             try model.accept(flag)
-            model.page = next; model.acceptedPages[next.projection] = next
+            model.record(next)
             model.notice = "Showing retained relationships \(start)..<\(start + UInt64(next.links.count)) of \(next.total). No source files were reread."
         }
     }
+
+    /// Only the accepted filter, direction or projection adds a journey step.
+    /// Paging within the same location updates its anchor and preserves Forward.
+    private func record(_ next: AtlasProjectLinksPage, refreshed: Bool = false) {
+        let scope = Scope(next)
+        if !refreshed, let current = locations.current, current.scope == scope {
+            var previous = current.previousStarts
+            if next.start > current.start {
+                previous.append(current.start)
+            } else if next.start < current.start {
+                previous = Array(previous.prefix { $0 < next.start })
+            }
+            locations.replaceCurrent(Location(scope: scope, start: next.start, previousStarts: previous))
+        } else {
+            let location = Location(scope: scope, start: next.start, previousStarts: [])
+            if refreshed {
+                locations.reset(to: location)
+            } else {
+                let move = locations.visit(location)
+                locations.commit(move, resolved: location)
+            }
+        }
+        display(next)
+    }
+
+    private func display(_ next: AtlasProjectLinksPage) {
+        acceptedPages[next.projection] = next
+        projection = next.projection; direction = next.direction; selectedPath = next.path?.bytes
+        page = next
+    }
+
+    func goBack() { if canGoBack, let move = locations.back() { restore(move) } }
+    func goForward() { if canGoForward, let move = locations.forward() { restore(move) } }
+
+    private func restore(_ move: AtlasNavigationHistory<Location>.Move) {
+        let target = move.target, scope = target.scope
+        guard let index = prepared, index.basis == scope.basis,
+              let retained = acceptedPages[scope.projection], retained.basis == scope.basis,
+              retained.generation == scope.generation else { return }
+        perform { model, flag in
+            let next = try await model.fetch(index, generation: scope.generation, coverage: retained.coverage,
+                direction: scope.direction, path: scope.path, start: target.start, flag: flag)
+            try model.accept(flag)
+            guard Scope(next) == scope, model.locations.commit(move, resolved: target) else {
+                throw AtlasProjectLinksError.invalidResponse
+            }
+            model.display(next)
+            model.notice = next.summary
+        }
+    }
+
     private func fetch(_ index: AtlasPreparedIndex, generation: UInt64, coverage: AtlasProjectLinksCoverage,
         direction: AtlasProjectLinkDirection, path: [UInt8]?, start: UInt64,
         flag: AtlasSearchCancellation) async throws -> AtlasProjectLinksPage {
@@ -382,6 +459,7 @@ import Observation
     func close() {
         guard !closed else { return }
         closed = true; cancel(); page = nil; captureProgress = nil; relationshipProgress = nil; acceptedPages = [:]
+        locations.reset()
         if !busy { prepared = nil; indexWorker = nil }
     }
     private func accept(_ flag: AtlasSearchCancellation) throws {

@@ -1827,6 +1827,14 @@ that file's incoming and outgoing relationships; the existing evidence list and
 exact source/target reader actions remain available. A selected file with no
 retained relationships still has its own parcel.
 
+Use **Back** and **Forward** beside the path field to retrace up to 32
+relationship locations. Returning restores the evidence type, file, direction
+and results page, including the previous page when a response was shortened.
+Paging updates your current location. Following a new file after going back
+starts a new trail. Refreshing sources starts a fresh history once the new
+inventory is accepted. The Back and Forward controls above the source reader
+follow its separate history of opened captures.
+
 The map groups repeated directed pairs and shows their per-page evidence count
 as **×N**. At most **32 distinct connections** are drawn from the current
 bounded result page. Its summary separately counts records without catalog

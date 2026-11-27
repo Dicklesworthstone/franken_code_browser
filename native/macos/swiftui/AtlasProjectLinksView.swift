@@ -26,24 +26,11 @@ import SwiftUI
         failureMessage: { ($0 as? AtlasProjectLinksError)?.message ?? ($0 as? AtlasReaderError)?.message
             ?? "The linked capture could not be opened. Your retained reading position is unchanged." })
     @State private var readerNotice = ""
-    @State private var paginationScope: PaginationScope?
-    @State private var pageStarts: [UInt64] = []
     @State private var showsNeighborhood = true
     @State private var pins = AtlasPinnedReaders<AtlasPagedReaderModel>(
         canFork: { $0.canPin }, fork: { try await $0.fork() }, retire: { $0.close() },
         failureMessage: { ($0 as? AtlasReaderError)?.message ?? "The retained relationship source could not be pinned." })
     @Environment(\.dismiss) private var dismiss
-
-    private struct PaginationScope: Equatable {
-        let owner, index, generation: UInt64
-        let direction: AtlasProjectLinkDirection
-        let projection: AtlasProjectRelationshipProjection
-        let path: [UInt8]?
-        init(_ page: AtlasProjectLinksPage) {
-            owner = page.basis.owner; index = page.basis.index; generation = page.generation
-            direction = page.direction; projection = page.projection; path = page.path?.bytes
-        }
-    }
 
     init(presentation: AtlasProjectLinksPresentation, desk: AtlasReadingDeskModel) {
         self.presentation = presentation; self.desk = desk
@@ -57,12 +44,6 @@ import SwiftUI
     }
     private var reader: AtlasProjectLinkReaderCapture? { history.current }
     private var pinGroup: String { "project-links:\(presentation.id.uuidString)" }
-    private var previousPageStart: UInt64? {
-        guard let page = model.page, paginationScope == PaginationScope(page),
-              let current = pageStarts.firstIndex(of: page.start), current > 0 else { return nil }
-        return pageStarts[current - 1]
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
@@ -110,7 +91,6 @@ import SwiftUI
         .onChange(of: model.selectedPath) { _, path in
             pathInput = path.flatMap { String(bytes: $0, encoding: .utf8) } ?? ""
         }
-        .onChange(of: model.page?.id) { _, _ in rememberPage() }
         .onDisappear { close() }
     }
 
@@ -145,6 +125,18 @@ import SwiftUI
             }
             .pickerStyle(.segmented).frame(maxWidth: 400).disabled(!canOperate)
             HStack {
+                Button {
+                    readerNotice = ""; model.goBack()
+                } label: { Label("Back", systemImage: "chevron.left") }
+                    .accessibilityLabel("Back in relationship history")
+                    .help("Return to the previous relationship filter and results page.")
+                    .disabled(!canOperate || !model.canGoBack)
+                Button {
+                    readerNotice = ""; model.goForward()
+                } label: { Label("Forward", systemImage: "chevron.right") }
+                    .accessibilityLabel("Forward in relationship history")
+                    .help("Revisit the next relationship filter and results page.")
+                    .disabled(!canOperate || !model.canGoForward)
                 TextField("Exact project-relative path, such as src/lib.rs", text: $pathInput)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit { selectTypedPath() }
@@ -209,9 +201,9 @@ import SwiftUI
                 }
                 HStack {
                     Button("Previous") {
-                        readerNotice = ""; if let previousPageStart { model.loadPage(start: previousPageStart) }
+                        readerNotice = ""; if let previousPageStart = model.previousPageStart { model.loadPage(start: previousPageStart) }
                     }
-                        .disabled(!canOperate || previousPageStart == nil)
+                        .disabled(!canOperate || model.previousPageStart == nil)
                     Spacer()
                     Text("\(page.start + UInt64(page.links.isEmpty ? 0 : 1))–\(page.start + UInt64(page.links.count)) of \(page.total)")
                         .font(.caption).foregroundStyle(.secondary)
@@ -311,19 +303,6 @@ import SwiftUI
     private func selectTypedPath() {
         guard canOperate, !pathInput.isEmpty else { return }
         readerNotice = ""; model.selectPath(Array(pathInput.utf8))
-    }
-    private func rememberPage() {
-        guard let page = model.page else { paginationScope = nil; pageStarts = []; return }
-        let scope = PaginationScope(page)
-        if paginationScope != scope {
-            paginationScope = scope; pageStarts = [page.start]
-        } else if let position = pageStarts.firstIndex(of: page.start) {
-            pageStarts = Array(pageStarts.prefix(position + 1))
-        } else if pageStarts.count < 4096 {
-            // Response-byte limits can shorten pages. Remember actual starts
-            // instead of subtracting the requested page size from an offset.
-            pageStarts.append(page.start)
-        }
     }
     private func open(_ link: AtlasProjectLink, page: AtlasProjectLinksPage, side: AtlasProjectLinkSide) {
         guard canOperate, !page.building else { return }
