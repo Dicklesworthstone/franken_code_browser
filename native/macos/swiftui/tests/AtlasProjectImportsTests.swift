@@ -65,6 +65,10 @@ import Foundation
             var bad = valid, rows = valid["links"] as! [[String: Any]]
             rows[0]["evidence_range"] = range; bad["links"] = rows; refuse(bad, index: index)
         }
+        for range in [["start": "10", "end": "15"], ["start": "17", "end": "17"], ["start": "19", "end": "22"]] {
+            var bad = valid, rows = valid["links"] as! [[String: Any]]
+            rows[0]["specifier_range"] = range; bad["links"] = rows; refuse(bad, index: index)
+        }
         var markdown = valid, rows = valid["links"] as! [[String: Any]]
         rows[0]["block_index"] = "0"; markdown["links"] = rows; refuse(markdown, index: index)
 
@@ -889,6 +893,7 @@ import Foundation
             rows[i]["target_path"] = ProjectLinksFixture.path("src/platform/custom.rs")
             let start = UInt64(11) + UInt64(i) * span
             rows[i]["evidence_range"] = ["start": String(start), "end": String(start + span)]
+            rows[i]["specifier_range"] = ["start": String(start + 10), "end": String(start + 28)]
         }
         value["links"] = rows
         let link = try decode(value, index: index).links[0]
@@ -999,7 +1004,67 @@ import Foundation
         }
     }
 
+    @MainActor private static func selectedImport(encoding: String?) async throws {
+        let fixture = ProjectLinksFixture(includesImports: true, largeImportEncoding: encoding)
+        let model = AtlasProjectLinksModel(root: "/project", projection: .imports, transport: fixture.transport)
+        model.prepare(); await settled(model)
+        let visible = model.page!
+        let capture = try await model.open(visible.links[0], from: visible, side: .evidence,
+            readerTransport: fixture.readerTransport)
+        let reader = capture.reader
+        let text = reader.page!.text as NSString
+        let lastName = text.range(of: "child", options: .backwards)
+        precondition(lastName.location != NSNotFound)
+        reader.updateTextSelection(source: reader.source!, navigation: reader.navigation, range: lastName)
+        var deadline = ProcessInfo.processInfo.systemUptime + 10
+        while reader.resolvingTextSelection && ProcessInfo.processInfo.systemUptime < deadline { await Task.yield() }
+        guard let selection = model.importSelection(from: capture) else { preconditionFailure(reader.textSelectionNotice) }
+        let destination = try await model.openSelectedImport(id: selection.id, from: capture, readerTransport: fixture.readerTransport)
+        precondition(destination.link.id == 70 && destination.file.path.bytes == Array("src/child.rs".utf8)
+            && destination.link.specifierRange?.start == selection.originalStart
+            && destination.link.specifierRange?.end == selection.originalEnd
+            && model.page?.id == visible.id && model.importSelection(from: capture)?.id == selection.id,
+            "The last repeated spelling follows its own later-page evidence and preserves the Inspector and reader")
+        destination.reader.close()
+
+        if encoding == nil {
+            let start = selection.originalStart, end = selection.originalEnd
+            fixture.patch { phase, value in
+                var value = value
+                guard phase == "imports-page", var rows = value["links"] as? [[String: Any]],
+                      rows.last?["link_id"] as? String == "70" else { return value }
+                let earlier = rows.count - 2
+                rows[earlier]["evidence_range"] = rows[earlier + 1]["evidence_range"]
+                rows[earlier]["specifier_range"] = ["start": String(start), "end": String(end)]
+                value["links"] = rows
+                return value
+            }
+            do {
+                _ = try await model.openSelectedImport(id: selection.id, from: capture, readerTransport: fixture.readerTransport)
+                preconditionFailure("Two retained occurrences claimed the same selection")
+            } catch AtlasProjectLinksError.ambiguousImportSelection {}
+            fixture.patch { _, value in value }
+            fixture.pause("imports-page")
+            let pending = Task { try await model.openSelectedImport(id: selection.id, from: capture,
+                readerTransport: fixture.readerTransport) }
+            deadline = ProcessInfo.processInfo.systemUptime + 10
+            while !fixture.isBlocked && ProcessInfo.processInfo.systemUptime < deadline { await Task.yield() }
+            precondition(fixture.isBlocked)
+            reader.updateTextSelection(source: reader.source!, navigation: reader.navigation, range: nil)
+            fixture.gate.signal()
+            do {
+                _ = try await pending.value
+                preconditionFailure("A retired native selection opened a target")
+            } catch AtlasProjectLinksError.staleImportSelection {}
+            precondition(model.page?.id == visible.id && !model.busy)
+        }
+        reader.close(); model.close()
+    }
+
     @MainActor static func main() async throws {
+        for encoding in [nil, "utf16le", "utf16be"] as [String?] {
+            try await selectedImport(encoding: encoding)
+        }
         try await largeSourceReaders()
         let fixture = ProjectLinksFixture(includesImports: true), index = try await prepared(fixture)
         try ProjectLinksGeometryTests.run(index, projection: .imports)

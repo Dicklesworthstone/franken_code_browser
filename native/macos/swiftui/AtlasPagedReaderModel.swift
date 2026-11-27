@@ -305,7 +305,7 @@ import Observation
 
     /// A retained menu action must still name the displayed selection receipt.
     /// No selected string is reconstructed from native offsets or a live path.
-    private var searchableSelection: AtlasReaderTextSelection? {
+    var searchableSelection: AtlasReaderTextSelection? {
         guard !busy, !pinning, !documentPreview.busy, !resolvingTextSelection,
               let selection = textSelection, let intent = textSelectionIntent, let page,
               source === intent.source, navigation == intent.navigation,

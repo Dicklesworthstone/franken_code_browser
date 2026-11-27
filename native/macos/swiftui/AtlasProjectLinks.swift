@@ -3,12 +3,21 @@ import Foundation
 enum AtlasProjectLinksError: Error, Sendable {
     case unavailable, invalidInput, invalidResponse, canceled, engine(String)
     case staleDocumentLink, unindexedDocumentLink, unavailableDocumentTarget
+    case staleImportSelection, missingImportSelection, ambiguousImportSelection, unavailableImportTarget
     var message: String {
         switch self {
         case .unavailable: return "Project relationships are unavailable. Capture the project again."
         case .invalidInput: return "Choose a current relationship or an exact relative project path."
         case .invalidResponse: return "The relationship response could not be verified. It is not an empty result."
         case .canceled: return "Relationship work was canceled."
+        case .staleImportSelection:
+            return "Select an import in a reader from the current project capture and build the Imports inventory."
+        case .missingImportSelection:
+            return "The selection does not identify an import specifier in the retained evidence. Select a module name or path."
+        case .ambiguousImportSelection:
+            return "The selection touches multiple import candidates. Select one module name or path."
+        case .unavailableImportTarget:
+            return "This import has no captured target candidate. Its source is still available."
         case .staleDocumentLink:
             return "This document link no longer belongs to the current project capture. The retained reader and its history remain available."
         case .unindexedDocumentLink:
@@ -317,6 +326,7 @@ struct AtlasProjectLink: Identifiable, Sendable, Equatable, Decodable {
     let sourceLink: UInt64
     let block: UInt64?
     let evidenceRange: AtlasProjectLinkRange
+    let specifierRange: AtlasProjectLinkRange?
     let importEvidence: AtlasProjectImportEvidence?
     let geometry: AtlasProjectLinkGeometry?
     let destination, resolution, destinationSuffix, fragmentResolution: String
@@ -391,7 +401,7 @@ struct AtlasProjectLink: Identifiable, Sendable, Equatable, Decodable {
         if projection == .documentation {
             block = try w.number("block_index")
             destinationSuffix = try w.text("destination_suffix"); fragmentResolution = try w.text("fragment_resolution")
-            importEvidence = nil
+            importEvidence = nil; specifierRange = nil
             guard bytes <= 262_144, evidenceRange.start == 0, evidenceRange.end == bytes,
                   destinationSuffix.utf8.count <= 4096,
                   fragmentResolution == (destinationSuffix.isEmpty ? "none" : "unqualified"),
@@ -400,6 +410,16 @@ struct AtlasProjectLink: Identifiable, Sendable, Equatable, Decodable {
         } else {
             block = nil; destinationSuffix = ""; fragmentResolution = "none"
             importEvidence = try AtlasProjectImportEvidence(w)
+            if w.fields.contains(.init("specifier_range")) {
+                let range = try AtlasProjectLinkRange(w.object("specifier_range"))
+                guard evidenceRange.start <= range.start, range.start < range.end,
+                      range.end <= evidenceRange.end else { throw AtlasProjectLinksError.invalidResponse }
+                specifierRange = range
+            } else {
+                // Older receipts can open their row, but cannot identify a
+                // selected module name inside the enclosing statement.
+                specifierRange = nil
+            }
             guard bytes <= AtlasProjectImportEvidence.sourceLimit, evidenceRange.start < evidenceRange.end, evidenceRange.end <= bytes,
                   !destination.isEmpty,
                   importEvidence?.resolutionBasis != "python-absolute-module-candidate" || !destination.hasPrefix("."),
@@ -476,7 +496,7 @@ struct AtlasProjectLink: Identifiable, Sendable, Equatable, Decodable {
         a.id == b.id && a.projection == b.projection && a.source == b.source && a.target == b.target
             && a.targetPath == b.targetPath && a.targetFile == b.targetFile && a.sourceLink == b.sourceLink
             && a.block == b.block && a.evidenceRange == b.evidenceRange && a.importEvidence == b.importEvidence
-            && a.geometry == b.geometry
+            && a.specifierRange == b.specifierRange && a.geometry == b.geometry
             && a.destination.utf8.elementsEqual(b.destination.utf8) && a.resolution == b.resolution
             && a.destinationSuffix.utf8.elementsEqual(b.destinationSuffix.utf8) && a.fragmentResolution == b.fragmentResolution
     }

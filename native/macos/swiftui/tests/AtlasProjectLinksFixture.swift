@@ -251,7 +251,32 @@ final class ProjectLinksFixture: @unchecked Sendable {
             self.readerFiles.removeValue(forKey: owner); self.readerProjections.removeValue(forKey: owner)
             self.events.append("close-reader"); return true
         }, retirementFailed: { preconditionFailure("Unexpected fixture retirement failure") },
-        comparison: .init(domain: domain, compare: { _, _, _, _, _ in nil }))
+        comparison: .init(domain: domain, compare: { _, _, _, _, _ in nil }),
+        textSelection: .init(resolve: { owner, start, end, first, last in
+            self.lock.lock()
+            let file = self.readerFiles[owner], projection = self.readerProjections[owner]
+            self.lock.unlock()
+            guard let file, projection == .imports else { return nil }
+            let large = file == 1 && self.largeImportBytes != nil
+            let bytes = large ? self.largeImportBytes! : Array(Self.source(file, projection: .imports).utf8)
+            let encoding: String.Encoding = large && self.largeImportEncoding == "utf16le" ? .utf16LittleEndian
+                : (large && self.largeImportEncoding == "utf16be" ? .utf16BigEndian : .utf8)
+            guard start <= end, end <= bytes.count,
+                  let page = String(bytes: bytes[Int(start)..<Int(end)], encoding: encoding),
+                  first < last, last <= page.utf8.count else { return nil }
+            let utf8 = Array(page.utf8)
+            guard let prefix = String(bytes: utf8.prefix(Int(first)), encoding: .utf8),
+                  let text = String(bytes: utf8[Int(first)..<Int(last)], encoding: .utf8),
+                  let prefixBytes = prefix.data(using: encoding), let selected = text.data(using: encoding) else { return nil }
+            let offset = start + UInt64(prefixBytes.count)
+            var value = Self.readerInfo(owner, file: file, projection: .imports, importEncoding: self.largeImportEncoding)
+            value["command"] = "resolve-selection"; value["selection_namespace"] = "native-text"
+            value["window_original_range"] = ["start": String(start), "end": String(end)]
+            value["window_utf8_range"] = ["start": String(first), "end": String(last)]
+            value["original_range"] = ["start": String(offset), "end": String(offset + UInt64(selected.count))]
+            value["text"] = text; value["original_hex"] = Self.hex(selected); value["contains_replacements"] = false
+            return self.call("resolve-selection", value)
+        }))
     }
 }
 
@@ -341,7 +366,10 @@ extension ProjectLinksFixture {
         value["target_path"] = path(name(2, projection: .imports))
         value["destination"] = "child"
         value["source_bytes"] = String(importSourceBytes(1, encoding: encoding))
-        value["evidence_range"] = importEvidenceRange(id, encoding: encoding)
+        let statement = importEvidenceRange(id, encoding: encoding)
+        let start = UInt64(statement["start"]!)!, unit: UInt64 = encoding == nil || encoding == "utf8" ? 1 : 2
+        value["evidence_range"] = statement
+        value["specifier_range"] = ["start": String(start + 4 * unit), "end": String(start + 9 * unit)]
         value["language"] = "rust"; value["lexical_import_kind"] = "rust-module"
         value["resolution_basis"] = "rust-module-file-candidate"
         for key in ["block_index", "destination_suffix", "fragment_resolution"] { value.removeValue(forKey: key) }

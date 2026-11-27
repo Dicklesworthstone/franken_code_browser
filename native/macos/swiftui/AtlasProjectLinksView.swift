@@ -274,6 +274,18 @@ import SwiftUI
                         .disabled(!history.canForward || !model.canOperate)
                     Text(verbatim: capture.path.display).font(.headline).lineLimit(2).textSelection(.enabled)
                     Spacer()
+                    if model.hasPreparedSources && model.availableProjections.contains(.imports) {
+                        Button("Follow selected import") {
+                            guard let selection = model.importSelection(from: capture) else { return }
+                            readerNotice = ""
+                            history.follow {
+                                try await model.openSelectedImport(id: selection.id, from: capture,
+                                    readerTransport: .native, search: .native, outline: .native, document: .native)
+                            }
+                        }
+                        .disabled(!canOperate || model.importSelection(from: capture) == nil)
+                        .help("Build Imports, then select a module name or path in the captured source to open its catalog candidate.")
+                    }
                     Button("Close reader") {
                         readerNotice = ""; history.close()
                         history.bind(root: presentation.root, accessIdentity: ObjectIdentifier(presentation))

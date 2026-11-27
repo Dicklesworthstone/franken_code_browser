@@ -350,11 +350,11 @@ import Observation
     }
 
     func canFollowDocumentLinks(from source: AtlasProjectLinkReaderCapture) -> Bool {
-        canOperate && ownsDocumentSource(source)
+        canOperate && ownsReaderSource(source)
             && acceptedPages[.documentation].map({ !$0.building && $0.basis == source.basis }) == true
     }
 
-    private func ownsDocumentSource(_ source: AtlasProjectLinkReaderCapture) -> Bool {
+    private func ownsReaderSource(_ source: AtlasProjectLinkReaderCapture) -> Bool {
         guard !closed, prepared?.basis == source.basis, source.owner == source.basis.owner,
               let domain = transport.readerDomain, source.reader.retainedRegistryDomain == domain,
               source.reader.retainedCaptureSHA256 == source.file.digest,
@@ -366,7 +366,7 @@ import Observation
 
     private func ownsDocumentLink(_ target: AtlasReaderDocumentLinkTarget,
         from source: AtlasProjectLinkReaderCapture) -> Bool {
-        ownsDocumentSource(source) && target.link.kind == .local
+        ownsReaderSource(source) && target.link.kind == .local
             && source.reader.page?.identity.matches(target.inventory.identity) == true
             && source.reader.documentPreview.allows(target)
             && target.link.evidence.start == 0 && target.link.evidence.end == source.file.capturedBytes
@@ -404,48 +404,111 @@ import Observation
         }
     }
 
+    private typealias LocatedLink = (AtlasProjectLink, AtlasProjectLinksPage)
+
     private func resolveDocumentLink(_ target: AtlasReaderDocumentLinkTarget,
-        from source: AtlasProjectLinkReaderCapture) async throws -> (AtlasProjectLink, AtlasProjectLinksPage) {
-        guard canOperate, ownsDocumentLink(target, from: source), let index = prepared,
-              let inventory = acceptedPages[.documentation], !inventory.building,
-              inventory.basis == source.basis else { throw AtlasProjectLinksError.staleDocumentLink }
+        from source: AtlasProjectLinkReaderCapture) async throws -> LocatedLink {
+        var found: LocatedLink?
+        try await scanOutgoing(from: source, projection: .documentation, stillCurrent: {
+            self.ownsDocumentLink(target, from: source)
+        }) { link, page in
+            guard link.sourceLink == target.link.id else { return true }
+            guard link.block == target.link.blockIndex,
+                  link.evidenceRange.start == target.link.evidence.start,
+                  link.evidenceRange.end == target.link.evidence.end,
+                  link.destination.utf8.elementsEqual(target.link.destination.utf8) else {
+                throw AtlasProjectLinksError.invalidResponse
+            }
+            guard link.canOpenTarget else { throw AtlasProjectLinksError.unavailableDocumentTarget }
+            found = (link, page)
+            return false
+        }
+        guard let found else { throw AtlasProjectLinksError.unindexedDocumentLink }
+        return found
+    }
+
+    func importSelection(from source: AtlasProjectLinkReaderCapture) -> AtlasReaderTextSelection? {
+        guard ownsReaderSource(source), acceptedPages[.imports]?.basis == source.basis,
+              let selection = source.reader.searchableSelection, !selection.containsReplacements else { return nil }
+        return selection
+    }
+
+    /// Only original-byte positions identify an import leaf. Repeated names,
+    /// normalized Rust paths and UTF-16 captures never use a text comparison.
+    func openSelectedImport(id: UUID, from source: AtlasProjectLinkReaderCapture,
+        readerTransport: AtlasReaderTransport, search: AtlasReaderSearchTransport? = nil,
+        outline: AtlasReaderOutlineTransport? = nil,
+        document: AtlasReaderDocumentTransport? = nil) async throws -> AtlasProjectLinkReaderCapture {
+        guard canOperate, let selection = importSelection(from: source), selection.id == id,
+              readerTransport.comparison?.domain == transport.readerDomain else {
+            throw AtlasProjectLinksError.staleImportSelection
+        }
+        var found: LocatedLink?
+        try await scanOutgoing(from: source, projection: .imports, stillCurrent: {
+            self.importSelection(from: source)?.id == id
+        }) { link, page in
+            let first = selection.originalStart, last = selection.originalEnd
+            guard first < link.evidenceRange.end, link.evidenceRange.start < last else { return true }
+            guard let range = link.specifierRange else { throw AtlasProjectLinksError.missingImportSelection }
+            guard first < range.end, range.start < last else { return true }
+            guard found == nil else { throw AtlasProjectLinksError.ambiguousImportSelection }
+            found = (link, page)
+            // Validate all outgoing pages before choosing this occurrence.
+            return true
+        }
+        guard let (link, page) = found,
+              link.evidenceRange.start <= selection.originalStart, selection.originalEnd <= link.evidenceRange.end else {
+            throw AtlasProjectLinksError.missingImportSelection
+        }
+        guard link.canOpenTarget else { throw AtlasProjectLinksError.unavailableImportTarget }
+        guard !Task.isCancelled, importSelection(from: source)?.id == id else {
+            throw AtlasProjectLinksError.staleImportSelection
+        }
+        let opened = try await openRetainedLink(link, from: page, side: .target, readerTransport: readerTransport,
+            search: search, outline: outline, document: document)
+        guard !Task.isCancelled, importSelection(from: source)?.id == id,
+              acceptedPages[.imports]?.generation == page.generation else {
+            opened.reader.close()
+            throw AtlasProjectLinksError.staleImportSelection
+        }
+        return opened
+    }
+
+    /// Decode one bounded page at a time; callers inspect the frozen
+    /// outgoing inventory without changing the visible Inspector filters.
+    private func scanOutgoing(from source: AtlasProjectLinkReaderCapture,
+        projection: AtlasProjectRelationshipProjection, stillCurrent: () -> Bool,
+        inspect: (AtlasProjectLink, AtlasProjectLinksPage) throws -> Bool) async throws {
+        let stale: AtlasProjectLinksError = projection == .imports ? .staleImportSelection : .staleDocumentLink
+        guard canOperate, stillCurrent(), let index = prepared,
+              let inventory = acceptedPages[projection], !inventory.building,
+              inventory.basis == source.basis else { throw stale }
         let flag = AtlasSearchCancellation()
         cancellation = flag; busy = true
         defer { finish() }
-        return try await withTaskCancellationHandler(operation: {
+        try await withTaskCancellationHandler(operation: {
             var first: UInt64 = 0, lastOccurrence: UInt64 = 0, lastLink: UInt64 = 0
             var total: UInt64?
             while true {
                 try accept(flag)
-                guard ownsDocumentLink(target, from: source),
-                      acceptedPages[.documentation]?.generation == inventory.generation else {
-                    throw AtlasProjectLinksError.staleDocumentLink
-                }
+                guard stillCurrent(), acceptedPages[projection]?.generation == inventory.generation else { throw stale }
                 let next = try await fetch(index, generation: inventory.generation,
                     coverage: inventory.coverage, direction: .outgoing, path: source.file.path.bytes,
                     start: first, flag: flag)
                 try accept(flag)
-                guard ownsDocumentLink(target, from: source), next.filterFile == source.file.id,
-                      total == nil || total == next.total else { throw AtlasProjectLinksError.invalidResponse }
+                guard stillCurrent() else { throw stale }
+                guard next.filterFile == source.file.id, total == nil || total == next.total else {
+                    throw AtlasProjectLinksError.invalidResponse
+                }
                 total = next.total
                 for link in next.links {
                     guard link.source == source.file, link.sourceLink > lastOccurrence, link.id > lastLink else {
                         throw AtlasProjectLinksError.invalidResponse
                     }
                     lastOccurrence = link.sourceLink; lastLink = link.id
-                    if link.sourceLink == target.link.id {
-                        guard link.block == target.link.blockIndex,
-                              link.evidenceRange.start == target.link.evidence.start,
-                              link.evidenceRange.end == target.link.evidence.end,
-                              link.destination.utf8.elementsEqual(target.link.destination.utf8) else {
-                            throw AtlasProjectLinksError.invalidResponse
-                        }
-                        guard link.canOpenTarget else { throw AtlasProjectLinksError.unavailableDocumentTarget }
-                        return (link, next)
-                    }
+                    if try !inspect(link, next) { return }
                 }
-                guard let offset = next.next else { throw AtlasProjectLinksError.unindexedDocumentLink }
-                // The wire proves strict progress and at most 4096 entries.
+                guard let offset = next.next else { return }
                 first = offset
             }
         }, onCancel: { flag.cancel() })

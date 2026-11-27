@@ -1902,6 +1902,15 @@ documentation view. **Outgoing** shows import statements in one file;
 range. **Read target candidate** opens an independent reader over the retained
 target, even if the live files have since changed.
 
+In the relationship reader, select a module name or path and choose **Follow
+selected import** to open its captured target. This works on an import
+statement elsewhere in the open file, including occurrences beyond the
+visible Inspector page. A selection can include the surrounding statement
+when it identifies one specifier. For a grouped statement, select a single
+leaf. Back returns to the retained source. Selection uses original byte
+offsets, including for UTF-16, and requires an Imports inventory from the same
+capture. Unavailable targets and ambiguous selections keep the source open.
+
 The shared import engine supports Rust external module/use declarations,
 JavaScript/TypeScript static imports, re-exports and literal load expressions
 (including JSX/TSX), Python `import` and `from` statements in `.py` and `.pyi`
