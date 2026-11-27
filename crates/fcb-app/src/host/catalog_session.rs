@@ -34,7 +34,7 @@ use std::{collections::VecDeque, fs, mem::size_of, path::Path};
 use fcb::{ArenaOwnerId, ByteLength, FileId};
 use fcb::search::{ResourceAllocationId, ResourceBudget, RootId};
 use fcb::source::{CancelFlag, DirectoryId, NormalizedPath, RawPath, RootGrant, SourceError, SymlinkPolicy};
-use fcb::source::discovery::{BoundedDiscovery, DiscoveryAggregate, DiscoveryKind, DiscoveryLimits};
+use fcb::source::discovery::{BoundedDiscovery, DiscoveryAggregate, DiscoveryKind, DiscoveryLimits, DiscoveryScope};
 use fcb::source::ignore::IgnoreMatcher;
 use fcb::source::ignore::repository::{RepositoryRules, RuleError, RuleLimits, RULE_POLICY_NAME};
 use fcb_core::ResourceLease;
@@ -141,7 +141,7 @@ pub struct CatalogSession {
     discovery_policy: CatalogDiscoveryPolicy,
     // Discovery is narrower than the project grant. Keep its exact raw target
     // after the walker retires so replay and complete/partial receipts agree.
-    directory: Option<NormalizedPath>,
+    scope: DiscoveryScope,
     // Bounded exact spelling admitted at open, before canonicalization. It is
     // a label alias only; all later acquisition uses the canonical grant.
     requested_root: RawPath,
@@ -180,7 +180,7 @@ impl CatalogSession {
     pub fn open_with_policy(owner: ArenaOwnerId, root: &Path, policy: CatalogDiscoveryPolicy,
         canceled: impl FnMut() -> bool)
         -> Result<Self, CatalogSessionError> {
-        Self::open_scoped(owner, root, None, policy, canceled)
+        Self::open_scoped(owner, root, policy, || Ok(DiscoveryScope::Workspace), canceled)
     }
 
     /// Browse one existing directory without enumerating its siblings. Paths,
@@ -190,15 +190,34 @@ impl CatalogSession {
     pub fn open_directory_with_policy(owner: ArenaOwnerId, root: &Path,
         directory: &[u8], policy: CatalogDiscoveryPolicy, canceled: impl FnMut() -> bool)
         -> Result<Self, CatalogSessionError> {
-        Self::open_scoped(owner, root, Some(directory), policy, canceled)
+        Self::open_scoped(owner, root, policy, || {
+            super::atlas_session::directory_path(directory).map(DiscoveryScope::Directory)
+                .map_err(|_| CatalogSessionError::InvalidLimits)
+        }, canceled)
     }
 
-    fn open_scoped(owner: ArenaOwnerId, root: &Path, directory: Option<&[u8]>, policy: CatalogDiscoveryPolicy,
+    /// Start inside an explicit folder or at the exact file. A visible set can
+    /// span the project and still uses the full walk to establish membership.
+    fn open_for_search(owner: ArenaOwnerId, root: &Path, policy: CatalogDiscoveryPolicy,
+        scope: &super::atlas_search::AtlasSearchScope, canceled: impl FnMut() -> bool)
+        -> Result<Self, CatalogSessionError> {
+        use super::atlas_search::AtlasSearchPathKind;
+        let (kind, raw) = scope.path_predicate();
+        Self::open_scoped(owner, root, policy, || {
+            match kind {
+                AtlasSearchPathKind::Directory => super::atlas_session::directory_path(raw).map(DiscoveryScope::Directory),
+                AtlasSearchPathKind::File => super::atlas_session::file_path(raw).map(DiscoveryScope::File),
+                AtlasSearchPathKind::Workspace | AtlasSearchPathKind::Visible => Ok(DiscoveryScope::Workspace),
+            }.map_err(|_| CatalogSessionError::InvalidLimits)
+        }, canceled)
+    }
+
+    fn open_scoped(owner: ArenaOwnerId, root: &Path, policy: CatalogDiscoveryPolicy,
+        make_scope: impl FnOnce() -> Result<DiscoveryScope, CatalogSessionError>,
         mut canceled: impl FnMut() -> bool)
         -> Result<Self, CatalogSessionError> {
         check(&mut canceled)?;
-        if root.as_os_str().is_empty() || root.as_os_str().len() > 16_384
-            || directory.is_some_and(|path| path.is_empty() || path.len() > MAX_CATALOG_DIRECTORY_BYTES) {
+        if root.as_os_str().is_empty() || root.as_os_str().len() > 16_384 {
             return Err(CatalogSessionError::InvalidLimits);
         }
         if !input::NATIVE_FILE_SUPPORTED { return Err(AppError::UnsupportedPlatform.into()); }
@@ -208,8 +227,10 @@ impl CatalogSession {
         // Share the existing raw Unix component admission with directory atlas
         // focus. This preserves backslashes/non-UTF-8 names and the 31-component
         // limit; all path allocations are covered by the state reservation.
-        let directory = directory.map(super::atlas_session::directory_path).transpose()
-            .map_err(|_| CatalogSessionError::InvalidLimits)?;
+        let scope = make_scope()?;
+        if scope.directory().or_else(|| scope.file()).is_some_and(|path| path.as_bytes().len() > MAX_CATALOG_PATH_BYTES) {
+            return Err(CatalogSessionError::InvalidLimits);
+        }
         let root = input::absolute(root)?;
         let requested_root = RawPath::from_path(&root);
         let metadata = fs::symlink_metadata(&root).map_err(|_| AppError::Io)?;
@@ -221,20 +242,24 @@ impl CatalogSession {
         let grant = RootGrant::new(RootId::new(owner, 1).map_err(|_| CatalogSessionError::IdentityExhausted)?, RawPath::from_path(&root));
         let limits = DiscoveryLimits::new(1, WALK_DEPTH, MAX_CATALOG_PATH_BYTES as u32,
             MAX_CATALOG_PAGE_ENTRIES as u32, 64 * 1024, WALK_QUEUE)?;
-        let discovery = match (policy, directory.as_ref()) {
-            (CatalogDiscoveryPolicy::RepositoryRules, None) => BoundedDiscovery::open_rule_aware(
+        let discovery = match (policy, &scope) {
+            (CatalogDiscoveryPolicy::RepositoryRules, DiscoveryScope::Workspace) => BoundedDiscovery::open_rule_aware(
                 grant.clone(), limits, RuleLimits::default(), &budget, allocation(2)?)?,
-            (CatalogDiscoveryPolicy::IncludeExcluded, None) => BoundedDiscovery::open_metadata_only(
+            (CatalogDiscoveryPolicy::IncludeExcluded, DiscoveryScope::Workspace) => BoundedDiscovery::open_metadata_only(
                 grant.clone(), SymlinkPolicy::DisallowAll, limits, IgnoreMatcher::include_all())?,
-            (CatalogDiscoveryPolicy::RepositoryRules, Some(directory)) => BoundedDiscovery::open_rule_aware_in_directory(
+            (CatalogDiscoveryPolicy::RepositoryRules, DiscoveryScope::Directory(directory)) => BoundedDiscovery::open_rule_aware_in_directory(
                 grant.clone(), directory.clone(), limits, RuleLimits::default(), &budget, allocation(2)?)?,
-            (CatalogDiscoveryPolicy::IncludeExcluded, Some(directory)) => BoundedDiscovery::open_metadata_only_in_directory(
+            (CatalogDiscoveryPolicy::IncludeExcluded, DiscoveryScope::Directory(directory)) => BoundedDiscovery::open_metadata_only_in_directory(
                 grant.clone(), directory.clone(), limits, IgnoreMatcher::include_all())?,
+            (CatalogDiscoveryPolicy::RepositoryRules, DiscoveryScope::File(file)) => BoundedDiscovery::open_rule_aware_for_file(
+                grant.clone(), file.clone(), limits, RuleLimits::default(), &budget, allocation(2)?)?,
+            (CatalogDiscoveryPolicy::IncludeExcluded, DiscoveryScope::File(file)) => BoundedDiscovery::open_metadata_only_for_file(
+                grant.clone(), file.clone(), limits, IgnoreMatcher::include_all())?,
         };
         let mut pages = VecDeque::new();
         pages.try_reserve_exact(MAX_CATALOG_RETAINED_PAGES).map_err(|_| AppError::Admission)?;
         if pages.capacity() > MAX_CATALOG_RETAINED_PAGES { return Err(AppError::Admission.into()); }
-        let mut session = Self { grant, discovery_policy: policy, directory, requested_root, root_identity, discovery: Some(discovery), repository_rules: None,
+        let mut session = Self { grant, discovery_policy: policy, scope, requested_root, root_identity, discovery: Some(discovery), repository_rules: None,
             aggregate: DiscoveryAggregate::default(),
             pages, latest_page: 0, catalogued_files: 0, catalogued_directories: 0,
             next_link_file: FIRST_CATALOG_LINK_FILE_ID, complete: false, paused: false,
@@ -248,7 +273,7 @@ impl CatalogSession {
     pub fn owner(&self) -> ArenaOwnerId { self.grant.owner() }
     pub fn grant(&self) -> &RootGrant { &self.grant }
     pub const fn discovery_policy(&self) -> CatalogDiscoveryPolicy { self.discovery_policy }
-    pub fn directory(&self) -> Option<&NormalizedPath> { self.directory.as_ref() }
+    pub fn directory(&self) -> Option<&NormalizedPath> { self.scope.directory() }
 
     fn rule_policy_complete(&self) -> bool {
         !self.discovery_policy.reads_rule_files()
@@ -261,6 +286,19 @@ impl CatalogSession {
     fn retire_discovery(&mut self) {
         self.repository_rules = self.discovery.take().and_then(BoundedDiscovery::into_repository_rules);
     }
+    fn encode_discovery_scope(&self, out: &mut Output) -> Result<(), OutputError> {
+        out.literal(",\"discovery_scope\":")?;
+        out.quoted(match self.scope {
+            DiscoveryScope::Workspace => "workspace", DiscoveryScope::Directory(_) => "directory",
+            DiscoveryScope::File(_) => "file",
+        })?;
+        for (key, path) in [("discovery_directory", self.scope.directory()), ("discovery_file", self.scope.file())] {
+            out.literal(",")?; out.quoted(key)?; out.literal(":")?;
+            if let Some(path) = path { out.path(&path.raw().to_path_buf())?; } else { out.literal("null")?; }
+        }
+        out.literal(",\"path_basis\":\"project-root\"")
+    }
+
     fn encode_rule_policy(&self, out: &mut Output) -> Result<(), OutputError> {
         // Eight worst-case diagnostic paths fit alongside a full catalog page
         // in the existing response envelope. The omitted count remains exact.
@@ -462,7 +500,7 @@ impl CatalogSession {
                         path_bytes += entry.path().as_bytes().len();
                         files.push(CatalogFile { id: file, path: entry.path().clone(), observed_bytes: entry.observed_len().unwrap_or(0) });
                     }
-                    DiscoveryKind::Directory if direct_child(entry.path().as_bytes(), self.directory.as_ref()) => {
+                    DiscoveryKind::Directory if direct_child(entry.path().as_bytes(), self.scope.directory()) => {
                         self.catalogued_directories += 1;
                         path_bytes += entry.path().as_bytes().len();
                         directories.push(CatalogDirectory { id: self.catalogued_directories, path: entry.path().clone() });
@@ -491,12 +529,7 @@ impl CatalogSession {
         out.literal(",\"owner\":")?; out.integer(self.owner().get())?;
         out.literal(",\"identity_scope\":\"retained-session\",\"ordering\":\"provisional-discovery-order\",\"policy\":")?;
         out.quoted(self.discovery_policy.name())?;
-        out.literal(",\"discovery_scope\":")?;
-        out.quoted(if self.directory.is_some() { "directory" } else { "workspace" })?;
-        out.literal(",\"discovery_directory\":")?;
-        if let Some(directory) = &self.directory { out.path(&directory.raw().to_path_buf())?; }
-        else { out.literal("null")?; }
-        out.literal(",\"path_basis\":\"project-root\"")?;
+        self.encode_discovery_scope(&mut out)?;
         out.literal(",\"directory_rows_policy\":\"direct-child-directories-v1\"")?;
         self.encode_rule_policy(&mut out)?;
         out.literal(",\"native_presented\":false,\"discovery_source_bytes_read\":\"0\",\"discovery_source_read_calls\":\"0\",\"state\":")?;

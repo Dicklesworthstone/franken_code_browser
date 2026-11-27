@@ -89,6 +89,7 @@ impl CatalogContentSearchSession {
             \"capture_kind\":\"literal-witnesses-with-context\",\"source_observation\":\"per-file-streams-not-atomic-workspace\",
             \"ordering\":\"provisional-discovery-order\",\"membership\":\"progressive-observation\",\"discovery_policy\":")?;
         out.quoted(self.catalog.discovery_policy().name())?;
+        self.catalog.encode_discovery_scope(out)?;
         self.catalog.encode_rule_policy(out)?;
         self.options.scope.encode(out)?;
         out.literal(",\"mode\":")?;

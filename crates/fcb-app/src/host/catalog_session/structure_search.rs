@@ -192,7 +192,7 @@ impl CatalogStructureSearchSession {
         }
         check(&mut canceled)?;
         let generation = QueryGeneration::new(owner, generation).map_err(|_| CatalogStructureSearchError::InvalidLimits)?;
-        let mut catalog = CatalogSession::open_with_policy(owner, root, policy, &mut canceled)?;
+        let mut catalog = CatalogSession::open_for_search(owner, root, policy, &options.scope, &mut canceled)?;
         let id = catalog.next_id()?;
         // Contains uses the shared normalized cursor with needle-sized tables
         // and source-scalar provenance. Admit that scratch before allocation;

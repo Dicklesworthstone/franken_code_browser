@@ -293,3 +293,37 @@ fn lowercase_identifier_discovery_retains_case_variants_in_later_windows() {
         assert_eq!(session.io, before);
     }
 }
+
+#[test]
+fn focused_discovery_ignores_unrelated_siblings_and_applies_ancestor_rules() {
+    let root = fixture("direct-search");
+    fs::create_dir_all(root.join("src/nested")).unwrap();
+    fs::create_dir(root.join("src-other")).unwrap();
+    fs::write(root.join(".gitignore"), b"src/nested/secret.rs\n").unwrap();
+    fs::write(root.join("src-other/.gitignore"), vec![0xff; 128]).unwrap();
+    fs::write(root.join("src-other/also.rs"), b"needle").unwrap();
+    fs::write(root.join("src/nested/file.rs"), b"needle").unwrap();
+    fs::write(root.join("src/nested/secret.rs"), b"needle").unwrap();
+
+    for (i, (kind, path, policy, expected)) in [
+        (AtlasSearchPathKind::Directory, "src/nested", CatalogDiscoveryPolicy::RepositoryRules, 1),
+        (AtlasSearchPathKind::File, "src/nested/file.rs", CatalogDiscoveryPolicy::RepositoryRules, 1),
+        (AtlasSearchPathKind::File, "src/nested/secret.rs", CatalogDiscoveryPolicy::RepositoryRules, 0),
+        (AtlasSearchPathKind::Directory, "src/nested", CatalogDiscoveryPolicy::IncludeExcluded, 2),
+        (AtlasSearchPathKind::File, "src/nested/secret.rs", CatalogDiscoveryPolicy::IncludeExcluded, 1),
+    ].into_iter().enumerate() {
+        let scope = AtlasSearchScope::all().with_path(kind, path).unwrap();
+        let mut session = CatalogContentSearchSession::open_with_policy(owner(78200 + i as u64), &root,
+            1, "needle", CatalogContentSearchOptions { scope, ..counted() }, policy, || false).unwrap();
+        finish(&mut session);
+        assert!(session.complete());
+        assert_eq!(session.catalog.catalogued_files, expected);
+        assert_eq!(session.matches_seen, expected);
+        assert_eq!(session.io.bytes_read, 6 * expected);
+        let receipt = session.info(|| false).unwrap();
+        assert!(receipt.as_str().contains(&format!("\"discovery_scope\":\"{}\"", kind.name())));
+    }
+    let scope = AtlasSearchScope::all().with_path(AtlasSearchPathKind::File, "missing.rs").unwrap();
+    assert!(CatalogContentSearchSession::open(owner(78206), &root, 1, "needle",
+        CatalogContentSearchOptions { scope, ..counted() }, || false).is_err());
+}

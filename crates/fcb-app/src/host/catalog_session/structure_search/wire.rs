@@ -93,6 +93,7 @@ impl CatalogStructureSearchSession {
         out.literal(",\"root_path\":")?; out.path(&self.grant().root_path().to_path_buf())?;
         out.literal(",\"scope\":\"progressively-discovered-whole-files\",\"strategy\":\"bounded-complete-capture-extraction\",\"capture_kind\":\"complete-retained-source\",\"source_observation\":\"per-file-captures-not-atomic-workspace\",\"ordering\":\"provisional-discovery-order\",\"membership\":\"progressive-observation\",\"discovery_policy\":")?;
         out.quoted(self.catalog.discovery_policy().name())?;
+        self.catalog.encode_discovery_scope(out)?;
         self.catalog.encode_rule_policy(out)?;
         self.options.scope.encode(out)?;
         out.literal(",\"requested_mode\":")?; out.quoted(self.options.mode.requested())?;

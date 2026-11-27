@@ -203,6 +203,9 @@ impl AtlasSearchScope {
         }
         Ok(self)
     }
+    pub(crate) fn path_predicate(&self) -> (AtlasSearchPathKind, &[u8]) {
+        (self.path.kind, self.path.path())
+    }
     /// Declared viewport membership, including paths absent from a search
     /// catalog. This is independent of any additional file-type filtering.
     pub fn region_files(&self) -> Option<usize> { self.region.as_ref().map(|region| region.files()) }

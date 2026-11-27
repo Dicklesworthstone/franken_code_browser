@@ -210,7 +210,7 @@ impl CatalogContentSearchSession {
         }
         let generation = QueryGeneration::new(owner, generation).map_err(|_| CatalogContentSearchError::StaleQuery)?;
         check(&mut canceled)?;
-        let mut catalog = CatalogSession::open_with_policy(owner, root, policy, &mut canceled)?;
+        let mut catalog = CatalogSession::open_for_search(owner, root, policy, &options.scope, &mut canceled)?;
         let id = catalog.next_id()?;
         let lease = catalog.budget.try_reserve_managed(owner, id,
             ByteLength::new(STATE_BYTES + size_of::<Self>() as u64)).map_err(|_| AppError::Admission)?;

@@ -113,7 +113,11 @@ fn directory_file_and_visible_scopes_precede_source_budgets() {
         drain(&mut session);
         assert!(session.complete());
         assert_eq!(session.eligible, 1);
-        assert_eq!(session.excluded, 2);
+        // The folder has two files and the exact target just one. Only the
+        // visible-set predicate requires observing all three project files.
+        let expected_catalogued = [2, 1, 3][offset];
+        assert_eq!(session.catalog.catalogued_files, expected_catalogued);
+        assert_eq!(session.excluded, expected_catalogued - 1);
         assert_eq!(session.io.bytes, source.len() as u64);
         assert_eq!(session.matches_seen, 1);
         assert_eq!(session.unsupported, 0);
