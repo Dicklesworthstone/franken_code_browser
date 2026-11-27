@@ -37,18 +37,6 @@ pub(super) fn search<'index, 'source, 'catalog>(source: &'index WorkspaceTextSou
         [allocation(70), allocation(71), allocation(72)], &mut *canceled)?)
 }
 
-pub(super) fn counts(out: &mut Output, overlay: Option<&AtlasTextOverlay<'_, '_, '_>>,
-    parcel: fcb::map::VisibleParcel) -> Result<(), Error> {
-    out.literal(",\"retained_text_matches\":")?;
-    let Some(overlay) = overlay.filter(|_| parcel.detail() != AtlasDetail::SiblingGroup) else {
-        out.literal("null")?; return Ok(());
-    };
-    let counts = overlay.retained_matches_in(parcel.node())?;
-    out.literal("{\"occurrences\":")?; out.integer(counts.occurrences as u64)?;
-    out.literal(",\"files\":")?; out.integer(counts.files as u64)?; out.literal("}")?;
-    Ok(())
-}
-
 pub(super) fn json(out: &mut Output, overlay: Option<&AtlasTextOverlay<'_, '_, '_>>,
     io: &IoCounts, index: &AtlasIndex<'_>, focus: AtlasNodeId, camera: Camera2D,
     options: &Options, canceled: &mut impl FnMut() -> bool) -> Result<(), Error> {

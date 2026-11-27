@@ -487,6 +487,8 @@ impl AtlasSession {
             out.literal(",\"detail\":")?; out.quoted(detail(parcel.detail()))?;
             out.literal(",\"logical_rect\":")?; rectangle(&mut out, parcel.logical_rect())?;
             out.literal(",\"represented_leaves\":")?; out.integer(parcel.represented_leaves() as u64)?;
+            out.literal(",\"contains_selection\":")?;
+            out.boolean(selected.map(|node| parcel.contains_file(&index, node)).transpose()?.unwrap_or(false))?;
             out.literal(",\"reason\":")?; out.quoted(&format!("{:?}", parcel.reason()))?;
             out.literal("}")?;
         }

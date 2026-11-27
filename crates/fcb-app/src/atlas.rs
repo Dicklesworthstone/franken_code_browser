@@ -13,6 +13,7 @@ use std::{ffi::OsString, fs, io::Write, path::{Component, Path, PathBuf}};
 use fcb::{ByteLength, CameraGeneration, DisplayGeneration, DisplayMetrics, Point2D, Rect2D, Size2D};
 use fcb::map::{AtlasDetail, AtlasError, AtlasIndex, AtlasNodeId, Camera2D, CameraError,
     DisplayColorConfig, LayoutOptions, LayoutRevision, LodThresholds, VisibleLimits, VisibleQuery, VisibleState};
+use fcb::map::atlas::matches::AtlasMatchDensity;
 use fcb::map::workspace::{AtlasScope, WorkspaceAtlas, WorkspaceAtlasError, WorkspaceAtlasLimits};
 use fcb::map::workspace::text_search::{WorkspaceTextError, WorkspaceTextSource};
 use fcb::map::workspace::text_preview::{AtlasTextPreviewError, AtlasTextPreviewOptions};
@@ -415,6 +416,19 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget,
     let detail_limited = stats.budget_aggregates != 0 || stats.precision_aggregates != 0;
     let document_entire;
     if args.json {
+        let density = if let Some(paths) = &overlay {
+            paths.validate_delivery(&atlas, generation())?;
+            Some(AtlasMatchDensity::build(&index, paths.generation(), paths.hits().iter().map(|h| (h.node, 1)),
+                budget, allocation(83), &mut *canceled)?)
+        } else if let Some(text) = &text_hits {
+            text.validate_delivery(text.source(), generation())?;
+            Some(AtlasMatchDensity::build(&index, text.generation(), text.hits().iter().map(|h| (h.node(), 1)),
+                budget, allocation(83), &mut *canceled)?)
+        } else if let Some(stream) = &stream_hits {
+            stream.validate_delivery(&atlas, generation())?;
+            Some(AtlasMatchDensity::build(&index, stream.generation(), stream.hits().iter().map(|h| (h.node(), 1)),
+                budget, allocation(83), &mut *canceled)?)
+        } else { None };
         workspace::common(out, "atlas", &catalog, &root)?;
         out.literal(",\"atlas_schema\":\"fcb.atlas/1\",\"qualification\":\"implemented-unqualified\",\"plan_complete\":true,\"native_presented\":false,\"payload_bytes_read\":")?;
         out.integer(payload_bytes_read)?;
@@ -452,13 +466,18 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget,
             out.literal(",\"file_id\":")?;
             if parcel.is_source_parcel() { out.integer(atlas.file(parcel.node())?.get())?; } else { out.literal("null")?; }
             out.literal(",\"retained_path_matches\":")?;
-            match &overlay {
-                Some(hits) if parcel.detail() != AtlasDetail::SiblingGroup =>
-                    out.integer(hits.retained_matches_in(parcel.node()).map_err(Error::from)? as u64)?,
-                _ => out.literal("null")?,
+            let counts = density.as_ref().map(|d| d.counts(*parcel, generation())).transpose()?;
+            match counts.filter(|_| overlay.is_some()) {
+                Some(counts) => out.integer(counts.files as u64)?,
+                None => out.literal("null")?,
             }
-            if let Some(report) = stream_hits.as_ref() { stream_overlay::counts(out, report, *parcel)?; }
-            else { text_overlay::counts(out, text_hits.as_ref(), *parcel)?; }
+            out.literal(",\"retained_text_matches\":")?;
+            if let Some(counts) = counts.filter(|_| text_hits.is_some() || stream_hits.is_some()) {
+                out.literal("{\"occurrences\":")?; out.integer(counts.occurrences)?;
+                out.literal(",\"files\":")?; out.integer(counts.files as u64)?; out.literal("}")?;
+            } else { out.literal("null")?; }
+            out.literal(",\"contains_selection\":")?;
+            out.boolean(selected.map(|node| parcel.contains_file(&index, node)).transpose()?.unwrap_or(false))?;
             out.literal("}")?;
         }
         out.literal("],\"traversal\":{\"visited_nodes\":")?; out.integer(stats.visited_nodes as u64)?;

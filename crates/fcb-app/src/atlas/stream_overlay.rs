@@ -4,7 +4,6 @@
 //! capture/index pass, matcher, decoder or source-sized retained allocation.
 use fcb::map::workspace::stream_search::{AtlasStreamError, AtlasStreamFileState,
     AtlasStreamLimits, AtlasStreamReport, AtlasStreamSearch, AtlasStreamState, AtlasStreamStop};
-use fcb::map::VisibleParcel;
 use fcb::search::{DetectedEncoding, ExtentConsistency, StreamReadState, StreamReadStep, StreamingNeedle};
 use fcb::source::SourceError;
 use super::*;
@@ -27,18 +26,6 @@ pub(super) fn build<'a, 'c>(atlas: &'a WorkspaceAtlas<'c>, root: &Path, text: &s
         }, &mut *canceled)?;
     }
     Ok(search.finish()?)
-}
-
-pub(super) fn counts(out: &mut Output, report: &AtlasStreamReport<'_, '_>, parcel: VisibleParcel)
-    -> Result<(), Error> {
-    out.literal(",\"retained_text_matches\":")?;
-    if parcel.detail() == AtlasDetail::SiblingGroup { out.literal("null")?; }
-    else {
-        let (occurrences, files) = report.retained_matches_in(parcel.node())?;
-        out.literal("{\"occurrences\":")?; out.integer(occurrences as u64)?;
-        out.literal(",\"files\":")?; out.integer(files as u64)?; out.literal("}")?;
-    }
-    Ok(())
 }
 
 pub(super) fn json(out: &mut Output, report: &AtlasStreamReport<'_, '_>, index: &AtlasIndex<'_>,

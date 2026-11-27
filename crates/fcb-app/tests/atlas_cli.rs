@@ -237,3 +237,27 @@ fn path_overlay_options_preserve_literal_values_and_reject_unpaired_limits() {
         assert_eq!(code, EXIT_ERROR); assert!(!out.contains("\"parcels\":"));
     }
 }
+
+#[test]
+fn zoomed_out_search_counts_and_selection_stay_on_the_correct_sibling_group() {
+    let root = root();
+    for name in ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs", "f.rs", "g.rs", "h.rs"] {
+        fs::write(root.join(name), if name == "a.rs" { "needle needle" } else { "other" }).unwrap();
+    }
+    for (search, expected) in [
+        (vec!["--path", "a.rs"], "\"retained_path_matches\":\"1\""),
+        (vec!["--text", "needle"], "\"retained_text_matches\":{\"occurrences\":\"2\",\"files\":\"1\"}"),
+        (vec!["--whole-file", "--text", "needle"], "\"retained_text_matches\":{\"occurrences\":\"2\",\"files\":\"1\"}"),
+    ] {
+        let mut options = vec!["--json", "--limit", "2", "--detail-pixels", "0.001", "--select", "a.rs"];
+        options.extend(search);
+        let (code, json, err) = run(&arguments(&root, &options));
+        assert_eq!(code, EXIT_PARTIAL, "{json} {err}");
+        let parcels = json.split_once("\"parcels\":[").unwrap().1.split_once("],\"traversal\"").unwrap().0;
+        assert_eq!(parcels.matches("\"detail\":\"sibling-group\"").count(), 2);
+        assert_eq!(parcels.matches("\"contains_selection\":true").count(), 1);
+        let selected = parcels.split("{\"node\":").find(|p| p.contains("\"contains_selection\":true")).unwrap();
+        assert!(selected.contains(expected), "{selected}");
+        assert_eq!(parcels.matches(expected).count(), 1);
+    }
+}
