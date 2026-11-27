@@ -70,15 +70,15 @@ pub(super) fn execute(options: &Options, out: &mut Output, budget: &ResourceBudg
         }.map_err(|error| Failure::new(&error.to_string()))?;
         let opts = PagedQueryOptions { generation: generation(), first_file: file_id(), first_revision: revision(), max_matches: options.limit };
         let ids = [allocation(158), allocation(159), allocation(160)];
-        let query = PagedQuery::new_paged_page(&mut archive, &needle, &mut index, opts,
-            options.skip_matches, options.count_all_matches, budget, ids)?;
+        let query = PagedQuery::new_paged_scoped_page(&mut archive, &needle, &mut index, opts,
+            options.search_scope(), options.skip_matches, options.count_all_matches, budget, ids)?;
         matching::finish(query, budget, canceled)?
     };
     if options.json {
         begin(out, "snapshot-index-search")?; summary(out, archive.directory(), index.stats(), pin)?; search_fields(out, options.ignore_case)?;
         io_fields(out, index.io_stats(), index.file_bytes(), index.cache_capacity_bytes())?;
         out.literal(",\"identity_scope\":\"response-local\"")?;
-        matching::fields(out, &report, options.raw.is_some(), options.ignore_case, true)?;
+        matching::fields(out, &report, options.raw.is_some(), options.ignore_case, true, options.search_scope())?;
         out.literal(",\"unsupported_text_files_count\":")?; out.integer(report.stats().unsupported_files as u64)?;
         out.literal(",\"index_eliminated_files\":")?; out.integer(report.stats().index_eliminated_files as u64)?;
         out.literal(",\"index_candidates\":")?; out.integer(report.stats().index_candidates as u64)?;
@@ -92,7 +92,7 @@ pub(super) fn execute(options: &Options, out: &mut Output, budget: &ResourceBudg
     } else {
         out.literal(if report.is_complete() { "Complete saved-scope search.\n" } else { "PARTIAL saved-scope search.\n" })?;
         out.literal("Index pages and source members were verified on demand; unread backing integrity remains unchecked.\n")?;
-        matching::human(out, &report, options.ignore_case, true)?;
+        matching::human(out, &report, options.ignore_case, true, options.search_scope())?;
     }
     matching::hits(&mut archive, &report, options.raw.is_some(), options.json, out, budget, canceled)?;
     if options.json { out.literal("}\n")?; }

@@ -1448,6 +1448,57 @@ source bytes, places and notes; the archive handle and import projection are not
 persisted or reopened. This consumer is code-first; independent executable
 verification remains pending.
 
+## Limit saved text and expression searches to a folder or file
+
+Saved literal, original-byte and expression searches accept the same raw path
+scope as structural searches. Literal and original-byte searches also accept
+these scopes with all three saved substring-index layouts (FCBI, FCBO and FCBD).
+The CLI expression route continues to scan verified members directly:
+
+```sh
+fcb snapshot search saved.fcbs --text needle --directory src --count-all --json
+fcb snapshot search saved.fcbs --query 'needle required -excluded lang:rust' --directory src --json
+fcb snapshot search saved.fcbs --raw-hex 6e6565646c65 --member src/main.rs --json
+fcb snapshot index search saved.fcbs --index saved.fcbd --index-digest TRUSTED_SHA256 --paged \
+  --text needle --member src/main.rs --skip-matches 100 --limit 50 --count-all --json
+```
+
+Use one of `--directory PATH`, `--directory-hex HEX`, `--member NAME`, or
+`--member-hex HEX`. Omitting these options searches the whole saved archive.
+Folder selection is recursive and compares exact raw path components: `src`
+includes `src/nested/a.rs` and excludes `src-other/a.rs`. Hex forms preserve
+non-UTF-8 labels. Absolute paths, empty components, dot components, parent
+traversal, NUL bytes and conflicting scopes are rejected before opening input
+files. A saved path remains an archive label and grants no live filesystem access.
+
+Membership is frozen before metadata filters, posting candidates, source work,
+match counts and result offsets. An expression's `path:` and language filters
+further narrow that selection; conjunction and exclusion terms still apply to
+the complete captured member. Counts include only qualified occurrences inside
+the selected scope. Repeat the same scope alongside the same archive digest,
+query and matching options when following `next_match_offset`.
+
+JSON includes `scope`, `scope_path`, `scope_path_hex`, `scope_known_members`,
+`scope_captured_members`, `scope_unavailable_members`,
+`scope_membership_complete` and `scope_complete`. Whole-archive
+`discovery_complete` stays separate, and `workspace_complete` is reserved for
+a complete whole-archive search. A captured exact member can be searched
+completely even if discovery elsewhere was incomplete. Missing requested
+members remain partial. An empty folder is an exact zero only when archive
+discovery was complete. Unavailable or unsupported selected members and query
+work limits retain their existing partial-result behavior. Expression metadata
+filters may establish that an unavailable selected member cannot qualify.
+
+Rust hosts can use `SavedRepositorySession::search_scoped_page` and
+`expression_search_scoped_page` with the shared `SnapshotScope`. Accepted
+generations retain their own admitted copy of the raw scope; result pages and
+hit-reader receipts echo it after index attachment, detachment or a failed
+replacement query. Existing host methods keep their whole-archive behavior.
+The public engine exposes scoped direct, per-member-index, postings and paged
+postings constructors, with identical original-byte witnesses across routes.
+Scoped host and CLI regression fixtures have been added; independent executable
+verification remains pending.
+
 ## Search structure in a saved repository
 
 The saved structural query uses the same symbol, whole-token and qualified

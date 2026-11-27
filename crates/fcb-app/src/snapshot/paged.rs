@@ -85,14 +85,14 @@ fn inspect(settings: &Settings, directory: &SnapshotDirectory, out: &mut Output,
 fn search(settings: &Settings, archive: &mut PagedSnapshot<File>, out: &mut Output,
     budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool) -> Result<u8, Failure> {
     let report = matching::direct(archive, settings.text.as_deref(), settings.raw_needle.as_deref(),
-        settings.ignore_case, settings.count_all_matches, settings.limit, settings.skip_matches, budget,
+        settings.ignore_case, settings.count_all_matches, settings.limit, settings.skip_matches, settings.search_scope(), budget,
         [allocation(105), allocation(106), allocation(107), allocation(108)], canceled)?;
     if settings.json {
         begin(out, "snapshot-search")?; summary(out, archive.directory())?;
         out.literal(",\"identity_scope\":\"response-local\",\"engine\":")?;
         out.quoted(if settings.ignore_case { "bounded-stream-unicode-lowercase" } else { "bounded-stream-exact" })?;
         out.literal(",\"payload_residency\":\"one-verified-member\"")?;
-        matching::fields(out, &report, settings.raw_needle.is_some(), settings.ignore_case, false)?;
+        matching::fields(out, &report, settings.raw_needle.is_some(), settings.ignore_case, false, settings.search_scope())?;
         out.literal(",\"unsupported_text_files_count\":")?; out.integer(report.stats().unsupported_files as u64)?;
         out.literal(",\"files_searched\":")?; out.integer(report.stats().files_searched as u64)?;
         out.literal(",\"peak_source_bytes\":")?; out.integer(report.stats().peak_source_bytes as u64)?;
@@ -101,7 +101,7 @@ fn search(settings: &Settings, archive: &mut PagedSnapshot<File>, out: &mut Outp
         out.literal(",\"scanned_bytes\":")?; out.integer(report.stats().scanned_bytes)?;
     } else {
         out.literal(if report.is_complete() { "Complete saved-scope search; no live roots accessed.\n" } else { "PARTIAL saved-scope search; no live roots accessed.\n" })?;
-        matching::human(out, &report, settings.ignore_case, false)?;
+        matching::human(out, &report, settings.ignore_case, false, settings.search_scope())?;
     }
     matching::hits(archive, &report, settings.raw_needle.is_some(), settings.json, out, budget, canceled)?;
     if settings.json { out.literal("}\n")?; }

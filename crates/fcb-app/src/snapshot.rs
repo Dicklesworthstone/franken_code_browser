@@ -17,6 +17,7 @@ mod save;
 use std::{ffi::OsString, fs::{File, OpenOptions}, io::{self, Write}, path::{Path, PathBuf}};
 use fcb::ByteLength;
 use fcb::search::{RawPath, ResourceBudget, SymbolNameMode};
+use fcb::search::snapshot_scope::SnapshotScope;
 use fcb::search::snapshot_structure::{StructureMode, StructureScope, MAX_STRUCTURE_SOURCE_BYTES};
 use fcb::search::workspace::WorkspaceLimits;
 use fcb::search::snapshot::{SavedSourceError, SnapshotError, SnapshotLimits, Sha256Digest,
@@ -48,7 +49,7 @@ fcb snapshot structure FILE --mode symbols|headings|occurrences --name TEXT [--j
 fcb snapshot read FILE (--member NAME | --member-hex HEX) [--json]\n\
 fcb snapshot index help  # Build/reopen pinned substring indexes\n\
 Structure options: --name-mode exact|prefix|contains --limit N --max-source-bytes N\n\
-Structure scope: whole archive by default, or --directory PATH | --directory-hex HEX | --member NAME | --member-hex HEX.\n\
+Search/structure scope: whole archive by default, or --directory PATH | --directory-hex HEX | --member NAME | --member-hex HEX.\n\
 Occurrences require whole-token names (--name-mode exact); comments and string literals participate.\n\
 Declarations are heuristic candidates; headings have qualified original-byte ranges.\n\
 Structure limits: 4096 hits; 64 MiB aggregate source; symbols 1 MiB, headings 256 KiB, occurrences 32 MiB per file.\n\
@@ -86,6 +87,11 @@ struct Settings {
     ignore_case: bool, count_all_matches: bool, skip_matches: u64,
 }
 impl Settings {
+    fn search_scope(&self) -> SnapshotScope<'_> {
+        if let Some(member) = &self.member { SnapshotScope::Member(member) }
+        else if let Some(directory) = &self.directory { SnapshotScope::Directory(directory) }
+        else { SnapshotScope::Archive }
+    }
     fn structure_scope(&self) -> StructureScope<'_> {
         if let Some(member) = &self.member { StructureScope::Member(member) }
         else if let Some(directory) = &self.directory { StructureScope::Directory(directory) }
@@ -259,7 +265,8 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
         Mode::Inspect => settings.source.is_some() && seen & !(1 | 8 | catalog_options) == 0,
         Mode::Search => settings.source.is_some()
             && usize::from(settings.text.is_some()) + usize::from(settings.raw_needle.is_some()) + usize::from(settings.expression.is_some()) == 1
-            && seen & !(1 | 4 | 8 | 32768 | catalog_options | 524288 | 1048576 | 33554432 | 67108864 | 134217728) == 0
+            && !(settings.member.is_some() && settings.directory.is_some())
+            && seen & !(1 | 4 | 8 | 256 | 512 | 268435456 | 32768 | catalog_options | 524288 | 1048576 | 33554432 | 67108864 | 134217728) == 0
             && (seen & 1048576 == 0 || settings.expression.is_some())
             && (!settings.ignore_case || settings.text.is_some() || settings.expression.is_some()),
         Mode::Structure => settings.source.is_some() && settings.structure_mode.is_some() && settings.structure_name.is_some()
@@ -274,6 +281,7 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
     };
     if !valid { return Err(Failure::new("CLI_INCOMPATIBLE_OPTIONS")); }
     if mode == Mode::Structure { settings.structure_scope().validate()?; }
+    if mode == Mode::Search { settings.search_scope().validate()?; }
     if settings.structure_mode == Some(StructureMode::Occurrences) {
         let name = settings.structure_name.as_deref().ok_or_else(|| Failure::new("CLI_INVALID_NEEDLE"))?;
         fcb::search::symbols::validate_reference_name(name).map_err(|error| Failure::new(error.code()))?;

@@ -4,6 +4,7 @@
 //! resumable query; it never evaluates repository text as commands/configuration.
 
 use fcb::search::{StreamReadStep};
+use fcb::search::snapshot_scope::SnapshotScope;
 use fcb::search::expression::{ExpressionError, ExpressionOptions, ExpressionPlan, ExpressionQuery, ExpressionState};
 use fcb::search::paged_snapshot::{PagedSearchError, PagedSnapshotError};
 use crate::{generation, allocation, file_id, owner, revision, EXIT_NO_MATCH, EXIT_OK, EXIT_PARTIAL};
@@ -32,8 +33,9 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
     let options = ExpressionOptions { generation: generation(), first_file: file_id(), first_revision: revision(),
         max_matches: settings.limit, max_scan_bytes: settings.max_scan_bytes };
     let allocations = [allocation(151), allocation(152), allocation(153)];
-    let mut query = ExpressionQuery::new_page(&mut archive, &plan, options,
-        settings.skip_matches, settings.count_all_matches, budget, allocations)?;
+    let scope = settings.search_scope();
+    let mut query = ExpressionQuery::new_scoped_page(&mut archive, &plan, options,
+        scope, settings.skip_matches, settings.count_all_matches, budget, allocations)?;
     while query.state() == ExpressionState::Pending {
         query.step(StreamReadStep::default(), generation(), budget, &mut *canceled)?;
     }
@@ -50,7 +52,10 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
         out.quoted(&report.archive_digest().to_hex())?;
         out.literal(",\"policy\":")?; out.quoted(archive.directory().policy())?;
         out.literal(",\"discovery_complete\":")?; out.boolean(archive.directory().discovery_complete())?;
-        out.literal(",\"workspace_complete\":")?; out.boolean(report.is_complete())?;
+        matching::scope_fields(out, scope, report.selected_members(), report.captured_members(),
+            report.membership_complete(), report.is_complete())?;
+        out.literal(",\"workspace_complete\":")?;
+        out.boolean(scope == SnapshotScope::Archive && report.is_complete())?;
         out.literal(",\"truncated\":")?; out.boolean(report.hits_truncated())?;
         out.literal(",\"count_all_matches\":")?; out.boolean(report.count_all_matches())?;
         matching::window_fields(out, report.skip_matches(), report.skipped_matches(),
@@ -64,6 +69,7 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
         for (name, count) in [
             ("known_files", archive.directory().len() as u64),
             ("scope_files", stats.scope_files as u64),
+            ("metadata_examined", stats.metadata_examined as u64),
             ("metadata_excluded_files", stats.metadata_excluded as u64),
             ("unavailable_files_count", stats.unavailable_files as u64),
             ("unsupported_text_files_count", stats.unsupported_files as u64),
@@ -86,6 +92,7 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
     } else {
         out.literal(if report.is_complete() { "Complete saved-scope expression search; no live root accessed.\n" }
             else { "PARTIAL saved-scope expression search; no live root accessed.\n" })?;
+        matching::scope_human(out, scope, report.selected_members(), report.captured_members(), report.membership_complete())?;
         out.literal("Query: ")?; out.human_text(raw)?; out.literal("\n")?;
         matching::window_human(out, report.skip_matches(), report.skipped_matches(),
             report.hits().len(), report.has_more_matches(), report.next_match_offset())?;

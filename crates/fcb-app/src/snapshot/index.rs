@@ -10,7 +10,8 @@ mod paging;
 
 use std::{ffi::OsString, fs, io::{self, Read, Seek, Write}, path::{Path, PathBuf}};
 use fcb::ByteLength;
-use fcb::search::{IndexLimits, ResourceBudget};
+use fcb::search::{IndexLimits, RawPath, ResourceBudget};
+use fcb::search::snapshot_scope::SnapshotScope;
 use fcb::search::paged_snapshot::{PagedQuery, PagedQueryOptions,
     IndexedNeedle, SnapshotDirectory, PagedSnapshotError};
 use fcb::search::snapshot::Sha256Digest;
@@ -29,6 +30,7 @@ fcb snapshot index inspect SNAPSHOT --index INDEX --index-digest TRUSTED_SHA256 
 fcb snapshot index search SNAPSHOT --index INDEX --index-digest TRUSTED_SHA256\n\
     (--text LITERAL | --raw-hex HEX) [--paged] [--limit N] [--json]\n\
 Search options: --ignore-case (text only), --count-all (text or raw bytes), --skip-matches N.\n\
+Search scope: whole archive by default, or --directory PATH | --directory-hex HEX | --member NAME | --member-hex HEX.\n\
 Match offsets consume verified matches, not index candidates; all index layouts share result order.\n\
 Repeat the same archive digest, query and options with next_match_offset for later rows.\n\
 Earlier omitted rows keep ordinary exits partial (3); --count-all keeps total-based exits.\n\
@@ -61,6 +63,14 @@ struct Options {
     limit: usize, build: IndexLimits, catalog: Option<PathBuf>, catalog_pin: Option<Sha256Digest>,
     base: Option<PathBuf>, base_catalog: Option<PathBuf>, base_catalog_pin: Option<Sha256Digest>,
     inverted: bool, paged: bool, ignore_case: bool, count_all_matches: bool, skip_matches: u64,
+    member: Option<Vec<u8>>, directory: Option<Vec<u8>>,
+}
+impl Options {
+    fn search_scope(&self) -> SnapshotScope<'_> {
+        if let Some(member) = &self.member { SnapshotScope::Member(member) }
+        else if let Some(directory) = &self.directory { SnapshotScope::Directory(directory) }
+        else { SnapshotScope::Archive }
+    }
 }
 impl From<SnapshotIndexError> for Failure {
     fn from(error: SnapshotIndexError) -> Self {
@@ -72,7 +82,8 @@ impl From<SnapshotIndexError> for Failure {
 fn takes_value(arg: &str) -> bool {
     matches!(arg, "--output" | "--index" | "--index-digest" | "--text" | "--raw-hex" | "--limit"
         | "--max-grams" | "--max-file-bytes" | "--max-source-bytes" | "--catalog" | "--catalog-digest"
-        | "--base" | "--base-catalog" | "--base-catalog-digest" | "--skip-matches")
+        | "--base" | "--base-catalog" | "--base-catalog-digest" | "--skip-matches"
+        | "--directory" | "--directory-hex" | "--member" | "--member-hex")
 }
 fn wants_json(args: &[OsString]) -> bool {
     let mut i = 0;
@@ -100,7 +111,7 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
     let mut out = Options { action, archive: None, output: None, index: None, pin: None, text: None,
         raw: None, json: false, limit: 100, build: IndexLimits::default(), catalog: None, catalog_pin: None,
         base: None, base_catalog: None, base_catalog_pin: None, inverted: false, paged: false,
-        ignore_case: false, count_all_matches: false, skip_matches: 0 };
+        ignore_case: false, count_all_matches: false, skip_matches: 0, member: None, directory: None };
     let mut seen = 0u32;
     let mut cursor = usize::from(!args.is_empty());
     let mut positional = false;
@@ -118,6 +129,7 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
             "--catalog" => 1024, "--catalog-digest" => 2048,
             "--base" => 4096, "--base-catalog" => 8192, "--base-catalog-digest" => 16384,
             "--inverted" => 32768, "--paged" => 65536, "--ignore-case" => 131072, "--count-all" => 262144, "--skip-matches" => 524288,
+            "--directory" | "--directory-hex" => 1048576, "--member" | "--member-hex" => 2097152,
             _ => return Err(Failure::new("CLI_UNKNOWN_OPTION")),
         };
         if seen & bit != 0 { return Err(Failure::new("CLI_DUPLICATE_OPTION")); }
@@ -135,6 +147,8 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
             "--catalog" => { out.catalog = Some(PathBuf::from(value)); continue; }
             "--base" => { out.base = Some(PathBuf::from(value)); continue; }
             "--base-catalog" => { out.base_catalog = Some(PathBuf::from(value)); continue; }
+            "--directory" => { out.directory = Some(RawPath::from_path(Path::new(value)).as_bytes().to_vec()); continue; }
+            "--member" => { out.member = Some(RawPath::from_path(Path::new(value)).as_bytes().to_vec()); continue; }
             _ => {},
         }
         let text = value.to_str().ok_or_else(|| Failure::new("CLI_INVALID_VALUE"))?;
@@ -150,6 +164,8 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
             out.text = Some(text.to_owned()); continue;
         }
         if option == "--raw-hex" { out.raw = Some(hex(text, 1024)?); continue; }
+        if option == "--directory-hex" { out.directory = Some(hex(text, 16_384)?); continue; }
+        if option == "--member-hex" { out.member = Some(hex(text, 16_384)?); continue; }
         let number = decimal(text).map_err(|error| Failure::new(error.code()))?;
         match option {
             "--limit" if number <= 4096 => out.limit = number as usize,
@@ -172,9 +188,11 @@ fn parse(args: &[OsString]) -> Result<Options, Failure> {
         Action::Inspect => out.archive.is_some() && out.index.is_some() && out.pin.is_some() && seen & !(1 | 4 | 8 | catalog_options | 65536) == 0,
         Action::Search => out.archive.is_some() && out.index.is_some() && out.pin.is_some()
             && (out.text.is_some() != out.raw.is_some()) && (!out.ignore_case || out.text.is_some())
-            && seen & !(1 | 4 | 8 | 16 | 32 | 64 | catalog_options | 65536 | 131072 | 262144 | 524288) == 0,
+            && !(out.member.is_some() && out.directory.is_some())
+            && seen & !(1 | 4 | 8 | 16 | 32 | 64 | catalog_options | 65536 | 131072 | 262144 | 524288 | 1048576 | 2097152) == 0,
     };
     if !valid || (out.inverted && out.paged) { return Err(Failure::new("CLI_INCOMPATIBLE_OPTIONS")); }
+    if action == Action::Search { out.search_scope().validate()?; }
     Ok(out)
 }
 
@@ -287,14 +305,14 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget, effect:
             _ => return Err(Failure::new("CLI_INVALID_NEEDLE")),
         }.map_err(|error| Failure::new(&error.to_string()))?;
         let opts = PagedQueryOptions { generation: generation(), first_file: file_id(), first_revision: revision(), max_matches: options.limit };
-        let query = index.query(&mut archive, &needle, opts, options.skip_matches, options.count_all_matches, budget)?;
+        let query = index.query(&mut archive, &needle, opts, options.search_scope(), options.skip_matches, options.count_all_matches, budget)?;
         matching::finish(query, budget, canceled)?
     };
     if options.json {
         begin(out, "snapshot-index-search")?; summary(out, archive.directory(), index.stats(), pin)?;
         inverted::search_fields(out, index.inverted(), options.ignore_case)?;
         out.literal(",\"identity_scope\":\"response-local\"")?;
-        matching::fields(out, &report, options.raw.is_some(), options.ignore_case, true)?;
+        matching::fields(out, &report, options.raw.is_some(), options.ignore_case, true, options.search_scope())?;
         out.literal(",\"unsupported_text_files_count\":")?; out.integer(report.stats().unsupported_files as u64)?;
         out.literal(",\"index_eliminated_files\":")?; out.integer(report.stats().index_eliminated_files as u64)?;
         out.literal(",\"index_candidates\":")?; out.integer(report.stats().index_candidates as u64)?;
@@ -311,7 +329,7 @@ fn execute(options: &Options, out: &mut Output, budget: &ResourceBudget, effect:
         out.literal(",\"peak_retained_source_bytes\":")?; out.integer(report.stats().peak_source_bytes as u64)?;
     } else {
         out.literal(if report.is_complete() { "Complete saved-scope search.\n" } else { "PARTIAL saved-scope search.\n" })?;
-        matching::human(out, &report, options.ignore_case, true)?;
+        matching::human(out, &report, options.ignore_case, true, options.search_scope())?;
     }
     matching::hits(&mut archive, &report, options.raw.is_some(), options.json, out, budget, canceled)?;
     if options.json { out.literal("}\n")?; }

@@ -10,6 +10,7 @@ use fcb::source::{CaptureEncodingMap, SpanKind, detect_encoding};
 use fcb::search::{RawPath, ResourceBudget, StreamingNeedle, StreamReadStep};
 use fcb::search::paged_snapshot::{PagedSnapshot, PagedQuery, PagedQueryOptions, PagedQueryState,
     PagedReport, VerifiedMember, PagedSearchError};
+use fcb::search::snapshot_scope::SnapshotScope;
 use fcb_core::ResourceAllocationId;
 use crate::{allocation, file_id, generation, owner, revision, EXIT_OK, EXIT_NO_MATCH, EXIT_PARTIAL};
 use crate::output::Output;
@@ -22,7 +23,8 @@ const MAX_WITNESS_BYTES: usize = 12 * 1024;
 
 pub(super) fn direct<R: Read + Seek>(archive: &mut PagedSnapshot<R>,
     text: Option<&str>, raw: Option<&[u8]>, ignore_case: bool, count_all_matches: bool,
-    max_matches: usize, skip_matches: u64, budget: &ResourceBudget, ids: [ResourceAllocationId; 4],
+    max_matches: usize, skip_matches: u64, scope: SnapshotScope<'_>,
+    budget: &ResourceBudget, ids: [ResourceAllocationId; 4],
     canceled: &mut impl FnMut() -> bool) -> Result<PagedReport, Failure> {
     let needle = match (text, raw) {
         (Some(text), None) => StreamingNeedle::text_matching(owner(), text, !ignore_case, budget, ids[0]),
@@ -32,7 +34,7 @@ pub(super) fn direct<R: Read + Seek>(archive: &mut PagedSnapshot<R>,
     let options = PagedQueryOptions { generation: generation(), first_file: file_id(),
         first_revision: revision(), max_matches };
     let allocations = [ids[1], ids[2], ids[3]];
-    let query = PagedQuery::new_page(archive, &needle, options, skip_matches,
+    let query = PagedQuery::new_scoped_page(archive, &needle, options, scope, skip_matches,
         count_all_matches, budget, allocations)?;
     finish(query, budget, canceled)
 }
@@ -46,7 +48,9 @@ pub(super) fn finish<R: Read + Seek>(mut query: PagedQuery<'_, '_, R>,
     Ok(report)
 }
 pub(super) fn fields(out: &mut Output, report: &PagedReport, raw: bool,
-    ignore_case: bool, index_available: bool) -> Result<(), Failure> {
+    ignore_case: bool, index_available: bool, scope: SnapshotScope<'_>) -> Result<(), Failure> {
+    scope_fields(out, scope, report.selected_members(), report.captured_members(),
+        report.membership_complete(), report.is_complete())?;
     out.literal(",\"mode\":")?;
     out.quoted(if raw { "original-bytes" } else if ignore_case { "unicode-lowercase-literal" } else { "exact-text" })?;
     out.literal(",\"case_sensitive\":")?; out.boolean(!ignore_case)?;
@@ -58,7 +62,8 @@ pub(super) fn fields(out: &mut Output, report: &PagedReport, raw: bool,
     out.quoted(if !index_available { "direct-verified-member-scan" }
         else if ignore_case { "ascii-case-variants-with-source-fallback" } else { "exact-compatible-index" })?;
     out.literal(",\"index_bypass_reason\":null")?;
-    out.literal(",\"workspace_complete\":")?; out.boolean(report.is_complete())?;
+    out.literal(",\"workspace_complete\":")?;
+    out.boolean(scope == SnapshotScope::Archive && report.is_complete())?;
     out.literal(",\"truncated\":")?; out.boolean(report.truncated())?;
     out.literal(",\"count_all_matches\":")?; out.boolean(report.count_all_matches())?;
     window_fields(out, report.skip_matches(), report.skipped_matches(), report.hits().len(),
@@ -76,7 +81,8 @@ pub(super) fn fields(out: &mut Output, report: &PagedReport, raw: bool,
     Ok(())
 }
 pub(super) fn human(out: &mut Output, report: &PagedReport, ignore_case: bool,
-    index_available: bool) -> Result<(), Failure> {
+    index_available: bool, scope: SnapshotScope<'_>) -> Result<(), Failure> {
+    scope_human(out, scope, report.selected_members(), report.captured_members(), report.membership_complete())?;
     if ignore_case {
         out.literal("Unicode scalar-lowercase literal matching; no full case folding or canonical normalization.\n")?;
         if index_available { out.literal("ASCII-qualified index rows prune case variants; Unicode, legacy and uncovered sources retain direct verification.\n")?; }
@@ -89,6 +95,35 @@ pub(super) fn human(out: &mut Output, report: &PagedReport, ignore_case: bool,
         out.literal("; retained hits: ")?; out.literal(&report.hits().len().to_string())?;
         out.literal("; matching files: ")?; out.literal(&report.matching_files().to_string())?; out.literal(".\n")?;
     }
+    Ok(())
+}
+
+/// Report the frozen raw-member selection separately from the whole archive's
+/// discovery state and from query completeness. Exact member selection can be
+/// closed even when discovery elsewhere in the archive was incomplete.
+pub(super) fn scope_fields(out: &mut Output, scope: SnapshotScope<'_>, members: usize,
+    captured: usize, membership_complete: bool, complete: bool) -> Result<(), Failure> {
+    out.literal(",\"scope\":")?; out.quoted(scope.label())?;
+    out.literal(",\"scope_path\":")?;
+    if scope == SnapshotScope::Archive { out.literal("null")?; }
+    else { out.path(&RawPath::from_bytes(scope.path()).to_path_buf())?; }
+    out.literal(",\"scope_path_hex\":")?; out.hex(scope.path())?;
+    out.literal(",\"scope_known_members\":")?; out.integer(members as u64)?;
+    out.literal(",\"scope_captured_members\":")?; out.integer(captured as u64)?;
+    out.literal(",\"scope_unavailable_members\":")?; out.integer(members.saturating_sub(captured) as u64)?;
+    out.literal(",\"scope_membership_complete\":")?; out.boolean(membership_complete)?;
+    out.literal(",\"scope_complete\":")?; out.boolean(complete)?;
+    Ok(())
+}
+pub(super) fn scope_human(out: &mut Output, scope: SnapshotScope<'_>, members: usize,
+    captured: usize, membership_complete: bool) -> Result<(), Failure> {
+    out.literal("Scope: ")?; out.literal(scope.label())?;
+    if scope != SnapshotScope::Archive {
+        out.literal(" ")?; out.path(&RawPath::from_bytes(scope.path()).to_path_buf())?;
+    }
+    out.literal("; known members: ")?; out.literal(&members.to_string())?;
+    out.literal("; captured members: ")?; out.literal(&captured.to_string())?;
+    out.literal(if membership_complete { "; membership complete.\n" } else { "; membership incomplete.\n" })?;
     Ok(())
 }
 
