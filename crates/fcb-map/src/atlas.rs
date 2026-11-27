@@ -13,6 +13,7 @@
 //! than accumulating the absolute coordinates of all its ancestors.
 
 pub mod retained;
+pub mod focus;
 
 use std::{mem::size_of, sync::Arc};
 use fcb_core::{ArenaOwnerId, ByteLength, LayoutRevision, Rect2D,

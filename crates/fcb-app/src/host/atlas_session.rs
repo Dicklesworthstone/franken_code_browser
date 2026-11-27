@@ -11,6 +11,7 @@ use fcb::{ArenaOwnerId, ByteLength, CameraGeneration, DisplayGeneration, Display
 use fcb::map::{AtlasDetail, AtlasError, AtlasHit, AtlasNodeId, Camera2D, CameraError,
     DisplayColorConfig, LayoutOptions, LayoutRevision, LodThresholds, VisibleLimits,
     VisiblePlan, VisibleQuery, VisibleState};
+use fcb::map::atlas::focus::AtlasFocus;
 use fcb::map::workspace::{WorkspaceAtlasError, WorkspaceAtlasLimits};
 use fcb::map::workspace::retained::RetainedWorkspaceAtlas;
 use fcb::search::{QueryGeneration, RawPath, ResourceAllocationId, ResourceBudget, RootId, SearchManifestId};
@@ -124,7 +125,7 @@ pub enum AtlasAction {
     Scope(AtlasScope),
 }
 #[derive(Clone, Copy)]
-struct Position { focus: AtlasNodeId, camera: Camera2D }
+struct Position { focus: AtlasFocus, camera: Camera2D }
 
 /// A pending or presented plan pins the layout that gives its node ordinals
 /// meaning. Repacking another scope must not retire the displayed frame's
@@ -270,7 +271,7 @@ impl AtlasSession {
         }
         check(&mut canceled)?;
         Ok(Self { atlas: Arc::new(atlas), scoped: None, scope: AtlasScope::All, next_layout: 2,
-            position: Position { focus, camera }, selected: None, history, forward, pending: None,
+            position: Position { focus: AtlasFocus::new(focus), camera }, selected: None, history, forward, pending: None,
             presented: None, frame: None, last_attempt: 0, last_display_generation: 1, next_allocation: 10,
             visible: options.visible, budget, _lease: lease })
     }
@@ -420,13 +421,13 @@ impl AtlasSession {
             AtlasAction::Scope(_) => {},
             AtlasAction::View => {},
             AtlasAction::Pan(delta) => next.camera = old.camera.pan(delta)?,
-            AtlasAction::Zoom { anchor, factor } => next.camera = old.camera.zoom_at(anchor, factor)?,
+            AtlasAction::Zoom { anchor, factor } => (next.focus, next.camera) = old.focus.zoom(&index, old.camera, anchor, factor)?,
             AtlasAction::Focus(ordinal) => {
                 let node = AtlasNodeId::new(index.root(), index.revision(), ordinal);
                 index.node(node)?;
-                next.focus = node;
+                next.focus = AtlasFocus::new(node);
                 next.camera = index.focus_camera(node, camera_id, old.camera.display(), 12.0)?;
-                if node != old.focus || next.camera.origin() != old.camera.origin()
+                if next.focus != old.focus || next.camera.origin() != old.camera.origin()
                     || next.camera.points_per_unit() != old.camera.points_per_unit() {
                     history_change = HistoryChange::Push;
                 }
@@ -453,17 +454,21 @@ impl AtlasSession {
             // layout revision; carrying them across a repack would alias a
             // different file. A scope change is an explicit navigation reset
             // to the new layout's root.
-            next.focus = index.root_node();
-            next.camera = index.focus_camera(next.focus, camera_id, old.camera.display(), 12.0)?;
+            next.focus = AtlasFocus::new(index.root_node());
+            next.camera = index.focus_camera(next.focus.node(), camera_id, old.camera.display(), 12.0)?;
             selected = None;
             history_change = HistoryChange::Reset;
+        }
+        (next.focus, next.camera) = next.focus.accommodate(&index, next.camera)?;
+        if matches!(history_change, HistoryChange::Keep) && next.focus != old.focus {
+            history_change = HistoryChange::Push;
         }
         // History restores transforms, not old camera identities.
         next.camera = Camera2D::new(camera_id, next.camera.display(),
             next.camera.origin(), next.camera.points_per_unit())?;
         let query_generation = QueryGeneration::new(self.owner(), generation).map_err(|_| AtlasSessionError::IdentityExhausted)?;
         let previous = self.pending_plan().or(self.presented_plan());
-        let mut query = VisibleQuery::new(&index, next.focus, next.camera, query_generation, LodThresholds::default(),
+        let mut query = VisibleQuery::new(&index, next.focus.node(), next.camera, query_generation, LodThresholds::default(),
             self.visible, previous, &self.budget, plan_allocation)?;
         while query.state() == VisibleState::Pending {
             self.validate_active()?;
@@ -714,7 +719,7 @@ impl AtlasSession {
     }
 }
 fn position_json(out: &mut Output, atlas: &RetainedWorkspaceAtlas, position: Position, selected: Option<AtlasNodeId>) -> Result<(), AtlasSessionError> {
-    out.literal(",\"focus\":")?; node_json(out, atlas, position.focus)?;
+    out.literal(",\"focus\":")?; node_json(out, atlas, position.focus.node())?;
     out.literal(",\"selection\":")?;
     if let Some(node) = selected { node_json(out, atlas, node)?; } else { out.literal("null")?; }
     let c = position.camera;

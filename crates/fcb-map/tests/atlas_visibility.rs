@@ -239,3 +239,32 @@ fn retained_and_replacement_plans_hold_independent_leases() {
     drop(old); assert!(budget.accounting().reserved().get() > 0);
     drop(new); assert_eq!(budget.accounting().reserved().get(), 0);
 }
+
+#[test]
+fn an_automatic_island_allows_panning_to_a_sibling_inside_the_explicit_focus() {
+    use fcb_map::atlas::focus::AtlasFocus;
+    let layout = fixture();
+    let budget = budget();
+    let index = AtlasIndex::build(&layout, AtlasBuildLimits::default(), &budget, allocation(1), || false).unwrap();
+    let directory = index.find_path(b"d1").unwrap();
+    let mut children: Vec<_> = index.children(directory).unwrap().map(|key|
+        (key, index.bounds_in(key, directory).unwrap())).collect();
+    children.sort_by(|(_, a), (_, b)| a.min_x().max(a.min_y()).total_cmp(&b.min_x().max(b.min_y())));
+    let &(source, start) = children.last().unwrap();
+    let &(destination, end) = children.first().unwrap();
+    let camera = Camera2D::new(CameraGeneration::new(owner(), 1).unwrap(), display(1.0, 1),
+        start.origin(), 1.0).unwrap();
+    let factor = 0.1 / (start.min_x().max(start.min_y()) * f64::EPSILON);
+    let anchor = Point2D::new(0.01, 0.01).unwrap();
+    let (island, close) = AtlasFocus::new(directory).zoom(&index, camera, anchor, factor).unwrap();
+    assert_eq!(island.node(), source);
+    // Pan into a different parcel and run the normal visibility query there.
+    let center = Point2D::new(end.min_x() + end.size().width() / 2.0, end.min_y() + end.size().height() / 2.0).unwrap();
+    let pan = Point2D::new((start.min_x() + 0.01 - center.x()) * factor,
+        (start.min_y() + 0.01 - center.y()) * factor).unwrap();
+    let (next, camera) = island.accommodate(&index, close.pan(pan).unwrap()).unwrap();
+    let shown = plan(&index, next.node(), camera, exact(), VisibleLimits::default(), None, &budget, 3);
+    assert!(shown.parcels().iter().any(|parcel| parcel.node() == destination));
+    let (wide, _) = next.zoom(&index, camera, anchor, 0.01 / factor).unwrap();
+    assert_eq!(wide.node(), directory, "never widen an explicitly focused neighborhood");
+}

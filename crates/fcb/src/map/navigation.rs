@@ -13,16 +13,18 @@ use fcb_core::{ByteLength, CameraGeneration, DisplayMetrics, Point2D, ResourceAl
     ResourceBudget, ResourceLease};
 use super::{AtlasError, AtlasHit, AtlasIndex, AtlasNodeId, Camera2D, CameraError, PresentedAtlas};
 
+use super::atlas::focus::AtlasFocus;
+
 pub const MAX_NAVIGATION_HISTORY: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AtlasLocation {
-    focus: AtlasNodeId,
+    focus: AtlasFocus,
     camera: Camera2D,
     selection: Option<AtlasNodeId>,
 }
 impl AtlasLocation {
-    pub const fn focus(self) -> AtlasNodeId { self.focus }
+    pub const fn focus(self) -> AtlasNodeId { self.focus.node() }
     pub const fn camera(self) -> Camera2D { self.camera }
     pub const fn selection(self) -> Option<AtlasNodeId> { self.selection }
 }
@@ -51,7 +53,7 @@ impl<'index, 'layout> AtlasNavigation<'index, 'layout> {
         if back.capacity() > history_capacity || forward.capacity() > history_capacity {
             return Err(AtlasError::ResourceDenied);
         }
-        Ok(Self { index, current: AtlasLocation { focus: index.root_node(), camera, selection: None },
+        Ok(Self { index, current: AtlasLocation { focus: AtlasFocus::new(index.root_node()), camera, selection: None },
             back, forward, capacity: history_capacity, _lease: lease })
     }
     pub const fn location(&self) -> AtlasLocation { self.current }
@@ -81,7 +83,7 @@ impl<'index, 'layout> AtlasNavigation<'index, 'layout> {
     pub fn focus(&mut self, target: AtlasNodeId, padding_points: f64) -> Result<(), AtlasError> {
         let camera = self.index.focus_camera(target, self.next_generation()?,
             self.current.camera.display(), padding_points)?;
-        let next = AtlasLocation { focus: target, camera, selection: self.current.selection };
+        let next = AtlasLocation { focus: AtlasFocus::new(target), camera, selection: self.current.selection };
         self.commit_navigation(next);
         Ok(())
     }
@@ -91,7 +93,7 @@ impl<'index, 'layout> AtlasNavigation<'index, 'layout> {
         Ok(true)
     }
     pub fn fit_parent(&mut self, padding_points: f64) -> Result<bool, AtlasError> {
-        let Some(parent) = self.index.parent(self.current.focus)? else { return Ok(false); };
+        let Some(parent) = self.index.parent(self.current.focus())? else { return Ok(false); };
         self.focus(parent, padding_points)?;
         Ok(true)
     }
@@ -99,16 +101,30 @@ impl<'index, 'layout> AtlasNavigation<'index, 'layout> {
         self.focus(self.index.root_node(), padding_points)
     }
     pub fn pan(&mut self, delta_points: Point2D) -> Result<(), AtlasError> {
-        self.current.camera = self.current.camera.pan(delta_points)?;
+        let (focus, camera) = self.current.focus.accommodate(self.index, self.current.camera.pan(delta_points)?)?;
+        self.apply_gesture(focus, camera);
         Ok(())
     }
+    /// Zoom at a logical point in the current viewport. When the enclosing
+    /// coordinate system approaches pixel precision, enter the containing
+    /// subtree and record a Back destination. Panning to a sibling or zooming
+    /// out returns to its ancestors up to the last explicit focus. A zoom
+    /// without a sufficiently precise domain leaves the location intact.
     pub fn zoom_at(&mut self, point: Point2D, factor: f64) -> Result<(), AtlasError> {
-        self.current.camera = self.current.camera.zoom_at(point, factor)?;
+        let (focus, camera) = self.current.focus.zoom(self.index, self.current.camera, point, factor)?;
+        self.apply_gesture(focus, camera);
         Ok(())
     }
     pub fn set_display(&mut self, display: DisplayMetrics) -> Result<(), AtlasError> {
-        self.current.camera = self.current.camera.with_display(display)?;
+        let (focus, camera) = self.current.focus.accommodate(self.index, self.current.camera.with_display(display)?)?;
+        self.apply_gesture(focus, camera);
         Ok(())
+    }
+
+    fn apply_gesture(&mut self, focus: AtlasFocus, camera: Camera2D) {
+        let next = AtlasLocation { focus, camera, ..self.current };
+        if focus != self.current.focus { self.commit_navigation(next); }
+        else { self.current = next; }
     }
 
     pub fn go_back(&mut self) -> Result<bool, AtlasError> {
@@ -139,7 +155,7 @@ impl<'index, 'layout> AtlasNavigation<'index, 'layout> {
         CameraGeneration::new(generation.owner(), value).map_err(|_| AtlasError::Camera(CameraError::GenerationExhausted))
     }
     fn restore(&self, saved: AtlasLocation) -> Result<AtlasLocation, AtlasError> {
-        self.index.node(saved.focus)?;
+        self.index.node(saved.focus())?;
         let camera = saved.camera;
         let display = self.current.camera.display();
         // Restore the saved local center using the CURRENT display's dimensions.
@@ -149,7 +165,8 @@ impl<'index, 'layout> AtlasNavigation<'index, 'layout> {
             camera.origin().y() + (old_size.height() - new_size.height()) * 0.5 / camera.points_per_unit())
             .map_err(|_| AtlasError::Camera(CameraError::InvalidGeometry))?;
         let camera = Camera2D::new(self.next_generation()?, display, origin, camera.points_per_unit())?;
-        Ok(AtlasLocation { camera, ..saved })
+        let (focus, camera) = saved.focus.accommodate(self.index, camera)?;
+        Ok(AtlasLocation { focus, camera, ..saved })
     }
 }
 fn push_bounded(stack: &mut VecDeque<AtlasLocation>, capacity: usize, item: AtlasLocation) {

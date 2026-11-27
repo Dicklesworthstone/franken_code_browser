@@ -264,3 +264,56 @@ fn history_and_source_bindings_release_only_their_own_admitted_capacity() {
     drop(nav); assert_eq!(budget.accounting().reserved().get(), baseline + source_charge);
     drop(sources); assert_eq!(budget.accounting().reserved().get(), baseline);
 }
+
+#[test]
+fn deep_zoom_keeps_pointer_and_selection_and_restores_the_surrounding_map() {
+    let layout = layout(1);
+    let budget = budget();
+    let index = AtlasIndex::build(&layout, AtlasBuildLimits::default(), &budget, allocation(1), || false).unwrap();
+    let root = index.root_node();
+    // Choose a leaf far from the origin, so its root-space ULP would become
+    // several physical pixels under the proposed magnification.
+    let (leaf, cell) = layout.nodes().iter().filter(|n| n.kind() != NodeKind::Directory)
+        .map(|n| {
+            let id = index.find_path(n.path()).unwrap();
+            (id, index.bounds_in(id, root).unwrap())
+        })
+        .max_by(|(_, a), (_, b)| a.min_x().max(a.min_y()).total_cmp(&b.min_x().max(b.min_y()))).unwrap();
+    let camera = Camera2D::new(CameraGeneration::new(owner(), 1).unwrap(), display(800.0, 600.0, 1),
+        cell.origin(), 100.0).unwrap();
+    let anchor = Point2D::new(1.0, 1.0).unwrap();
+    let mut nav = AtlasNavigation::new(&index, camera, 8, &budget, allocation(2)).unwrap();
+    nav.select(Some(leaf)).unwrap();
+    nav.zoom_at(anchor, 1e12).unwrap();
+    let close = nav.location();
+    assert_ne!(close.focus(), root);
+    assert_eq!(close.selection(), Some(leaf));
+    let local = index.bounds_in(leaf, close.focus()).unwrap();
+    let mapped = close.camera().local_to_logical(Point2D::new(local.min_x() + 0.01, local.min_y() + 0.01).unwrap()).unwrap();
+    assert!((mapped.x() - 1.0).abs() < 0.02 && (mapped.y() - 1.0).abs() < 0.02);
+    assert_eq!(nav.back_len(), 1);
+    assert!(nav.go_back().unwrap());
+    assert_eq!(nav.location().focus(), root);
+    assert_eq!(nav.location().camera().origin(), camera.origin());
+    assert!(nav.go_forward().unwrap());
+    assert_eq!(nav.location().focus(), close.focus());
+    nav.zoom_at(anchor, 1e-12).unwrap();
+    assert_eq!(nav.location().focus(), root);
+    assert_eq!(nav.location().camera().points_per_unit(), camera.points_per_unit());
+    assert!((nav.location().camera().origin().x() - camera.origin().x()).abs() < 1e-10);
+    assert!((nav.location().camera().origin().y() - camera.origin().y()).abs() < 1e-10);
+}
+
+#[test]
+fn deep_zoom_on_a_boundary_refuses_without_changing_history_or_selection() {
+    let layout = layout(1);
+    let budget = budget();
+    let index = AtlasIndex::build(&layout, AtlasBuildLimits::default(), &budget, allocation(1), || false).unwrap();
+    let outside = Point2D::new(1.0e5, 1.0e5).unwrap();
+    let camera = Camera2D::new(CameraGeneration::new(owner(), 1).unwrap(), display(800.0, 600.0, 1), outside, 1.0).unwrap();
+    let mut nav = AtlasNavigation::new(&index, camera, 8, &budget, allocation(2)).unwrap();
+    let before = nav.location();
+    assert_eq!(nav.zoom_at(Point2D::ORIGIN, 1e12), Err(AtlasError::Camera(CameraError::PrecisionLost)));
+    assert_eq!(nav.location(), before);
+    assert_eq!(nav.back_len(), 0);
+}

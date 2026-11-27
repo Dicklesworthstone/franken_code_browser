@@ -301,3 +301,34 @@ fn refocus_after_pan_is_reversible_and_forward_adapts_to_current_display() {
     assert!(matches!(session.prepare(10, AtlasAction::Forward, || false),
         Err(AtlasSessionError::EmptyHistory)));
 }
+
+#[test]
+fn zoom_into_a_precision_island_preserves_presented_picking_and_return_route() {
+    let fixture = Fixture::new();
+    let mut session = fixture.open();
+    session.prepare(1, AtlasAction::View, || false).unwrap();
+    let index = session.atlas().index().unwrap();
+    let root = index.root_node();
+    let leaf = index.find_path(b"src/b.rs").unwrap();
+    let cell = index.bounds_in(leaf, root).unwrap();
+    let camera = session.pending_plan().unwrap().camera();
+    let anchor = camera.local_to_logical(point(cell.min_x() + 0.001, cell.min_y() + 0.001)).unwrap();
+    drop(index);
+    session.acknowledge(1, 1, 1, || false).unwrap();
+    let old_pick = session.pick(1, 1, anchor, || false).unwrap();
+    session.prepare(2, AtlasAction::Zoom { anchor, factor: 1e14 }, || false).unwrap();
+    let island = session.pending_plan().unwrap().focus();
+    assert_ne!(island, root);
+    assert_eq!(session.pick(1, 1, anchor, || false).unwrap().as_str(), old_pick.as_str());
+    session.acknowledge(2, 2, 1, || false).unwrap();
+    assert!(session.pick(2, 1, anchor, || false).unwrap().as_str().contains("src/b.rs"));
+    session.prepare(3, AtlasAction::Back, || false).unwrap();
+    assert_eq!(session.pending_plan().unwrap().focus(), root);
+    session.prepare(4, AtlasAction::Forward, || false).unwrap();
+    assert_eq!(session.pending_plan().unwrap().focus(), island);
+    session.prepare(5, AtlasAction::Zoom { anchor, factor: 1e-14 }, || false).unwrap();
+    let restored = session.pending_plan().unwrap();
+    assert_eq!(restored.focus(), root);
+    near(restored.camera().origin().x(), camera.origin().x());
+    near(restored.camera().origin().y(), camera.origin().y());
+}
