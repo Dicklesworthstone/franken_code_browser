@@ -61,11 +61,15 @@ fn open(args: &Arguments, canceled: &mut impl FnMut() -> bool)
         Some(Needle::Query(query)) => (CatalogContentSearchMode::Expression, query.raw_query.as_str()),
         _ => return Err(CatalogContentSearchError::InvalidLimits),
     };
+    let mut scope = AtlasSearchScope::all().with_case_sensitive(!args.ignore_case);
+    if let Some((kind, path)) = &args.progressive_target {
+        scope = scope.with_path(*kind, path)?;
+    }
     CatalogContentSearchSession::open_with_policy(owner(), args.file.as_deref().ok_or(AppError::InvalidRange)?, 1, query,
         CatalogContentSearchOptions { mode, count_all_matches: args.count_all, start_after: args.skip_matches,
             limits: AtlasStreamSearchOptions { max_matches: args.limit, max_scan_bytes: args.max_scan_bytes,
                 max_read_calls: MAX_ATLAS_STREAM_SEARCH_READ_CALLS },
-            scope: AtlasSearchScope::all().with_case_sensitive(!args.ignore_case) }, discovery_policy(args), canceled)
+            scope }, discovery_policy(args), canceled)
 }
 
 /// Poll cancellation before every bounded service step. An accepted file is
@@ -179,6 +183,10 @@ fn stream_response<C: FnMut() -> bool>(parsed: Result<Arguments, ArgumentError>,
             out.path(args.file.as_deref().ok_or(AppError::InvalidRange)?)?;
             out.literal(",\"membership\":\"progressive-observation\",\"ordering\":\"provisional-discovery-order\",\"respect_ignores\":")?;
             out.boolean(args.respect_ignores)?;
+            if let Some((kind, path)) = &args.progressive_target {
+                out.literal(",\"requested_scope_kind\":")?; out.quoted(kind.name())?;
+                out.literal(",\"requested_scope_path\":")?; out.quoted(path)?;
+            }
             out.literal(",\"include_excluded\":")?; out.boolean(args.include_excluded)?;
             out.literal(",\"discovery_policy\":")?; out.quoted(discovery_policy(&args).name())?;
             out.literal(",\"terminal_required\":true,\"capture_limits_applied\":false,\"aggregate_file_limit\":null,\"aggregate_path_byte_limit\":null")?;

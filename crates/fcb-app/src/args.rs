@@ -4,6 +4,7 @@
 //! traversal and repository rule-file reads each require explicit switches.
 
 use std::{ffi::OsString, path::PathBuf};
+use crate::host::atlas_search::AtlasSearchPathKind;
 use fcb::search::{ParsedQuery, QueryError, QueryGeneration, QueryOptions, SearchMode, UnicodeNormalization};
 
 pub const MAX_ARGUMENTS: usize = 64;
@@ -27,6 +28,8 @@ pub struct Arguments {
     /// Opt into bounded discovery interleaved with content search. This route
     /// has its own schema and explicit policy/options, not a frozen manifest.
     pub progressive: bool,
+    /// Optional project-relative target for progressive discovery.
+    pub progressive_target: Option<(AtlasSearchPathKind, String)>,
     pub offset: u64, pub bytes: usize, pub limit: usize, pub encoding: Encoding,
     pub needle: Option<Needle>, pub workspace: bool, pub include_excluded: bool,
     pub respect_ignores: bool,
@@ -73,7 +76,7 @@ fn output_flag_requested(args: &[OsString], flag: &str) -> bool {
         if argument == "--" { break; }
         if argument == flag { return true; }
         if matches!(argument.to_str(), Some("--offset" | "--bytes" | "--limit" | "--encoding" | "--text" | "--raw-hex"
-            | "--query" | "--identifier" | "--skip-matches" | "--path" | "--max-files" | "--max-file-bytes" | "--max-total-bytes" | "--max-scan-bytes")) { cursor += 1; }
+            | "--query" | "--identifier" | "--directory" | "--file" | "--skip-matches" | "--path" | "--max-files" | "--max-file-bytes" | "--max-total-bytes" | "--max-scan-bytes")) { cursor += 1; }
     }
     false
 }
@@ -88,7 +91,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
         if total > MAX_ARGUMENT_BYTES { return Err(ArgumentError::Limit); }
     }
     let mut parsed = Arguments { command: Command::Launch, json: false, file: None,
-        stdin: false, stream: false, progressive: false, offset: 0, bytes: 64 * 1024, limit: 100, encoding: Encoding::Auto, needle: None,
+        stdin: false, stream: false, progressive: false, progressive_target: None, offset: 0, bytes: 64 * 1024, limit: 100, encoding: Encoding::Auto, needle: None,
         workspace: false, include_excluded: false, respect_ignores: false, max_files: 4096,
         max_file_bytes: 1024 * 1024, max_total_bytes: 32 * 1024 * 1024,
         whole_file: false, max_scan_bytes: 256 * 1024 * 1024, ignore_case: false, count_all: false, skip_matches: 0 };
@@ -123,6 +126,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
                 "--query" => 131072, "--ignore-case" => 262144, "--count-all" => 524288,
                 "--identifier" => 1048576, "--stream" => 2097152, "--skip-matches" => 4194304,
                 "--progressive" => 8388608,
+                "--directory" | "--file" => 16777216,
                 _ => return Err(ArgumentError::UnknownOption),
             };
             if seen & bit != 0 { return Err(ArgumentError::DuplicateOption); }
@@ -140,6 +144,10 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
             let value = args.get(cursor).ok_or(ArgumentError::MissingValue)?; cursor += 1;
             let value = value.to_str().ok_or(ArgumentError::MissingValue)?;
             match option {
+                "--directory" | "--file" => {
+                    let kind = if option == "--directory" { AtlasSearchPathKind::Directory } else { AtlasSearchPathKind::File };
+                    parsed.progressive_target = Some((kind, value.to_owned()));
+                }
                 "--offset" => parsed.offset = decimal(value)?,
                 "--skip-matches" => parsed.skip_matches = decimal(value)?,
                 "--bytes" => {
@@ -224,6 +232,7 @@ pub fn parse(args: &[OsString]) -> Result<Arguments, ArgumentError> {
     if parsed.ignore_case && (parsed.command != Command::Search || !allows_ignore_case) {
         return Err(ArgumentError::IncompatibleOptions);
     }
+    if parsed.progressive_target.is_some() && !parsed.progressive { return Err(ArgumentError::ProgressiveOptions); }
     if parsed.progressive {
         if parsed.command != Command::Search || !parsed.workspace || !parsed.whole_file
             || seen & (32 | 1024 | 128) != 0 {

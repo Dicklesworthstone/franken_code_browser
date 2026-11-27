@@ -451,3 +451,32 @@ fn explicit_errors_and_human_output_use_the_new_route_without_source_side_effect
     assert!(err.is_empty() && !out.contains(&0x1b));
     assert!(std::str::from_utf8(&out).unwrap().contains("all-regular-files/no-rule-files-v1"));
 }
+
+#[test]
+fn file_and_folder_targets_retain_project_paths_and_visit_only_selected_members() {
+    let tree = Tree::new("scoped");
+    tree.file("src/a.rs", b"token");
+    tree.file("src/nested/b.rs", b"token");
+    tree.file("src/ignore.rs", b"token");
+    tree.file(".gitignore", b"src/ignore.rs\n");
+    tree.file("src-other/c.rs", b"token");
+    let (code, page) = invoke(&tree.0, &["--text", "token", "--directory", "src"]);
+    assert_eq!(code, EXIT_OK);
+    assert_eq!(page.get("discovery_scope").text(), "directory");
+    assert_eq!(page.get("scope_path").text(), "src");
+    assert_eq!(page.get("summary").get("catalogued_files").number(), 2);
+    assert_eq!(page.get("summary").get("matches_seen").number(), 2);
+    let (code, records) = stream(&tree.0, &["--identifier", "token", "--file", "src/nested/b.rs"]);
+    assert_eq!(code, EXIT_OK);
+    assert_eq!(records[0].get("requested_scope_kind").text(), "file");
+    assert_eq!(records[0].get("requested_scope_path").text(), "src/nested/b.rs");
+    assert_eq!(records.last().unwrap().get("catalogued_files").number(), 1);
+    assert_eq!(records.last().unwrap().get("payload_bytes_read").number(), 5);
+    for flags in [
+        vec!["--directory", "../src"], vec!["--file", "missing.rs"],
+        vec!["--file", "src/a.rs", "--directory", "src"],
+    ] {
+        let mut args = vec!["--text", "token"]; args.extend(flags);
+        assert_eq!(invoke(&tree.0, &args).0, EXIT_ERROR);
+    }
+}
