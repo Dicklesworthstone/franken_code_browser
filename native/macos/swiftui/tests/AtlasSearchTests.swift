@@ -6,6 +6,45 @@ import Foundation
         precondition(condition(), message)
         checks += 1
     }
+    static func rawSearchLocations() throws {
+        let raw: [UInt8] = [0xff, 47, 0xfe, 46, 114, 115]
+        let file = try AtlasSearchPathScope(kind: .file, rawPath: raw)
+        let directory = try AtlasSearchPathScope(kind: .directory, rawPath: [0xff])
+        let replacement = try AtlasSearchPathScope(kind: .file, path: String(decoding: raw, as: UTF8.self))
+        let displayAlias = try AtlasSearchPathScope(kind: .file, path: file.path)
+        check(file != replacement && file != displayAlias && !file.admitsRawPath(displayAlias.rawPath),
+            "A lossy UTF-8 spelling or hex display string cannot borrow a raw file's identity")
+        check(file.admitsRawPath(raw) && !file.admitsRawPath(raw + [97])
+            && directory.admitsRawPath(raw) && !directory.admitsRawPath([0xff, 97, 47, 98]),
+            "Raw file equality and directory component boundaries are exact")
+        let fileCatalog = try AtlasSearchCatalogScope(file: raw)
+        let folderCatalog = try AtlasSearchCatalogScope(directory: [0xff])
+        check(file.isContained(in: fileCatalog) && file.isContained(in: folderCatalog)
+            && directory.isContained(in: folderCatalog) && !directory.isContained(in: fileCatalog)
+            && !replacement.isContained(in: folderCatalog), "Discovery preserves independent raw scope bounds")
+        file.withCString { kind, pointer in
+            let bytes = UnsafeBufferPointer(start: pointer, count: raw.count + 1).map { UInt8(bitPattern: $0) }
+            check(kind == 2 && bytes == raw + [0], "Native search receives the original bytes and one terminator")
+        }
+        try file.validateEcho(kind: "file", path: nil, hex: "ff2ffe2e7273")
+        check(file.pathHex == "ff2ffe2e7273", "Non-UTF-8 query receipts use exact hex and JSON null text")
+        for (label, hex) in [(file.path as String?, file.pathHex), (replacement.path, file.pathHex), (nil, "fe")] {
+            do {
+                try file.validateEcho(kind: "file", path: label, hex: hex)
+                preconditionFailure("Unrelated raw scope echo accepted")
+            } catch AtlasSearchError.invalidResponse { checks += 1 }
+        }
+        do {
+            try AtlasSearchCatalogReceipt.validateFieldPresence(in: Data(#"{"scope_path_kind":"file","scope_path_hex":"ff"}"#.utf8))
+            preconditionFailure("Missing raw path echo accepted as an explicit JSON null")
+        } catch AtlasSearchError.invalidResponse { checks += 1 }
+        try AtlasSearchCatalogReceipt.validateFieldPresence(in: Data(#"{"scope_path_kind":"file","scope_path_hex":"ff","scope_path":null}"#.utf8))
+        for invalid: [UInt8] in [[0xff, 0], [0xff, 47, 46, 46], [47, 0xff], [0xff, 47], [UInt8](repeating: 0xff, count: 4097)] {
+            do { _ = try AtlasSearchPathScope(kind: .file, rawPath: invalid); preconditionFailure("Invalid native path accepted") }
+            catch AtlasSearchError.invalidPathScope { checks += 1 }
+        }
+    }
+
     static func catalogScopes() throws {
         let folder = try AtlasSearchCatalogScope(directory: Array("zz-late".utf8))
         let query = try AtlasSearchPathScope(kind: .directory, path: "zz-late")
@@ -184,6 +223,7 @@ import Foundation
     }
 
     static func main() throws {
+        try rawSearchLocations()
         try catalogScopes()
         try exactFileCatalogScopes()
         func envelope(_ hits: [[String: Any]] = []) -> [String: Any] {

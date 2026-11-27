@@ -253,7 +253,7 @@ struct AtlasWorkspaceStructureSummary: Equatable, Sendable {
                   counters["incomplete_files"] == 0, examined == eligible else { throw AtlasWorkspaceStructureError.invalidResponse }
         }
         func optional(_ key: String) throws -> String? { try wire.optionalText(key) }
-        try request.pathScope.validateEcho(kind: wire.text("scope_path_kind"), path: wire.text("scope_path"),
+        try request.pathScope.validateEcho(kind: wire.text("scope_path_kind"), path: wire.optionalText("scope_path", required: true),
             hex: wire.text("scope_path_hex"), regionSHA256: optional("scope_region_sha256"),
             regionFiles: optional("scope_region_files"), regionPathBytes: optional("scope_region_path_bytes"))
         let admitted = try request.fileScope.eligibleFiles(kind: wire.text("search_scope"),

@@ -31,7 +31,7 @@ uint64_t fcb_catalog_structure_create(void);
  * Null extensions AND filenames means all file types; a non-null empty list
  * means an empty predicate. Lists use at most 1024 bytes of shared ASCII CSV.
  * path_kind: 0 workspace, 1 directory, 2 exact file, 3 frozen visible membership.
- * Directory/file paths are relative UTF-8, at most 4096 bytes. Workspace requires
+ * Directory/file paths are NUL-terminated relative native bytes, at most 4096 bytes. Workspace requires
  * null/empty path. Visible is sorted unique lowercase-hex raw-path CSV, at most
  * 1048576 bytes and 20000 paths. Scope filters run before source I/O budgets.
  *

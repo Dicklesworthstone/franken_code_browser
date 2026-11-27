@@ -43,7 +43,10 @@ struct AtlasIndexWire: Decodable {
     func optionalNumber(_ key: String) throws -> UInt64? {
         try fields.decodeIfPresent(String.self, forKey: Key(key)).map(Self.integer)
     }
-    func optionalText(_ key: String) throws -> String? { try fields.decodeIfPresent(String.self, forKey: Key(key)) }
+    func optionalText(_ key: String, required: Bool = false) throws -> String? {
+        guard !required || fields.contains(Key(key)) else { throw Self.invalid() }
+        return try fields.decodeIfPresent(String.self, forKey: Key(key))
+    }
     func optionalFlag(_ key: String) throws -> Bool? { try fields.decodeIfPresent(Bool.self, forKey: Key(key)) }
     func object(_ key: String) throws -> Self { try fields.decode(Self.self, forKey: Key(key)) }
     func absent(_ keys: [String]) throws -> Bool {
@@ -121,7 +124,7 @@ struct AtlasIndexedCaptureScope: Sendable, Equatable {
             catalogued: files, pathScoped: !pathScope.isWorkspace)
         excludedFiles = files - eligibleFiles
         try pathScope.validateEcho(kind: wire.text("capture_scope_path_kind"),
-            path: wire.text("capture_scope_path"), hex: wire.text("capture_scope_path_hex"),
+            path: wire.optionalText("capture_scope_path", required: true), hex: wire.text("capture_scope_path_hex"),
             regionSHA256: wire.optionalText("capture_scope_region_sha256"),
             regionFiles: wire.optionalText("capture_scope_region_files"),
             regionPathBytes: wire.optionalText("capture_scope_region_path_bytes"))
@@ -377,7 +380,7 @@ struct AtlasIndexedQueryPage {
         }
         let kind = try w.optionalText("search_scope")
         try pathScope.validateEcho(kind: w.optionalText("scope_path_kind"),
-            path: w.optionalText("scope_path"), hex: w.optionalText("scope_path_hex"),
+            path: w.optionalText("scope_path", required: !pathScope.isWorkspace), hex: w.optionalText("scope_path_hex"),
             regionSHA256: w.optionalText("scope_region_sha256"), regionFiles: w.optionalText("scope_region_files"),
             regionPathBytes: w.optionalText("scope_region_path_bytes"))
         let eligible = try scope.eligibleFiles(kind: kind, extensions: w.optionalText("scope_extensions"),

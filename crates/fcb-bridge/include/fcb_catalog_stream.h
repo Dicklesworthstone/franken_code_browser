@@ -34,7 +34,7 @@ uint64_t fcb_catalog_stream_create(void);
  * Null extensions AND filenames means all types; a non-null empty list is an
  * explicit empty predicate. Lists use shared comma-separated ASCII tokens, at
  * most 1024 bytes each. path_kind: 0 workspace, 1 directory, 2 exact file,
- * 3 explicit raw visible membership. Directory/file paths are relative UTF-8,
+ * 3 explicit raw visible membership. Directory/file paths are NUL-terminated relative native bytes,
  * at most 4096 bytes. Workspace requires null/empty path. Visible membership is
  * a canonical sorted unique lowercase-hex CSV (at most 1048576 bytes, 20000
  * paths), not atlas frame proof. Membership is applied before source I/O.

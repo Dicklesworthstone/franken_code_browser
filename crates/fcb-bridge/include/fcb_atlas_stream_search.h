@@ -45,7 +45,7 @@ char *fcb_atlas_stream_search_cancelable(uint64_t handle, const char *needle,
  * of its extensions and exact basenames. Lists are at most 1024 bytes each.
  *
  * path_kind: 0 workspace (NULL or empty path), 1 directory, 2 exact file,
- * 3 frozen visible region. Directory/file paths are exact UTF-8 relative paths
+ * 3 frozen visible region. Directory/file paths are exact NUL-terminated native relative paths
  * up to 4096 bytes, without dot/repeated/leading/trailing components. Directory
  * matching respects component boundaries. Visible path is canonical sorted,
  * unique lowercase hex CSV of raw relative paths (up to 20000 paths and 1 MiB

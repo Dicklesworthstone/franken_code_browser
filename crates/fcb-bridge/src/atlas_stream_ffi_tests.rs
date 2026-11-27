@@ -1,6 +1,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use super::*;
+use fcb_app::host::atlas_search::{MAX_SEARCH_SCOPE_PATH_BYTES, MAX_SEARCH_REGION_WIRE_BYTES};
 use crate::atlas_ffi::{fcb_atlas_create, fcb_atlas_open, fcb_atlas_close};
 use crate::reader_ffi::FFI_TEST_LOCK;
 use std::{ffi::{CStr, CString}, fs, os::unix::ffi::OsStrExt, path::PathBuf,
@@ -269,7 +270,7 @@ fn c_scoped_stream_bounds_foreign_scope_strings_and_preserves_explicit_empty_mem
         (std::ptr::null(), list_overflow.as_ptr().cast(), 0, std::ptr::null()),
         (invalid_utf8.as_ptr().cast(), std::ptr::null(), 0, std::ptr::null()),
         (std::ptr::null(), std::ptr::null(), 1, path_overflow.as_ptr().cast()),
-        (std::ptr::null(), std::ptr::null(), 1, invalid_utf8.as_ptr().cast()),
+        (std::ptr::null(), std::ptr::null(), 3, invalid_utf8.as_ptr().cast()),
         (std::ptr::null(), std::ptr::null(), 1, invalid_path.as_ptr()),
         (std::ptr::null(), std::ptr::null(), 3, invalid_region.as_ptr()),
         (std::ptr::null(), std::ptr::null(), 3, region_overflow.as_ptr().cast()),

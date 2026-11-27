@@ -9,7 +9,7 @@ use fcb_app::host::{HostResponse, catalog_session::{CatalogStructureSearchMode,
     MAX_CATALOG_STRUCTURE_QUERY_BYTES, MAX_CATALOG_STRUCTURE_READ_CALLS,
     MAX_CATALOG_STRUCTURE_SCAN_BYTES}};
 use fcb_app::host::atlas_search::{AtlasSearchPathKind, AtlasSearchScope,
-    MAX_SEARCH_SCOPE_LIST_BYTES, MAX_SEARCH_SCOPE_PATH_BYTES, MAX_SEARCH_REGION_WIRE_BYTES};
+    MAX_SEARCH_SCOPE_LIST_BYTES};
 use fcb::search::SymbolNameMode;
 use super::{cstr, reply, string_out};
 use super::catalog_structure_sessions::{AccessError, CatalogStructureSessions, Command};
@@ -176,11 +176,10 @@ unsafe fn bounded_scope(extensions: *const c_char, filenames: *const c_char,
     kind: AtlasSearchPathKind, path: *const c_char, case_sensitive: bool) -> Result<AtlasSearchScope, AccessError> {
     let extensions = unsafe { bounded_optional(extensions, MAX_SEARCH_SCOPE_LIST_BYTES) }?;
     let filenames = unsafe { bounded_optional(filenames, MAX_SEARCH_SCOPE_LIST_BYTES) }?;
-    let limit = if kind == AtlasSearchPathKind::Visible { MAX_SEARCH_REGION_WIRE_BYTES } else { MAX_SEARCH_SCOPE_PATH_BYTES };
-    let path = unsafe { bounded_optional(path, limit) }?;
-    if path.is_none() && kind != AtlasSearchPathKind::Workspace { return Err(AccessError::InvalidArgument); }
-    AtlasSearchScope::from_csv(extensions, filenames)?.with_case_sensitive(case_sensitive)
-        .with_path(kind, path.unwrap_or("")).map_err(AccessError::from)
+    if path.is_null() && kind != AtlasSearchPathKind::Workspace { return Err(AccessError::InvalidArgument); }
+    let scope = AtlasSearchScope::from_csv(extensions, filenames)?.with_case_sensitive(case_sensitive);
+    unsafe { crate::search_path_ffi::with_path(scope, kind, path,
+        AccessError::InvalidArgument, AccessError::InvalidArgument) }
 }
 unsafe fn bounded_optional<'a>(pointer: *const c_char, limit: usize) -> Result<Option<&'a str>, AccessError> {
     if pointer.is_null() { return Ok(None); }

@@ -265,7 +265,7 @@ fn c_path_scope_freezes_exact_components_and_rejects_invalid_replacements_before
         std::ptr::null(), std::ptr::null(), 2, too_long.as_ptr(), 1, 1, 32768, 65536) });
     assert!(rejected.contains("INVALID_SCOPE"));
     let invalid_utf8 = CString::new(vec![0xff]).unwrap();
-    for (kind, path) in [(99, std::ptr::null()), (2, invalid_utf8.as_ptr())] {
+    for (kind, path) in [(99, std::ptr::null()), (3, invalid_utf8.as_ptr())] {
         let rejected = take(unsafe { fcb_atlas_search_begin_path_scoped(atlas, 3, needle.as_ptr(),
             std::ptr::null(), std::ptr::null(), kind, path, 1, 1, 32768, 65536) });
         assert!(rejected.contains("INVALID_ARGUMENT"));

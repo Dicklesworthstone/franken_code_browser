@@ -960,7 +960,7 @@ struct AtlasWorkspaceStreamWire: Decodable {
         func additive(_ key: String) throws -> String? {
             try fields.decodeIfPresent(String.self, forKey: Key(key))
         }
-        try request.pathScope.validateEcho(kind: text("scope_path_kind"), path: text("scope_path"),
+        try request.pathScope.validateEcho(kind: text("scope_path_kind"), path: additive("scope_path"),
             hex: text("scope_path_hex"), regionSHA256: additive("scope_region_sha256"),
             regionFiles: additive("scope_region_files"), regionPathBytes: additive("scope_region_path_bytes"))
         let eligible = try request.fileScope.eligibleFiles(kind: text("search_scope"),

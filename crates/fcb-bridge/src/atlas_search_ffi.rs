@@ -60,12 +60,13 @@ pub unsafe extern "C" fn fcb_atlas_search_begin_scoped(handle: u64, generation: 
 
 /// Search a frozen directory or exact-file intersection with the file types.
 /// path_kind is 0=workspace, 1=directory, 2=file, 3=frozen visible files.
-/// Visible paths use a canonical sorted raw-byte hex CSV; other paths use exact UTF-8 native
+/// Visible paths use a canonical sorted raw-byte hex CSV; other paths use exact native
 /// bytes, <=4096 bytes, relative components without empty, dot or dotdot parts.
 /// Directory paths omit a trailing slash; matching includes its descendants.
 /// Workspace requires a null/empty path. This predicate never grants access.
 /// # Safety
-/// Every non-null string is readable NUL-terminated UTF-8 until return. Existing
+/// Every non-null string is readable and NUL-terminated until return. The needle
+/// and scope lists are UTF-8. File and directory paths use original bytes. Existing
 /// scoped-list limits, worker restriction and returned-string ownership apply.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fcb_atlas_search_path_scoped(handle: u64, generation: u64, needle: *const c_char,
@@ -147,9 +148,9 @@ unsafe fn parse_path_scope(extensions: *const c_char, filenames: *const c_char,
         1 => AtlasSearchPathKind::Directory, 2 => AtlasSearchPathKind::File,
         3 => AtlasSearchPathKind::Visible,
         _ => return Err(AccessError::InvalidArgument) };
-    let path = if path.is_null() { "" }
-        else { unsafe { cstr(path) }.ok_or(AccessError::InvalidArgument)? };
-    unsafe { parse_scope(extensions, filenames) }?.with_path(kind, path).map_err(AccessError::from)
+    let scope = unsafe { parse_scope(extensions, filenames) }?;
+    unsafe { crate::search_path_ffi::with_path(scope, kind, path, AccessError::InvalidArgument,
+        fcb_app::host::atlas_search::AtlasSearchError::InvalidScope.into()) }
 }
 
 // Marshaling only: both public entrypoints use the same safe application engine.

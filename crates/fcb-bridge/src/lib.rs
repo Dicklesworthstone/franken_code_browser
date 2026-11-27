@@ -19,6 +19,7 @@ mod desk_ffi;
 mod desk_checkpoint_ffi;
 mod atlas_sessions;
 mod atlas_ffi;
+mod search_path_ffi;
 mod city_sessions;
 mod city_ffi;
 mod text_layout_ffi;

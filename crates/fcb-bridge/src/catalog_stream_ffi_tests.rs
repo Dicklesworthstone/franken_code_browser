@@ -38,13 +38,25 @@ fn drain(handle: u64) -> String {
 #[test]
 fn actual_catalog_stream_c_api_retains_raw_path_utf16_witnesses_after_close() {
     let _guard = FFI_TEST_LOCK.lock().unwrap();
-    let root = root(); let path = root.join(OsString::from_vec(b"raw-\xff.rs".to_vec()));
+    let root = root();
+    let directory = root.join(OsString::from_vec(b"src-\xff".to_vec()));
+    fs::create_dir(&directory).unwrap();
+    let path = directory.join(OsString::from_vec(b"raw-\xff.rs".to_vec()));
+    let sibling = root.join(OsString::from_vec(b"src-\xff-old".to_vec()));
+    fs::create_dir(&sibling).unwrap();
+    fs::write(sibling.join("decoy.rs"), b"needle").unwrap();
     let bytes: Vec<u8> = "\u{feff}before needle after\r\n".encode_utf16().flat_map(u16::to_be_bytes).collect();
     fs::write(&path, bytes).unwrap();
     let croot = CString::new(root.to_str().unwrap()).unwrap();
     let handle = fcb_catalog_stream_create(); assert_ne!(handle, 0);
     let mut query = b"needle".to_vec();
-    let initial = open(handle, &croot, &query, 0, 1);
+    let scope = CString::new(b"src-\xff".to_vec()).unwrap();
+    let initial = take(unsafe { fcb_catalog_stream_open(handle, croot.as_ptr(), 11,
+        query.as_ptr(), query.len() as u64, 0, 1, 1, 0, std::ptr::null(), std::ptr::null(),
+        1, scope.as_ptr(), 32, 64 * 1024 * 1024, 1_048_576) });
+    drop(scope);
+    assert!(initial.contains("\"scope_path\":null"), "{initial}");
+    assert!(initial.contains("\"scope_path_hex\":\"7372632dff\""), "{initial}");
     assert!(initial.contains("\"schema\":\"fcb.catalog-stream/1\""));
     assert_eq!(number(&initial, "revision"), 1);
     assert_eq!(number(&initial, "payload_bytes_read"), 0);

@@ -44,7 +44,14 @@ fn actual_c_api_retains_raw_path_utf16_symbols_and_installs_an_independent_reade
     let croot = CString::new(root.to_str().unwrap()).unwrap();
     let handle = fcb_catalog_structure_create(); assert_ne!(handle, 0);
     let mut query = b"target".to_vec();
-    let initial = open(handle, &croot, &query, 0);
+    fs::write(root.join("raw-�.rs"), b"fn target() {}\n").unwrap();
+    let scope = CString::new(b"raw-\xff.rs".to_vec()).unwrap();
+    let initial = take(unsafe { fcb_catalog_structure_open(handle, croot.as_ptr(), 11,
+        query.as_ptr(), query.len() as u64, 0, 2, 0, std::ptr::null(), std::ptr::null(),
+        2, scope.as_ptr(), 32, 64 * 1024 * 1024, 1_048_576) });
+    drop(scope);
+    assert!(initial.contains("\"scope_path\":null"), "{initial}");
+    assert!(initial.contains("\"scope_path_hex\":\"7261772dff2e7273\""), "{initial}");
     assert!(initial.contains("\"schema\":\"fcb.catalog-structure/1\""));
     assert!(initial.contains("\"name_case\":\"sensitive\""));
     assert!(initial.contains("\"case_sensitive\":true"));

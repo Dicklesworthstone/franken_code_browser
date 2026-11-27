@@ -7,7 +7,7 @@ use std::ffi::{c_char, c_void};
 use fcb_app::host::atlas_stream_search::{AtlasStreamSearchOptions,
     MAX_ATLAS_STREAM_SEARCH_NEEDLE_BYTES};
 use fcb_app::host::atlas_search::{AtlasSearchPathKind, AtlasSearchScope,
-    MAX_SEARCH_SCOPE_LIST_BYTES, MAX_SEARCH_SCOPE_PATH_BYTES, MAX_SEARCH_REGION_WIRE_BYTES};
+    MAX_SEARCH_SCOPE_LIST_BYTES};
 use crate::SearchCancellationCallback;
 use crate::atlas_sessions::StreamCommand;
 use super::{answer, number, reply, AccessError};
@@ -450,10 +450,10 @@ unsafe fn bounded_scope(extensions: *const c_char, filenames: *const c_char,
     };
     let extensions = unsafe { bounded_optional(extensions, MAX_SEARCH_SCOPE_LIST_BYTES) }?;
     let filenames = unsafe { bounded_optional(filenames, MAX_SEARCH_SCOPE_LIST_BYTES) }?;
-    let allowance = if kind == AtlasSearchPathKind::Visible { MAX_SEARCH_REGION_WIRE_BYTES } else { MAX_SEARCH_SCOPE_PATH_BYTES };
-    let path = unsafe { bounded_optional(path, allowance) }?;
-    if path.is_none() && kind != AtlasSearchPathKind::Workspace { return Err(AccessError::InvalidArgument); }
-    AtlasSearchScope::from_csv(extensions, filenames)?.with_path(kind, path.unwrap_or("")).map_err(AccessError::from)
+    if path.is_null() && kind != AtlasSearchPathKind::Workspace { return Err(AccessError::InvalidArgument); }
+    let scope = AtlasSearchScope::from_csv(extensions, filenames)?;
+    unsafe { crate::search_path_ffi::with_path(scope, kind, path,
+        AccessError::InvalidArgument, AccessError::InvalidArgument) }
 }
 
 unsafe fn bounded_optional<'a>(pointer: *const c_char, limit: usize) -> Result<Option<&'a str>, AccessError> {

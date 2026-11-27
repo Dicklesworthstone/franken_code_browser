@@ -80,7 +80,7 @@ char *fcb_atlas_search_begin_scoped(uint64_t handle, uint64_t generation, const 
  * 3 frozen visible files. The same contract applies to indexed and structural
  * entrypoints; a visible region selects whole files, not source byte windows.
  * Workspace requires null/empty path. Directory/file require a nonempty relative
- * UTF-8 path <=4096 bytes with no NUL, leading/trailing slash, repeated slash,
+ * NUL-terminated native path of <=4096 bytes with no NUL, leading/trailing slash, repeated slash,
  * or "." / ".." component. The directory path excludes a trailing slash and
  * selects descendants at a slash boundary ("src" excludes "src-old/file.rs").
  * Case and Unicode bytes are not normalized. Backslash is an ordinary Unix
@@ -95,9 +95,8 @@ char *fcb_atlas_search_begin_scoped(uint64_t handle, uint64_t generation, const 
  * be substituted for exact paths. This manifest is host-declared membership;
  * it does not prove a native frame was displayed or expand the root grant.
  * JSON scope_path_kind is "workspace", "directory", "file" or "visible"; for
- * the first three, scope_path is
- * the exact input string, scope_path_hex its original UTF-8 bytes in lowercase
- * hex. Legacy entrypoints emit workspace + empty path. search_scope still
+ * the first three, scope_path_hex contains the original bytes in lowercase
+ * hex. scope_path contains the exact UTF-8 string or JSON null for undecodable bytes. Legacy entrypoints emit workspace + empty path. search_scope still
  * identifies the file-type component. Visible emits empty scope_path and
  * scope_path_hex, plus scope_region_sha256 (SHA-256 of the canonical input CSV),
  * scope_region_files and scope_region_path_bytes (sum of decoded path lengths).

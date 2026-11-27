@@ -203,6 +203,14 @@ same. The existing map stays visible while the scoped catalog is prepared.
 If the file has disappeared from the new catalog, the map and history stay
 at the previous location.
 
+To search that location, choose **File** or **Folder** in the search sidebar,
+then **Use focused atlas file** or **Use focused atlas folder**. **Use open
+file** and **Use open file’s folder** also accept a current retained reader.
+The search keeps the selected path if you navigate elsewhere. A non-UTF-8
+name appears as hexadecimal bytes. **Enter another path** switches back to
+typed input. Literal, indexed, whole-file and structural searches use the
+same exact filename or folder boundary.
+
 The navigator shows at most 32 rows at once. **Previous files** and **Next files**
 move through the known atlas catalog, and arrow navigation crosses page
 boundaries. The count describes the current scope and filter; it does not claim

@@ -718,6 +718,7 @@ struct AtlasSearchCatalogReceipt: Equatable, Sendable {
     }
     struct Fields: Decodable, Sendable {
         enum Key: String, CodingKey {
+            case scope_path_kind, scope_path
             case discovery_scope, discovery_directory, discovery_file, path_basis
             case discovery_excluded_entries, discovery_unavailable_entries
             case discovery_symlinks_not_followed, discovery_special_objects
@@ -726,6 +727,10 @@ struct AtlasSearchCatalogReceipt: Equatable, Sendable {
         let discoveryCoverage: AtlasSearchDiscoveryCoverage?
         init(from decoder: Decoder) throws {
             let fields = try decoder.container(keyedBy: Key.self)
+            if let kind = try fields.decodeIfPresent(String.self, forKey: .scope_path_kind),
+               (kind == "file" || kind == "directory"), !fields.contains(.scope_path) {
+                throw AtlasSearchError.invalidResponse
+            }
             let base: [Key] = [.discovery_scope, .discovery_directory, .path_basis]
             let count = base.filter { fields.contains($0) }.count
             hasEcho = count == base.count
@@ -947,6 +952,7 @@ struct AtlasSearchPathScope: Equatable, Sendable {
     let kind: Kind
     let path: String
     let pathHex: String
+    let rawPath: [UInt8]
     private let visiblePaths: [[UInt8]]?
     let visibleIdentity: String?
     private let visiblePathBytes: Int
@@ -964,15 +970,18 @@ struct AtlasSearchPathScope: Equatable, Sendable {
     }
 
     private init() {
-        kind = .workspace; path = ""; pathHex = ""
+        kind = .workspace; path = ""; pathHex = ""; rawPath = []
         visiblePaths = nil; visibleIdentity = nil; visiblePathBytes = 0
     }
     init(kind: Kind, path: String) throws {
-        guard kind != .visible, path.utf8.count <= 4096,
-              (kind == .workspace ? path.isEmpty : !path.isEmpty) else {
+        guard path.utf8.count <= 4096 else { throw AtlasSearchError.invalidPathScope }
+        try self.init(kind: kind, rawPath: Array(path.utf8))
+    }
+
+    init(kind: Kind, rawPath raw: [UInt8]) throws {
+        guard kind != .visible, raw.count <= 4096, (kind == .workspace ? raw.isEmpty : !raw.isEmpty) else {
             throw AtlasSearchError.invalidPathScope
         }
-        let raw = Array(path.utf8)
         if kind != .workspace {
             guard !raw.contains(0),
                   !raw.split(separator: 47, omittingEmptySubsequences: false).contains(where: {
@@ -980,10 +989,11 @@ struct AtlasSearchPathScope: Equatable, Sendable {
                   }) else { throw AtlasSearchError.invalidPathScope }
         }
         self.kind = kind
-        self.path = path
+        rawPath = raw
         visiblePaths = nil; visibleIdentity = nil; visiblePathBytes = 0
         let digits = Array("0123456789abcdef".utf8)
         pathHex = String(decoding: raw.flatMap { [digits[Int($0 >> 4)], digits[Int($0 & 15)]] }, as: UTF8.self)
+        path = String(bytes: raw, encoding: .utf8) ?? "hex " + pathHex
     }
     /// Worker-only construction of a frozen raw-path predicate. Exact native
     /// bytes, including undecodable names and Unix backslashes, survive intact.
@@ -1012,7 +1022,7 @@ struct AtlasSearchPathScope: Equatable, Sendable {
             if index > 0 { wire.append(44) }
             for byte in raw { wire.append(digits[Int(byte >> 4)]); wire.append(digits[Int(byte & 15)]) }
         }
-        kind = .visible; path = String(decoding: wire, as: UTF8.self); pathHex = ""
+        kind = .visible; path = String(decoding: wire, as: UTF8.self); pathHex = ""; rawPath = []
         visiblePaths = paths; visiblePathBytes = rawBytes
         #if canImport(CryptoKit)
         visibleIdentity = SHA256.hash(data: Data(wire)).map { String(format: "%02x", $0) }.joined()
@@ -1024,11 +1034,14 @@ struct AtlasSearchPathScope: Equatable, Sendable {
         #endif
     }
     static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.kind == rhs.kind && lhs.path.utf8.elementsEqual(rhs.path.utf8)
+        lhs.kind == rhs.kind && lhs.rawPath == rhs.rawPath && (!lhs.isVisible || lhs.path.utf8.elementsEqual(rhs.path.utf8))
     }
     func withCString<Result>(_ body: (UInt64, UnsafePointer<CChar>?) throws -> Result) rethrows -> Result {
         if isWorkspace { return try body(0, nil) }
-        return try path.withCString { try body(kind.code, $0) }
+        if isVisible { return try path.withCString { try body(kind.code, $0) } }
+        // Directory and file scopes use native NUL-terminated bytes at the C boundary.
+        let terminated = rawPath.map(CChar.init(bitPattern:)) + [0]
+        return try terminated.withUnsafeBufferPointer { try body(kind.code, $0.baseAddress) }
     }
     func admitsRawPath(_ raw: [UInt8]) -> Bool {
         if isWorkspace { return true }
@@ -1041,7 +1054,7 @@ struct AtlasSearchPathScope: Equatable, Sendable {
             }
             return lower < visiblePaths.count && visiblePaths[lower] == raw
         }
-        let prefix = Array(path.utf8)
+        let prefix = rawPath
         if kind == .file { return raw == prefix }
         return raw.count > prefix.count && raw.starts(with: prefix) && raw[prefix.count] == 47
     }
@@ -1050,11 +1063,10 @@ struct AtlasSearchPathScope: Equatable, Sendable {
     func isContained(in catalog: AtlasSearchCatalogScope) -> Bool {
         if catalog.isWorkspace { return true }
         if let visiblePaths { return visiblePaths.allSatisfy(catalog.containsFile) }
-        if kind == .file { return catalog.containsFile(Array(path.utf8)) }
+        if kind == .file { return catalog.containsFile(rawPath) }
         if kind == .directory {
             guard catalog.kind == .directory else { return false }
-            let raw = Array(path.utf8)
-            return raw == catalog.directory || catalog.containsFile(raw)
+            return rawPath == catalog.directory || catalog.containsFile(rawPath)
         }
         return false
     }
@@ -1072,8 +1084,12 @@ struct AtlasSearchPathScope: Equatable, Sendable {
             guard isWorkspace else { throw AtlasSearchError.invalidResponse }
             return
         }
-        guard kind == self.kind.rawValue, let path, path.utf8.elementsEqual(self.path.utf8),
-              hex == pathHex else { throw AtlasSearchError.invalidResponse }
+        guard kind == self.kind.rawValue, hex == pathHex else { throw AtlasSearchError.invalidResponse }
+        if let path {
+            guard rawPath.elementsEqual(path.utf8) else { throw AtlasSearchError.invalidResponse }
+        } else if String(bytes: rawPath, encoding: .utf8) != nil {
+            throw AtlasSearchError.invalidResponse
+        }
     }
     /// Membership counts remain in their own domain: missing requested paths
     /// must not be hidden among type exclusions or complete zero-hit results.

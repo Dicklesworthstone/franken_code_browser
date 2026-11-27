@@ -382,6 +382,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
     @State private var customExtensions = ""
     @State private var searchPathKind: AtlasSearchPathScope.Kind = .workspace
     @State private var searchPathInput = ""
+    @State private var rawSearchLocation: AtlasSearchPathScope?
     @State private var visibleSearchView: AtlasVisibleSearchScope.View?
     @State private var frozenVisibleSearch: AtlasFrozenViewportSearch?
     @State private var visibleSearchIO = AtlasProjectIO()
@@ -527,8 +528,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 pathScope = frozen.pathScope
                 streamTransport = .native(catalogScope: frozen.catalogScope, discoveryPolicy: projectBrowser.discoveryPolicy)
             } else {
-                pathScope = try AtlasSearchPathScope(kind: searchPathKind,
-                    path: searchPathKind == .workspace ? "" : searchPathInput)
+                pathScope = try selectedSearchLocation()
                 streamTransport = .catalogNative
             }
             types = try fileScope.searchScope(custom: customExtensions)
@@ -594,12 +594,29 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 : (searchPathKind == .file ? .file : (searchPathKind == .directory ? .directory : .workspace)),
             catalogPath: searchPathKind == .visible ? (currentVisibleSearch?.catalogScope.rawPath ?? [])
                 : (searchPathKind == .directory || searchPathKind == .file
-                    ? Array(searchPathInput.utf8.prefix(AtlasSearchCatalogScope.maximumFileBytes + 1)) : []))
+                    ? Array(searchPathEditKey.prefix(AtlasSearchCatalogScope.maximumFileBytes + 1)) : []))
     }
 
     // Observe byte-distinct edits without duplicating an arbitrarily large
     // paste. Every value longer than the admitted path bound is invalid.
-    private var searchPathEditKey: [UInt8] { Array(searchPathInput.utf8.prefix(4097)) }
+    private var searchPathEditKey: [UInt8] {
+        rawSearchLocation?.rawPath ?? Array(searchPathInput.utf8.prefix(4097))
+    }
+
+    private func selectedSearchLocation() throws -> AtlasSearchPathScope {
+        if searchPathKind == .workspace { return .workspace }
+        if let rawSearchLocation, rawSearchLocation.kind == searchPathKind { return rawSearchLocation }
+        return try AtlasSearchPathScope(kind: searchPathKind, path: searchPathInput)
+    }
+
+    private func useSearchLocation(_ raw: [UInt8]) {
+        guard let scoped = try? AtlasSearchPathScope(kind: searchPathKind, rawPath: raw) else { return }
+        if let text = String(bytes: raw, encoding: .utf8) {
+            rawSearchLocation = nil; searchPathInput = text
+        } else {
+            rawSearchLocation = scoped; searchPathInput = ""
+        }
+    }
 
     private var currentVisibleSearch: AtlasFrozenViewportSearch? {
         guard !atlasLayoutPending, hasMetadataAtlas, !hasRetainedAtlas, let frozenVisibleSearch,
@@ -615,14 +632,28 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 layout: atlasRevision, catalogTarget: atlasCatalogTarget) == true
     }
 
-    private var openFileSearchPath: String? {
-        guard let path = selectedPath else { return nil }
+    private var openFileSearchPath: [UInt8]? {
+        if workspaceReader != nil {
+            guard let origin = workspaceReaderAtlasNavigation else { return nil }
+            switch searchPathKind {
+            case .file: return origin.file?.rawPath
+            case .directory: return origin.directory.flatMap { $0.isProject ? nil : $0.rawPath }
+            default: return nil
+            }
+        }
+        guard let selectedPath else { return nil }
+        let raw = Array(selectedPath.utf8)
+        if searchPathKind == .file { return raw }
+        guard searchPathKind == .directory, let slash = raw.lastIndex(of: 47) else { return nil }
+        return Array(raw[..<slash])
+    }
+
+    private var focusedAtlasSearchPath: [UInt8]? {
+        guard canChangeAtlasDirectory, hasMetadataAtlas, !hasRetainedAtlas else { return nil }
         switch searchPathKind {
-        case .workspace, .visible: return nil
-        case .file: return path
-        case .directory:
-            guard let slash = path.lastIndex(of: "/") else { return nil }
-            return String(path[..<slash])
+        case .file: return atlasCatalogTarget.file?.rawPath
+        case .directory: return atlasCatalogTarget.directory.isProject ? nil : atlasCatalogTarget.directory.rawPath
+        default: return nil
         }
     }
 
@@ -992,7 +1023,8 @@ private struct AtlasPreparedProjectRefresh: Sendable {
             atlasRestoredScope = nil
             if fileScope == .custom { clearSearch() }
         }
-        .onChange(of: searchPathKind) { _, _ in
+        .onChange(of: searchPathKind) { _, kind in
+            if rawSearchLocation?.kind != kind { rawSearchLocation = nil }
             clearSearch()
             if searchPathKind == .visible { freezeVisibleSearch() }
             else {
@@ -1166,19 +1198,31 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 Text("Search whole files whose parcels intersect the chosen view, including files without loaded previews. Camera movement does not change the frozen scope.")
                     .font(.caption2).foregroundStyle(.secondary)
             } else if searchPathKind == .directory || searchPathKind == .file {
-                TextField(searchPathKind == .file ? "Relative file path, e.g. src/main.rs"
-                    : "Relative folder path, e.g. src", text: $searchPathInput)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(.caption, design: .monospaced))
-                    .accessibilityLabel(searchPathKind == .file ? "Exact project-relative file path"
-                        : "Project-relative search folder")
-                    .onSubmit(runSearch)
+                if let rawSearchLocation, rawSearchLocation.kind == searchPathKind {
+                    Text("Path bytes (hex)").font(.caption2)
+                    Text(verbatim: rawSearchLocation.pathHex).font(.system(.caption, design: .monospaced))
+                        .lineLimit(2).truncationMode(.middle).textSelection(.enabled)
+                    Button("Enter another path") { self.rawSearchLocation = nil }
+                } else {
+                    TextField(searchPathKind == .file ? "Relative file path, e.g. src/main.rs"
+                        : "Relative folder path, e.g. src", text: $searchPathInput)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.caption, design: .monospaced))
+                        .accessibilityLabel(searchPathKind == .file ? "Exact project-relative file path"
+                            : "Project-relative search folder")
+                        .onSubmit(runSearch)
+                }
                 Button(searchPathKind == .file ? "Use open file" : "Use open file's folder") {
-                    if let path = openFileSearchPath { searchPathInput = path }
+                    if let raw = openFileSearchPath { useSearchLocation(raw) }
                 }
                 .disabled(openFileSearchPath == nil)
-                .help(searchPathKind == .file ? "Copy the open file's path into this search"
-                    : "Copy its containing folder. Choose Workspace for a file at the project root.")
+                .help("Use the open file’s original path. Choose Workspace for a file’s root folder.")
+                if let raw = focusedAtlasSearchPath {
+                    Button(searchPathKind == .file ? "Use focused atlas file" : "Use focused atlas folder") {
+                        guard focusedAtlasSearchPath == raw else { return }
+                        useSearchLocation(raw)
+                    }
+                }
                 Text("Search stays in this \(searchPathKind.label.lowercased()) when you open another file.")
                     .font(.caption2).foregroundStyle(.secondary)
             }
@@ -2832,6 +2876,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
         let ticket = projectOpening.begin()
         browserProject = ticket.project
         searchPathKind = .workspace
+        rawSearchLocation = nil
         searchPathInput = ""
         let cancellation = AtlasSearchCancellation()
         loadCancellation = cancellation
@@ -3658,8 +3703,7 @@ private struct AtlasPreparedProjectRefresh: Sendable {
                 guard let visibleScope else { throw AtlasSearchError.invalidPathScope }
                 pathScope = visibleScope.pathScope
             } else {
-                pathScope = try AtlasSearchPathScope(kind: searchPathKind,
-                    path: searchPathKind == .workspace ? "" : searchPathInput)
+                pathScope = try selectedSearchLocation()
             }
             let input = try AtlasSearchInput(root: requestedRoot, query: requestedText,
                 fileScope: fileScope.searchScope(custom: customExtensions),
