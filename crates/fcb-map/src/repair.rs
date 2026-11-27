@@ -318,18 +318,8 @@ fn emit_new_subtree(
     out: &mut Vec<LaidOutNode>,
     inserted: &mut u32,
 ) -> Result<(), LayoutError> {
-    let local_world = Rect2D::from_xywh(
-        0.0,
-        0.0,
-        cell_in_parent.size().width(),
-        cell_in_parent.size().height(),
-    )?;
-    let mut tmp = Vec::new();
-    emit_tree(tree, local_world, local_world, base.options, &mut tmp)?;
-    if let Some(root_emitted) = tmp.first_mut() {
-        root_emitted.parent_local = cell_in_parent;
-    }
-    *inserted = inserted.saturating_add(tmp.len() as u32);
-    out.extend(tmp);
+    let start = out.len();
+    emit_tree(tree, cell_in_parent, base.options, out)?;
+    *inserted = inserted.saturating_add((out.len() - start) as u32);
     Ok(())
 }

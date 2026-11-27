@@ -255,3 +255,24 @@ fn owner_mismatch_on_revision_is_refused() {
     let err = commit_layout(foreign, canvas(), &s, LayoutOptions::modest()).unwrap_err();
     assert_eq!(err.code(), CoreError::OwnershipMismatch.code());
 }
+
+#[test]
+fn nested_files_keep_separate_parcels_below_world_coordinate_precision() {
+    // Eight leaves force rows on both axes. Their parent lies far from the
+    // world origin, with both dimensions shrinking down a long directory chain.
+    let directory = format!("z/{}", vec!["nest"; 45].join("/"));
+    let mut files = vec![NodeSpec::new(b"a".to_vec(), NodeKind::File, Some(100))];
+    for i in 0..8 {
+        files.push(NodeSpec::new(format!("{directory}/{i}").into_bytes(), NodeKind::File, Some(100)));
+    }
+    let layout = commit_layout(rev(1), canvas(), &spec(files),
+        LayoutOptions::new(WeightMetric::CappedLogBytes, 0.9).unwrap()).unwrap();
+    let leaves: Vec<_> = (0..8).map(|i| layout.node(format!("{directory}/{i}").as_bytes())
+        .unwrap().parent_local()).collect();
+    for (i, &leaf) in leaves.iter().enumerate() {
+        assert!(!leaf.size().is_empty());
+        for &other in &leaves[..i] {
+            assert!(!interiors_overlap(leaf, other), "two different deep files share a parcel");
+        }
+    }
+}

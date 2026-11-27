@@ -575,32 +575,20 @@ pub(crate) fn pack_ordered(rect: Rect2D, items: &[(Vec<u8>, f64)]) -> Result<Vec
     Ok(out)
 }
 
-fn to_parent_local(parent_world: Rect2D, child_world: Rect2D) -> Result<Rect2D, LayoutError> {
-    Rect2D::from_xywh(
-        child_world.min_x() - parent_world.min_x(),
-        child_world.min_y() - parent_world.min_y(),
-        child_world.size().width(),
-        child_world.size().height(),
-    )
-    .map_err(LayoutError::from)
-}
-
 pub(crate) fn emit_tree(
     tree: &TreeNode,
-    world_rect: Rect2D,
-    parent_world: Rect2D,
+    parent_local: Rect2D,
     options: LayoutOptions,
     out: &mut Vec<LaidOutNode>,
 ) -> Result<(), LayoutError> {
-    let parent_local = to_parent_local(parent_world, world_rect)?;
-    let (usable_world, slack_world) = if tree.children.is_empty() {
-        (world_rect, None)
+    // Pack descendants at this node's origin. Computing their world coordinates
+    // and subtracting the parent afterward erases distinct small parcels when
+    // the ancestor offset is many orders of magnitude larger than a child.
+    let local = Rect2D::new(Point2D::ORIGIN, parent_local.size());
+    let (usable, slack) = if tree.children.is_empty() {
+        (local, None)
     } else {
-        split_slack(world_rect, options.slack_fraction)?
-    };
-    let slack = match slack_world {
-        Some(rect) => Some(to_parent_local(world_rect, rect)?),
-        None => None,
+        split_slack(local, options.slack_fraction)?
     };
     out.push(LaidOutNode {
         path: tree.path.clone(),
@@ -617,14 +605,14 @@ pub(crate) fn emit_tree(
         .values()
         .map(|child| (child.path.clone(), child.weight(options.metric)))
         .collect();
-    let packed = pack_ordered(usable_world, &items)?;
+    let packed = pack_ordered(usable, &items)?;
     let mut by_path: BTreeMap<Vec<u8>, Rect2D> = BTreeMap::new();
     for (path, child_rect) in packed {
         by_path.insert(path, child_rect);
     }
     for child in tree.children.values() {
-        let child_world = *by_path.get(&child.path).expect("every child was packed");
-        emit_tree(child, child_world, world_rect, options, out)?;
+        let child_local = *by_path.get(&child.path).expect("every child was packed");
+        emit_tree(child, child_local, options, out)?;
     }
     Ok(())
 }
@@ -643,7 +631,7 @@ pub fn commit_layout(
     let world_rect = Rect2D::new(Point2D::ORIGIN, world);
     let tree = build_tree(spec)?;
     let mut nodes = Vec::new();
-    emit_tree(&tree, world_rect, world_rect, options, &mut nodes)?;
+    emit_tree(&tree, world_rect, options, &mut nodes)?;
     Ok(PartitionLayout {
         owner: spec.owner,
         root: spec.root,
