@@ -425,8 +425,8 @@ char *fcb_saved_search_page(uint64_t handle, uint64_t generation,
  * known exact member closes its membership even in a partial archive; a missing
  * exact member or directory cannot prove absence from an incomplete catalog.
  * Every search/results/open-hit receipt freezes scope, scope_path_hex,
- * scope_known_members and scope_membership_complete alongside the matching and
- * window policy. Failed/canceled replacement preserves the preceding receipt.
+ * scope_known_members, scope_captured_members and scope_membership_complete
+ * alongside the matching and window policy. Failed/canceled replacement preserves the preceding receipt.
  * All existing entrypoints continue to search the whole archive.
  */
 char *fcb_saved_search_scoped_page(uint64_t handle, uint64_t generation,

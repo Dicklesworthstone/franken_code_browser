@@ -668,12 +668,13 @@ canonical normalization, or expression syntax. **Count all matches** remains
 independent of the 4,096 retained result limit and does not turn partial archive
 coverage into a complete count.
 
-Lowercase queries scan verified saved members directly, because exact FCBD
-postings cannot establish absence under a different matching policy. An
-attached index stays available for subsequent exact searches. The accepted
-query's case policy follows its counts, result pages and source activation.
-Changing the draft's policy disables actions on the previous results;
-**Use accepted query** restores those inputs without rescanning.
+Literal queries may use a compatible attached index to eliminate candidates
+within the selected scope; remaining members are verified directly. Lowercase
+matching uses compatible ASCII case variants where supported and source
+fallback elsewhere. The accepted query's scope and case policy follow its
+counts, result pages and source activation. Changing the draft's policy or
+scope disables actions on the previous results; **Use accepted query** restores
+those inputs without rescanning.
 
 **Read source** opens the exact original-byte occurrence, preserving the actual
 UTF-8 or UTF-16 spelling even when the query matches a lowercase expansion.
@@ -701,6 +702,39 @@ per-step I/O, corrupt-tail, cancellation, expression and retained-reader
 regressions. Focused portable Rust diagnostics pass; pinned-toolchain, independent
 batch and native qualification remain pending for this checkpoint.
 
+### Saved search scope
+
+The scope menu above **Literal**, **Expression**, **Symbols**, **Headings**, and
+**Occurrences** applies to every mode. Choose **Whole archive**, or select a
+member in **Files** and choose **Selected file** or **Selected file’s folder**.
+A folder includes its descendants at a raw path-component boundary; a similarly
+named sibling folder is excluded. Exact-file scope preserves the member's
+original path bytes, including non-UTF-8 names.
+
+Literal and expression coverage now reports selected recorded and captured
+members. Unavailable captures outside that selection do not make its count
+partial. A known exact member has closed membership even when archive discovery
+was interrupted; folder and whole-archive searches retain that discovery
+limitation, and an unknown exact member does not claim complete absence.
+Archive-wide coverage remains visible separately. Expression `path:` and
+`lang:` filters further narrow the selected scope before source reads.
+
+Scope belongs to each accepted query and stays fixed across metadata pages,
+**Later matches**, index attachment changes and source activation. Editing the
+scope makes earlier rows inactive until the accepted inputs are restored or a
+replacement search succeeds. Lost replies and cancellation recover the
+accepted scope without repeating the scan. Reader receipts must echo the same
+raw selection before exact source navigation is admitted; already opened
+readers remain independent when the archive is replaced or closed.
+
+Native regression source covers scoped indexed counting, metadata pages and
+later windows, raw path boundaries, exact-member coverage in incomplete
+archives, draft changes, lost/canceled replacements, forged scope receipts and
+UTF-8/UTF-16 reader witnesses. C fixtures cover raw path bytes, whole-archive
+null/zero framing, full-width offsets and owned-response cleanup. These additions
+have been reviewed as source; executable Swift and physical-Mac verification
+remain pending.
+
 ### Saved result windows
 
 Literal, expression, symbol, Markdown heading and identifier-occurrence results
@@ -713,7 +747,7 @@ occurrences in one member—remain reachable without increasing that cap.
 Earlier repeats the accepted query up to 4,096 qualified positions earlier;
 First returns to offset zero. The displayed skipped count belongs to the current
 window. Each new window uses a fresh query generation and freezes the accepted
-query, matching/count policy and source budget. It revalidates the opened
+query, raw member scope, matching/count policy and source budget. It revalidates the opened
 archive's captured members and rechecks whole-member expression predicates;
 it never opens a current-project path.
 
@@ -726,9 +760,10 @@ only metadata.
 ## Searching saved repository structure
 
 Open **Saved Repository**, choose an FCBS archive, and use **Search** to select
-**Symbols**, **Headings**, or **Occurrences**. The scope is the entire opened
-saved archive. Search runs on the worker over verified captured bytes; saved
-member names are labels and never open working-tree paths.
+**Symbols**, **Headings**, or **Occurrences**. The shared scope menu selects the
+whole archive, a folder, or one exact member. Search runs on the worker over
+verified captured bytes; saved member names are labels and never open
+working-tree paths.
 
 | Mode | Matching and evidence | Per-member source limit |
 | --- | --- | --- |

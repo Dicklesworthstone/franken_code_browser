@@ -177,6 +177,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
     var pathCaseSensitive = false
     var searchInput = ""
     var searchMode: AtlasSavedSearchMode = .literal
+    // One draft scope applies to literal, expression and structural searches.
     var structureScope: AtlasSavedStructureScope = .archive
     var searchNameMode: AtlasSearchNameMode = .contains
     var countAllMatches = true
@@ -272,13 +273,13 @@ private final class AtlasSavedSession: @unchecked Sendable {
         guard searchMode == .literal, let searchPage, info?.identity == searchPage.identity,
               queryGeneration == searchPage.generation else { return false }
         return searchInput.utf8.elementsEqual(searchPage.needle.utf8) && countAllMatches == searchPage.counting.all
-            && searchCaseSensitive == searchPage.caseSensitive
+            && searchCaseSensitive == searchPage.caseSensitive && structureScope == searchPage.scope.scope
     }
     var expressionIsCurrent: Bool {
         guard searchMode == .expression, let expressionPage, info?.identity == expressionPage.identity,
               expressionGeneration == expressionPage.generation else { return false }
         return searchInput.utf8.elementsEqual(expressionPage.expression.utf8) && countAllMatches == expressionPage.counting.all
-            && searchCaseSensitive == expressionPage.caseSensitive
+            && searchCaseSensitive == expressionPage.caseSensitive && structureScope == expressionPage.scope.scope
     }
 
     private var structurePolicy: AtlasSavedStructurePolicy {
@@ -1346,14 +1347,17 @@ private final class AtlasSavedSession: @unchecked Sendable {
         guard validSearchInput else {
             notice = "Enter 1–1024 UTF-8 bytes of literal text, without NUL. Matching does not normalize Unicode."; return
         }
-        let needle = searchInput, counting = countAllMatches, caseSensitive = searchCaseSensitive
+        let needle = searchInput, counting = countAllMatches, caseSensitive = searchCaseSensitive, scope = structureScope
         perform { model, flag in
             guard let lease = model.session else { throw AtlasSavedError.unavailable }
             let generation = try model.nextQueryGeneration()
-            model.notice = "Searching decoded text across the captured archive…"
+            model.notice = "Searching decoded text in the selected saved scope…"
             do {
                 let request: AtlasSavedRequest
-                if caseSensitive {
+                if scope != .archive {
+                    request = .scopedSearchWindow(generation: generation, needle: needle, caseSensitive: caseSensitive,
+                        countAllMatches: counting, matches: 4096, skipMatches: 0, scope: scope)
+                } else if caseSensitive {
                     request = counting ? .countedSearch(generation: generation, needle: needle, matches: 4096)
                         : .search(generation: generation, needle: needle, matches: 4096)
                 } else {
@@ -1362,7 +1366,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
                 }
                 let page = try AtlasSavedSearchPage.decode(await model.run(lease, request, flag: flag),
                     identity: info.identity, generation: generation, needle: needle, start: 0, limit: 64,
-                    searching: true, countAllMatches: counting, caseSensitive: caseSensitive)
+                    searching: true, countAllMatches: counting, caseSensitive: caseSensitive, scope: scope)
                 guard page.counting.maximum == 4096, page.window.offset == 0,
                       page.indexGeneration == info.index?.generation,
                       page.indexPin == info.index?.pin else {
@@ -1370,7 +1374,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
                 }
                 guard model.session === lease, !model.closed else { throw AtlasSavedError.canceled }
                 model.queryGeneration = generation; model.searchPage = page
-                model.notice = page.complete ? "Search finished across the complete captured manifest."
+                model.notice = page.complete ? "Search finished in the complete selected saved scope."
                     : "Search coverage is partial. Inspect unavailable files, unsupported decoding and the retained-match limit."
             } catch {
                 let recovered = await model.reconcileSearch(lease)
@@ -1413,13 +1417,16 @@ private final class AtlasSavedSession: @unchecked Sendable {
             let generation = try model.nextQueryGeneration()
             model.notice = "Finding the saved result window after \(offset) matches…"
             do {
-                let next = try AtlasSavedSearchPage.decode(await model.run(lease,
-                    .searchWindow(generation: generation, needle: page.needle, caseSensitive: page.caseSensitive,
-                        countAllMatches: page.counting.all, matches: page.counting.maximum, skipMatches: offset), flag: flag),
+                let request: AtlasSavedRequest = page.scope.scope == .archive
+                    ? .searchWindow(generation: generation, needle: page.needle, caseSensitive: page.caseSensitive,
+                        countAllMatches: page.counting.all, matches: page.counting.maximum, skipMatches: offset)
+                    : .scopedSearchWindow(generation: generation, needle: page.needle, caseSensitive: page.caseSensitive,
+                        countAllMatches: page.counting.all, matches: page.counting.maximum, skipMatches: offset, scope: page.scope.scope)
+                let next = try AtlasSavedSearchPage.decode(await model.run(lease, request, flag: flag),
                     identity: page.identity, generation: generation, needle: page.needle, start: 0, limit: 64,
                     searching: true, countAllMatches: page.counting.all, caseSensitive: page.caseSensitive,
-                    resultOffset: offset)
-                guard next.counting.maximum == page.counting.maximum,
+                    resultOffset: offset, scope: page.scope.scope)
+                guard next.scope == page.scope, next.counting.maximum == page.counting.maximum,
                       next.indexGeneration == info.index?.generation,
                       next.indexPin == info.index?.pin else {
                     throw AtlasSavedError.invalidResponse
@@ -1448,7 +1455,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
             let next = try AtlasSavedSearchPage.decode(await model.run(lease,
                 .results(generation: generation, start: start, limit: 64), flag: flag),
                 identity: info.identity, generation: generation, needle: accepted.needle, start: start, limit: 64,
-                countAllMatches: accepted.counting.all, caseSensitive: accepted.caseSensitive)
+                countAllMatches: accepted.counting.all, caseSensitive: accepted.caseSensitive, scope: accepted.scope.scope)
             guard next.hasSameSummary(as: accepted) else {
                 throw AtlasSavedError.invalidResponse
             }
@@ -1495,14 +1502,18 @@ private final class AtlasSavedSession: @unchecked Sendable {
         guard validSearchInput else {
             notice = "Enter 1–1024 UTF-8 bytes of expression syntax without NUL. The first positive term names matches."; return
         }
-        let query = searchInput, counting = countAllMatches, caseSensitive = searchCaseSensitive
+        let query = searchInput, counting = countAllMatches, caseSensitive = searchCaseSensitive, scope = structureScope
         perform { model, flag in
             guard let lease = model.session else { throw AtlasSavedError.unavailable }
             let generation = try model.nextExpressionGeneration()
             model.notice = "Checking required and excluded terms across captured members…"
             do {
                 let request: AtlasSavedRequest
-                if caseSensitive {
+                if scope != .archive {
+                    request = .scopedExpressionWindow(generation: generation, query: query, caseSensitive: caseSensitive,
+                        countAllMatches: counting, matches: 4096, scanBytes: AtlasSavedSearchWire.maximumSourceBytes,
+                        skipMatches: 0, scope: scope)
+                } else if caseSensitive {
                     request = counting
                         ? .countedExpressionSearch(generation: generation, query: query, matches: 4096,
                             scanBytes: AtlasSavedSearchWire.maximumSourceBytes)
@@ -1514,7 +1525,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
                 }
                 let page = try AtlasSavedExpressionPage.decode(await model.run(lease, request, flag: flag),
                     identity: info.identity, generation: generation, expression: query, start: 0, limit: 64,
-                    countAllMatches: counting, caseSensitive: caseSensitive)
+                    countAllMatches: counting, caseSensitive: caseSensitive, scope: scope)
                 guard page.counting.maximum == 4096, page.window.offset == 0 else { throw AtlasSavedError.invalidResponse }
                 guard model.session === lease, !model.closed else { throw AtlasSavedError.canceled }
                 model.expressionGeneration = generation; model.expressionPage = page
@@ -1558,13 +1569,17 @@ private final class AtlasSavedSession: @unchecked Sendable {
             let generation = try model.nextExpressionGeneration()
             model.notice = "Checking the saved expression window after \(offset) primary matches…"
             do {
-                let next = try AtlasSavedExpressionPage.decode(await model.run(lease,
-                    .expressionWindow(generation: generation, query: page.expression, caseSensitive: page.caseSensitive,
+                let request: AtlasSavedRequest = page.scope.scope == .archive
+                    ? .expressionWindow(generation: generation, query: page.expression, caseSensitive: page.caseSensitive,
                         countAllMatches: page.counting.all, matches: page.counting.maximum,
-                        scanBytes: page.scanLimit, skipMatches: offset), flag: flag),
+                        scanBytes: page.scanLimit, skipMatches: offset)
+                    : .scopedExpressionWindow(generation: generation, query: page.expression, caseSensitive: page.caseSensitive,
+                        countAllMatches: page.counting.all, matches: page.counting.maximum,
+                        scanBytes: page.scanLimit, skipMatches: offset, scope: page.scope.scope)
+                let next = try AtlasSavedExpressionPage.decode(await model.run(lease, request, flag: flag),
                     identity: page.identity, generation: generation, expression: page.expression, start: 0, limit: 64,
-                    countAllMatches: page.counting.all, caseSensitive: page.caseSensitive, resultOffset: offset)
-                guard next.counting.maximum == page.counting.maximum, next.scanLimit == page.scanLimit,
+                    countAllMatches: page.counting.all, caseSensitive: page.caseSensitive, resultOffset: offset, scope: page.scope.scope)
+                guard next.scope == page.scope, next.counting.maximum == page.counting.maximum, next.scanLimit == page.scanLimit,
                       next.primaryNeedle.utf8.elementsEqual(page.primaryNeedle.utf8) else {
                     throw AtlasSavedError.invalidResponse
                 }
@@ -1589,7 +1604,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
             let next = try AtlasSavedExpressionPage.decode(await model.run(lease,
                 .expressionResults(generation: page.generation, start: start, limit: 64), flag: flag),
                 identity: page.identity, generation: page.generation, expression: page.expression, start: start, limit: 64,
-                countAllMatches: page.counting.all, caseSensitive: page.caseSensitive)
+                countAllMatches: page.counting.all, caseSensitive: page.caseSensitive, scope: page.scope.scope)
             guard next.hasSameSummary(as: accepted) else { throw AtlasSavedError.invalidResponse }
             guard model.session === lease, !model.closed, model.expressionGeneration == page.generation,
                   next.primaryNeedle.utf8.elementsEqual(page.primaryNeedle.utf8) else { throw AtlasSavedError.canceled }
@@ -1782,7 +1797,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
         }
         return try await openReader(saved: page.identity, ordinal: hit.member, expected: nil,
             origin: .expressionHit(generation: page.generation, expression: page.expression,
-                primaryNeedle: page.primaryNeedle, hit: hit, caseSensitive: page.caseSensitive),
+                primaryNeedle: page.primaryNeedle, hit: hit, caseSensitive: page.caseSensitive, scope: page.scope.scope),
             readerTransport: readerTransport, search: search, outline: outline, document: document)
     }
 
@@ -1796,7 +1811,7 @@ private final class AtlasSavedSession: @unchecked Sendable {
               page.hits.contains(where: { $0.matches(hit) }),
               accepted.hits.contains(where: { $0.matches(hit) }) else { throw AtlasSavedError.invalidInput }
         return try await openReader(saved: page.identity, ordinal: hit.member, expected: nil,
-            origin: .hit(generation: page.generation, needle: page.needle, hit: hit, caseSensitive: page.caseSensitive),
+            origin: .hit(generation: page.generation, needle: page.needle, hit: hit, caseSensitive: page.caseSensitive, scope: page.scope.scope),
             readerTransport: readerTransport, search: search, outline: outline, document: document)
     }
 
@@ -2018,9 +2033,9 @@ private final class AtlasSavedSession: @unchecked Sendable {
                             request = .openRelationship(reader: destination, generation: generation, link: link.id, side: side)
                         case .importLink(let generation, let link, let side):
                             request = .openImport(reader: destination, generation: generation, importID: link.id, side: side)
-                        case .hit(let generation, _, let hit, _):
+                        case .hit(let generation, _, let hit, _, _):
                             request = .openHit(reader: destination, generation: generation, hit: hit.id)
-                        case .expressionHit(let generation, _, _, let hit, _):
+                        case .expressionHit(let generation, _, _, let hit, _, _):
                             request = .openExpressionHit(reader: destination, generation: generation, hit: hit.id)
                         case .structureHit(let generation, _, _, _, let item, _):
                             request = .openStructureHit(reader: destination, generation: generation, hit: item.id)

@@ -226,6 +226,20 @@ the same original-byte matches, counts and result-window order. Older indexes
 remain readable; rebuilding enables the new pruning. See
 [the host and CLI contract](crates/fcb-app/README.md#indexed-case-insensitive-search-in-saved-repositories).
 
+**Saved text and expression searches now keep their selected folder or file.**
+The Saved Repository search scope applies to Literal, Expression, Symbols,
+Headings and Occurrences. Direct and indexed text searches select raw archive
+members before source reads, keep exact counts and later result windows within
+that scope, and preserve it when opening retained readers. A known exact member
+can finish searching even when the broader archive has incomplete discovery;
+missing members and partial directory inventories keep explicit incomplete
+coverage. The CLI accepts the same `--directory`, `--member` and raw-byte
+`--directory-hex` / `--member-hex` choices for saved text and expression search.
+Indexed text and original-byte searches use the same scope choices. See the
+[CLI reference](crates/fcb-app/README.md) and
+[native saved-repository workflow](native/macos/README.md).
+This source addition awaits executable and physical-Mac verification.
+
 **Matching brackets connects exact selections across retained source pages.**
 Select one parenthesis, square bracket or brace and choose **Go to matching
 bracket**. The reader skips comments and strings, checks the destination in the

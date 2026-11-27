@@ -245,6 +245,53 @@ extension AtlasReaderTransport {
             nameMode: .exact, query: "target", matches: 100, sourceBytes: 200, skipMatches: UInt64.max,
             policy: .init(caseSensitive: false, countAllMatches: true, scope: .directory([115, 255])))) == "{}")
         precondition(count(25) == 2 && count(6) == 71)
+        let scopedWindows: [AtlasSavedRequest] = [
+            .scopedSearchWindow(generation: generation, needle: "e\u{301}", caseSensitive: false,
+                countAllMatches: true, matches: 4096, skipMatches: 9_007_199_254_740_993,
+                scope: .directory([115, 255])),
+            .scopedExpressionWindow(generation: generation, query: "e\u{301} path:src/", caseSensitive: true,
+                countAllMatches: false, matches: 4096, scanBytes: 67_108_864, skipMatches: UInt64.max,
+                scope: .member([115, 255, 47, 97]))
+        ]
+        for request in scopedWindows { precondition(transport.run(owner, request) == "{}") }
+        precondition(count(26) == 1 && count(27) == 1 && count(6) == 73)
+        let invalidScopes: [AtlasSavedRequest] = [
+            .scopedSearchWindow(generation: generation, needle: "ana", caseSensitive: true,
+                countAllMatches: true, matches: 4096, skipMatches: 0, scope: .directory([])),
+            .scopedSearchWindow(generation: 0, needle: "ana", caseSensitive: true,
+                countAllMatches: true, matches: 4096, skipMatches: 0, scope: .member([97])),
+            .scopedSearchWindow(generation: generation, needle: "ana", caseSensitive: true,
+                countAllMatches: false, matches: 0, skipMatches: 0, scope: .member([97])),
+            .scopedSearchWindow(generation: generation, needle: "ana", caseSensitive: true,
+                countAllMatches: true, matches: 4096, skipMatches: 0,
+                scope: .member(Array(repeating: 97, count: 2049))),
+            .scopedExpressionWindow(generation: generation, query: "ana", caseSensitive: false,
+                countAllMatches: true, matches: 4096, scanBytes: 67_108_865, skipMatches: 0,
+                scope: .member([97])),
+            .scopedExpressionWindow(generation: generation, query: "ana\0", caseSensitive: false,
+                countAllMatches: true, matches: 4096, scanBytes: 64, skipMatches: 0, scope: .member([97])),
+            .scopedExpressionWindow(generation: generation, query: "ana", caseSensitive: false,
+                countAllMatches: true, matches: 4096, scanBytes: 64, skipMatches: 0, scope: .member([]))
+        ]
+        for request in invalidScopes { precondition(transport.run(owner, request) == nil) }
+        precondition(count(26) == 1 && count(27) == 1 && count(6) == 73,
+            "invalid scoped search crossed the foreign boundary")
+        for invalid in [Int32(1), 2, 3, 4] {
+            mode(invalid)
+            for request in scopedWindows { precondition(transport.run(owner, request) == nil) }
+        }
+        precondition(count(26) == 5 && count(27) == 5 && count(6) == 79,
+            "scoped result-window response ownership leaked or double-freed")
+        mode(0)
+        precondition(transport.run(owner, .scopedSearchWindow(generation: generation, needle: "e\u{301}",
+            caseSensitive: false, countAllMatches: true, matches: 4096, skipMatches: 9_007_199_254_740_993,
+            scope: .archive)) == "{}")
+        precondition(transport.run(owner, .scopedExpressionWindow(generation: generation, query: "e\u{301} path:src/",
+            caseSensitive: true, countAllMatches: false, matches: 4096, scanBytes: 67_108_864,
+            skipMatches: UInt64.max, scope: .archive)) == "{}")
+        precondition(count(26) == 6 && count(27) == 6 && count(6) == 81,
+            "whole-archive scope must cross the ABI as null, zero-length path")
+
         print("AtlasSavedIndexBridgeTests: public-header signatures, publication/import/path/matching/window requests, native bytes, full-width IDs and offsets, and buffer ownership passed")
     }
 }

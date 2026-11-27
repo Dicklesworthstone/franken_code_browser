@@ -5,10 +5,10 @@
 
 /* Public-header-checked foreign boundary. These responses test Swift marshaling
  * and ownership; real archive/posting behavior is exercised in saved_sessions_tests. */
-static uint64_t calls[26];
+static uint64_t calls[28];
 static int result_mode;
 void fixture_saved_index_mode(int mode) { result_mode = mode; }
-uint64_t fixture_saved_index_count(uint64_t index) { assert(index < 26); return calls[index]; }
+uint64_t fixture_saved_index_count(uint64_t index) { assert(index < 28); return calls[index]; }
 static char *reply(void) {
     if (result_mode == 1) return NULL;
     if (result_mode == 2) { char *p = malloc(2); assert(p); p[0] = (char)0xff; p[1] = 0; return p; }
@@ -187,4 +187,28 @@ char *fcb_saved_structure_search_scoped_page(uint64_t handle, uint64_t generatio
     assert(path && length == 2 && path[0] == 's' && path[1] == 0xff);
     assert((scope == 2 && skip == 0) || (scope == 1 && skip == UINT64_MAX));
     calls[25]++; return reply();
+}
+
+/* Shared raw scopes preserve arbitrary path bytes and full-width offsets. */
+char *fcb_saved_search_scoped_page(uint64_t handle, uint64_t generation, const char *needle,
+    uint64_t case_sensitive, uint64_t count_all_matches, uint64_t matches, uint64_t skipped,
+    uint64_t scope, const uint8_t *path, uint64_t path_bytes) {
+    assert(handle == UINT64_MAX - 10 && generation == UINT64_MAX - 9);
+    assert(needle && strcmp(needle, "e\xcc\x81") == 0);
+    assert(case_sensitive == 0 && count_all_matches == 1 && matches == 4096);
+    assert(skipped == UINT64_C(9007199254740993));
+    if (scope == 0) { assert(path == NULL && path_bytes == 0); }
+    else { assert(scope == 1 && path && path_bytes == 2 && path[0] == 's' && path[1] == 0xff); }
+    calls[26]++; return reply();
+}
+char *fcb_saved_expression_search_scoped_page(uint64_t handle, uint64_t generation, const char *query,
+    uint64_t case_sensitive, uint64_t count_all_matches, uint64_t matches, uint64_t bytes, uint64_t skipped,
+    uint64_t scope, const uint8_t *path, uint64_t path_bytes) {
+    assert(handle == UINT64_MAX - 10 && generation == UINT64_MAX - 9);
+    assert(query && strcmp(query, "e\xcc\x81 path:src/") == 0);
+    assert(case_sensitive == 1 && count_all_matches == 0 && matches == 4096);
+    assert(bytes == 67108864 && skipped == UINT64_MAX);
+    if (scope == 0) { assert(path == NULL && path_bytes == 0); }
+    else { assert(scope == 2 && path && path_bytes == 4 && memcmp(path, "s\xff/a", 4) == 0); }
+    calls[27]++; return reply();
 }

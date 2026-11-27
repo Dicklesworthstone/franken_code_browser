@@ -536,20 +536,35 @@ private final class AtlasSavedTrailArchiveAccess {
             Picker("Saved search mode", selection: $model.searchMode) {
                 ForEach(AtlasSavedSearchMode.allCases) { mode in Text(mode.label).tag(mode) }
             }.pickerStyle(.segmented).disabled(!model.canOperate).padding(.leading, 8)
+            savedSearchScopeControl
             if model.searchMode == .literal { literalSearchPane }
             else if model.searchMode == .expression { expressionSearchPane }
             else { structureSearchPane }
         }
     }
+    private var savedSearchScopeControl: some View {
+        Menu {
+            Button("Whole archive") { model.structureScope = .archive }
+            if let member = model.selectedMember {
+                Button("Selected file") { model.structureScope = .member(member.path.bytes) }
+                if let slash = member.path.bytes.lastIndex(of: 47) {
+                    Button("Selected file’s folder") { model.structureScope = .directory(Array(member.path.bytes[..<slash])) }
+                }
+            }
+        } label: { Label(model.structureScope.label, systemImage: "scope").lineLimit(1) }
+            .disabled(!model.canOperate).accessibilityLabel("Search scope, " + model.structureScope.label)
+            .help("Choose a member in Files to search that exact file or its folder. This scope applies to every search mode.")
+            .padding(.leading, 8)
+    }
     private var literalSearchPane: some View {
         VStack(alignment: .leading, spacing: 10) {
             indexPane
             HStack {
-                TextField("Literal text in all captured members", text: $model.searchInput)
+                TextField("Literal text in selected saved scope", text: $model.searchInput)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit { panelNotice = ""; model.search() }
-                    .accessibilityLabel("Literal search across the saved archive")
-                Button { panelNotice = ""; model.search() } label: { Label("Search archive", systemImage: "magnifyingglass") }
+                    .accessibilityLabel("Literal search in the selected saved scope")
+                Button { panelNotice = ""; model.search() } label: { Label("Search", systemImage: "magnifyingglass") }
                     .disabled(!model.canSearch || !model.validSearchInput)
                 Button("Clear") { panelNotice = ""; model.clearSearch() }
                     .disabled(!model.canOperate || (model.searchPage == nil && model.searchInput.isEmpty))
@@ -560,7 +575,7 @@ private final class AtlasSavedTrailArchiveAccess {
                     .help("Turn off to compare Unicode lowercase text. This does not use full case folding or Unicode normalization.")
                 Toggle("Count all matches", isOn: $model.countAllMatches)
                     .toggleStyle(.checkbox).disabled(!model.canOperate)
-                Text("Entire saved archive · up to 4,096 matches per window")
+                Text("Up to 4,096 matches per window")
                     .font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Button("Reload results") { panelNotice = ""; model.reloadSearchResults() }
@@ -582,7 +597,7 @@ private final class AtlasSavedTrailArchiveAccess {
                             Spacer()
                             Button("Use accepted query") {
                                 model.searchInput = page.needle; model.countAllMatches = page.counting.all
-                                model.searchCaseSensitive = page.caseSensitive; panelNotice = ""
+                                model.searchCaseSensitive = page.caseSensitive; model.structureScope = page.scope.scope; panelNotice = ""
                             }
                                 .controlSize(.small).disabled(!model.canOperate)
                         }
@@ -595,7 +610,7 @@ private final class AtlasSavedTrailArchiveAccess {
                         Text("No retained text matches.").font(.headline)
                         Text(page.window.offset > 0 ? "This window retained no later matches. Use Earlier or First to return to previous results; partial coverage can leave later matches unknown."
                             : page.seen > 0 ? "Matches were counted without retaining rows. Search again with a positive retained-match limit to open them."
-                            : page.complete ? "The accepted literal has no matches in the complete saved manifest."
+                            : page.complete ? "The accepted literal has no matches in the complete selected saved scope."
                             : "Coverage is partial. An empty result cannot establish that the literal is absent from the repository.")
                             .foregroundStyle(.secondary)
                     }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).padding(.top, 10)
@@ -768,7 +783,7 @@ private final class AtlasSavedTrailArchiveAccess {
                             Spacer()
                             Button("Use accepted expression") {
                                 model.searchInput = page.expression; model.countAllMatches = page.counting.all
-                                model.searchCaseSensitive = page.caseSensitive; panelNotice = ""
+                                model.searchCaseSensitive = page.caseSensitive; model.structureScope = page.scope.scope; panelNotice = ""
                             }
                                 .controlSize(.small).disabled(!model.canOperate)
                         }
@@ -832,16 +847,6 @@ private final class AtlasSavedTrailArchiveAccess {
     }
     private var structureSearchPane: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Menu {
-                Button("Whole archive") { model.structureScope = .archive }
-                if let member = model.selectedMember {
-                    Button("Selected file") { model.structureScope = .member(member.path.bytes) }
-                    if let slash = member.path.bytes.lastIndex(of: 47) {
-                        Button("Selected file’s folder") { model.structureScope = .directory(Array(member.path.bytes[..<slash])) }
-                    }
-                }
-            } label: { Label(model.structureScope.label, systemImage: "scope").lineLimit(1) }
-                .disabled(!model.canOperate).accessibilityLabel("Search scope, " + model.structureScope.label)
             HStack {
                 TextField(model.searchMode == .headings ? "Heading title in captured Markdown" : "Name in captured source",
                     text: $model.searchInput)
@@ -1015,7 +1020,8 @@ private final class AtlasSavedTrailArchiveAccess {
                 .font(.caption.weight(.semibold)).foregroundStyle(page.complete ? Color.secondary : Color.orange)
             Text(page.counting.summary(seen: page.seen, retained: page.retained, skipped: page.window.skipped))
                 .font(.caption)
-            Text("\(page.scopeFiles) members in scope · \(page.filteredFiles) filtered by path/language")
+            Text(page.scope.scope.label).font(.caption.weight(.semibold))
+            Text("\(page.scope.members) recorded scope members · \(page.scopeFiles) eligible · \(page.filteredFiles) filtered by path/language")
                 .font(.caption)
             Text("Unavailable: \(page.unavailable) · Unsupported decoding: \(page.unsupported) · Predicate rejections: \(page.predicateRejections)")
                 .font(.caption).foregroundStyle(.secondary)
@@ -1044,6 +1050,8 @@ private final class AtlasSavedTrailArchiveAccess {
                 Text("Query generation \(page.generation)").foregroundStyle(.secondary)
             }.font(.caption.weight(.semibold))
             Text(page.counting.summary(seen: page.seen, retained: page.retained, skipped: page.window.skipped))
+                .font(.caption)
+            Text(page.scope.scope.label + " · \(page.scope.captured) captured / \(page.scope.members) recorded members")
                 .font(.caption)
             Text("Unavailable members: \(page.unavailable) · Unsupported decoding: \(page.unsupported) · \(page.sourceBytes) source bytes read")
                 .font(.caption).foregroundStyle(.secondary)
@@ -1758,11 +1766,13 @@ private final class AtlasSavedTrailArchiveAccess {
     }
     private func savedMatchActions(_ match: AtlasSavedMatchEvidence) -> some View {
         VStack(alignment: .leading, spacing: 5) {
-            if case .hit(_, let needle, _, let caseSensitive) = capture.origin {
+            if case .hit(_, let needle, _, let caseSensitive, let scope) = capture.origin {
                 Text("Saved literal: \(needle)").font(.callout.monospaced()).lineLimit(2).textSelection(.enabled)
+                Text(scope.label).font(.caption).foregroundStyle(.secondary)
                 Text(caseSensitive ? "Match case" : "Unicode lowercase matching").font(.caption).foregroundStyle(.secondary)
-            } else if case .expressionHit(_, let expression, let primary, _, let caseSensitive) = capture.origin {
+            } else if case .expressionHit(_, let expression, let primary, _, let caseSensitive, let scope) = capture.origin {
                 Text("Saved expression: \(expression)").font(.callout.monospaced()).lineLimit(2).textSelection(.enabled)
+                Text(scope.label).font(.caption).foregroundStyle(.secondary)
                 Text(caseSensitive ? "Match case" : "Unicode lowercase matching").font(.caption).foregroundStyle(.secondary)
                 Text("Primary occurrence: \(primary)").font(.caption.monospaced()).lineLimit(2).textSelection(.enabled)
             } else if case .structureHit(_, _, _, _, let item, _) = capture.origin {

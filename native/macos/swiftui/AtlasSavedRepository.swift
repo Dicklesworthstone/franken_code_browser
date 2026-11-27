@@ -754,6 +754,8 @@ enum AtlasSavedRequest: Sendable {
     case matchingSearch(generation: UInt64, needle: String, caseSensitive: Bool, countAllMatches: Bool, matches: UInt64)
     case searchWindow(generation: UInt64, needle: String, caseSensitive: Bool, countAllMatches: Bool,
         matches: UInt64, skipMatches: UInt64)
+    case scopedSearchWindow(generation: UInt64, needle: String, caseSensitive: Bool, countAllMatches: Bool,
+        matches: UInt64, skipMatches: UInt64, scope: AtlasSavedStructureScope)
     case results(generation: UInt64, start: UInt64, limit: UInt64)
     case clearResults(generation: UInt64)
     case openHit(reader: UInt64, generation: UInt64, hit: UInt64)
@@ -763,6 +765,8 @@ enum AtlasSavedRequest: Sendable {
         countAllMatches: Bool, matches: UInt64, scanBytes: UInt64)
     case expressionWindow(generation: UInt64, query: String, caseSensitive: Bool, countAllMatches: Bool,
         matches: UInt64, scanBytes: UInt64, skipMatches: UInt64)
+    case scopedExpressionWindow(generation: UInt64, query: String, caseSensitive: Bool, countAllMatches: Bool,
+        matches: UInt64, scanBytes: UInt64, skipMatches: UInt64, scope: AtlasSavedStructureScope)
     case expressionResults(generation: UInt64, start: UInt64, limit: UInt64)
     case clearExpression(generation: UInt64)
     case openExpressionHit(reader: UInt64, generation: UInt64, hit: UInt64)

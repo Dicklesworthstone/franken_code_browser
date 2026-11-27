@@ -15,8 +15,16 @@ private final class SavedResultWindowFixture: @unchecked Sendable {
         let matching, counting: Bool
         let mode: AtlasSavedSearchMode?
         let nameMode: AtlasSearchNameMode?
+        var scope: AtlasSavedStructureScope = .archive
     }
-    let base = SavedRepositoryFixture(searchVectors: true)
+    let base: SavedRepositoryFixture
+    init(nested: Bool = false) {
+        let original = SavedRepositoryFixture(searchVectors: true)
+        let member = original.members[1]
+        base = nested ? SavedRepositoryFixture(searchVectors: true, sourceMemberOverride:
+            .init(path: Array("src/".utf8) + member.path, display: "src/" + member.display,
+                bytes: member.bytes, digest: member.digest)) : original
+    }
     let entered = DispatchSemaphore(value: 0), resume = DispatchSemaphore(value: 0)
     private let lock = NSLock()
     private var accepted: [Namespace: Scan] = [:]
@@ -25,23 +33,40 @@ private final class SavedResultWindowFixture: @unchecked Sendable {
     private var fault: Fault?
     private var metadataChange: String?
     private var changedMetadata: String?
+    private var wrongReaderScope = false
     private func locked<T>(_ body: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return body() }
     var calls: [Scan] { locked { scans } }
     var metadataCalls: [String] { locked { metadata } }
     var changedMetadataReply: String? { locked { changedMetadata } }
     func failNext(_ value: Fault) { locked { fault = value } }
     func changeNextMetadata(_ field: String) { locked { metadataChange = field } }
+    func forgeNextReaderScope() { locked { wrongReaderScope = true } }
+
+    private func addScope(_ scope: AtlasSavedStructureScope, to out: inout [String: Any]) {
+        let selected = base.members.filter { scope.includes($0.path) }
+        out["scope"] = scope == .archive ? "whole-saved-archive" : scope.code == 1 ? "saved-directory" : "saved-member"
+        out["scope_path_hex"] = base.hex(scope.path)
+        out["scope_known_members"] = String(selected.count)
+        out["scope_captured_members"] = String(selected.filter { $0.bytes != nil }.count)
+        out["scope_membership_complete"] = scope.code == 2 ? selected.count == 1 : out["discovery_complete"] as! Bool
+    }
 
     private func render(_ reply: String, scan: Scan, start: UInt64 = 0, limit: UInt64 = 64) -> String {
         var out = try! JSONSerialization.jsonObject(with: Data(reply.utf8)) as! [String: Any]
-        let actual = out["hits"] as! [[String: Any]]
+        let original = out["hits"] as! [[String: Any]]
+        let actual = original.filter { row in
+            let member = Int(row["member"] as! String)!
+            return scan.scope.includes(base.members[member].path)
+        }.enumerated().map { index, row -> [String: Any] in
+            var row = row; row["hit_id"] = String(index + 1); return row
+        }
         precondition(!actual.isEmpty)
         let first = scan.offset == 0
         let retained: UInt64 = first ? 4096 : UInt64(actual.count)
         let omitted: UInt64 = first && scan.namespace == .structure ? 2 : 0
         let continuation = retained + omitted
         let seen: UInt64 = first
-            ? continuation + (scan.counting ? 4 : 1)
+            ? continuation + (scan.counting ? (scan.scope == .archive ? 4 : UInt64(actual.count)) : 1)
             : scan.offset + retained
         let end = min(retained, start + limit)
         precondition(start <= retained)
@@ -93,6 +118,27 @@ private final class SavedResultWindowFixture: @unchecked Sendable {
                 out["search_complete"] = false
             }
         }
+        if scan.scope != .archive {
+            precondition(scan.namespace != .structure)
+            addScope(scan.scope, to: &out)
+            let members = UInt64(out["scope_known_members"] as! String)!
+            let captured = UInt64(out["scope_captured_members"] as! String)!
+            let complete = (out["scope_membership_complete"] as! Bool) && members == captured
+                && (scan.counting || !first)
+            out["unavailable_files"] = String(members - captured)
+            out["matching_files"] = "1"; out["retained_matching_files"] = "1"
+            out["matches_seen_exact"] = complete
+            if scan.namespace == .expression {
+                out["metadata_examined"] = String(members); out["scope_files"] = String(members)
+                out["metadata_excluded"] = "0"; out["members_loaded"] = String(captured)
+                out["predicate_scans"] = String(captured * 2); out["predicate_rejections"] = "0"
+                out["primary_scans"] = String(captured); out["complete"] = complete
+            } else {
+                out["index_eliminated_files"] = "0"
+                out["fallback_files"] = out["index_used"] as? Bool == true ? String(captured) : "0"
+                out["search_complete"] = complete
+            }
+        }
         return base.encode(out)
     }
 
@@ -122,14 +168,41 @@ private final class SavedResultWindowFixture: @unchecked Sendable {
             let value = metadataChange; metadataChange = nil; return value
         }
         guard let field else { return result }
-        precondition(namespace == .structure)
         var out = try! JSONSerialization.jsonObject(with: Data(result.utf8)) as! [String: Any]
+        if field == "scope" {
+            addScope(.archive, to: &out)
+            let changed = base.encode(out)
+            locked { changedMetadata = changed }
+            return changed
+        }
+        precondition(namespace == .structure)
         let value = UInt64(out[field] as! String)!
         out[field] = String(["max_hits", "max_source_bytes", "files_searched"].contains(field) ? value - 1 : value + 1)
         if field == "loaded_bytes" { out["member_bytes_read"] = out[field] }
         let changed = base.encode(out)
         locked { changedMetadata = changed }
         return changed
+    }
+
+    private func reader(_ owner: UInt64, reader: UInt64, namespace: Namespace,
+        generation: UInt64, hit: UInt64, upstream: AtlasSavedTransport) -> String? {
+        guard let scan = locked({ accepted[namespace] }), scan.generation == generation else { return nil }
+        let needle = namespace == .expression ? base.expressionPrimary(scan.query) : scan.query
+        let candidates = base.searchHits(needle, caseSensitive: scan.matching).enumerated().filter {
+            scan.scope.includes(base.members[Int($0.element.member)].path)
+        }
+        guard hit > 0, hit <= UInt64(candidates.count) else { return nil }
+        let original = UInt64(candidates[Int(hit - 1)].offset + 1)
+        let request: AtlasSavedRequest = namespace == .expression
+            ? .openExpressionHit(reader: reader, generation: generation, hit: original)
+            : .openHit(reader: reader, generation: generation, hit: original)
+        guard let reply = upstream.run(owner, request) else { return nil }
+        var out = try! JSONSerialization.jsonObject(with: Data(reply.utf8)) as! [String: Any]
+        var selection = out["selection"] as! [String: Any]
+        selection["hit_id"] = String(hit); out["selection"] = selection
+        let forged = locked { let value = wrongReaderScope; wrongReaderScope = false; return value }
+        if scan.scope != .archive || forged { addScope(forged ? .archive : scan.scope, to: &out) }
+        return base.encode(out)
     }
 
     var transport: AtlasSavedTransport {
@@ -152,6 +225,11 @@ private final class SavedResultWindowFixture: @unchecked Sendable {
                     maximum: maximum, bytes: 0, query: query, matching: matching, counting: counting,
                     mode: nil, nameMode: nil), request: .matchingSearch(generation: generation, needle: query,
                         caseSensitive: matching, countAllMatches: counting, matches: maximum), upstream: upstream)
+            case .scopedSearchWindow(let generation, let query, let matching, let counting, let maximum, let offset, let scope):
+                return search(owner, scan: Scan(namespace: .literal, generation: generation, offset: offset,
+                    maximum: maximum, bytes: 0, query: query, matching: matching, counting: counting,
+                    mode: nil, nameMode: nil, scope: scope), request: .matchingSearch(generation: generation, needle: query,
+                        caseSensitive: matching, countAllMatches: counting, matches: maximum), upstream: upstream)
             case .expressionSearch(let generation, let query, let maximum, let bytes),
                  .countedExpressionSearch(let generation, let query, let maximum, let bytes):
                 let counting: Bool
@@ -167,6 +245,12 @@ private final class SavedResultWindowFixture: @unchecked Sendable {
                 return search(owner, scan: Scan(namespace: .expression, generation: generation, offset: offset,
                     maximum: maximum, bytes: bytes, query: query, matching: matching, counting: counting,
                     mode: nil, nameMode: nil), request: .matchingExpressionSearch(generation: generation,
+                        query: query, caseSensitive: matching, countAllMatches: counting,
+                        matches: maximum, scanBytes: bytes), upstream: upstream)
+            case .scopedExpressionWindow(let generation, let query, let matching, let counting, let maximum, let bytes, let offset, let scope):
+                return search(owner, scan: Scan(namespace: .expression, generation: generation, offset: offset,
+                    maximum: maximum, bytes: bytes, query: query, matching: matching, counting: counting,
+                    mode: nil, nameMode: nil, scope: scope), request: .matchingExpressionSearch(generation: generation,
                         query: query, caseSensitive: matching, countAllMatches: counting,
                         matches: maximum, scanBytes: bytes), upstream: upstream)
             case .structureSearch(let generation, let mode, let nameMode, let query, let maximum, let bytes, let policy):
@@ -188,6 +272,10 @@ private final class SavedResultWindowFixture: @unchecked Sendable {
             case .structureResults(let generation, let start, let limit):
                 return results(owner, namespace: .structure, generation: generation, start: start, limit: limit,
                     request: .structureResults(generation: generation, start: 0, limit: 64), upstream: upstream)
+            case .openHit(let destination, let generation, let hit):
+                return reader(owner, reader: destination, namespace: .literal, generation: generation, hit: hit, upstream: upstream)
+            case .openExpressionHit(let destination, let generation, let hit):
+                return reader(owner, reader: destination, namespace: .expression, generation: generation, hit: hit, upstream: upstream)
             default: return upstream.run(owner, request)
             }
         }, cancel: upstream.cancel, close: upstream.close, retirementFailed: upstream.retirementFailed,
@@ -218,6 +306,7 @@ enum AtlasSavedResultWindowTests {
         await refusedLostAndCanceledWindowsReconcileOnce()
         try await expressionAndStructureWindowsKeepIndependentAuthority()
         try await structuralMetadataCannotRewriteAcceptedCoverage()
+        try await sharedScopesFreezeWindowsRecoveryAndReaders()
     }
 
     @MainActor private static func literalWindowsKeepPoliciesAndExactReaders() async throws {
@@ -379,6 +468,100 @@ enum AtlasSavedResultWindowTests {
         _ = try await structuralReader.withMatchReader { $0 }
         precondition(!f.base.calls.contains("LIVE-OPEN"))
         expressionReader.reader.close(); structuralReader.reader.close(); model.close()
+    }
+
+
+    @MainActor private static func sharedScopesFreezeWindowsRecoveryAndReaders() async throws {
+        let f = SavedResultWindowFixture(nested: true), model = await opened(f)
+        let directory = AtlasSavedStructureScope.directory(Array("src".utf8))
+        let member = AtlasSavedStructureScope.member(f.base.members[2].path)
+        model.attachIndex(path: "/saved/index.fcbd", pin: String(repeating: "a", count: 64), accessLease: nil)
+        await wait("scoped fixture index did not attach") { !model.busy }
+        model.structureScope = directory; model.searchInput = "ANA"
+        model.searchCaseSensitive = false; model.countAllMatches = true
+        model.search(); await wait("scoped literal query did not finish") { !model.busy }
+        let first = model.searchPage!
+        precondition(first.scope.scope == directory && first.scope.members == 2 && first.scope.captured == 2)
+        precondition(first.complete && first.counting.exact && first.retained == 4096 && first.seen == 4098)
+        precondition(first.indexGeneration == 1 && first.unavailable == 0 && first.fallbackFiles == 2)
+        let scans = f.calls.count
+        model.structureScope = .archive
+        model.loadSearchWindow(offset: 4096, from: first)
+        await refused("A different draft scope authorized a retained match") {
+            _ = try await model.openHit(first.hits[0], from: first, readerTransport: f.base.readerTransport())
+        }
+        precondition(!model.busy && !model.searchIsCurrent && f.calls.count == scans)
+        model.structureScope = directory
+        model.loadSearchResults(start: 64, from: first)
+        await wait("scoped metadata page did not finish") { !model.busy }
+        let metadata = model.searchPage!
+        precondition(metadata.scope == first.scope && metadata.start == 64 && f.calls.count == scans)
+        f.changeNextMetadata("scope")
+        model.loadSearchResults(start: 128, from: metadata)
+        await wait("wrong-scope metadata did not drain") { !model.busy }
+        precondition(model.searchPage?.start == 64 && model.searchPage!.hasSameSummary(as: metadata))
+        model.loadSearchWindow(offset: 4096, from: metadata)
+        await wait("scoped later window did not finish") { !model.busy }
+        let later = model.searchPage!
+        precondition(later.scope == first.scope && later.window.offset == 4096 && later.hits.count == 2)
+        precondition(f.calls.last?.scope == directory && f.calls.last?.matching == false
+            && f.calls.last?.counting == true && f.calls.count == scans + 1)
+        f.forgeNextReaderScope()
+        await refused("A reader receipt with another raw scope was accepted") {
+            _ = try await model.openHit(later.hits[1], from: later, readerTransport: f.base.readerTransport())
+        }
+        let rawReader = try await model.openHit(later.hits[1], from: later, readerTransport: f.base.readerTransport())
+        precondition(rawReader.match?.originalHex == "616e61" && rawReader.match?.start == 205)
+        if case .hit(_, _, _, _, let scope) = rawReader.origin { precondition(scope == directory) }
+        else { preconditionFailure("literal reader lost its accepted scope") }
+
+        // An index change does not rewrite the query-time membership receipt.
+        model.detachIndex(); await wait("scoped index detach did not finish") { !model.busy }
+        precondition(model.searchPage!.hasSameSummary(as: later) && model.searchIsCurrent && rawReader.canUseMatch)
+
+        model.searchMode = .expression; model.structureScope = member
+        model.searchInput = "ANA +BANANA -UNSAFE"; model.search()
+        await wait("scoped expression did not finish") { !model.busy }
+        let expressionFirst = model.expressionPage!
+        precondition(expressionFirst.scope.scope == member && expressionFirst.scope.members == 1
+            && expressionFirst.complete && expressionFirst.scopeFiles == 1)
+        let beforeRecovery = f.calls.count
+        f.failNext(.lost); model.loadExpressionWindow(offset: 4096, from: expressionFirst)
+        model.structureScope = directory
+        await wait("scoped expression did not recover its lost reply") { !model.busy }
+        let expression = model.expressionPage!
+        precondition(expression.scope == expressionFirst.scope && expression.window.offset == 4096
+            && expression.hits.count == 2 && !model.expressionIsCurrent && f.calls.count == beforeRecovery + 1)
+        precondition(f.calls.last?.scope == member && f.metadataCalls.last == "expression:2:0")
+        model.structureScope = member; precondition(model.expressionIsCurrent)
+        f.forgeNextReaderScope()
+        await refused("An expression reader with a different scope was accepted") {
+            _ = try await model.openExpressionHit(expression.hits[1], from: expression, readerTransport: f.base.readerTransport())
+        }
+        let utf16Reader = try await model.openExpressionHit(expression.hits[1], from: expression,
+            readerTransport: f.base.readerTransport())
+        precondition(utf16Reader.match?.start == 410 && utf16Reader.match?.end == 416
+            && utf16Reader.match?.originalHex == "61006e006100")
+        if case .expressionHit(_, _, _, _, _, let scope) = utf16Reader.origin { precondition(scope == member) }
+        else { preconditionFailure("expression reader lost its exact raw member scope") }
+
+        f.failNext(.blocked); model.loadExpressionWindow(offset: 0, from: expression)
+        await wait("scoped replacement did not enter its worker") { f.entered.wait(timeout: .now()) == .success }
+        model.structureScope = .archive; model.cancel(); f.resume.signal()
+        await wait("canceled scoped replacement did not reconcile") { !model.busy }
+        precondition(model.expressionPage?.scope.scope == member && model.expressionPage?.window.offset == 0
+            && !model.expressionIsCurrent && f.calls.filter { $0.namespace == .expression && $0.generation == 3 }.count == 1)
+        model.structureScope = member; precondition(model.expressionIsCurrent)
+        await refused("A replaced scoped generation authorized its old hit") {
+            _ = try await model.openExpressionHit(expression.hits[0], from: expression, readerTransport: f.base.readerTransport())
+        }
+        model.open(path: "/saved/replacement.fcbs", accessLease: nil)
+        await wait("archive replacement did not finish") { !model.busy }
+        precondition(model.structureScope == .archive && model.searchPage == nil && model.expressionPage == nil)
+        precondition(rawReader.canUseMatch && utf16Reader.canUseMatch)
+        _ = try await utf16Reader.withMatchReader { $0 }
+        precondition(!f.base.calls.contains("LIVE-OPEN"))
+        rawReader.reader.close(); utf16Reader.reader.close(); model.close()
     }
 
     @MainActor private static func structuralMetadataCannotRewriteAcceptedCoverage() async throws {

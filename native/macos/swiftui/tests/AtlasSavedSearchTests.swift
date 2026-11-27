@@ -48,6 +48,7 @@ import Dispatch
         try exactPageAndPartialCoverageContracts()
         try countedTotalsRemainIndependentOfStoredRows()
         try laterWindowsValidateOffsetsCountsAndContinuations()
+        try savedRawScopesBindCoverageAndMembership()
         try await AtlasSavedResultWindowTests.run()
         try await countedPoliciesStayFrozenAcrossPagingAndReaders()
         try await exactUTF8AndUTF16HandoffsKeepOriginalMatches()
@@ -79,6 +80,116 @@ import Dispatch
         await damagedIndexKeepsAcceptedResultsAndCanDetach()
         await canceledAndClosedIndexAttachmentsDrainBeforeRelease()
         print("Saved text and structural search, index attachment and coverage, UTF-8/UTF-16 captures, independent generations, grant lifetimes, bounded navigation and recovery regressions passed.")
+    }
+
+    private static func savedRawScopesBindCoverageAndMembership() throws {
+        let f = SavedRepositoryFixture(searchVectors: true)
+        let member = AtlasSavedStructureScope.member(f.rawPath)
+        let folder = AtlasSavedStructureScope.directory(Array("src".utf8))
+        let scopeFields = ["scope", "scope_path_hex", "scope_known_members",
+            "scope_captured_members", "scope_membership_complete"]
+        func scoped(expression: Bool, directory: Bool = false) -> [String: Any] {
+            var out = expression
+                ? f.expressionPage(40, generation: 1, countAllMatches: true, caseSensitive: false)
+                : f.searchPage(40, generation: 1, index: 7, pin: String(repeating: "a", count: 64),
+                    countAllMatches: true, caseSensitive: false)
+            // The selected captured file can be closed even when discovery of
+            // unrelated archive members was interrupted.
+            out["discovery_complete"] = false
+            out["scope"] = directory ? "saved-directory" : "saved-member"
+            out["scope_path_hex"] = f.hex(directory ? Array("src".utf8) : f.rawPath)
+            out["scope_known_members"] = "1"; out["scope_captured_members"] = "1"
+            out["scope_membership_complete"] = !directory
+            var rows = Array((out["hits"] as! [[String: Any]]).prefix(2))
+            if directory {
+                for index in rows.indices {
+                    rows[index]["path"] = f.path(Array("src/".utf8) + f.rawPath, "src/raw-file.rs")
+                }
+            }
+            out["hits"] = rows; out["retained_hits"] = "2"; out["matches_seen"] = "2"
+            out["matching_files"] = "1"; out["retained_matching_files"] = "1"
+            out["unavailable_files"] = "0"; out["matches_seen_exact"] = !directory
+            out["member_read_calls"] = "1"; out["member_bytes_read"] = String(f.searchUTF8.count)
+            out["peak_source_bytes"] = String(f.searchUTF8.count)
+            out["scanned_bytes"] = String(f.searchUTF8.count)
+            if expression {
+                out["metadata_examined"] = "1"; out["scope_files"] = "1"; out["metadata_excluded"] = "0"
+                out["members_loaded"] = "1"; out["loaded_bytes"] = String(f.searchUTF8.count)
+                out["predicate_scans"] = "2"; out["predicate_rejections"] = "0"; out["primary_scans"] = "1"
+                out["complete"] = !directory
+            } else {
+                out["search_complete"] = !directory
+                out["index_eliminated_files"] = "0"; out["fallback_files"] = "1"
+            }
+            return out
+        }
+        let literalObject = scoped(expression: false)
+        let identity = try JSONDecoder().decode(AtlasSavedIdentity.self, from: Data(f.encode(literalObject).utf8))
+        func literal(_ out: [String: Any], scope: AtlasSavedStructureScope? = nil) throws -> AtlasSavedSearchPage {
+            try AtlasSavedSearchPage.decode(f.encode(out), identity: identity, generation: 1, needle: "ana",
+                start: 0, limit: 64, countAllMatches: true, caseSensitive: false, scope: scope ?? member)
+        }
+        func expression(_ out: [String: Any], scope: AtlasSavedStructureScope? = nil) throws -> AtlasSavedExpressionPage {
+            try AtlasSavedExpressionPage.decode(f.encode(out), identity: identity, generation: 1,
+                expression: "ana +banana -unsafe", start: 0, limit: 64,
+                countAllMatches: true, caseSensitive: false, scope: scope ?? member)
+        }
+        let page = try literal(literalObject), expressionObject = scoped(expression: true)
+        let expressionPage = try expression(expressionObject)
+        precondition(!identity.discoveryComplete && page.complete && expressionPage.complete)
+        precondition(page.scope.scope == member && page.scope.captured == 1 && page.counting.exact
+            && page.indexGeneration == 7 && page.fallbackFiles == 1)
+        precondition(page.hits.allSatisfy { $0.path.bytes == f.rawPath })
+        precondition(expressionPage.scope == page.scope && expressionPage.scopeFiles == 1)
+        rejected("an unrelated scope satisfied a literal request") { _ = try literal(literalObject, scope: folder) }
+        rejected("an unrelated scope satisfied an expression request") { _ = try expression(expressionObject, scope: folder) }
+        for field in scopeFields {
+            var bad = literalObject; bad.removeValue(forKey: field)
+            rejected("literal search accepted a missing scope receipt field: \(field)") { _ = try literal(bad) }
+            bad = expressionObject; bad.removeValue(forKey: field)
+            rejected("expression search accepted a missing scope receipt field: \(field)") { _ = try expression(bad) }
+        }
+        var bad = literalObject; bad["scope_captured_members"] = "2"
+        rejected("scope capture count exceeded selected membership") { _ = try literal(bad) }
+        bad = literalObject; bad["scope_membership_complete"] = false
+        rejected("known exact member lost its closed membership receipt") { _ = try literal(bad) }
+        bad = expressionObject; bad["metadata_examined"] = "5"; bad["metadata_excluded"] = "4"
+        rejected("expression metadata silently covered the whole archive") { _ = try expression(bad) }
+        bad = literalObject; bad["fallback_files"] = "2"
+        rejected("index fallback accounting escaped the selected member") { _ = try literal(bad) }
+
+        let directoryObject = scoped(expression: false, directory: true)
+        let directoryPage = try literal(directoryObject, scope: folder)
+        precondition(!directoryPage.complete && !directoryPage.scope.complete && directoryPage.scope.members == 1)
+        bad = directoryObject
+        var rows = bad["hits"] as! [[String: Any]]
+        rows[0]["path"] = f.path(Array("src-other/file.rs".utf8), "src/file.rs")
+        bad["hits"] = rows
+        rejected("a directory prefix sibling escaped raw component matching") { _ = try literal(bad, scope: folder) }
+
+        var missing = literalObject
+        for key in ["scope_known_members", "scope_captured_members", "retained_hits", "matches_seen",
+            "matching_files", "retained_matching_files", "member_read_calls", "member_bytes_read",
+            "scanned_bytes", "peak_source_bytes", "fallback_files", "posting_entries_visited"] { missing[key] = "0" }
+        missing["scope_path_hex"] = f.hex(Array("absent.rs".utf8))
+        missing["scope_membership_complete"] = false; missing["search_complete"] = false
+        missing["matches_seen_exact"] = false; missing["hits"] = [[String: Any]]()
+        let absent = try literal(missing, scope: .member(Array("absent.rs".utf8)))
+        precondition(!absent.complete && !absent.scope.complete && absent.hits.isEmpty)
+
+        // Old whole-archive producers remain source-compatible; a partially
+        // populated new receipt must never masquerade as a legacy reply.
+        let legacy = f.searchPage(40, generation: 1, countAllMatches: true)
+        let legacyIdentity = try JSONDecoder().decode(AtlasSavedIdentity.self, from: Data(f.encode(legacy).utf8))
+        _ = try AtlasSavedSearchPage.decode(f.encode(legacy), identity: legacyIdentity, generation: 1,
+            needle: "ana", start: 0, limit: 64)
+        var half = legacy
+        half["scope"] = "whole-saved-archive"; half["scope_known_members"] = "5"
+        half["scope_captured_members"] = "4"; half["scope_membership_complete"] = true
+        rejected("an archive receipt omitted its raw path framing") {
+            _ = try AtlasSavedSearchPage.decode(f.encode(half), identity: legacyIdentity, generation: 1,
+                needle: "ana", start: 0, limit: 64)
+        }
     }
 
     private static func matchingPoliciesBindPagesAndRejectIncompatiblePostings() throws {
@@ -1137,7 +1248,7 @@ import Dispatch
         precondition(utf8.match?.start == 203 && utf8.match?.end == 206 && utf8.match?.originalHex == "616e61")
         precondition(utf16.match?.start == 410 && utf16.match?.end == 416 && utf16.match?.originalHex == "61006e006100")
         precondition(utf16.reader.page?.start == 278 && utf16.reader.page?.identity.encoding == "utf16le")
-        guard case .expressionHit(let generation, let query, let primary, _, _) = utf16.origin else {
+        guard case .expressionHit(let generation, let query, let primary, _, _, _) = utf16.origin else {
             preconditionFailure("expression reader lost its accepted predicate provenance")
         }
         precondition(generation == 1 && query == expression.expression && primary == "ana")
