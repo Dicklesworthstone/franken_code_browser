@@ -13,6 +13,7 @@
 //! than accumulating the absolute coordinates of all its ancestors.
 
 pub mod retained;
+pub mod matches;
 pub mod focus;
 
 use std::{mem::size_of, sync::Arc};
@@ -96,11 +97,12 @@ pub(crate) struct IndexedNode {
     pub(crate) child_end: usize,
     pub(crate) acceleration: Option<usize>,
     pub(crate) leaves: usize,
+    pub(crate) first_leaf: usize,
     pub(crate) depth: usize,
 }
 impl IndexedNode {
     fn empty() -> Self {
-        Self { parent: None, child_start: 0, child_end: 0, acceleration: None, leaves: 0, depth: 0 }
+        Self { parent: None, child_start: 0, child_end: 0, acceleration: None, leaves: 0, first_leaf: 0, depth: 0 }
     }
 }
 #[derive(Clone, Copy, Debug)]
@@ -111,6 +113,7 @@ pub(crate) struct Branch {
     pub(crate) kind: BranchKind,
     pub(crate) parent: usize,
     pub(crate) leaves: usize,
+    pub(crate) first_leaf: usize,
 }
 
 pub struct AtlasIndex<'layout> {
@@ -216,6 +219,17 @@ impl<'layout> AtlasIndex<'layout> {
                     .ok_or(AtlasError::InvalidLimits)?;
             }
         }
+        // Assign contiguous leaf intervals in tree order. Raw path order can
+        // interleave a sibling such as "a.rs" with descendants of "a".
+        for &index in &by_path {
+            if canceled() { return Err(AtlasError::Canceled); }
+            let parent = nodes[index];
+            let mut first = parent.first_leaf;
+            for &child in &children[parent.child_start..parent.child_end] {
+                nodes[child].first_leaf = first;
+                first += nodes[child].leaves;
+            }
+        }
         for index in 0..count {
             if canceled() { return Err(AtlasError::Canceled); }
             let range = nodes[index].child_start..nodes[index].child_end;
@@ -309,7 +323,7 @@ fn build_group(children: &[usize], parent: usize, layout: &PartitionLayout, node
     let first = children[0];
     let index = branches.len();
     branches.push(Branch { bounds: layout.nodes()[first].parent_local(), kind: BranchKind::Leaf(first),
-        parent, leaves: nodes[first].leaves });
+        parent, first_leaf: nodes[first].first_leaf, leaves: nodes[first].leaves });
     if children.len() > 1 {
         let middle = children.len() / 2;
         let left = build_group(&children[..middle], parent, layout, nodes, branches, canceled)?;
@@ -317,7 +331,7 @@ fn build_group(children: &[usize], parent: usize, layout: &PartitionLayout, node
         let bounds = branches[left].bounds.union(branches[right].bounds).map_err(|_| AtlasError::InvalidHierarchy)?;
         checked_rect(bounds)?;
         branches[index] = Branch { bounds, kind: BranchKind::Fork(left, right), parent,
-            leaves: branches[left].leaves + branches[right].leaves };
+            first_leaf: branches[left].first_leaf, leaves: branches[left].leaves + branches[right].leaves };
     }
     Ok(index)
 }

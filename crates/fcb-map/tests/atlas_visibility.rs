@@ -268,3 +268,62 @@ fn an_automatic_island_allows_panning_to_a_sibling_inside_the_explicit_focus() {
     let (wide, _) = next.zoom(&index, camera, anchor, 0.01 / factor).unwrap();
     assert_eq!(wide.node(), directory, "never widen an explicitly focused neighborhood");
 }
+
+#[test]
+fn partial_sibling_groups_locate_selection_and_sum_only_their_verified_files() {
+    use fcb_map::atlas::matches::AtlasMatchDensity;
+    let paths: &[&[u8]] = &[b"a/x.rs", b"a/y.rs", b"a.rs", b"a-1", b"a0/n", b"z\xff.rs"];
+    let specs = |revision| layout(paths.iter().map(|p| NodeSpec::new(p.to_vec(), NodeKind::File, Some(9))).collect(), revision);
+    let layout = specs(1);
+    let budget = budget();
+    let index = AtlasIndex::build(&layout, AtlasBuildLimits::default(), &budget, allocation(1), || false).unwrap();
+    let files: Vec<_> = paths.iter().map(|p| index.find_path(p).unwrap()).collect();
+    let contributions = [(files[2], 1), (files[0], 1_000_000), (files[2], 4), (files[5], 0)];
+    let density = AtlasMatchDensity::build(&index, generation(21), contributions.into_iter(),
+        &budget, allocation(2), || false).unwrap();
+    let mut partial_group = false;
+    for limit in 1..=12 {
+        let view = plan(&index, index.root_node(), camera(&index), exact(),
+            VisibleLimits { max_items: limit, max_visits: 128 }, None, &budget, 3);
+        let mut assigned = vec![0; files.len()];
+        let mut totals = (0, 0);
+        for parcel in view.parcels() {
+            let mut expected = (0, 0);
+            for (position, &file) in files.iter().enumerate() {
+                // The center of the leaf in the original projected geometry is
+                // an independent oracle for inclusion in the grouped rectangle.
+                let bounds = index.bounds_in(file, index.root_node()).unwrap();
+                let screen = view.camera().project_clipped(bounds).unwrap().unwrap();
+                let center = Point2D::new(screen.min_x() + screen.size().width() / 2.0,
+                    screen.min_y() + screen.size().height() / 2.0).unwrap();
+                let is_member = parcel.contains_file(&index, file).unwrap();
+                // Sibling bounding boxes can include empty space and overlap.
+                // Compare exact membership with the fully refined file's bounds
+                // for accepted members, never infer identity from empty space.
+                if is_member {
+                    assert!(parcel.logical_rect().contains_point(center));
+                    assigned[position] += 1;
+                    let n = [1_000_000, 0, 5, 0, 0, 0][position];
+                    expected.0 += n;
+                    expected.1 += usize::from(n > 0);
+                }
+            }
+            let counts = density.counts(*parcel, generation(21)).unwrap();
+            assert_eq!((counts.occurrences, counts.files), expected);
+            assert_eq!(density.counts(*parcel, generation(22)), Err(AtlasError::StaleQuery));
+            partial_group |= parcel.detail() == AtlasDetail::SiblingGroup && parcel.represented_leaves() < files.len();
+            totals.0 += counts.occurrences;
+            totals.1 += counts.files;
+        }
+        assert!(assigned.iter().all(|&n| n == 1));
+        assert_eq!(totals, (1_000_005, 2));
+    }
+    assert!(partial_group);
+    let other = specs(2);
+    let other_index = AtlasIndex::build(&other, AtlasBuildLimits::default(), &budget, allocation(5), || false).unwrap();
+    let other_view = plan(&other_index, other_index.root_node(), camera(&other_index), exact(),
+        VisibleLimits::default(), None, &budget, 6);
+    assert_eq!(density.counts(other_view.parcels()[0], generation(21)), Err(AtlasError::StaleLayout));
+    assert!(matches!(AtlasMatchDensity::build(&index, generation(23), [(files[0], u64::MAX), (files[2], 1)].into_iter(),
+        &budget, allocation(7), || false), Err(AtlasError::InvalidLimits)));
+}

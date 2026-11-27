@@ -62,6 +62,7 @@ pub struct VisibleParcel {
     detail: AtlasDetail,
     logical_rect: Rect2D,
     represented_leaves: usize,
+    pub(crate) first_leaf: usize,
     reason: AggregateReason,
 }
 impl VisibleParcel {
@@ -261,22 +262,22 @@ impl<'index, 'layout, 'previous> VisibleQuery<'index, 'layout, 'previous> {
         Ok(Visit { target: Target::Group(branch), parent_origin: origin, bounds })
     }
     fn emit(&mut self, visit: Visit, screen: Rect2D, reason: AggregateReason) {
-        let (node, detail, leaves) = match visit.target {
+        let (node, detail, first_leaf, leaves) = match visit.target {
             Target::Node(index) => {
                 let detail = match self.index.layout.nodes()[index].kind() {
                     NodeKind::File => AtlasDetail::File,
                     NodeKind::Placeholder => AtlasDetail::Placeholder,
                     NodeKind::Directory => AtlasDetail::Directory,
                 };
-                (index, detail, self.index.nodes[index].leaves)
+                (index, detail, self.index.nodes[index].first_leaf, self.index.nodes[index].leaves)
             }
             Target::Group(index) => {
                 let branch = self.index.branches[index];
-                (branch.parent, AtlasDetail::SiblingGroup, branch.leaves)
+                (branch.parent, AtlasDetail::SiblingGroup, branch.first_leaf, branch.leaves)
             }
         };
         self.items.push(VisibleParcel { node: self.index.key(node), detail, logical_rect: screen,
-            represented_leaves: leaves, reason });
+            first_leaf, represented_leaves: leaves, reason });
         self.stats.emitted_items += 1;
         match reason {
             AggregateReason::Distance => self.stats.distance_aggregates += 1,
