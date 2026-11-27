@@ -37,20 +37,10 @@ swiftc -swift-version 6 -warnings-as-errors "$out/Support.swift" "$src/AtlasProj
     "$src/AtlasProjectWorker.swift" "$src/tests/AtlasDirectoryCatalogBridgeTests.swift" "$out/fixture.o" -o "$out/directory-bridge"
 "$out/directory-bridge"
 printf 'Retained test artifacts: %s\n' "$out"
-python3 - "$src" "$out/Context.swift" <<'PY'
-from pathlib import Path
-import sys
-text = (Path(sys.argv[1]) / 'AtlasSearch.swift').read_text()
-start = text.index('struct AtlasSearchContext:')
-end = text.index('/// Hit indices are only unique', start)
-modes = text[text.index('enum AtlasSearchMode:'):text.index('struct AtlasSearchStructure:')]
-policy = text[text.index('enum AtlasDiscoveryPolicy:'):text.index('struct SearchHit:')]
-Path(sys.argv[2]).write_text('import Foundation\n' + policy + modes + text[start:end])
-PY
-swiftc -swift-version 6 -warnings-as-errors "$out/Context.swift" "$src/AtlasProjectCatalog.swift" \
+swiftc -swift-version 6 -warnings-as-errors "$src/AtlasSearch.swift" "$src/AtlasSearchExpression.swift" "$src/AtlasProjectCatalog.swift" \
     "$src/AtlasProjectOpening.swift" "$src/tests/AtlasProjectOpeningTests.swift" -o "$out/opening"
 "$out/opening"
-swiftc -swift-version 6 -warnings-as-errors "$out/Context.swift" "$src/AtlasProjectCatalog.swift" \
+swiftc -swift-version 6 -warnings-as-errors "$src/AtlasSearch.swift" "$src/AtlasSearchExpression.swift" "$src/AtlasProjectCatalog.swift" \
     "$src/AtlasProjectOpening.swift" "$src/tests/AtlasDirectoryFocusTests.swift" -o "$out/directory-focus"
 "$out/directory-focus"
 set --

@@ -237,7 +237,7 @@ fn counting_never_overrides_scope_coverage_work_limits_or_cancellation() {
     drop(saved);
     let oversized = vec![b'x'; StructureMode::Symbols.source_limit() + 1];
     let mut partial = archive(&[entry(b"a.rs", source), entry(b"b.bin", b"needle"), entry(b"c.rs", &oversized),
-        SnapshotEntry { path: b"d.rs", observed_bytes: 1, data: SnapshotData::Unavailable("missing") }], false, &budget);
+        SnapshotEntry { path: b"d.rs", observed_bytes: 1, data: SnapshotData::Unavailable("SOURCE_UNAVAILABLE") }], false, &budget);
     let report = run_matching(&mut partial, "needle", opts, 0, true, true, &budget);
     assert_eq!(report.matches_seen(), 2); assert_eq!(report.state(), StructureState::Complete);
     assert!(!report.matches_seen_exact()); assert!(!report.is_complete());

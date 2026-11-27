@@ -118,7 +118,7 @@ private final class CityFixture: @unchecked Sendable {
         while !condition(), Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
         precondition(condition(), "City fixture deadline; no missing callback is a pass")
     }
-    static func make(_ fixture: CityFixture) -> AtlasCityModel {
+    private static func make(_ fixture: CityFixture) -> AtlasCityModel {
         let model = AtlasCityModel(revision: UUID(), entries: entries, complete: true,
             seed: AtlasCitySeed(scale: 1, offsetX: 0, offsetY: 0), transport: fixture.transport)
         model.resize(width: 300, height: 100, backing: 1); model.start()
