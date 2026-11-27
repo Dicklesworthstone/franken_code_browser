@@ -17,7 +17,7 @@ mod save;
 use std::{ffi::OsString, fs::{File, OpenOptions}, io::{self, Write}, path::{Path, PathBuf}};
 use fcb::ByteLength;
 use fcb::search::{RawPath, ResourceBudget, SymbolNameMode};
-use fcb::search::snapshot_structure::{StructureMode, MAX_STRUCTURE_SOURCE_BYTES};
+use fcb::search::snapshot_structure::{StructureMode, StructureScope, MAX_STRUCTURE_SOURCE_BYTES};
 use fcb::search::workspace::WorkspaceLimits;
 use fcb::search::snapshot::{SavedSourceError, SnapshotError, SnapshotLimits, Sha256Digest,
     MAX_SNAPSHOT_BYTES, MAX_PAGED_SNAPSHOT_FILE_BYTES, MAX_PAGED_SNAPSHOT_SOURCE_BYTES};
@@ -48,10 +48,10 @@ fcb snapshot structure FILE --mode symbols|headings|occurrences --name TEXT [--j
 fcb snapshot read FILE (--member NAME | --member-hex HEX) [--json]\n\
 fcb snapshot index help  # Build/reopen pinned substring indexes\n\
 Structure options: --name-mode exact|prefix|contains --limit N --max-source-bytes N\n\
-Structural queries inspect the whole saved archive; names are case sensitive by default.\n\
+Structure scope: whole archive by default, or --directory PATH | --directory-hex HEX | --member NAME | --member-hex HEX.\n\
 Occurrences require whole-token names (--name-mode exact); comments and string literals participate.\n\
 Declarations are heuristic candidates; headings have qualified original-byte ranges.\n\
-Structure limits: 4096 hits; 64 MiB aggregate source; symbols 64 KiB, headings 256 KiB, occurrences 32 MiB per file.\n\
+Structure limits: 4096 hits; 64 MiB aggregate source; symbols 1 MiB, headings 256 KiB, occurrences 32 MiB per file.\n\
 Zero source allowance stops before a nonempty eligible member; zero hits probes existence.\n\
 Expressions: quoted phrases, whitespace conjunctions, -excluded terms, path: and lang:/type: filters.\n\
 Expression work: --max-scan-bytes N, default 256 MiB across ALL predicate and primary scans.\n\
@@ -82,7 +82,15 @@ struct Settings {
     expression: Option<String>, max_scan_bytes: u64,
     structure_mode: Option<StructureMode>, structure_name: Option<String>,
     name_mode: SymbolNameMode, max_structure_source_bytes: u64,
+    directory: Option<Vec<u8>>,
     ignore_case: bool, count_all_matches: bool, skip_matches: u64,
+}
+impl Settings {
+    fn structure_scope(&self) -> StructureScope<'_> {
+        if let Some(member) = &self.member { StructureScope::Member(member) }
+        else if let Some(directory) = &self.directory { StructureScope::Directory(directory) }
+        else { StructureScope::Archive }
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Effect { None, Incomplete, Written, Synced }
@@ -112,7 +120,7 @@ impl From<SavedSourceError> for Failure {
 }
 fn takes_value(text: &str) -> bool {
     matches!(text, "--output" | "--text" | "--raw-hex" | "--limit" | "--max-files" | "--max-file-bytes" | "--max-total-bytes"
-        | "--member" | "--member-hex" | "--offset" | "--line" | "--bytes" | "--lines" | "--catalog" | "--catalog-digest"
+        | "--member" | "--member-hex" | "--directory" | "--directory-hex" | "--offset" | "--line" | "--bytes" | "--lines" | "--catalog" | "--catalog-digest"
         | "--query" | "--max-scan-bytes" | "--mode" | "--name" | "--name-mode" | "--max-source-bytes" | "--skip-matches")
 }
 fn wants_json(args: &[OsString]) -> bool {
@@ -147,7 +155,7 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
         catalog: None, catalog_pin: None, expression: None, max_scan_bytes: 256 * 1024 * 1024,
         structure_mode: None, structure_name: None, name_mode: SymbolNameMode::Exact,
         max_structure_source_bytes: MAX_STRUCTURE_SOURCE_BYTES, ignore_case: false, count_all_matches: false,
-        skip_matches: 0 };
+        skip_matches: 0, directory: None };
     let mut seen = 0u32;
     let mut cursor = usize::from(!args.is_empty());
     let mut positional = false;
@@ -163,6 +171,7 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
                 "--bytes" => 4096, "--lines" => 8192, "--raw" => 16384, "--raw-hex" => 32768,
                 "--catalog" => 65536, "--catalog-digest" => 131072, "--respect-ignores" => 262144,
                 "--query" => 524288, "--max-scan-bytes" => 1048576,
+                "--directory" | "--directory-hex" => 268435456,
                 "--mode" => 2097152, "--name" => 4194304, "--name-mode" => 8388608, "--max-source-bytes" => 16777216,
                 "--ignore-case" => 33554432, "--count-all" => 67108864, "--skip-matches" => 134217728,
                 _ => return Err(Failure::new("CLI_UNKNOWN_OPTION")), };
@@ -180,6 +189,9 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
                 if option == "--output" { settings.output = Some(PathBuf::from(value)); }
                 else { settings.catalog = Some(PathBuf::from(value)); }
                 continue;
+            }
+            if option == "--directory" {
+                settings.directory = Some(RawPath::from_path(Path::new(value)).as_bytes().to_vec()); continue;
             }
             if option == "--member" {
                 if value.is_empty() || settings.member.is_some() { return Err(Failure::new("CLI_INVALID_MEMBER")); }
@@ -211,6 +223,7 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
                 else { settings.text = Some(text.to_owned()); }
                 continue;
             }
+            if option == "--directory-hex" { settings.directory = Some(hex(text, 16_384)?); continue; }
             if option == "--member-hex" {
                 if settings.member.is_some() { return Err(Failure::new("CLI_INVALID_MEMBER")); }
                 settings.member = Some(hex(text, 16_384)?); continue;
@@ -250,7 +263,8 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
             && (seen & 1048576 == 0 || settings.expression.is_some())
             && (!settings.ignore_case || settings.text.is_some() || settings.expression.is_some()),
         Mode::Structure => settings.source.is_some() && settings.structure_mode.is_some() && settings.structure_name.is_some()
-            && seen & !(1 | 8 | catalog_options | 2097152 | 4194304 | 8388608 | 16777216 | 33554432 | 67108864 | 134217728) == 0
+            && !(settings.member.is_some() && settings.directory.is_some())
+            && seen & !(1 | 8 | 256 | 512 | 268435456 | catalog_options | 2097152 | 4194304 | 8388608 | 16777216 | 33554432 | 67108864 | 134217728) == 0
             && (settings.structure_mode != Some(StructureMode::Occurrences)
                 || settings.name_mode == SymbolNameMode::Exact),
         Mode::Read => settings.source.is_some() && settings.member.is_some()
@@ -259,6 +273,7 @@ fn parse(args: &[OsString]) -> Result<Settings, Failure> {
             && (!settings.raw || (settings.line.is_none() && seen & 8192 == 0)),
     };
     if !valid { return Err(Failure::new("CLI_INCOMPATIBLE_OPTIONS")); }
+    if mode == Mode::Structure { settings.structure_scope().validate()?; }
     if settings.structure_mode == Some(StructureMode::Occurrences) {
         let name = settings.structure_name.as_deref().ok_or_else(|| Failure::new("CLI_INVALID_NEEDLE"))?;
         fcb::search::symbols::validate_reference_name(name).map_err(|error| Failure::new(error.code()))?;

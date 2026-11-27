@@ -6,7 +6,7 @@
 
 use fcb::search::SymbolNameMode;
 use fcb::search::snapshot_structure::{StructureError, StructureMode, StructureOptions,
-    StructureQuery, StructureState};
+    StructureQuery, StructureScope, StructureState};
 use crate::{allocation, file_id, generation, revision, EXIT_OK, EXIT_NO_MATCH, EXIT_PARTIAL};
 use super::{Settings, Failure, ResourceBudget, Output, RawPath, begin, catalog, matching};
 
@@ -27,7 +27,8 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
     let options = StructureOptions { generation: generation(), first_file: file_id(),
         first_revision: revision(), mode, name_mode: settings.name_mode,
         max_matches: settings.limit, max_source_bytes: settings.max_structure_source_bytes };
-    let mut query = StructureQuery::new_matching_page(&mut archive, name, options, settings.skip_matches,
+    let scope = settings.structure_scope();
+    let mut query = StructureQuery::new_scoped_page(&mut archive, name, options, scope, settings.skip_matches,
         !settings.ignore_case, settings.count_all_matches, budget,
         [allocation(160), allocation(161), allocation(162), allocation(163), allocation(164)])?;
     while query.state() == StructureState::Pending {
@@ -36,9 +37,21 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
     let report = query.finish()?;
     if canceled() { return Err(Failure::canceled()); }
     let stats = report.stats();
+    let (scope_label, scope_path) = match scope {
+        StructureScope::Archive => ("whole-saved-archive", None),
+        StructureScope::Member(path) => ("saved-member", Some(path)),
+        StructureScope::Directory(path) => ("saved-directory", Some(path)),
+    };
     if settings.json {
         begin(out, "snapshot-structure")?;
-        out.literal(",\"source_scope\":\"saved-observations-only\",\"scope\":\"whole-saved-archive\",\"live_roots_accessed\":false,\"identity_scope\":\"response-local\",\"payload_residency\":\"one-verified-member\",\"retained_source_payload_bytes\":\"0\",\"snapshot_digest\":")?;
+        out.literal(",\"source_scope\":\"saved-observations-only\",\"scope\":")?; out.quoted(scope_label)?;
+        out.literal(",\"scope_path\":")?;
+        if let Some(path) = scope_path { out.path(&RawPath::from_bytes(path).to_path_buf())?; }
+        else { out.literal("null")?; }
+        out.literal(",\"scope_known_members\":")?; out.integer(report.selected_members() as u64)?;
+        out.literal(",\"scope_membership_complete\":")?; out.boolean(report.membership_complete())?;
+        out.literal(",\"scope_complete\":")?; out.boolean(report.is_complete())?;
+        out.literal(",\"live_roots_accessed\":false,\"identity_scope\":\"response-local\",\"payload_residency\":\"one-verified-member\",\"retained_source_payload_bytes\":\"0\",\"snapshot_digest\":")?;
         out.quoted(&report.archive_digest().to_hex())?;
         out.literal(",\"policy\":")?; out.quoted(archive.directory().policy())?;
         out.literal(",\"requested_mode\":")?; out.quoted(mode.requested())?;
@@ -56,7 +69,7 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
             out.literal(",\"includes_comments_and_literals\":true,\"compiler_resolved\":false,\"token_policy\":\"ascii-alphanumeric-underscore-dollar-plus-nonascii-nonwhitespace-noncontrol-v1\",\"name_syntax\":\"single-token-no-leading-ascii-digit\",\"unicode_normalization\":\"none\"")?;
         }
         out.literal(",\"discovery_complete\":")?; out.boolean(archive.directory().discovery_complete())?;
-        out.literal(",\"workspace_complete\":")?; out.boolean(report.is_complete())?;
+        out.literal(",\"workspace_complete\":")?; out.boolean(scope == StructureScope::Archive && report.is_complete())?;
         out.literal(",\"matches_seen_exact\":")?; out.boolean(report.matches_seen_exact())?;
         out.literal(",\"truncated\":")?;
         out.boolean(report.truncated() || report.skipped_matches() > 0)?;
@@ -89,6 +102,11 @@ pub(super) fn execute(settings: &Settings, out: &mut Output, budget: &ResourceBu
     } else {
         if !archive.directory().fully_verified_on_open() {
             out.literal("Trusted saved catalog; archive boundaries checked. Unread body integrity is unchecked; loaded members are digest-verified.\n")?;
+        }
+        if let Some(path) = scope_path {
+            out.literal(scope_label)?; out.literal(" ")?; out.path(&RawPath::from_bytes(path).to_path_buf())?;
+            out.literal(" (known members: ")?; out.literal(&report.selected_members().to_string())?; out.literal(")\n")?;
+            if !report.membership_complete() { out.literal("Requested scope membership is incomplete.\n")?; }
         }
         out.literal(if report.is_complete() { "Complete saved-scope structural search; no live roots accessed.\n" }
             else { "PARTIAL saved-scope structural search; no live roots accessed.\n" })?;

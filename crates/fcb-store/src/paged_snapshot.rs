@@ -120,6 +120,18 @@ impl SnapshotDirectory {
     pub fn members(&self) -> impl ExactSizeIterator<Item = PagedMember<'_>> {
         (0..self.entries.len()).map(|ordinal| self.member(ordinal).expect("validated ordinal"))
     }
+    /// Archive ordinals below a raw directory label. FCBS entries are unique
+    /// and sorted bytewise, so every descendant shares one contiguous range.
+    /// Search against the virtual prefix `directory/` without allocating it.
+    pub fn descendants(&self, directory: &[u8]) -> Range<usize> {
+        let start = self.entries.partition_point(|entry| {
+            self.paths[entry.path.clone()].iter().cmp(directory.iter().chain(std::iter::once(&b'/'))).is_lt()
+        });
+        let count = self.entries[start..].partition_point(|entry| {
+            self.paths[entry.path.clone()].strip_prefix(directory).is_some_and(|tail| tail.starts_with(b"/"))
+        });
+        start..start + count
+    }
     pub fn find_path(&self, native: &[u8]) -> Option<usize> {
         self.entries.binary_search_by(|entry| self.paths[entry.path.clone()].cmp(native)).ok()
     }

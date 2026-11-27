@@ -372,3 +372,55 @@ fn lowercase_occurrence_cli_rejects_partial_expansions_and_preserves_wider_sourc
     assert_eq!(report.get("metadata_omitted").number(), 0);
     assert_eq!(report.get("metadata_bytes").number(), spelling.len() as u64);
 }
+
+#[test]
+fn exact_and_folder_scopes_preserve_raw_labels_and_only_consume_selected_source() {
+    let source = b"fn needle() {}\n";
+    let f = Fixture::new(&[entry(b"a.rs", &[b'x'; 200]), entry(b"src-extra.rs", source),
+        entry(b"src/nested/\xff.rs", source), entry(b"src/main.rs", source),
+        entry(b"src2/decoy.rs", source), entry(b"src\\stray.rs", source)], true);
+    let (exit, folder) = invoke(&args(&f, "symbols", "needle",
+        &["--directory-hex", "737263", "--max-source-bytes", "30", "--limit", "1", "--skip-matches", "1", "--count-all"]), || false);
+    assert_eq!(exit, EXIT_OK); assert_eq!(folder.get("scope").text(), "saved-directory");
+    assert_eq!(folder.get("scope_path").get("hex").text(), "737263");
+    assert!(folder.get("scope_complete").flag()); assert!(!folder.get("workspace_complete").flag());
+    assert_eq!(folder.get("scope_known_members").number(), 2); assert_eq!(folder.get("matches_seen").number(), 2);
+    assert_eq!(folder.get("members_visited").number(), 2); assert_eq!(folder.get("loaded_source_bytes").number(), 30);
+    assert_eq!(folder.get("hits").array()[0].get("path").get("hex").text(), "7372632f6e65737465642fff2e7273");
+    let (exit, member) = invoke(&args(&f, "symbols", "needle",
+        &["--member-hex", "7372632f6e65737465642fff2e7273", "--max-source-bytes", "15"]), || false);
+    assert_eq!(exit, EXIT_OK); assert_eq!(member.get("scope").text(), "saved-member");
+    assert_eq!(member.get("scope_path"), member.get("hits").array()[0].get("path"));
+    assert_eq!(member.get("members_visited").number(), 1);
+    let (exit, absent) = invoke(&args(&f, "symbols", "needle", &["--directory", "absent"]), || false);
+    assert_eq!(exit, EXIT_NO_MATCH); assert_eq!(absent.get("scope_known_members").number(), 0);
+    assert!(absent.get("scope_complete").flag());
+}
+
+#[test]
+fn partial_discovery_closes_only_an_observed_singleton_and_unavailable_members_remain_partial() {
+    let f = Fixture::new(&[entry(b"src/a.md", b"# Heading\n"),
+        SnapshotEntry { path: b"other.md", observed_bytes: 1, data: SnapshotData::Unavailable("missing") }], false);
+    for (flag, path, exit, membership, unavailable) in [
+        ("--member", "src/a.md", EXIT_OK, true, 0),
+        ("--member", "other.md", EXIT_PARTIAL, true, 1),
+        ("--member", "unknown.md", EXIT_PARTIAL, false, 0),
+        ("--directory", "src", EXIT_PARTIAL, false, 0),
+        ("--directory", "missing", EXIT_PARTIAL, false, 0),
+    ] {
+        let (observed, page) = invoke(&args(&f, "headings", "Heading", &[flag, path, "--count-all"]), || false);
+        assert_eq!(observed, exit, "{flag} {path}");
+        assert_eq!(page.get("scope_membership_complete").flag(), membership);
+        assert_eq!(page.get("unavailable_files").number(), unavailable);
+        assert_eq!(page.get("matches_seen_exact").flag(), observed == EXIT_OK);
+        assert!(!page.get("discovery_complete").flag()); assert!(!page.get("workspace_complete").flag());
+    }
+    for extra in [vec!["--member", "../src/a.md"], vec!["--directory", "/src"],
+        vec!["--directory", "a//b"], vec!["--member-hex", "610062"], vec!["--directory", "src", "--member", "src/a.md"]] {
+        let mut input = args(&f, "headings", "Heading", &extra);
+        input[2] = f.root.join("unopened.fcbs").into_os_string();
+        let (exit, result) = invoke(&input, || false);
+        assert_eq!(exit, EXIT_ERROR);
+        assert!(matches!(result.get("error").get("code").text(), "STRUCTURE_INVALID_SCOPE" | "CLI_INCOMPATIBLE_OPTIONS"));
+    }
+}

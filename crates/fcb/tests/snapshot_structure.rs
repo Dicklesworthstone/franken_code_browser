@@ -688,3 +688,29 @@ fn larger_saved_symbol_members_keep_exact_names_and_release_analysis_between_ste
         assert_eq!(capture.bytes(), source);
     }
 }
+
+#[test]
+fn scoped_windows_freeze_archive_ordinals_before_limits_and_activation() {
+    use fcb::search::snapshot_structure::StructureScope;
+    let budget = budget();
+    let target = b"needle needle";
+    let mut saved = archive(&[
+        entry(b"a", b"unrelated payload wider than our allowance"),
+        entry(b"src-other", b"needle"), entry(b"src/a", target),
+        entry(b"src/nested/b", b"needle"), entry(b"src0", b"needle")
+    ], true, &budget);
+    let mut opts = options(StructureMode::Occurrences, 1);
+    opts.max_source_bytes = (target.len() + b"needle".len()) as u64;
+    let mut query = StructureQuery::new_scoped_page(&mut saved, "needle", opts,
+        StructureScope::Directory(b"src"), 2, true, true, &budget, allocations()).unwrap();
+    assert_eq!(query.step(opts.generation, &budget, || false).unwrap(), StructureState::Pending);
+    assert_eq!(query.step(opts.generation, &budget, || false).unwrap(), StructureState::Complete);
+    let report = query.finish().unwrap();
+    assert!(report.membership_complete()); assert!(report.is_complete());
+    assert_eq!(report.selected_members(), 2); assert_eq!(report.stats().members_visited, 2);
+    assert_eq!(report.stats().loaded_bytes, opts.max_source_bytes); assert_eq!(report.matches_seen(), 3);
+    let hit = &report.hits()[0]; assert_eq!(hit.ordinal(), 3);
+    let capture = hit.open(&mut saved, opts.generation, &budget,
+        [allocation(80), allocation(81)], || false).unwrap();
+    assert_eq!(capture.bytes(), b"needle");
+}

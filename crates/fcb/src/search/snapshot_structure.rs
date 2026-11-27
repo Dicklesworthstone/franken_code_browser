@@ -10,7 +10,7 @@
 //! retain metadata only. Activating a hit verifies its archive member again and
 //! never consults a path from the archived workspace.
 
-use std::{io::{Read, Seek}, mem::size_of};
+use std::{io::{Read, Seek}, mem::size_of, ops::Range};
 use fcb_search::{SearchMode, UnicodeNormalization};
 use fcb_search::normalized::{NormalizedCursor, SourceScalar, matched_text_capacity};
 use fcb_core::{ByteLength, ByteRange, FileId, QueryGeneration, ResourceAllocationId,
@@ -51,6 +51,22 @@ impl StructureMode {
     }
 }
 
+/// A frozen selection of raw FCBS member labels. Only slash separates
+/// components. No case folding, text conversion or filesystem lookup occurs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StructureScope<'a> { Archive, Directory(&'a [u8]), Member(&'a [u8]) }
+
+impl StructureScope<'_> {
+    pub fn validate(self) -> Result<(), StructureError> {
+        let path = match self { Self::Archive => return Ok(()), Self::Directory(path) | Self::Member(path) => path };
+        if path.len() > 16_384 || path.contains(&0)
+            || path.split(|&byte| byte == b'/').any(|part| part.is_empty() || part == b"." || part == b"..") {
+            return Err(StructureError::InvalidScope);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StructureOptions {
     pub generation: QueryGeneration,
@@ -67,7 +83,7 @@ pub struct StructureOptions {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StructureError {
     Search(PagedSearchError), Reference(ReferenceError), InvalidLimits, ResourceDenied,
-    IdentityExhausted, Pending, Canceled, StaleQuery, CapabilityUnavailable, InvalidHit,
+    IdentityExhausted, Pending, Canceled, StaleQuery, CapabilityUnavailable, InvalidHit, InvalidScope,
 }
 impl StructureError {
     pub fn is_canceled(self) -> bool {
@@ -87,6 +103,7 @@ impl std::fmt::Display for StructureError {
             Self::Canceled => f.write_str("STRUCTURE_CANCELED"),
             Self::StaleQuery => f.write_str("STRUCTURE_STALE_QUERY"),
             Self::CapabilityUnavailable => f.write_str("STRUCTURE_CAPABILITY_UNAVAILABLE"),
+            Self::InvalidScope => f.write_str("STRUCTURE_INVALID_SCOPE"),
             Self::InvalidHit => f.write_str("STRUCTURE_INVALID_HIT"),
         }
     }
@@ -183,7 +200,9 @@ pub struct StructureQuery<'archive, R: Read + Seek> {
     case_sensitive: bool,
     count_all_matches: bool,
     first_unretained: Option<u64>,
-    next: usize,
+    remaining: Range<usize>,
+    selected_members: usize,
+    membership_complete: bool,
     metadata_limit: usize,
     occurrence_name_bytes: usize,
     state: StructureState,
@@ -215,7 +234,29 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
     pub fn new_matching_page(archive: &'archive mut PagedSnapshot<R>, needle: &str, options: StructureOptions,
         skip_matches: u64, case_sensitive: bool, count_all_matches: bool,
         budget: &ResourceBudget, allocations: [ResourceAllocationId; 5]) -> Result<Self, StructureError> {
-        let owner = archive.directory().owner();
+        Self::new_scoped_page(archive, needle, options, StructureScope::Archive, skip_matches,
+            case_sensitive, count_all_matches, budget, allocations)
+    }
+
+    /// Freeze the selected directory or exact member before any extraction,
+    /// hit skip or byte quota. The archive's original ordinals remain stable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_scoped_page(archive: &'archive mut PagedSnapshot<R>, needle: &str, options: StructureOptions,
+        scope: StructureScope<'_>, skip_matches: u64, case_sensitive: bool, count_all_matches: bool,
+        budget: &ResourceBudget, allocations: [ResourceAllocationId; 5]) -> Result<Self, StructureError> {
+        scope.validate()?;
+        let directory = archive.directory();
+        let remaining = match scope {
+            StructureScope::Archive => 0..directory.len(),
+            StructureScope::Directory(prefix) => directory.descendants(prefix),
+            StructureScope::Member(path) => directory.find_path(path).map_or(0..0, |n| n..n + 1),
+        };
+        let selected_members = remaining.len();
+        let membership_complete = match scope {
+            StructureScope::Member(_) => selected_members == 1,
+            _ => directory.discovery_complete(),
+        };
+        let owner = directory.owner();
         if options.generation.owner() != owner || options.first_file.owner() != owner
             || options.first_revision.owner() != owner { return Err(PagedSearchError::OwnerMismatch.into()); }
         if needle.is_empty() || needle.len() > MAX_STRUCTURE_NEEDLE_BYTES || needle.as_bytes().contains(&0)
@@ -229,7 +270,7 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
         }
         #[cfg(not(feature = "markdown"))]
         if options.mode == StructureMode::Headings { return Err(StructureError::CapabilityUnavailable); }
-        let last = archive.directory().len().saturating_sub(1) as u64;
+        let last = remaining.end.saturating_sub(1) as u64;
         options.first_file.get().checked_add(last).ok_or(StructureError::IdentityExhausted)?;
         options.first_revision.get().checked_add(last).ok_or(StructureError::IdentityExhausted)?;
         let metadata_limit = options.max_matches.checked_mul(MAX_STRUCTURE_NAME_BYTES * 2)
@@ -263,7 +304,7 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
         hits.try_reserve_exact(options.max_matches).map_err(|_| StructureError::ResourceDenied)?;
         if hits.capacity() > options.max_matches { return Err(StructureError::ResourceDenied); }
         Ok(Self { archive, options, needle: copy_text(needle)?, allocations, hits, seen: 0, skip_matches,
-            case_sensitive, count_all_matches, first_unretained: None, next: 0,
+            case_sensitive, count_all_matches, first_unretained: None, remaining, selected_members, membership_complete,
             metadata_limit, occurrence_name_bytes, state: StructureState::Pending, stats: StructureStats::default(), _lease: lease })
     }
     pub const fn state(&self) -> StructureState { self.state }
@@ -280,7 +321,7 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
             return Err(error);
         }
         if canceled() { self.cancel(); return Err(StructureError::Canceled); }
-        if self.state == StructureState::Pending && self.next == self.archive.directory().len() {
+        if self.state == StructureState::Pending && self.remaining.is_empty() {
             self.state = StructureState::Complete;
         }
         Ok(self.state)
@@ -288,10 +329,9 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
 
     fn one_member(&mut self, budget: &ResourceBudget, canceled: &mut impl FnMut() -> bool)
         -> Result<(), StructureError> {
-        if self.next == self.archive.directory().len() { return Ok(()); }
-        let ordinal = self.next;
+        let Some(ordinal) = self.remaining.next() else { return Ok(()); };
         let member = self.archive.directory().member(ordinal).ok_or(StructureError::InvalidHit)?;
-        self.next += 1; self.stats.members_visited += 1;
+        self.stats.members_visited += 1;
         if matches!(member.data, PagedMemberData::Unavailable(_)) {
             self.stats.unavailable_files += 1; return Ok(());
         }
@@ -473,7 +513,7 @@ impl<'archive, R: Read + Seek> StructureQuery<'archive, R> {
             StructureState::Canceled => Err(StructureError::Canceled),
             StructureState::Failed(error) => Err(error),
             _ => Ok(StructureReport { archive: self.archive.directory().digest(),
-                discovery_complete: self.archive.directory().discovery_complete(), options: self.options,
+                membership_complete: self.membership_complete, selected_members: self.selected_members, options: self.options,
                 needle: self.needle, hits: self.hits, seen: self.seen, skip_matches: self.skip_matches,
                 case_sensitive: self.case_sensitive, count_all_matches: self.count_all_matches,
                 first_unretained: self.first_unretained, state: self.state, stats: self.stats, _lease: self._lease }),
@@ -487,7 +527,8 @@ struct MemberIdentity { ordinal: usize, file: FileId, revision: SourceRevision, 
 /// No archive descriptor, source buffers, parser trees or live paths are retained.
 pub struct StructureReport {
     archive: Sha256Digest,
-    discovery_complete: bool,
+    membership_complete: bool,
+    selected_members: usize,
     options: StructureOptions,
     needle: String,
     hits: Vec<StructureHit>,
@@ -501,6 +542,11 @@ pub struct StructureReport {
     _lease: ResourceLease,
 }
 impl StructureReport {
+    /// Number of known members in the frozen scope, independent of work limits.
+    pub const fn selected_members(&self) -> usize { self.selected_members }
+    /// A known exact member establishes singleton membership even for a
+    /// partial archive. An absent requested member is explicitly unfulfilled.
+    pub const fn membership_complete(&self) -> bool { self.membership_complete }
     pub fn hits(&self) -> &[StructureHit] { &self.hits }
     pub const fn matches_seen(&self) -> u64 { self.seen }
     pub const fn skip_matches(&self) -> u64 { self.skip_matches }
@@ -527,7 +573,7 @@ impl StructureReport {
     /// metadata-only omissions do not make an otherwise complete count inexact.
     /// This never claims compiler semantic completeness.
     pub fn matches_seen_exact(&self) -> bool {
-        self.state == StructureState::Complete && self.discovery_complete
+        self.state == StructureState::Complete && self.membership_complete
             && self.stats.unsupported_files == 0 && self.stats.unavailable_files == 0
             && self.stats.source_limited_files == 0 && self.stats.extraction_limited_files == 0
     }

@@ -1462,14 +1462,32 @@ fcb snapshot structure saved.fcbs --mode symbols --name "load" --name-mode conta
 fcb snapshot structure saved.fcbs --mode occurrences --name "load_config" --json
 ```
 
-All name matching is case-sensitive; the default is exact. Symbols are bounded
+Name matching defaults to exact and case-sensitive. Add `--ignore-case` for Unicode scalar lowercase matching. Symbols are bounded
 heuristic declaration candidates. Headings come from FrankenMarkdown with
 qualified original-byte ranges. Occurrences are exact whole-token text
 matches, including comments and string literals; prefix/contains and
 compiler-reference claims are unavailable in that mode. UTF-8 and supported
 BOM-marked UTF-16 source retain original-byte coordinates.
 
-The scope is the whole saved archive. Member names remain reversible labels;
+The default scope is the whole saved archive. Select a directory subtree or one
+exact member to search a smaller scope, including with count-only or later windows.
+
+```sh
+fcb snapshot structure saved.fcbs --mode symbols --name open --directory src --count-all --json
+fcb snapshot structure saved.fcbs --mode headings --name Install --member docs/setup.md --json
+```
+
+`--directory-hex` and `--member-hex` accept raw path bytes. The directory
+is component-exact and recursive. For example, `src` includes `src/nested/a`
+and excludes `src-other/a`. Only selected members consume query source bytes
+or match offsets. Full archive validation on ordinary open still reads the
+complete envelope. JSON reports `scope_path`, `scope_known_members`,
+`scope_membership_complete`, and `scope_complete`. A file present in a
+partially discovered archive can yield an exact count for that one file.
+A missing requested file, an unavailable member, or incomplete directory
+discovery produces partial coverage. A directory query over a complete
+catalog with no matching members yields zero. `workspace_complete` is
+reserved for whole-archive queries. Member names remain reversible labels;
 the command grants no live-root access and never reads current workspace
 source. Results include the archive and source digests, member identity, exact
 selected and evidence ranges, candidate kind/language, and heading slugs where
